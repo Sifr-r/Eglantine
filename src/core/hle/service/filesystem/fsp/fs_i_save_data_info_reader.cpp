@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <utility>
 #include "common/hex_util.h"
 #include "core/file_sys/savedata_factory.h"
 #include "core/hle/service/cmif_serialization.h"
@@ -12,17 +16,58 @@
 
 namespace Service::FileSystem {
 
+namespace {
+
+/// Checks a single enumerated save against a save data filter.
+/// A field is only compared when its use_* flag is set, the rank is never compared.
+bool MatchesFilter(const ISaveDataInfoReader::SaveDataInfo& entry, const FileSys::SaveDataFilter& filter) {
+    const auto& attribute = filter.attribute;
+
+    if (filter.use_program_id && entry.title_id != attribute.program_id) {
+        return false;
+    }
+
+    if (filter.use_save_data_type && entry.type != attribute.type) {
+        return false;
+    }
+
+    if (filter.use_user_id) {
+        std::array<u8, 0x10> user_id{};
+        std::memcpy(user_id.data(), attribute.user_id.data(), user_id.size());
+        if (entry.user_id != user_id) {
+            return false;
+        }
+    }
+
+    if (filter.use_save_data_id && entry.save_id != attribute.system_save_data_id) {
+        return false;
+    }
+
+    if (filter.use_index && entry.index != attribute.index) {
+        return false;
+    }
+
+    return true;
+}
+
+} // Anonymous namespace
+
 ISaveDataInfoReader::ISaveDataInfoReader(Core::System& system_,
                                          std::shared_ptr<SaveDataController> save_data_controller_,
-                                         FileSys::SaveDataSpaceId space)
-    : ServiceFramework{system_, "ISaveDataInfoReader"}, save_data_controller{
-                                                            save_data_controller_} {
+                                         FileSys::SaveDataSpaceId space,
+                                         std::optional<FileSys::SaveDataFilter> filter_)
+    : ServiceFramework{system_, "ISaveDataInfoReader"},
+      save_data_controller{save_data_controller_}, filter{std::move(filter_)} {
     static const FunctionInfo functions[] = {
         {0, D<&ISaveDataInfoReader::ReadSaveDataInfo>, "ReadSaveDataInfo"},
     };
     RegisterHandlers(functions);
 
     FindAllSaves(space);
+
+    if (this->filter.has_value()) {
+        ApplyFilter();
+    }
 }
 
 ISaveDataInfoReader::~ISaveDataInfoReader() = default;
@@ -61,6 +106,18 @@ Result ISaveDataInfoReader::ReadSaveDataInfo(
     *out_count = actual_entries;
 
     R_SUCCEED();
+}
+
+void ISaveDataInfoReader::ApplyFilter() {
+    const auto& active_filter = *filter;
+
+    info.erase(std::remove_if(info.begin(), info.end(),
+                               [&active_filter](const SaveDataInfo& entry) {
+                                   return !MatchesFilter(entry, active_filter);
+                               }),
+               info.end());
+
+    LOG_DEBUG(Service_FS, "Applied save data filter, {} entries remain", info.size());
 }
 
 void ISaveDataInfoReader::FindAllSaves(FileSys::SaveDataSpaceId space) {

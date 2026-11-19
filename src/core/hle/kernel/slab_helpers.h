@@ -148,10 +148,10 @@ public:
     virtual ~KAutoObjectWithSlabHeapAndContainer() {}
 
     virtual void Destroy(KernelCore& kernel) override {
+        kernel.ObjectListContainer().Unregister(this);
         const bool is_initialized = this->IsInitialized();
         uintptr_t arg = 0;
         if (is_initialized) {
-            kernel.ObjectListContainer().Unregister(this);
             arg = this->GetPostDestroyArgument();
             this->Finalize(kernel);
         }

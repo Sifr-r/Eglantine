@@ -2413,7 +2413,14 @@ void RasterizerVulkan::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
         std::scoped_lock lock{texture_cache.mutex};
         texture_cache.UnmapGPUMemory(as_id, addr, size);
     }
-    buffer_cache.UnmapGPUMemory(as_id, addr, size);
+    {
+        // The virtual ranges the buffer cache keeps for the address space are its own state, so
+        // the unmap runs under its lock, as the one in UnmapMemory does. One cache at a time,
+        // like everywhere else here: the texture cache's lock is already released, so the two
+        // are never held at once and no lock order is inverted.
+        std::scoped_lock lock{buffer_cache.mutex};
+        buffer_cache.UnmapGPUMemory(as_id, addr, size);
+    }
 }
 
 void RasterizerVulkan::SignalFence(std::function<void()>&& func, bool force_completion) {

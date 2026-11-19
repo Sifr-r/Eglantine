@@ -98,6 +98,17 @@ struct ImageBase {
         return gpu_addr < overlap_end && overlap_gpu_addr < gpu_addr_end;
     }
 
+    /// Whether the title redraws this image every frame: it was written in this frame or in the
+    /// one before it, and it was not cleared this frame. A draw skipped now is submitted again
+    /// in the next frame, so nothing is left missing.
+    ///
+    /// `current_frame` is frame_tick + 1, the same counter first_written_frame and
+    /// last_written_frame use.
+    [[nodiscard]] bool RedrawnEveryFrame(u64 current_frame) const noexcept {
+        return last_written_frame != 0 && last_written_frame >= current_frame - 1 &&
+               cleared_frame != current_frame;
+    }
+
     void CheckBadOverlapState();
     void CheckAliasState();
 

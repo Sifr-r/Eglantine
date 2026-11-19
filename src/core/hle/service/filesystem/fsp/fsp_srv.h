@@ -8,6 +8,7 @@
 
 #include <memory>
 #include "core/file_sys/fs_save_data_types.h"
+#include "core/file_sys/fssrv/fssrv_sf_path.h"
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/filesystem/fsp/fsp_types.h"
 #include "core/hle/service/service.h"
@@ -27,6 +28,7 @@ class RomFsController;
 class SaveDataController;
 
 class IFileSystem;
+class IFile;
 class ISaveDataInfoReader;
 class ISaveDataTransferProhibiter;
 class IStorage;
@@ -55,6 +57,17 @@ private:
     Result OpenFileSystemWithPatch(OutInterface<IFileSystem> out_interface,
                                    FileSystemProxyType type, u64 open_program_id);
     Result OpenSdCardFileSystem(OutInterface<IFileSystem> out_interface);
+    Result OpenBisFileSystem(OutInterface<IFileSystem> out_interface,
+                              const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path,
+                              FileSys::BisPartitionId partition_id);
+    Result OpenBisStorage(OutInterface<IStorage> out_interface, FileSys::BisPartitionId partition_id);
+    Result InvalidateBisCache();
+    Result DeleteSaveDataFileSystem(u64 save_data_id);
+    Result RegisterSaveDataFileSystemAtomicDeletion(InBuffer<BufferAttr_HipcMapAlias> save_data_id_buffer);
+    Result DeleteSaveDataFileSystemBySaveDataSpaceId(FileSys::SaveDataSpaceId space_id, u64 save_data_id);
+    Result DeleteSaveDataFileSystemBySaveDataAttribute(FileSys::SaveDataSpaceId space_id,
+                                                       FileSys::SaveDataAttribute attribute);
+    Result DeleteCacheStorage(u16 index);
     Result CreateSaveDataFileSystem(FileSys::SaveDataCreationInfo save_create_struct,
                                     FileSys::SaveDataAttribute save_struct, u128 uid);
     Result CreateSaveDataFileSystemBySystemSaveDataId(
@@ -73,7 +86,13 @@ private:
                                           FileSys::SaveDataAttribute attribute);
     Result OpenSaveDataInfoReaderBySaveDataSpaceId(OutInterface<ISaveDataInfoReader> out_interface,
                                                    FileSys::SaveDataSpaceId space);
+    Result OpenSaveDataInfoReader(OutInterface<ISaveDataInfoReader> out_interface);
+    Result OpenSaveDataInfoReaderBySaveDataFilter(OutInterface<ISaveDataInfoReader> out_interface,
+                                                  FileSys::SaveDataSpaceId space_id,
+                                                  FileSys::SaveDataFilter filter);
     Result OpenSaveDataInfoReaderOnlyCacheStorage(OutInterface<ISaveDataInfoReader> out_interface);
+    Result OpenSaveDataMetaFile(OutInterface<IFile> out_interface, FileSys::SaveDataSpaceId space_id,
+                                FileSys::SaveDataMetaType meta_type, FileSys::SaveDataAttribute attribute);
     Result FindSaveDataWithFilter(Out<s64> out_count, OutBuffer<BufferAttr_HipcMapAlias> out_buffer,
                                   FileSys::SaveDataSpaceId space_id,
                                   FileSys::SaveDataFilter filter);
@@ -114,6 +133,14 @@ private:
     Result ExtendSaveDataFileSystem(FileSys::SaveDataSpaceId space_id, u64 save_data_id,
                                     s64 available_size, s64 journal_size);
     Result GetCacheStorageSize(s32 index, Out<s64> out_data_size, Out<s64> out_journal_size);
+    Result OpenImageDirectoryFileSystem(OutInterface<IFileSystem> out_interface,
+                                        ImageDirectoryId directory_id);
+    Result OpenContentStorageFileSystem(OutInterface<IFileSystem> out_interface, ContentStorageId storage_id);
+    Result QuerySaveDataTotalSize(s64 data_size, s64 journal_size, Out<s64> out_total_size);
+    Result GetFreeSpaceSizeForSaveData(FileSys::SaveDataSpaceId space_id, Out<s64> out_free_space_size);
+    Result QuerySaveDataInternalStorageTotalSize(s64 data_size, s64 journal_size, Out<s64> out_total_size);
+    Result GetSaveDataCommitId(FileSys::SaveDataSpaceId space_id, u64 save_data_id, Out<s64> out_commit_id);
+    Result SetSaveDataSize(s64 data_size, s64 journal_size);
 
     FileSystemController& fsc;
     const FileSys::ContentProvider& content_provider;

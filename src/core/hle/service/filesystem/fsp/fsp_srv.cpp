@@ -4,10 +4,13 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstring>
 #include <iterator>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -17,11 +20,14 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "common/string_util.h"
+#include "common/uuid.h"
 #include "core/core.h"
+#include "core/file_sys/bis_factory.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/errors.h"
 #include "core/file_sys/fs_directory.h"
 #include "core/file_sys/fs_filesystem.h"
+#include "core/file_sys/fssrv/fssrv_sf_path.h"
 #include "core/file_sys/nca_metadata.h"
 #include "core/file_sys/patch_manager.h"
 #include "core/file_sys/romfs.h"
@@ -30,8 +36,10 @@
 #include "core/file_sys/system_archive/system_archive.h"
 #include "core/file_sys/vfs/vfs.h"
 #include "core/hle/result.h"
+#include "core/hle/service/acc/profile_manager.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/filesystem.h"
+#include "core/hle/service/filesystem/fsp/fs_i_file.h"
 #include "core/hle/service/filesystem/fsp/fs_i_filesystem.h"
 #include "core/hle/service/filesystem/fsp/fs_i_multi_commit_manager.h"
 #include "core/hle/service/filesystem/fsp/fs_i_save_data_info_reader.h"
@@ -47,6 +55,118 @@
 
 namespace Service::FileSystem {
 
+namespace {
+
+/// Save data spaces the backing store can address. The remaining ids of the enum have no
+/// directory in the save data factory, so they are rejected before they reach it.
+bool IsSupportedSaveDataSpace(FileSys::SaveDataSpaceId space) {
+    switch (space) {
+    case FileSys::SaveDataSpaceId::System:
+    case FileSys::SaveDataSpaceId::User:
+    case FileSys::SaveDataSpaceId::SdUser:
+    case FileSys::SaveDataSpaceId::Temporary:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Save data types the backing store can address. Bcat saves have no directory either.
+bool IsSupportedSaveDataType(FileSys::SaveDataType type) {
+    switch (type) {
+    case FileSys::SaveDataType::System:
+    case FileSys::SaveDataType::Account:
+    case FileSys::SaveDataType::Device:
+    case FileSys::SaveDataType::Temporary:
+    case FileSys::SaveDataType::Cache:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// Returns the user id of the currently selected user, if there is one.
+std::optional<FileSys::UserId> GetCurrentUserId(Core::System& system) {
+    const auto& manager = system.GetProfileManager();
+    const auto index = static_cast<std::size_t>((std::max)(Settings::values.current_user.GetValue(), 0));
+
+    if (!manager.UserExistsIndex(index)) {
+        return std::nullopt;
+    }
+
+    const auto user_id = manager.GetUser(index);
+    if (!user_id.has_value() || !user_id->IsValid()) {
+        return std::nullopt;
+    }
+
+    return user_id->AsU128();
+}
+
+/// Builds the attribute of a system save owned by the given title and user.
+FileSys::SaveDataAttribute MakeSystemSaveAttribute(u64 program_id, FileSys::UserId user_id,
+                                                   u64 save_data_id) {
+    return FileSys::SaveDataAttribute::Make(program_id, FileSys::SaveDataType::System, user_id,
+                                            save_data_id);
+}
+
+/// Sanitizes a guest supplied path into a relative subdirectory path.
+/// Returns false when the path is absolute, escapes its root or holds invalid characters.
+bool SanitizeRelativePath(std::string_view raw_path, std::string* out_path) {
+    const auto path = raw_path.substr(0, raw_path.find('\0'));
+
+    if (path.empty()) {
+        out_path->clear();
+        return true;
+    }
+
+    if (path.size() > FileSys::EntryNameLengthMax) {
+        return false;
+    }
+
+    // An absolute path would escape the root it is resolved against.
+    if (path.front() == '/' || path.front() == '\\') {
+        return false;
+    }
+
+    out_path->clear();
+
+    size_t component_start = 0;
+    while (component_start <= path.size()) {
+        auto component_end = path.find_first_of("/\\", component_start);
+        if (component_end == std::string_view::npos) {
+            component_end = path.size();
+        }
+
+        const auto component = path.substr(component_start, component_end - component_start);
+
+        // A parent directory reference would escape the root it is resolved against.
+        if (component == "..") {
+            return false;
+        }
+
+        for (const auto character : component) {
+            const auto byte = static_cast<unsigned char>(character);
+            if (byte < 0x20 || character == '*' || character == '?' || character == ':' ||
+                character == '|' || character == '"' || character == '<' || character == '>') {
+                return false;
+            }
+        }
+
+        if (!component.empty()) {
+            if (!out_path->empty()) {
+                out_path->push_back('/');
+            }
+            out_path->append(component);
+        }
+
+        component_start = component_end + 1;
+    }
+
+    return true;
+}
+
+} // Anonymous namespace
+
 FSP_SRV::FSP_SRV(Core::System& system_)
     : ServiceFramework{system_, "fsp-srv"}, fsc{system.GetFileSystemController()},
       content_provider{system.GetContentProvider()}, reporter{system.GetReporter()} {
@@ -58,24 +178,24 @@ FSP_SRV::FSP_SRV(Core::System& system_)
         {7, D<&FSP_SRV::OpenFileSystemWithPatch>, "OpenFileSystemWithPatch"},
         {8, nullptr, "OpenFileSystemWithId"},
         {9, nullptr, "OpenDataFileSystemByApplicationId"},
-        {11, nullptr, "OpenBisFileSystem"},
-        {12, nullptr, "OpenBisStorage"},
-        {13, nullptr, "InvalidateBisCache"},
+        {11, D<&FSP_SRV::OpenBisFileSystem>, "OpenBisFileSystem"},
+        {12, D<&FSP_SRV::OpenBisStorage>, "OpenBisStorage"},
+        {13, D<&FSP_SRV::InvalidateBisCache>, "InvalidateBisCache"},
         {17, nullptr, "OpenHostFileSystem"},
         {18, D<&FSP_SRV::OpenSdCardFileSystem>, "OpenSdCardFileSystem"},
         {19, nullptr, "FormatSdCardFileSystem"},
-        {21, nullptr, "DeleteSaveDataFileSystem"},
+        {21, D<&FSP_SRV::DeleteSaveDataFileSystem>, "DeleteSaveDataFileSystem"},
         {22, D<&FSP_SRV::CreateSaveDataFileSystem>, "CreateSaveDataFileSystem"},
         {23, D<&FSP_SRV::CreateSaveDataFileSystemBySystemSaveDataId>, "CreateSaveDataFileSystemBySystemSaveDataId"},
-        {24, nullptr, "RegisterSaveDataFileSystemAtomicDeletion"},
-        {25, nullptr, "DeleteSaveDataFileSystemBySaveDataSpaceId"},
+        {24, D<&FSP_SRV::RegisterSaveDataFileSystemAtomicDeletion>, "RegisterSaveDataFileSystemAtomicDeletion"},
+        {25, D<&FSP_SRV::DeleteSaveDataFileSystemBySaveDataSpaceId>, "DeleteSaveDataFileSystemBySaveDataSpaceId"},
         {26, nullptr, "FormatSdCardDryRun"},
         {27, D<&FSP_SRV::IsExFatSupported>, "IsExFatSupported"},
-        {28, nullptr, "DeleteSaveDataFileSystemBySaveDataAttribute"},
+        {28, D<&FSP_SRV::DeleteSaveDataFileSystemBySaveDataAttribute>, "DeleteSaveDataFileSystemBySaveDataAttribute"},
         {30, nullptr, "OpenGameCardStorage"},
         {31, nullptr, "OpenGameCardFileSystem"},
         {32, D<&FSP_SRV::ExtendSaveDataFileSystem>, "ExtendSaveDataFileSystem"},
-        {33, nullptr, "DeleteCacheStorage"},
+        {33, D<&FSP_SRV::DeleteCacheStorage>, "DeleteCacheStorage"},
         {34, D<&FSP_SRV::GetCacheStorageSize>, "GetCacheStorageSize"},
         {35, nullptr, "CreateSaveDataFileSystemByHashSalt"},
         {36, nullptr, "OpenHostFileSystemWithOption"},
@@ -86,18 +206,18 @@ FSP_SRV::FSP_SRV(Core::System& system_)
         {57, D<&FSP_SRV::ReadSaveDataFileSystemExtraDataBySaveDataSpaceId>, "ReadSaveDataFileSystemExtraDataBySaveDataSpaceId"},
         {58, D<&FSP_SRV::ReadSaveDataFileSystemExtraData>, "ReadSaveDataFileSystemExtraData"},
         {59, D<&FSP_SRV::WriteSaveDataFileSystemExtraData>, "WriteSaveDataFileSystemExtraData"},
-        {60, nullptr, "OpenSaveDataInfoReader"},
+        {60, D<&FSP_SRV::OpenSaveDataInfoReader>, "OpenSaveDataInfoReader"},
         {61, D<&FSP_SRV::OpenSaveDataInfoReaderBySaveDataSpaceId>, "OpenSaveDataInfoReaderBySaveDataSpaceId"},
         {62, D<&FSP_SRV::OpenSaveDataInfoReaderOnlyCacheStorage>, "OpenSaveDataInfoReaderOnlyCacheStorage"},
         {64, nullptr, "OpenSaveDataInternalStorageFileSystem"},
         {65, nullptr, "UpdateSaveDataMacForDebug"},
         {66, nullptr, "WriteSaveDataFileSystemExtraData2"},
         {67, D<&FSP_SRV::FindSaveDataWithFilter>, "FindSaveDataWithFilter"},
-        {68, nullptr, "OpenSaveDataInfoReaderBySaveDataFilter"},
+        {68, D<&FSP_SRV::OpenSaveDataInfoReaderBySaveDataFilter>, "OpenSaveDataInfoReaderBySaveDataFilter"},
         {69, D<&FSP_SRV::ReadSaveDataFileSystemExtraDataBySaveDataAttribute>, "ReadSaveDataFileSystemExtraDataBySaveDataAttribute"},
         {70, D<&FSP_SRV::WriteSaveDataFileSystemExtraDataWithMaskBySaveDataAttribute>, "WriteSaveDataFileSystemExtraDataWithMaskBySaveDataAttribute"},
         {71, D<&FSP_SRV::ReadSaveDataFileSystemExtraDataWithMaskBySaveDataAttribute>, "ReadSaveDataFileSystemExtraDataWithMaskBySaveDataAttribute"},
-        {80, nullptr, "OpenSaveDataMetaFile"},
+        {80, D<&FSP_SRV::OpenSaveDataMetaFile>, "OpenSaveDataMetaFile"},
         {81, nullptr, "OpenSaveDataTransferManager"},
         {82, nullptr, "OpenSaveDataTransferManagerVersion2"},
         {83, D<&FSP_SRV::OpenSaveDataTransferProhibiter>, "OpenSaveDataTransferProhibiter"},
@@ -105,10 +225,10 @@ FSP_SRV::FSP_SRV(Core::System& system_)
         {85, nullptr, "OpenSaveDataTransferManagerForSaveDataRepair"},
         {86, nullptr, "OpenSaveDataMover"},
         {87, nullptr, "OpenSaveDataTransferManagerForRepair"},
-        {100, nullptr, "OpenImageDirectoryFileSystem"},
+        {100, D<&FSP_SRV::OpenImageDirectoryFileSystem>, "OpenImageDirectoryFileSystem"},
         {101, nullptr, "OpenBaseFileSystem"},
         {102, nullptr, "FormatBaseFileSystem"},
-        {110, nullptr, "OpenContentStorageFileSystem"},
+        {110, D<&FSP_SRV::OpenContentStorageFileSystem>, "OpenContentStorageFileSystem"},
         {120, nullptr, "OpenCloudBackupWorkStorageFileSystem"},
         {130, nullptr, "OpenCustomStorageFileSystem"},
         {200, D<&FSP_SRV::OpenDataStorageByCurrentProcess>, "OpenDataStorageByCurrentProcess"},
@@ -126,7 +246,7 @@ FSP_SRV::FSP_SRV(Core::System& system_)
         {511, nullptr, "NotifySystemDataUpdateEvent"},
         {520, nullptr, "SimulateGameCardDetectionEvent"},
         {600, nullptr, "SetCurrentPosixTime"},
-        {601, nullptr, "QuerySaveDataTotalSize"},
+        {601, D<&FSP_SRV::QuerySaveDataTotalSize>, "QuerySaveDataTotalSize"},
         {602, nullptr, "VerifySaveDataFileSystem"},
         {603, nullptr, "CorruptSaveDataFileSystem"},
         {604, nullptr, "CreatePaddingFile"},
@@ -137,11 +257,11 @@ FSP_SRV::FSP_SRV(Core::System& system_)
         {609, nullptr, "GetRightsIdByPath"},
         {610, nullptr, "GetRightsIdAndKeyGenerationByPath"},
         {611, nullptr, "SetCurrentPosixTimeWithTimeDifference"},
-        {612, nullptr, "GetFreeSpaceSizeForSaveData"},
+        {612, D<&FSP_SRV::GetFreeSpaceSizeForSaveData>, "GetFreeSpaceSizeForSaveData"},
         {613, nullptr, "VerifySaveDataFileSystemBySaveDataSpaceId"},
         {614, nullptr, "CorruptSaveDataFileSystemBySaveDataSpaceId"},
-        {615, nullptr, "QuerySaveDataInternalStorageTotalSize"},
-        {616, nullptr, "GetSaveDataCommitId"},
+        {615, D<&FSP_SRV::QuerySaveDataInternalStorageTotalSize>, "QuerySaveDataInternalStorageTotalSize"},
+        {616, D<&FSP_SRV::GetSaveDataCommitId>, "GetSaveDataCommitId"},
         {617, nullptr, "UnregisterExternalKey"},
         {620, nullptr, "SetSdCardEncryptionSeed"},
         {630, nullptr, "SetSdCardAccessibility"},
@@ -158,7 +278,7 @@ FSP_SRV::FSP_SRV(Core::System& system_)
         {830, nullptr, "EncryptStreamPlaySaveData"},
         {831, nullptr, "DecryptStreamPlaySaveData"},
         {1000, nullptr, "SetBisRootForHost"},
-        {1001, nullptr, "SetSaveDataSize"},
+        {1001, D<&FSP_SRV::SetSaveDataSize>, "SetSaveDataSize"},
         {1002, nullptr, "SetSaveDataRootPath"},
         {1003, D<&FSP_SRV::DisableAutoSaveDataCreation>, "DisableAutoSaveDataCreation"},
         {1004, D<&FSP_SRV::SetGlobalAccessLogMode>, "SetGlobalAccessLogMode"},
@@ -233,6 +353,109 @@ Result FSP_SRV::OpenSdCardFileSystem(OutInterface<IFileSystem> out_interface) {
     R_SUCCEED();
 }
 
+Result FSP_SRV::OpenBisFileSystem(OutInterface<IFileSystem> out_interface,
+                                  const InLargeData<FileSys::Sf::Path, BufferAttr_HipcPointer> path,
+                                  FileSys::BisPartitionId partition_id) {
+    LOG_DEBUG(Service_FS, "called, partition_id={:08X}", static_cast<u32>(partition_id));
+
+    // The guest path is a fixed size buffer that is not guaranteed to be null terminated.
+    const auto* path_data = path->str;
+    const auto path_end = std::find(path_data, path_data + sizeof(path->str), '\0');
+
+    std::string relative_path;
+    R_UNLESS(SanitizeRelativePath(
+                 std::string_view{path_data, static_cast<std::size_t>(path_end - path_data)},
+                 &relative_path),
+             FileSys::ResultInvalidPath);
+
+    FileSys::VirtualDir partition{};
+    R_TRY(fsc.OpenBISPartition(&partition, partition_id));
+
+    FileSys::VirtualDir dir = partition;
+    if (!relative_path.empty()) {
+        dir = partition->GetDirectoryRelative(relative_path);
+        R_UNLESS(dir != nullptr, FileSys::ResultPathNotFound);
+    }
+
+    *out_interface = std::make_shared<IFileSystem>(
+        system, std::move(dir), SizeGetter::FromStorageId(fsc, FileSys::StorageId::Host));
+
+    R_SUCCEED();
+}
+
+Result FSP_SRV::OpenBisStorage(OutInterface<IStorage> out_interface,
+                               FileSys::BisPartitionId partition_id) {
+    LOG_DEBUG(Service_FS, "called, partition_id={:08X}", static_cast<u32>(partition_id));
+
+    FileSys::VirtualFile storage{};
+    R_TRY(fsc.OpenBISPartitionStorage(&storage, partition_id));
+
+    *out_interface = std::make_shared<IStorage>(system, std::move(storage));
+
+    R_SUCCEED();
+}
+
+Result FSP_SRV::InvalidateBisCache() {
+    // The partitions are read straight through the virtual file system, there is no cached
+    // partition table that could go stale.
+    LOG_DEBUG(Service_FS, "called");
+
+    R_SUCCEED();
+}
+
+Result FSP_SRV::OpenImageDirectoryFileSystem(OutInterface<IFileSystem> out_interface,
+                                             ImageDirectoryId directory_id) {
+    LOG_DEBUG(Service_FS, "called, directory_id={:08X}", static_cast<u32>(directory_id));
+
+    FileSys::StorageId storage_id = FileSys::StorageId::None;
+    switch (directory_id) {
+    case ImageDirectoryId::NAND:
+        storage_id = FileSys::StorageId::Host;
+        break;
+    case ImageDirectoryId::SdCard:
+        storage_id = FileSys::StorageId::SdCard;
+        break;
+    default:
+        R_RETURN(FileSys::ResultInvalidArgument);
+    }
+
+    auto dir = fsc.GetImageDirectory(directory_id);
+    R_UNLESS(dir != nullptr, FileSys::ResultTargetNotFound);
+
+    *out_interface = std::make_shared<IFileSystem>(
+        system, std::move(dir), SizeGetter::FromStorageId(fsc, storage_id));
+
+    R_SUCCEED();
+}
+
+Result FSP_SRV::OpenContentStorageFileSystem(OutInterface<IFileSystem> out_interface,
+                                             ContentStorageId storage_id) {
+    LOG_DEBUG(Service_FS, "called, storage_id={:08X}", static_cast<u32>(storage_id));
+
+    FileSys::StorageId nand_storage_id = FileSys::StorageId::None;
+    switch (storage_id) {
+    case ContentStorageId::System:
+        nand_storage_id = FileSys::StorageId::NandSystem;
+        break;
+    case ContentStorageId::User:
+        nand_storage_id = FileSys::StorageId::NandUser;
+        break;
+    case ContentStorageId::SdCard:
+        nand_storage_id = FileSys::StorageId::SdCard;
+        break;
+    default:
+        R_RETURN(FileSys::ResultInvalidArgument);
+    }
+
+    auto dir = fsc.GetContentDirectory(storage_id);
+    R_UNLESS(dir != nullptr, FileSys::ResultTargetNotFound);
+
+    *out_interface = std::make_shared<IFileSystem>(
+        system, std::move(dir), SizeGetter::FromStorageId(fsc, nand_storage_id));
+
+    R_SUCCEED();
+}
+
 Result FSP_SRV::CreateSaveDataFileSystem(FileSys::SaveDataCreationInfo save_create_struct,
                                          FileSys::SaveDataAttribute save_struct, u128 uid) {
     LOG_DEBUG(Service_FS, "called save_struct = {}, uid = {:016X}{:016X}", save_struct.DebugInfo(),
@@ -257,6 +480,65 @@ Result FSP_SRV::CreateSaveDataFileSystemWithCreationInfo2(
     FileSys::VirtualDir save_data_dir{};
     R_RETURN(save_data_controller->CreateSaveData(&save_data_dir, save_data_creation_info.space_id,
                                                   save_data_creation_info.attribute));
+}
+
+Result FSP_SRV::DeleteSaveDataFileSystem(u64 save_data_id) {
+    LOG_DEBUG(Service_FS, "called, save_data_id={:016X}", save_data_id);
+
+    const auto user_id = GetCurrentUserId(system);
+    R_UNLESS(user_id.has_value(), FileSys::ResultInvalidArgument);
+
+    const auto attribute = MakeSystemSaveAttribute(program_id, *user_id, save_data_id);
+
+    R_RETURN(save_data_controller->DeleteSaveData(FileSys::SaveDataSpaceId::User, attribute));
+}
+
+Result FSP_SRV::RegisterSaveDataFileSystemAtomicDeletion(
+    InBuffer<BufferAttr_HipcMapAlias> save_data_id_buffer) {
+    R_UNLESS(save_data_id_buffer.size() >= sizeof(u64), FileSys::ResultInvalidArgument);
+
+    u64 save_data_id{};
+    std::memcpy(&save_data_id, save_data_id_buffer.data(), sizeof(save_data_id));
+
+    LOG_DEBUG(Service_FS, "called, save_data_id={:016X}", save_data_id);
+
+    const auto user_id = GetCurrentUserId(system);
+    R_UNLESS(user_id.has_value(), FileSys::ResultInvalidArgument);
+
+    const auto attribute = MakeSystemSaveAttribute(program_id, *user_id, save_data_id);
+
+    // The console defers this deletion until the next boot, we delete the save right away.
+    R_RETURN(save_data_controller->DeleteSaveData(FileSys::SaveDataSpaceId::User, attribute));
+}
+
+Result FSP_SRV::DeleteSaveDataFileSystemBySaveDataSpaceId(FileSys::SaveDataSpaceId space_id,
+                                                          u64 save_data_id) {
+    LOG_DEBUG(Service_FS, "called, space_id={}, save_data_id={:016X}", space_id, save_data_id);
+
+    R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
+
+    const auto user_id = GetCurrentUserId(system);
+    R_UNLESS(user_id.has_value(), FileSys::ResultInvalidArgument);
+
+    const auto attribute = MakeSystemSaveAttribute(program_id, *user_id, save_data_id);
+
+    R_RETURN(save_data_controller->DeleteSaveData(space_id, attribute));
+}
+
+Result FSP_SRV::DeleteSaveDataFileSystemBySaveDataAttribute(FileSys::SaveDataSpaceId space_id,
+                                                             FileSys::SaveDataAttribute attribute) {
+    LOG_DEBUG(Service_FS, "called, space_id={}, {}", space_id, attribute.DebugInfo());
+
+    R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
+    R_UNLESS(IsSupportedSaveDataType(attribute.type), FileSys::ResultInvalidArgument);
+
+    R_RETURN(save_data_controller->DeleteSaveData(space_id, attribute));
+}
+
+Result FSP_SRV::DeleteCacheStorage(u16 index) {
+    LOG_DEBUG(Service_FS, "called, index={}", index);
+
+    R_RETURN(save_data_controller->DeleteCacheStorage(index));
 }
 
 Result FSP_SRV::IsExFatSupported(Out<bool> out_is_supported) {
@@ -365,6 +647,53 @@ Result FSP_SRV::OpenSaveDataInfoReaderBySaveDataSpaceId(
     LOG_INFO(Service_FS, "called, space={}", space);
 
     *out_interface = std::make_shared<ISaveDataInfoReader>(system, save_data_controller, space);
+
+    R_SUCCEED();
+}
+
+Result FSP_SRV::OpenSaveDataInfoReader(OutInterface<ISaveDataInfoReader> out_interface) {
+    LOG_DEBUG(Service_FS, "called");
+
+    *out_interface = std::make_shared<ISaveDataInfoReader>(system, save_data_controller,
+                                                           FileSys::SaveDataSpaceId::User);
+
+    R_SUCCEED();
+}
+
+Result FSP_SRV::OpenSaveDataInfoReaderBySaveDataFilter(
+    OutInterface<ISaveDataInfoReader> out_interface, FileSys::SaveDataSpaceId space_id,
+    FileSys::SaveDataFilter filter) {
+    LOG_DEBUG(Service_FS, "called, space_id={}", space_id);
+
+    R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
+
+    if (filter.use_save_data_type) {
+        R_UNLESS(IsSupportedSaveDataType(filter.attribute.type), FileSys::ResultInvalidArgument);
+    }
+
+    *out_interface =
+        std::make_shared<ISaveDataInfoReader>(system, save_data_controller, space_id, filter);
+
+    R_SUCCEED();
+}
+
+Result FSP_SRV::OpenSaveDataMetaFile(OutInterface<IFile> out_interface,
+                                     FileSys::SaveDataSpaceId space_id, FileSys::SaveDataMetaType meta_type,
+                                     FileSys::SaveDataAttribute attribute) {
+    LOG_DEBUG(Service_FS, "called, space_id={}, meta_type={:02X}, {}", space_id,
+              static_cast<u8>(meta_type), attribute.DebugInfo());
+
+    R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
+    R_UNLESS(IsSupportedSaveDataType(attribute.type), FileSys::ResultInvalidArgument);
+    R_UNLESS(meta_type == FileSys::SaveDataMetaType::None ||
+                 meta_type == FileSys::SaveDataMetaType::Thumbnail ||
+                 meta_type == FileSys::SaveDataMetaType::ExtensionContext,
+             FileSys::ResultInvalidArgument);
+
+    auto meta_file = save_data_controller->OpenMetaFile(space_id, attribute, meta_type);
+    R_UNLESS(meta_file != nullptr, FileSys::ResultTargetNotFound);
+
+    *out_interface = std::make_shared<IFile>(system, std::move(meta_file));
 
     R_SUCCEED();
 }
@@ -640,6 +969,59 @@ Result FSP_SRV::GetCacheStorageSize(s32 index, Out<s64> out_data_size, Out<s64> 
 
     *out_data_size = 0;
     *out_journal_size = 0;
+
+    R_SUCCEED();
+}
+
+Result FSP_SRV::QuerySaveDataTotalSize(s64 data_size, s64 journal_size, Out<s64> out_total_size) {
+    LOG_DEBUG(Service_FS, "called, data_size={:#x}, journal_size={:#x}", data_size, journal_size);
+
+    *out_total_size = save_data_controller->QueryTotalSize(FileSys::SaveDataSpaceId::User);
+
+    R_SUCCEED();
+}
+
+Result FSP_SRV::GetFreeSpaceSizeForSaveData(FileSys::SaveDataSpaceId space_id,
+                                            Out<s64> out_free_space_size) {
+    LOG_DEBUG(Service_FS, "called, space_id={}", space_id);
+
+    R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
+
+    *out_free_space_size = save_data_controller->GetFreeSpace(space_id);
+
+    R_SUCCEED();
+}
+
+Result FSP_SRV::QuerySaveDataInternalStorageTotalSize(s64 data_size, s64 journal_size,
+                                                      Out<s64> out_total_size) {
+    LOG_DEBUG(Service_FS, "called, data_size={:#x}, journal_size={:#x}", data_size, journal_size);
+
+    *out_total_size = save_data_controller->QueryTotalSize(FileSys::SaveDataSpaceId::System);
+
+    R_SUCCEED();
+}
+
+Result FSP_SRV::GetSaveDataCommitId(FileSys::SaveDataSpaceId space_id, u64 save_data_id,
+                                    Out<s64> out_commit_id) {
+    LOG_DEBUG(Service_FS, "called, space_id={}, save_data_id={:016X}", space_id, save_data_id);
+
+    R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
+
+    *out_commit_id = static_cast<s64>(save_data_controller->GetCommitId(space_id, save_data_id));
+
+    R_SUCCEED();
+}
+
+Result FSP_SRV::SetSaveDataSize(s64 data_size, s64 journal_size) {
+    LOG_DEBUG(Service_FS, "called, data_size={:#x}, journal_size={:#x}", data_size, journal_size);
+
+    R_UNLESS(program_id != 0, FileSys::ResultInvalidArgument);
+
+    const auto user_id = GetCurrentUserId(system);
+    R_UNLESS(user_id.has_value(), FileSys::ResultInvalidArgument);
+
+    save_data_controller->WriteSaveDataSize(FileSys::SaveDataType::Account, program_id, *user_id,
+                                            {static_cast<u64>(data_size), static_cast<u64>(journal_size)});
 
     R_SUCCEED();
 }

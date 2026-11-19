@@ -59,6 +59,10 @@ else()
         drivers/joycon.h
         drivers/sdl_driver.cpp
         drivers/sdl_driver.h
+        drivers/switch2.cpp
+        drivers/switch2.h
+        drivers/switch2_auto_pair.cpp
+        drivers/switch2_auto_pair.h
         helpers/joycon_driver.cpp
         helpers/joycon_driver.h
         helpers/joycon_protocol/calibration.cpp
@@ -77,10 +81,21 @@ else()
         helpers/joycon_protocol/ringcon.cpp
         helpers/joycon_protocol/ringcon.h
         helpers/joycon_protocol/rumble.cpp
-        helpers/joycon_protocol/rumble.h)
+        helpers/joycon_protocol/rumble.h
+        helpers/switch2_protocol/switch2_ble_win.cpp
+        helpers/switch2_protocol/switch2_driver.cpp
+        helpers/switch2_protocol/switch2_driver.h
+        helpers/switch2_protocol/switch2_transport.h
+        helpers/switch2_protocol/switch2_types.cpp
+        helpers/switch2_protocol/switch2_types.h
+        helpers/switch2_protocol/switch2_usb.cpp)
 
     target_link_libraries(input_common PRIVATE SDL3::SDL3)
     target_compile_definitions(input_common PRIVATE HAVE_SDL3)
+
+    if (WIN32)
+        target_link_libraries(input_common PRIVATE windowsapp)
+    endif()
 endif()
 
 if (ENABLE_LIBUSB)

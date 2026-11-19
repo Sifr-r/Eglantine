@@ -84,6 +84,9 @@ SWITCHABLE(ScalingFilter, false);
 SWITCHABLE(SpirvOptimizeMode, true);
 SWITCHABLE(TimeZone, true);
 SETTING(VSyncMode, true);
+SETTING(Switch2GyroMouseMode, false);
+SETTING(Switch2GyroActivationMode, false);
+SETTING(u32, true);
 SWITCHABLE(bool, false);
 SWITCHABLE(int, false);
 SWITCHABLE(int, true);
@@ -139,6 +142,9 @@ struct TouchFromButtonMap {
 };
 
 struct Values {
+    Values();
+    ~Values();
+
     Linkage linkage{};
 
     // Applet
@@ -1016,6 +1022,22 @@ struct Values {
 
     // Per-game overrides
     bool use_squashed_iterated_blend;
+
+    // Switch 2 native controller driver
+    Setting<bool> enable_switch2_driver{linkage, true, "enable_switch2_driver", Category::Controls};
+    Setting<bool> switch2_auto_pair{linkage, true, "switch2_auto_pair", Category::Controls};
+    Setting<bool> switch2_combine_joycons{linkage, true, "switch2_combine_joycons",
+                                          Category::Controls};
+    Setting<bool> switch2_optical_mouse{linkage, true, "switch2_optical_mouse", Category::Controls};
+    Setting<Switch2GyroMouseMode> switch2_gyro_mouse_mode{
+        linkage, Switch2GyroMouseMode::Off, "switch2_gyro_mouse_mode", Category::Controls};
+    Setting<Switch2GyroActivationMode> switch2_gyro_activation_mode{
+        linkage, Switch2GyroActivationMode::Hold, "switch2_gyro_activation_mode",
+        Category::Controls};
+    Setting<u32, true> switch2_gyro_sensitivity{linkage, 40, 1, 200, "switch2_gyro_sensitivity",
+                                                Category::Controls};
+    Setting<u32, true> switch2_mouse_sensitivity{linkage, 50, 1, 200, "switch2_mouse_sensitivity",
+                                                 Category::Controls};
 
 };
 

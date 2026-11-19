@@ -9,13 +9,14 @@
 
 add_executable(tests
     core/nx2_frame_interval.cpp
+    core/save_data_lifecycle.cpp
+    video_core/etc2.cpp
     video_core/upload_batch.cpp
     video_core/texture_swizzle.cpp
     core/nx2_oot_time.cpp
     video_core/unbacked_image_policy.cpp
     core/builtin_patches.cpp
     core/gpu_dirty_memory_manager.cpp
-    video_core/macro_dma_forward.cpp
     video_core/gpu_timestamp.cpp
     video_core/maxwell_fast_method.cpp
     video_core/split_write_tracker.cpp
@@ -23,16 +24,9 @@ add_executable(tests
     video_core/list_copy_demand.cpp
     video_core/buffer_dependency_trace.cpp
     video_core/nx2_written_pages.cpp
-    video_core/frame_dump_schedule.cpp
-    core/nx2_debug_server.cpp
     core/system_test_context.h
     video_core/ampere_logged_numeric.cpp
-    video_core/pipeline_optimization.cpp
-    video_core/spirv_atomic_retry.cpp
-    video_core/spirv_storage_alignment.cpp
-    video_core/spirv_fragment_shuffle.cpp
     video_core/mesh_fallback.cpp
-    video_core/spirv_software_matrix.cpp
     common/bit_field.cpp
     common/cityhash.cpp
     common/container_hash.cpp
@@ -54,12 +48,17 @@ add_executable(tests
     common/zstd_compression.cpp
     core/core_timing.cpp
     core/ldn.cpp
+    core/memory_range.cpp
     core/internal_network/socket_proxy.cpp
     core/nup_writer.cpp
     core/nx2_debug_server.cpp
     core/nx2_movie_pacing.cpp
     core/nx2_gpu_memory_registry.cpp
+    core/nx2_gsv_bounds.cpp
+    core/nx2_guest_ranges.cpp
     core/priority_queue.cpp
+    core/process_load.cpp
+    core/shutdown_ordering.cpp
     core/internal_network/network.cpp
     video_core/frame_dump_schedule.cpp
     video_core/framebuffer_limits.cpp
@@ -71,6 +70,7 @@ add_executable(tests
     video_core/nx2_perf_query_callback.cpp
     video_core/nx2_perf_switches.cpp
     video_core/memory_manager_runs.cpp
+    video_core/memory_manager_page_table.cpp
     video_core/nx2_sparse_residency.cpp
     video_core/spirv_storage_alignment.cpp
     video_core/pipeline_cache_dir.cpp
@@ -83,6 +83,7 @@ add_executable(tests
     video_core/shader_precache_identity.cpp
     video_core/h264_packet.cpp
     video_core/vertex_repack.cpp
+    video_core/color_target_redraw.cpp
     video_core/virtual_range_cache.cpp
     video_core/query_copy.cpp
     video_core/ampere_lowering.cpp
@@ -91,7 +92,6 @@ add_executable(tests
     video_core/ampere_i2f.cpp
     video_core/ampere_gradient.cpp
     video_core/ampere_returns.cpp
-    video_core/ampere_guarded_ulea.cpp
     video_core/ampere_compute_lowering.cpp
     video_core/native_macro_fifo.cpp
     video_core/native_image_matching.cpp
@@ -113,7 +113,15 @@ add_executable(tests
     video_core/indirect_reset.cpp
     video_core/ocarina_upscale.cpp
     input_common/calibration_configuration_job.cpp
+    network/packet_bounds.cpp
+    network/room_information.cpp
 )
+
+if (NOT ANDROID)
+    target_sources(tests PRIVATE
+        input_common/switch2_auto_pair.cpp
+        input_common/switch2_protocol.cpp)
+endif()
 
 create_target_directory_groups(tests)
 

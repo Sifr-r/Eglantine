@@ -14,7 +14,10 @@
 #include <cstddef>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
+#include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include "common/bit_field.h"
@@ -322,6 +325,7 @@ private:
     [[nodiscard]] VideoCore::GameDlssReason GameDlssBlocker() const;
     void UpdateGameDlssStatus(bool complete, VideoCore::GameDlssReason blocker);
     const std::pair<std::vector<u32>, std::vector<u32>>& NativeImageHandles(GPUVAddr program);
+    bool NativeProgramDecodesSrgb(GPUVAddr program, bool* newly_cached = nullptr);
     bool UpscaleInsteadOfNativeProgram();
     void RememberNativeUpscaleInput();
     bool ReadConstBufferWords(u32 slot, std::vector<u32>& words) const;
@@ -394,7 +398,13 @@ private:
         bool matrix_multiply{};
         u32 upscale_failures{};
     };
+    struct NativeSrgbCacheEntry {
+        u64 map_serial{};
+        bool decodes_srgb{};
+    };
     std::unordered_map<GPUVAddr, RejectedComputeProgram> rejected_compute_programs;
+    std::unordered_map<GPUVAddr, NativeSrgbCacheEntry> native_srgb_cache;
+    std::set<std::tuple<GPUVAddr, GPUVAddr, GPUVAddr>> logged_native_network_copies;
     u64 seen_unreject_epoch{}; ///< Nx2Debug::UnrejectEpoch when the map was last valid
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
     NativeQmdScheduler native_qmd;

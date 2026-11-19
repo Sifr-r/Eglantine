@@ -44,6 +44,7 @@ using VideoCommon::SamplesLog2;
 using VideoCommon::SwizzleParameters;
 using VideoCore::Surface::BytesPerBlock;
 using VideoCore::Surface::IsPixelFormatASTC;
+using VideoCore::Surface::IsPixelFormatETC2;
 using VideoCore::Surface::IsPixelFormatSRGB;
 using VideoCore::Surface::MaxPixelFormat;
 using VideoCore::Surface::PixelFormat;
@@ -171,6 +172,9 @@ GLenum AttachmentType(PixelFormat format) {
 
 [[nodiscard]] bool IsConverted(const Device& device, PixelFormat format, ImageType type) {
     if (!device.HasASTC() && IsPixelFormatASTC(format)) {
+        return true;
+    }
+    if (IsPixelFormatETC2(format)) {
         return true;
     }
     switch (format) {
@@ -460,6 +464,27 @@ OGLTexture MakeImage(const VideoCommon::ImageInfo& info, GLenum gl_internal_form
         return is_srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8;
     }
 }
+
+[[nodiscard]] MaxwellToGL::FormatTuple ConvertedFormatTuple(PixelFormat format) {
+    switch (format) {
+    case PixelFormat::EAC_R11_UNORM:
+        return {GL_R8, GL_RED, GL_UNSIGNED_BYTE};
+    case PixelFormat::EAC_R11_SNORM:
+        return {GL_R8_SNORM, GL_RED, GL_BYTE};
+    case PixelFormat::EAC_R11G11_UNORM:
+        return {GL_RG8, GL_RG, GL_UNSIGNED_BYTE};
+    case PixelFormat::EAC_R11G11_SNORM:
+        return {GL_RG8_SNORM, GL_RG, GL_BYTE};
+    default:
+        break;
+    }
+    const bool is_srgb = IsPixelFormatSRGB(format);
+    if (IsPixelFormatASTC(format) && IsAstcRecompressionEnabled()) {
+        return {SelectAstcFormat(format, is_srgb), GL_NONE, GL_UNSIGNED_INT_8_8_8_8_REV};
+    }
+    return {static_cast<GLenum>(is_srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8), GL_RGBA,
+            GL_UNSIGNED_INT_8_8_8_8_REV};
+}
 } // Anonymous namespace
 
 TextureCacheRuntime::TextureCacheRuntime(const Device& device_, ProgramManager& program_manager,
@@ -706,15 +731,10 @@ Image::Image(TextureCacheRuntime& runtime_, const VideoCommon::ImageInfo& info_,
         flags |= ImageFlagBits::Converted;
         flags |= ImageFlagBits::CostlyLoad;
 
-        const bool is_srgb = IsPixelFormatSRGB(info.format);
-        gl_internal_format = is_srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8;
-        gl_format = GL_RGBA;
-        gl_type = GL_UNSIGNED_INT_8_8_8_8_REV;
-
-        if (IsPixelFormatASTC(info.format) && IsAstcRecompressionEnabled()) {
-            gl_internal_format = SelectAstcFormat(info.format, is_srgb);
-            gl_format = GL_NONE;
-        }
+        const auto tuple = ConvertedFormatTuple(info.format);
+        gl_internal_format = tuple.internal_format;
+        gl_format = tuple.format;
+        gl_type = tuple.type;
     } else {
         const auto& tuple = MaxwellToGL::GetFormatTuple(info.format);
         gl_internal_format = tuple.internal_format;
@@ -843,6 +863,9 @@ GLuint Image::StorageHandle() noexcept {
     case PixelFormat::ASTC_2D_12X12_SRGB:
     case PixelFormat::ASTC_2D_8X6_SRGB:
     case PixelFormat::ASTC_2D_6X5_SRGB:
+    case PixelFormat::ETC2_RGB_SRGB:
+    case PixelFormat::ETC2_RGBA_SRGB:
+    case PixelFormat::ETC2_RGB_PTA_SRGB:
         if (store_view.handle != 0) {
             return store_view.handle;
         }
@@ -1109,12 +1132,7 @@ ImageView::ImageView(TextureCacheRuntime& runtime, const VideoCommon::ImageViewI
       views{runtime.null_image_views} {
     const Device& device = runtime.device;
     if (True(image.flags & ImageFlagBits::Converted)) {
-        const bool is_srgb = IsPixelFormatSRGB(info.format);
-        internal_format = is_srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8;
-
-        if (IsPixelFormatASTC(info.format) && IsAstcRecompressionEnabled()) {
-            internal_format = SelectAstcFormat(info.format, is_srgb);
-        }
+        internal_format = ConvertedFormatTuple(info.format).internal_format;
     } else {
         internal_format = MaxwellToGL::GetFormatTuple(format).internal_format;
     }

@@ -214,12 +214,19 @@ struct KernelCore::Impl {
 
         object_name_global_data.reset();
 
-        // Ensure that the object list container is finalized and properly shutdown.
-        global_object_list_container->Finalize();
-        global_object_list_container.reset();
+        // Ensure that the object list container is finalized and properly shutdown. It stays
+        // alive: an object closed after the shutdown still unregisters itself from it.
+        // Finalizing empties the list. The registered objects live in the guest RAM arena,
+        // which the system frees before the kernel is destroyed, so the list must not be
+        // walked after that point.
+        if (global_object_list_container) {
+            global_object_list_container->Finalize();
+        }
 
-        hardware_timer->Finalize();
-        hardware_timer.reset();
+        if (hardware_timer) {
+            hardware_timer->Finalize();
+            hardware_timer.reset();
+        }
     }
 
     void CloseServices() {
@@ -992,6 +999,12 @@ KAutoObjectWithListContainer& KernelCore::ObjectListContainer() {
 
 const KAutoObjectWithListContainer& KernelCore::ObjectListContainer() const {
     return *impl->global_object_list_container;
+}
+
+void KernelCore::ClearObjectList() {
+    if (impl->global_object_list_container) {
+        impl->global_object_list_container->Finalize();
+    }
 }
 
 void KernelCore::PrepareReschedule(std::size_t id) {

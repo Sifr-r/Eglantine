@@ -3,12 +3,14 @@
 // SPDX-FileCopyrightText: Copyright 2017 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <list>
 #include <mutex>
 #include <set>
 #include <thread>
 #include "common/assert.h"
+#include "common/logging.h"
 #include "common/polyfill_thread.h"
 #include "common/socket_types.h"
 #include "enet/enet.h"
@@ -19,12 +21,22 @@ namespace Network {
 
 constexpr u32 ConnectionTimeoutMs = 5000;
 
+/// Minimum number of bytes that a member entry of the room information occupies. Every entry
+/// contains a fake ip address, the id of the game (a u64) and six strings, which are stored
+/// with a length prefix.
+constexpr std::size_t MinMemberEntrySize = sizeof(IPv4Address) + sizeof(u64) + 6 * sizeof(u32);
+
+/// Maximum number of members that a room information packet is allowed to describe.
+constexpr u32 MaxRoomMemberEntries = 1024;
+
 class RoomMember::RoomMemberImpl {
 public:
     void SetState(const State new_state) noexcept {
-        if (state != new_state) {
-            state = new_state;
-            Invoke<State>(state);
+        // The state is exchanged instead of compared and stored, so that only the thread that
+        // actually changed the state notifies the callbacks. Otherwise two threads that change
+        // the state at the same time could both notify a state that was already reached.
+        if (state.exchange(new_state) != new_state) {
+            Invoke<State>(new_state);
         }
     }
 
@@ -34,6 +46,13 @@ public:
 
     [[nodiscard]] bool IsConnected() const noexcept {
         return state == State::Joining || state == State::Joined || state == State::Moderator;
+    }
+
+    /// Returns whether the calling thread is the network loop thread of this member.
+    /// The id of the network thread is kept in its own member, so that the thread can identify
+    /// itself without touching the thread object, which another thread may destroy.
+    [[nodiscard]] bool IsLoopThread() const {
+        return loop_thread_id.load(std::memory_order_acquire) == std::this_thread::get_id();
     }
 
     ENetHost* client = nullptr; ///< ENet network interface.
@@ -56,9 +75,19 @@ public:
 
     IPv4Address fake_ip; ///< The fake ip of this member.
 
+    /// Mutex that guards the member list, the room information and the fake ip address. Those
+    /// are written by the network thread while they are read by other threads.
+    mutable std::mutex state_mutex;
+
     std::mutex network_mutex; ///< Mutex that controls access to the `client` variable.
     /// Thread that receives and dispatches network packets
     std::optional<std::jthread> loop_thread;
+    /// The id of the network loop thread. It is written when the thread starts and is never
+    /// changed afterwards, so that it can be read without holding a lock.
+    std::atomic<std::thread::id> loop_thread_id{};
+    /// Set when the member wants to leave from the network thread itself. The network thread
+    /// performs the state change when it returns to its loop.
+    std::atomic<bool> leave_requested{false};
     std::mutex send_list_mutex;  ///< Mutex that controls access to the `send_list` variable.
     std::vector<Packet> send_list; ///< A list that stores all packets to send the async
 
@@ -160,14 +189,22 @@ public:
 
 // RoomMemberImpl
 void RoomMember::RoomMemberImpl::StartLoop() {
+    leave_requested = false;
     loop_thread.emplace([&](std::stop_token stoken) {
+        loop_thread_id.store(std::this_thread::get_id(), std::memory_order_release);
         // Receive packets while the connection is open
-        while (IsConnected()) {
+        while (IsConnected() && !leave_requested.load(std::memory_order_acquire) &&
+               !stoken.stop_requested()) {
             std::lock_guard lock(network_mutex);
             ENetEvent event;
             if (enet_host_service(client, &event, 5) > 0) {
                 switch (event.type) {
                 case ENET_EVENT_TYPE_RECEIVE:
+                    if (event.packet->dataLength == 0) {
+                        LOG_WARNING(Network, "Received an empty packet from the room. Ignoring it.");
+                        enet_packet_destroy(event.packet);
+                        break;
+                    }
                     switch (event.packet->data[0]) {
                     case IdProxyPacket:
                         HandleProxyPackets(&event);
@@ -268,7 +305,15 @@ void RoomMember::RoomMemberImpl::StartLoop() {
             }
             enet_host_flush(client);
         }
+        if (leave_requested.exchange(false, std::memory_order_acq_rel)) {
+            // The leave was requested from a callback that runs on this thread. The state
+            // change is done here, outside of that callback, because the state callbacks
+            // cannot be invoked while the callback mutex is held by this thread.
+            SetState(State::Idle);
+        }
         Disconnect();
+        // The thread is gone, so that no other thread can be mistaken for it.
+        loop_thread_id.store(std::thread::id{}, std::memory_order_release);
     });
 }
 
@@ -305,18 +350,30 @@ void RoomMember::RoomMemberImpl::HandleRoomInformationPacket(const ENetEvent* ev
     packet.Read(info.port);
     packet.Read(info.preferred_game.name);
     packet.Read(info.host_username);
-    room_information.name = info.name;
-    room_information.description = info.description;
-    room_information.member_slots = info.member_slots;
-    room_information.port = info.port;
-    room_information.preferred_game = info.preferred_game;
-    room_information.host_username = info.host_username;
 
-    u32 num_members;
+    u32 num_members = 0;
     packet.Read(num_members);
-    member_information.resize(num_members);
 
-    for (auto& member : member_information) {
+    // The member count is controlled by the peer, so it has to be bounded by the amount of
+    // data that is left in the packet and by a sane maximum before anything is allocated.
+    const std::size_t max_members =
+        (std::min)(static_cast<std::size_t>(MaxRoomMemberEntries),
+                   packet.RemainingBytes() / MinMemberEntrySize);
+    if (num_members > max_members) {
+        LOG_ERROR(Network,
+                  "The room information claims to contain {} members, but the packet can only "
+                  "describe {}. Ignoring the packet.",
+                  num_members, max_members);
+        packet.Invalidate();
+        return;
+    }
+
+    MemberList new_members;
+    new_members.resize(num_members);
+
+    std::string own_username;
+    bool found_own_member = false;
+    for (auto& member : new_members) {
         packet.Read(member.nickname);
         packet.Read(member.fake_ip);
         packet.Read(member.game_info.name);
@@ -326,14 +383,34 @@ void RoomMember::RoomMemberImpl::HandleRoomInformationPacket(const ENetEvent* ev
         packet.Read(member.display_name);
         packet.Read(member.avatar_url);
 
-        {
-            std::lock_guard lock(username_mutex);
-            if (member.nickname == nickname) {
-                username = member.username;
-            }
+        if (member.nickname == nickname) {
+            own_username = member.username;
+            found_own_member = true;
         }
     }
-    Invoke(room_information);
+
+    if (!packet) {
+        LOG_ERROR(Network, "The room information packet is malformed. Ignoring it.");
+        return;
+    }
+
+    {
+        std::lock_guard lock(state_mutex);
+        room_information.name = info.name;
+        room_information.description = info.description;
+        room_information.member_slots = info.member_slots;
+        room_information.port = info.port;
+        room_information.preferred_game = info.preferred_game;
+        room_information.host_username = info.host_username;
+        member_information = std::move(new_members);
+    }
+
+    if (found_own_member) {
+        std::lock_guard lock(username_mutex);
+        username = own_username;
+    }
+
+    Invoke(info);
 }
 
 void RoomMember::RoomMemberImpl::HandleJoinPacket(const ENetEvent* event) {
@@ -344,7 +421,11 @@ void RoomMember::RoomMemberImpl::HandleJoinPacket(const ENetEvent* event) {
     packet.IgnoreBytes(sizeof(u8)); // Ignore the message type
 
     // Parse the MAC Address from the packet
-    packet.Read(fake_ip);
+    IPv4Address new_fake_ip{};
+    packet.Read(new_fake_ip);
+
+    std::lock_guard lock(state_mutex);
+    fake_ip = new_fake_ip;
 }
 
 void RoomMember::RoomMemberImpl::HandleProxyPackets(const ENetEvent* event) {
@@ -443,9 +524,12 @@ void RoomMember::RoomMemberImpl::HandleModBanListResponsePacket(const ENetEvent*
 }
 
 void RoomMember::RoomMemberImpl::Disconnect() {
-    member_information.clear();
-    room_information.member_slots = 0;
-    room_information.name.clear();
+    {
+        std::lock_guard lock(state_mutex);
+        member_information.clear();
+        room_information.member_slots = 0;
+        room_information.name.clear();
+    }
 
     if (!server) {
         return;
@@ -549,7 +633,8 @@ RoomMember::State RoomMember::GetState() const {
     return room_member_impl->state;
 }
 
-const RoomMember::MemberList& RoomMember::GetMemberInformation() const {
+RoomMember::MemberList RoomMember::GetMemberInformation() const {
+    std::lock_guard lock(room_member_impl->state_mutex);
     return room_member_impl->member_information;
 }
 
@@ -557,23 +642,31 @@ const std::string& RoomMember::GetNickname() const {
     return room_member_impl->nickname;
 }
 
-const std::string& RoomMember::GetUsername() const {
+std::string RoomMember::GetUsername() const {
     std::lock_guard lock(room_member_impl->username_mutex);
     return room_member_impl->username;
 }
 
-const IPv4Address& RoomMember::GetFakeIpAddress() const {
+IPv4Address RoomMember::GetFakeIpAddress() const {
     ASSERT_MSG(IsConnected(), "Tried to get fake ip address while not connected");
+    std::lock_guard lock(room_member_impl->state_mutex);
     return room_member_impl->fake_ip;
 }
 
 RoomInformation RoomMember::GetRoomInformation() const {
+    std::lock_guard lock(room_member_impl->state_mutex);
     return room_member_impl->room_information;
 }
 
 void RoomMember::Join(const std::string& nick, const char* server_addr, u16 server_port,
                       u16 client_port, const IPv4Address& preferred_fake_ip,
                       const std::string& password, const std::string& token) {
+    if (room_member_impl->IsLoopThread()) {
+        // The network thread cannot replace itself, that would mean joining itself.
+        LOG_ERROR(Network, "Join() was called from the network thread. Ignoring the request.");
+        return;
+    }
+
     // If the member is connected, kill the connection first
     if (room_member_impl->loop_thread && room_member_impl->loop_thread->joinable()) {
         Leave();
@@ -742,6 +835,18 @@ void RoomMember::Unbind(CallbackHandle<T> handle) {
 }
 
 void RoomMember::Leave() {
+    if (room_member_impl->IsLoopThread()) {
+        // Leave() was called from the network thread itself, for example from a callback. The
+        // state must not be changed here: the state change invokes the state callbacks, while
+        // the callback mutex is already held by this thread inside the callback that called
+        // Leave(). The leave is requested instead and the network thread performs the state
+        // change once it is back in its loop.
+        room_member_impl->leave_requested = true;
+        LOG_INFO(Network,
+                 "Leave() was called from the network thread. The network thread leaves the room "
+                 "itself.");
+        return;
+    }
     room_member_impl->SetState(State::Idle);
     room_member_impl->loop_thread.reset();
     enet_host_destroy(room_member_impl->client);

@@ -55,7 +55,9 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
+#include "hid_core/hid_core.h"
 #include "input_common/drivers/keyboard.h"
+#include "input_common/drivers/switch2_auto_pair.h"
 #include "input_common/main.h"
 #include "network/network.h"
 #include "sdl_config.h"
@@ -264,6 +266,18 @@ struct SdlState {
     InputCommon::InputSubsystem input_subsystem{};
     std::unique_ptr<EmuWindow_SDL3> emu_window;
     bool network_initialized{};
+    // The configuration of this session. It is owned by the state because SDL_AppMain returns
+    // before SDL_AppIterate runs, so a local would already be destroyed when the Switch 2
+    // auto-pair pass saves the bindings it makes.
+    std::unique_ptr<SdlConfig> owned_config;
+    // The configuration of this session, null until SDL_AppMain created it.
+    SdlConfig* config{nullptr};
+    // When the last Switch 2 auto-pair pass ran.
+    std::chrono::steady_clock::time_point last_switch2_auto_pair{};
+    // The Switch 2 auto-pair pass keeps the state of the controllers it saw: a controller is
+    // only reported as gone after it was missing for several passes. The pass has to run on
+    // the same object every time, a local would lose that state on every poll.
+    InputCommon::Switch2::Switch2AutoPair switch2_auto_pair;
 #ifdef YUZU_ENABLE_MCP
     // Built-in MCP server (only with --mcp): destroyed before the system shuts down.
     std::unique_ptr<CliMcpHost> mcp_host;
@@ -387,7 +401,8 @@ static bool PackNup(const std::string& source, const std::string& output) {
     fmt::print(stderr, "\n");
     switch (result) {
     case FileSys::Nup::PackResult::Success:
-        fmt::print(stderr, "Wrote {} in {:.1f} s\n", archive.string(), seconds);
+        fmt::print(stderr, "Wrote {} in {:.1f} s\n", Common::FS::PathToUTF8String(archive),
+                   seconds);
         return true;
     case FileSys::Nup::PackResult::Cancelled:
         fmt::print(stderr, "Cancelled\n");
@@ -428,7 +443,8 @@ static bool UnpackNup(const std::string& source, const std::string& output) {
     fmt::print(stderr, "\n");
     switch (result) {
     case FileSys::Nup::ExtractResult::Success:
-        fmt::print(stderr, "Extracted to {} in {:.1f} s\n", out_dir.string(), seconds);
+        fmt::print(stderr, "Extracted to {} in {:.1f} s\n", Common::FS::PathToUTF8String(out_dir),
+                   seconds);
         return true;
     case FileSys::Nup::ExtractResult::Cancelled:
         fmt::print(stderr, "Cancelled\n");
@@ -461,7 +477,8 @@ static bool EditNup(const Core::LaunchParams& lp) {
             const auto icon_path = to_path(*lp.edit_nup_icon);
             std::ifstream in(icon_path, std::ios::binary);
             if (!in) {
-                fmt::print(stderr, "Cannot read icon {}\n", icon_path.string());
+                fmt::print(stderr, "Cannot read icon {}\n",
+                           Common::FS::PathToUTF8String(icon_path));
                 return false;
             }
             edit.icon = std::vector<u8>((std::istreambuf_iterator<char>(in)), {});
@@ -480,7 +497,7 @@ static bool EditNup(const Core::LaunchParams& lp) {
     std::string error;
     switch (FileSys::Nup::EditNupMetadata(archive, edit, &error, &edit_nup_cancel)) {
     case FileSys::Nup::EditResult::Success:
-        fmt::print(stderr, "Updated {}\n", archive.string());
+        fmt::print(stderr, "Updated {}\n", Common::FS::PathToUTF8String(archive));
         return true;
     case FileSys::Nup::EditResult::NoChange:
         fmt::print(stderr, "No changes to apply\n");
@@ -496,7 +513,7 @@ static bool EditNup(const Core::LaunchParams& lp) {
 
 /// Hidden test hook (not in --help): builds a game's shader precache file without booting it.
 ///   yuzu-cmd --build-warm <game file> <title id hex> <output dir>
-static bool BuildWarm(Core::System& system, int argc, char** argv) {
+static bool BuildWarm(Core::System& system, int argc, char** argv, wchar_t** argv_w) {
     namespace ShaderWarm = VideoCommon::ShaderWarm;
     if (argc < 5) {
         fmt::print(stderr, "usage: --build-warm <game> <title id> <output dir>\n");
@@ -505,8 +522,18 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
     system.SetContentProvider(std::make_unique<FileSys::ContentProviderUnion>());
     system.SetFilesystem(std::make_shared<FileSys::RealVfsFilesystem>());
     const u64 title_id = std::strtoull(argv[3], nullptr, 16);
+#ifdef _WIN32
+    const std::string game_arg =
+        argv_w != nullptr && argv_w[2] != nullptr ? Common::UTF16ToUTF8(argv_w[2]) : argv[2];
+    const std::string out_arg =
+        argv_w != nullptr && argv_w[4] != nullptr ? Common::UTF16ToUTF8(argv_w[4]) : argv[4];
+#else
+    (void)argv_w;
+    const std::string game_arg = argv[2];
+    const std::string out_arg = argv[4];
+#endif
     ShaderWarm::BuildOptions options;
-    options.output_dir = Common::FS::ToU8String(argv[4]);
+    options.output_dir = Common::FS::ToU8String(out_arg);
     std::string last_stage;
     auto last_print = std::chrono::steady_clock::now();
     const auto begin = last_print;
@@ -523,7 +550,7 @@ static bool BuildWarm(Core::System& system, int argc, char** argv) {
         std::fflush(stdout);
     };
     const auto result = ShaderWarm::BuildWarmFilesWith(
-        system, Common::FS::ToU8String(argv[2]), title_id, options, on_progress, {});
+        system, Common::FS::ToU8String(game_arg), title_id, options, on_progress, {});
     // The error can hold a Windows path: escape it so the summary stays valid JSON.
     std::string error;
     for (const char c : result.error) {
@@ -591,26 +618,34 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     Common::Log::SetColorConsoleBackendEnabled(true);
     Common::Log::Start();
 
-    if (argc > 1 && std::string_view{argv[1]} == "--build-warm") {
-        return BuildWarm(state->system, argc, argv) ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
-    }
-
     int option_index = 0;
 #ifdef _WIN32
-    int argc_w;
+    int argc_w = 0;
     auto argv_w = CommandLineToArgvW(GetCommandLineW(), &argc_w);
     if (argv_w == nullptr) {
         LOG_CRITICAL(Frontend, "Failed to get command line arguments");
         return SDL_APP_FAILURE;
     }
+    wchar_t** const matched_argv_w = argc_w == argc ? argv_w : nullptr;
 #else
-    wchar_t **argv_w = nullptr;
+    wchar_t** argv_w = nullptr;
+    wchar_t** const matched_argv_w = nullptr;
 #endif
-    Core::LaunchParams lp = Core::ParseLaunchParams(state->system, argc, argv, argv_w);
+
+    if (argc > 1 && std::string_view{argv[1]} == "--build-warm") {
+        const bool ok = BuildWarm(state->system, argc, argv, matched_argv_w);
+#ifdef _WIN32
+        LocalFree(argv_w);
+#endif
+        return ok ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
+
+    Core::LaunchParams lp = Core::ParseLaunchParams(state->system, argc, argv, matched_argv_w);
 #ifdef _WIN32
     LocalFree(argv_w);
 #endif
-    SdlConfig config{lp.config_path};
+    state->owned_config = std::make_unique<SdlConfig>(lp.config_path);
+    state->config = state->owned_config.get();
     // Before anything loads a GPU driver.
     Common::ConfigureDriverShaderCache(Settings::values.private_driver_shader_cache.GetValue(),
                                        Settings::values.driver_shader_cache_size.GetValue());
@@ -953,9 +988,57 @@ static void RunKeyScript(InputCommon::InputSubsystem& input_subsystem, Core::Sys
     RunLiveKeys(input_subsystem, system);
 }
 
+// Binds the Switch 2 controllers that the driver found to player slots, so a controller that is
+// plugged in while the game is running is picked up as well. Runs about once per second:
+// SDL_AppIterate runs up to 240 times per second and this pass touches the settings.
+static void CheckSwitch2AutoPair(SdlState* state) {
+    constexpr auto kInterval = std::chrono::seconds(1);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - state->last_switch2_auto_pair < kInterval) {
+        return;
+    }
+    state->last_switch2_auto_pair = now;
+
+    auto* switch2 = state->input_subsystem.GetSwitch2();
+    if (switch2 == nullptr) {
+        // The driver is disabled (Settings::values.enable_switch2_driver).
+        return;
+    }
+
+    const auto changed = state->switch2_auto_pair.Apply(*switch2);
+    if (changed.empty()) {
+        return;
+    }
+
+    for (const auto& player : changed) {
+        const std::string name = player.device_name.empty() ? player.device_id : player.device_name;
+        if (player.disconnected) {
+            LOG_INFO(Frontend, "Switch 2 auto-pair: {} disconnected from Player {}", name,
+                     player.player_index + 1);
+        } else if (player.reconnected) {
+            LOG_INFO(Frontend, "Switch 2 auto-pair: {} reconnected to Player {}", name,
+                     player.player_index + 1);
+        } else {
+            LOG_INFO(Frontend, "Switch 2 auto-pair: {} bound to Player {}", name,
+                     player.player_index + 1);
+        }
+    }
+
+    // Let the running game see the new binding.
+    if (state->system.IsPoweredOn()) {
+        state->system.HIDCore().ReloadInputDevices();
+    }
+
+    // Keep the binding for the next start.
+    if (state->config != nullptr) {
+        state->config->SaveAllValues();
+    }
+}
+
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
     RunKeyScript(state->input_subsystem, state->system);
+    CheckSwitch2AutoPair(state);
 #ifdef YUZU_ENABLE_MCP
     if (state->mcp_host) {
         state->mcp_host->DrainMainThread();

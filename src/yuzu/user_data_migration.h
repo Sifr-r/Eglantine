@@ -7,20 +7,15 @@
 
 #pragma once
 
-#include <QMainWindow>
 #include "yuzu/migration_worker.h"
 
-// TODO(crueter): Quick implementation
 class UserDataMigrator {
 public:
-    UserDataMigrator(QMainWindow* main_window);
-
-    bool migrated{false};
-    Emulator selected_emu;
+    static bool MigrateIfNeeded();
 
 private:
-    void ShowMigrationPrompt(QMainWindow* main_window);
-    void ShowMigrationCancelledMessage(QMainWindow* main_window);
-    void MigrateUserData(QMainWindow* main_window, const bool clear_shader_cache,
-                         const MigrationWorker::MigrationStrategy strategy);
+    static bool ShowMigrationPrompt();
+    static void ShowMigrationCancelledMessage();
+    static bool MigrateUserData(Emulator selected_emu, bool clear_shader_cache,
+                                MigrationWorker::MigrationStrategy strategy);
 };

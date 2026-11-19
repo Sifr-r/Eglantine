@@ -38,6 +38,7 @@
 #endif
 
 #include "main_window.h"
+#include "user_data_migration.h"
 
 #ifdef YUZU_CRASH_DUMPS
 #include "yuzu/breakpad.h"
@@ -296,6 +297,10 @@ int main(int argc, char* argv[]) {
     // Qt changes the locale and causes issues in float conversion using std::to_string() when
     // generating shaders
     setlocale(LC_ALL, "C");
+
+    if (!UserDataMigrator::MigrateIfNeeded()) {
+        return EXIT_FAILURE;
+    }
 
     MainWindow main_window{has_broken_vulkan};
     // After settings have been loaded by GMainWindow, apply the filter

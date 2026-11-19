@@ -30,6 +30,57 @@
 #include "video_core/texture_cache/util.h"
 
 namespace Tegra {
+namespace {
+
+/// One segment of a range, as the page table maps it: what it covers and how a copy reads it.
+/// The page table is read under its lock; the copy and the cache flushes that follow run
+/// without it, because the rasterizer takes the cache mutexes the GPU thread holds while it
+/// reads the page table.
+struct MappedSegment {
+    enum class Kind : u8 {
+        Zero,  ///< Not mapped: the range reads as zero.
+        Small, ///< Mapped through a small page.
+        Big,   ///< Mapped through a big page.
+    };
+    Kind kind{Kind::Zero};
+    DAddr device_addr{}; ///< The device address the segment starts at.
+    std::size_t size{};  ///< Bytes the segment covers.
+    bool continuous{};   ///< The big page is host-contiguous (big segments only).
+};
+
+/// Merges the segments that cover one host-contiguous range.
+///
+/// A range that spans many pages produces one segment per page: the list, and the number of
+/// cache operations that follow it, grow with the size of the range instead of with the number
+/// of mappings in it. Two segments can be merged when the host memory behind them is
+/// contiguous, otherwise the copy that follows would run over a page boundary.
+template <typename DeviceMemory>
+void MergeSegments(DeviceMemory& memory, boost::container::small_vector<MappedSegment, 32>& segments) {
+    std::size_t out = 0;
+    for (std::size_t in = 0; in < segments.size(); ++in) {
+        const MappedSegment segment = segments[in];
+        if (out > 0) {
+            MappedSegment& last = segments[out - 1];
+            if (last.kind == segment.kind) {
+                const bool mergeable =
+                    segment.kind == MappedSegment::Kind::Zero
+                        ? true
+                        : (last.device_addr + last.size == segment.device_addr &&
+                           memory.GetSpan(last.device_addr, last.size + segment.size) != nullptr);
+                if (mergeable) {
+                    last.size += segment.size;
+                    last.continuous = last.continuous && segment.continuous;
+                    continue;
+                }
+            }
+        }
+        segments[out++] = segment;
+    }
+    segments.resize(out);
+}
+
+} // Anonymous namespace
+
 bool MemoryManager::IsShuttingDown() const {
     return system.IsShuttingDown();
 }
@@ -123,44 +174,61 @@ inline void MemoryManager::SetBigPageContinuous(size_t big_page_index, bool valu
 
 GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
     [[maybe_unused]] u64 remaining_size{size};
-    if (entry_type == EntryType::Mapped) {
-        page_table.ReserveRange(gpu_addr, size);
-    }
     // The caches hear about each run of pages whose entry changed in one call, not page by page
     // (a 1.45 GB Switch 2 region made ~370,000 texture cache scans).
-    GPUVAddr modified_start{};
-    u64 modified_size{};
-    const auto flush_modified = [&] {
-        if (modified_size != 0) {
-            rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
-            modified_size = 0;
-        }
-    };
-    for (u64 offset{}; offset < size; offset += page_size) {
-        const GPUVAddr current_gpu_addr = gpu_addr + offset;
-        [[maybe_unused]] const auto current_entry_type = GetEntry(current_gpu_addr, false);
-        SetEntry(current_gpu_addr, entry_type, false);
-        const bool changed_backing = entry_type == EntryType::Mapped &&
-            current_entry_type == EntryType::Mapped &&
-            page_table[PageEntryIndex(current_gpu_addr, false)] !=
-                static_cast<u32>((dev_addr + offset) >> cpu_page_bits);
-        if (current_entry_type != entry_type || changed_backing) {
-            if (modified_size == 0) {
-                modified_start = current_gpu_addr;
-            }
-            modified_size += page_size;
-        } else {
-            flush_modified();
-        }
+    boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 16> modified_ranges;
+    {
+        // The whole change is one step for the readers: they see the old table or the new one.
+        // The serial moves after the table changed and while the page table lock is held: a
+        // reader that sees the new serial therefore also sees the new table. A cache entry
+        // tagged with a serial always holds the translation that was current when the serial
+        // became that value.
+        std::scoped_lock lock{page_table_mutex};
         if (entry_type == EntryType::Mapped) {
-            const DAddr current_dev_addr = dev_addr + offset;
-            const auto index = PageEntryIndex(current_gpu_addr, false);
-            const u32 sub_value = static_cast<u32>(current_dev_addr >> cpu_page_bits);
-            page_table[index] = sub_value;
+            page_table.ReserveRange(gpu_addr, size);
         }
-        remaining_size -= page_size;
+        GPUVAddr modified_start{};
+        u64 modified_size{};
+        const auto flush_modified = [&] {
+            if (modified_size != 0) {
+                modified_ranges.emplace_back(modified_start, modified_size);
+                modified_size = 0;
+            }
+        };
+        for (u64 offset{}; offset < size; offset += page_size) {
+            const GPUVAddr current_gpu_addr = gpu_addr + offset;
+            [[maybe_unused]] const auto current_entry_type = GetEntry(current_gpu_addr, false);
+            SetEntry(current_gpu_addr, entry_type, false);
+            const bool changed_backing = entry_type == EntryType::Mapped &&
+                current_entry_type == EntryType::Mapped &&
+                page_table[PageEntryIndex(current_gpu_addr, false)] !=
+                    static_cast<u32>((dev_addr + offset) >> cpu_page_bits);
+            if (current_entry_type != entry_type || changed_backing) {
+                if (modified_size == 0) {
+                    modified_start = current_gpu_addr;
+                }
+                modified_size += page_size;
+            } else {
+                flush_modified();
+            }
+            if (entry_type == EntryType::Mapped) {
+                const DAddr current_dev_addr = dev_addr + offset;
+                const auto index = PageEntryIndex(current_gpu_addr, false);
+                const u32 sub_value = static_cast<u32>(current_dev_addr >> cpu_page_bits);
+                page_table[index] = sub_value;
+            }
+            remaining_size -= page_size;
+        }
+        flush_modified();
+        // The serial moves after the table changed and while the page table lock is held, so
+        // that a reader that sees the new serial also sees the new table.
+        map_serial.fetch_add(1, std::memory_order_release);
     }
-    flush_modified();
+    // The caches are told about the change without the page table lock: the rasterizer takes the
+    // cache mutexes, which the GPU thread holds while it reads the page table.
+    for (const auto& [modified_start, modified_size] : modified_ranges) {
+        rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
+    }
     {
         std::unique_lock<std::mutex> lock(guard);
         kind_map.Map(gpu_addr, gpu_addr + size, kind);
@@ -175,56 +243,68 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
 
 GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
     [[maybe_unused]] u64 remaining_size{size};
-    GPUVAddr modified_start{};
-    u64 modified_size{};
-    const auto flush_modified = [&] {
-        if (modified_size != 0) {
-            rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
-            modified_size = 0;
-        }
-    };
-    for (u64 offset{}; offset < size; offset += big_page_size) {
-        const GPUVAddr current_gpu_addr = gpu_addr + offset;
-        [[maybe_unused]] const auto current_entry_type = GetEntry(current_gpu_addr, true);
-        SetEntry(current_gpu_addr, entry_type, true);
-        const bool changed_backing = entry_type == EntryType::Mapped &&
-            current_entry_type == EntryType::Mapped &&
-            big_page_table_dev[PageEntryIndex(current_gpu_addr, true)] !=
-                static_cast<u32>((dev_addr + offset) >> cpu_page_bits);
-        if (current_entry_type != entry_type || changed_backing) {
-            if (modified_size == 0) {
-                modified_start = current_gpu_addr;
+    boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 16> modified_ranges;
+    {
+        // As in PageTableOp: the change is one step for the readers, and the caches are told
+        // about it once the page table lock is released.
+        std::scoped_lock lock{page_table_mutex};
+        GPUVAddr modified_start{};
+        u64 modified_size{};
+        const auto flush_modified = [&] {
+            if (modified_size != 0) {
+                modified_ranges.emplace_back(modified_start, modified_size);
+                modified_size = 0;
             }
-            modified_size += big_page_size;
-        } else {
-            flush_modified();
-        }
-        if (entry_type == EntryType::Mapped) {
-            const DAddr current_dev_addr = dev_addr + offset;
-            const auto index = PageEntryIndex(current_gpu_addr, true);
-            const u32 sub_value = static_cast<u32>(current_dev_addr >> cpu_page_bits);
-            big_page_table_dev.Set(index, sub_value);
-            const bool is_continuous = ([&] {
-                uintptr_t base_ptr{
-                    reinterpret_cast<uintptr_t>(memory.GetPointer<u8>(current_dev_addr))};
-                if (base_ptr == 0) {
-                    return false;
+        };
+        for (u64 offset{}; offset < size; offset += big_page_size) {
+            const GPUVAddr current_gpu_addr = gpu_addr + offset;
+            [[maybe_unused]] const auto current_entry_type = GetEntry(current_gpu_addr, true);
+            SetEntry(current_gpu_addr, entry_type, true);
+            const bool changed_backing = entry_type == EntryType::Mapped &&
+                current_entry_type == EntryType::Mapped &&
+                big_page_table_dev[PageEntryIndex(current_gpu_addr, true)] !=
+                    static_cast<u32>((dev_addr + offset) >> cpu_page_bits);
+            if (current_entry_type != entry_type || changed_backing) {
+                if (modified_size == 0) {
+                    modified_start = current_gpu_addr;
                 }
-                for (DAddr start_cpu = current_dev_addr + page_size;
-                     start_cpu < current_dev_addr + big_page_size; start_cpu += page_size) {
-                    base_ptr += page_size;
-                    auto next_ptr = reinterpret_cast<uintptr_t>(memory.GetPointer<u8>(start_cpu));
-                    if (next_ptr == 0 || base_ptr != next_ptr) {
+                modified_size += big_page_size;
+            } else {
+                flush_modified();
+            }
+            if (entry_type == EntryType::Mapped) {
+                const DAddr current_dev_addr = dev_addr + offset;
+                const auto index = PageEntryIndex(current_gpu_addr, true);
+                const u32 sub_value = static_cast<u32>(current_dev_addr >> cpu_page_bits);
+                big_page_table_dev.Set(index, sub_value);
+                const bool is_continuous = ([&] {
+                    uintptr_t base_ptr{
+                        reinterpret_cast<uintptr_t>(memory.GetPointer<u8>(current_dev_addr))};
+                    if (base_ptr == 0) {
                         return false;
                     }
-                }
-                return true;
-            })();
-            SetBigPageContinuous(index, is_continuous);
+                    for (DAddr start_cpu = current_dev_addr + page_size;
+                         start_cpu < current_dev_addr + big_page_size; start_cpu += page_size) {
+                        base_ptr += page_size;
+                        auto next_ptr = reinterpret_cast<uintptr_t>(memory.GetPointer<u8>(start_cpu));
+                        if (next_ptr == 0 || base_ptr != next_ptr) {
+                            return false;
+                        }
+                    }
+                    return true;
+                })();
+                SetBigPageContinuous(index, is_continuous);
+            }
+            remaining_size -= big_page_size;
         }
-        remaining_size -= big_page_size;
+        flush_modified();
+        // As in PageTableOp: the serial moves after the table changed and while the page
+        // table lock is held.
+        map_serial.fetch_add(1, std::memory_order_release);
     }
-    flush_modified();
+    for (const auto& [modified_start, modified_size] : modified_ranges) {
+        rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
+    }
     {
         std::unique_lock<std::mutex> lock(guard);
         kind_map.Map(gpu_addr, gpu_addr + size, kind);
@@ -278,12 +358,14 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
         return;
     }
     PreserveMapping(gpu_addr, size);
-    GetSubmappedRangeImpl<false>(gpu_addr, size, page_stash);
+    // The range is collected in a local vector: two threads that unmap at the same time would
+    // otherwise share the member and overwrite each other's list.
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> unmapped;
+    GetSubmappedRangeImpl<false>(gpu_addr, size, unmapped);
 
-    for (const auto& [map_addr, map_size] : page_stash) {
+    for (const auto& [map_addr, map_size] : unmapped) {
         rasterizer->UnmapMemory(map_addr, map_size);
     }
-    page_stash.clear();
 
     BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
     PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
@@ -316,15 +398,20 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
         return slot.device_page + (gpu_addr & SubpageMask);
     }
     std::optional<DAddr> result;
-    if (GetEntry(gpu_addr, true) != EntryType::Mapped) [[unlikely]] {
-        if (GetEntry(gpu_addr, false) != EntryType::Mapped) {
-            return std::nullopt;
+    {
+        // The page table is read under its lock: a mapping change cannot show a page as mapped
+        // with the backing of another mapping.
+        std::scoped_lock lock{page_table_mutex};
+        if (GetEntry(gpu_addr, true) != EntryType::Mapped) {
+            if (GetEntry(gpu_addr, false) != EntryType::Mapped) {
+                return std::nullopt;
+            }
+            const DAddr dev_addr_base = DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits;
+            result = dev_addr_base + (gpu_addr & page_mask);
+        } else {
+            const DAddr dev_addr_base = DAddr(big_page_table_dev[PageEntryIndex(gpu_addr, true)]) << cpu_page_bits;
+            result = dev_addr_base + (gpu_addr & big_page_mask);
         }
-        const DAddr dev_addr_base = DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits;
-        result = dev_addr_base + (gpu_addr & page_mask);
-    } else {
-        const DAddr dev_addr_base = DAddr(big_page_table_dev[PageEntryIndex(gpu_addr, true)]) << cpu_page_bits;
-        result = dev_addr_base + (gpu_addr & big_page_mask);
     }
     if ((*result >> MaxwellDeviceMemoryManager::AS_BITS) != 0) {
         LOG_ERROR(HW_GPU, "GPU address {:#x} maps outside the device space, to {:#x}", gpu_addr,
@@ -523,44 +610,68 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
         std::memset(dest_buffer, 0, size);
         return;
     }
-    auto set_to_zero = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
-        std::memset(dest_buffer, 0, copy_amount);
-        dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
-    };
-    auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
-        if (!unsafe) {
-            rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
+    // The page table is read under its lock; the copies and the cache flushes run without it:
+    // the rasterizer takes the cache mutexes the GPU thread holds while it reads the page table.
+    boost::container::small_vector<MappedSegment, 32> segments;
+    {
+        std::scoped_lock lock{page_table_mutex};
+        auto set_to_zero = [&]([[maybe_unused]] std::size_t page_index,
+                               [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
+            segments.push_back(MappedSegment{MappedSegment::Kind::Zero, 0, copy_amount, false});
+        };
+        auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
+            segments.push_back(
+                MappedSegment{MappedSegment::Kind::Small, dev_addr_base, copy_amount, false});
+        };
+        auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
+            segments.push_back(MappedSegment{MappedSegment::Kind::Big, dev_addr_base, copy_amount,
+                                             IsBigPageContinuous(page_index)});
+        };
+        auto read_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            GPUVAddr base = (page_index << big_page_bits) + offset;
+            MemoryOperation(base, copy_amount, false, mapped_normal, set_to_zero, set_to_zero);
+        };
+        MemoryOperation(gpu_src_addr, size, true, mapped_big, set_to_zero, read_short_pages);
+    }
+    // The merge runs without the page table lock: it asks the device memory whether the host
+    // memory behind two segments is contiguous.
+    MergeSegments(memory, segments);
+    auto* dest = static_cast<u8*>(dest_buffer);
+    for (const auto& segment : segments) {
+        switch (segment.kind) {
+        case MappedSegment::Kind::Zero:
+            std::memset(dest, 0, segment.size);
+            break;
+        case MappedSegment::Kind::Small:
+            if (!unsafe) {
+                rasterizer->FlushRegion(segment.device_addr, segment.size, which);
+            }
+            // A device page without memory (a sparse block nobody wrote yet) reads zero.
+            if (const u8* physical = memory.GetPointer<u8>(segment.device_addr)) {
+                std::memcpy(dest, physical, segment.size);
+            } else {
+                std::memset(dest, 0, segment.size);
+            }
+            break;
+        case MappedSegment::Kind::Big:
+            if (!unsafe) {
+                rasterizer->FlushRegion(segment.device_addr, segment.size, which);
+            }
+            // A continuous big page may still have no host memory (a Switch 2 region backed as it is
+            // written, while its backing is pending): the per-page copy handles that.
+            if (segment.continuous) {
+                if (const u8* physical = memory.GetPointer<u8>(segment.device_addr)) {
+                    std::memcpy(dest, physical, segment.size);
+                    break;
+                }
+            }
+            memory.ReadBlockUnsafe(segment.device_addr, dest, segment.size);
+            break;
         }
-        // A device page without memory (a sparse block nobody wrote yet) reads zero.
-        if (const u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
-            std::memcpy(dest_buffer, physical, copy_amount);
-        } else {
-            std::memset(dest_buffer, 0, copy_amount);
-        }
-        dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
-    };
-    auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
-        if (!unsafe) {
-            rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
-        }
-        // A continuous big page may still have no host memory (a Switch 2 region backed as it is
-        // written, while its backing is pending): the per-page copy handles that.
-        u8* const physical = IsBigPageContinuous(page_index) ? memory.GetPointer<u8>(dev_addr_base)
-                                                             : nullptr;
-        if (physical != nullptr) [[likely]] {
-            std::memcpy(dest_buffer, physical, copy_amount);
-        } else {
-            memory.ReadBlockUnsafe(dev_addr_base, dest_buffer, copy_amount);
-        }
-        dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
-    };
-    auto read_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        GPUVAddr base = (page_index << big_page_bits) + offset;
-        MemoryOperation(base, copy_amount, false, mapped_normal, set_to_zero, set_to_zero);
-    };
-    MemoryOperation(gpu_src_addr, size, true, mapped_big, set_to_zero, read_short_pages);
+        dest += segment.size;
+    }
 }
 
 void MemoryManager::ReadBlock(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which) const {
@@ -596,45 +707,60 @@ void MemoryManager::ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) {
     // Give Switch 2 sparse pages the write lands on their memory first (otherwise it is dropped).
     Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
-    auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
-        src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
-    };
-    auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
-        if (!unsafe) {
-            rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
+    // The page table is read under its lock; the copies and the cache calls run without it: the
+    // rasterizer takes the cache mutexes the GPU thread holds while it reads the page table.
+    boost::container::small_vector<MappedSegment, 32> segments;
+    {
+        std::scoped_lock lock{page_table_mutex};
+        auto just_advance = [&]([[maybe_unused]] std::size_t page_index,
+                                [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
+            segments.push_back(MappedSegment{MappedSegment::Kind::Zero, 0, copy_amount, false});
+        };
+        auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
+            segments.push_back(
+                MappedSegment{MappedSegment::Kind::Small, dev_addr_base, copy_amount, false});
+        };
+        auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
+            segments.push_back(MappedSegment{MappedSegment::Kind::Big, dev_addr_base, copy_amount,
+                                             IsBigPageContinuous(page_index)});
+        };
+        auto write_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            GPUVAddr base = (page_index << big_page_bits) + offset;
+            MemoryOperation(base, copy_amount, false, mapped_normal, just_advance, just_advance);
+        };
+        MemoryOperation(gpu_dest_addr, size, true, mapped_big, just_advance, write_short_pages);
+    }
+    // The merge runs without the page table lock: it asks the device memory whether the host
+    // memory behind two segments is contiguous.
+    MergeSegments(memory, segments);
+    const auto* src = static_cast<const u8*>(src_buffer);
+    for (const auto& segment : segments) {
+        if (segment.kind != MappedSegment::Kind::Zero) {
+            if (!unsafe) {
+                rasterizer->PrepareRegionWrite(segment.device_addr, segment.size, which);
+            }
+            if (segment.kind == MappedSegment::Kind::Small) {
+                if (u8* physical = memory.GetPointer<u8>(segment.device_addr)) {
+                    std::memcpy(physical, src, segment.size);
+                }
+            } else {
+                u8* const physical =
+                    segment.continuous ? memory.GetPointer<u8>(segment.device_addr) : nullptr;
+                if (physical != nullptr) {
+                    std::memcpy(physical, src, segment.size);
+                } else {
+                    memory.WriteBlockUnsafe(segment.device_addr, src, segment.size);
+                }
+            }
+            // After the copy: the buffer cache may upload the written bytes from guest memory.
+            if (!unsafe) {
+                rasterizer->InvalidateRegion(segment.device_addr, segment.size, which);
+            }
         }
-        if (u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
-            std::memcpy(physical, src_buffer, copy_amount);
-        }
-        // After the copy: the buffer cache may upload the written bytes from guest memory.
-        if (!unsafe) {
-            rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
-        }
-        src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
-    };
-    auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
-        if (!unsafe) {
-            rasterizer->PrepareRegionWrite(dev_addr_base, copy_amount, which);
-        }
-        u8* const physical = IsBigPageContinuous(page_index) ? memory.GetPointer<u8>(dev_addr_base)
-                                                             : nullptr;
-        if (physical != nullptr) [[likely]] {
-            std::memcpy(physical, src_buffer, copy_amount);
-        } else {
-            memory.WriteBlockUnsafe(dev_addr_base, src_buffer, copy_amount);
-        }
-        if (!unsafe) {
-            rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
-        }
-        src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
-    };
-    auto write_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        GPUVAddr base = (page_index << big_page_bits) + offset;
-        MemoryOperation(base, copy_amount, false, mapped_normal, just_advance, just_advance);
-    };
-    MemoryOperation(gpu_dest_addr, size, true, mapped_big, just_advance, write_short_pages);
+        src += segment.size;
+    }
 }
 
 void MemoryManager::WriteBlock(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which) {
@@ -698,51 +824,73 @@ void MemoryManager::FlushQueryResults(GPUVAddr gpu_addr, size_t size) const {
 
 void MemoryManager::FlushRegion(GPUVAddr gpu_addr, size_t size,
                                 VideoCommon::CacheType which) const {
-    auto do_nothing = [&]([[maybe_unused]] std::size_t page_index,
-                          [[maybe_unused]] std::size_t offset,
-                          [[maybe_unused]] std::size_t copy_amount) {};
+    // The page table is read under its lock; the flushes run without it: the rasterizer takes
+    // the cache mutexes the GPU thread holds while it reads the page table.
+    boost::container::small_vector<MappedSegment, 32> segments;
+    {
+        std::scoped_lock lock{page_table_mutex};
+        auto do_nothing = [&]([[maybe_unused]] std::size_t page_index,
+                              [[maybe_unused]] std::size_t offset,
+                              [[maybe_unused]] std::size_t copy_amount) {};
 
-    auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
-        rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
-    };
-    auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
-        rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
-    };
-    auto flush_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        GPUVAddr base = (page_index << big_page_bits) + offset;
-        MemoryOperation(base, copy_amount, false, mapped_normal, do_nothing, do_nothing);
-    };
-    MemoryOperation(gpu_addr, size, true, mapped_big, do_nothing, flush_short_pages);
+        auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
+            segments.push_back(
+                MappedSegment{MappedSegment::Kind::Small, dev_addr_base, copy_amount, false});
+        };
+        auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
+            segments.push_back(MappedSegment{MappedSegment::Kind::Big, dev_addr_base, copy_amount,
+                                             IsBigPageContinuous(page_index)});
+        };
+        auto flush_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            GPUVAddr base = (page_index << big_page_bits) + offset;
+            MemoryOperation(base, copy_amount, false, mapped_normal, do_nothing, do_nothing);
+        };
+        MemoryOperation(gpu_addr, size, true, mapped_big, do_nothing, flush_short_pages);
+    }
+    for (const auto& segment : segments) {
+        rasterizer->FlushRegion(segment.device_addr, segment.size, which);
+    }
 }
 
 bool MemoryManager::IsMemoryDirty(GPUVAddr gpu_addr, size_t size,
                                   VideoCommon::CacheType which) const {
-    bool result = false;
-    auto do_nothing = [&]([[maybe_unused]] std::size_t page_index,
-                          [[maybe_unused]] std::size_t offset,
-                          [[maybe_unused]] std::size_t copy_amount) { return false; };
+    // The page table is read under its lock; the queries run without it: the rasterizer takes
+    // the cache mutexes the GPU thread holds while it reads the page table.
+    boost::container::small_vector<MappedSegment, 32> segments;
+    {
+        std::scoped_lock lock{page_table_mutex};
+        auto do_nothing = [&]([[maybe_unused]] std::size_t page_index,
+                              [[maybe_unused]] std::size_t offset,
+                              [[maybe_unused]] std::size_t copy_amount) {};
 
-    auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        const DAddr dev_addr_base =
-            (static_cast<DAddr>(page_table[page_index]) << cpu_page_bits) + offset;
-        result |= rasterizer->MustFlushRegion(dev_addr_base, copy_amount, which);
-        return result;
-    };
-    auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        const DAddr dev_addr_base =
-            (static_cast<DAddr>(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
-        result |= rasterizer->MustFlushRegion(dev_addr_base, copy_amount, which);
-        return result;
-    };
-    auto check_short_pages = [&](std::size_t page_index, std::size_t offset,
-                                 std::size_t copy_amount) {
-        GPUVAddr base = (page_index << big_page_bits) + offset;
-        MemoryOperation(base, copy_amount, false, mapped_normal, do_nothing, do_nothing);
-        return result;
-    };
-    MemoryOperation(gpu_addr, size, true, mapped_big, do_nothing, check_short_pages);
+        auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            const DAddr dev_addr_base =
+                (static_cast<DAddr>(page_table[page_index]) << cpu_page_bits) + offset;
+            segments.push_back(
+                MappedSegment{MappedSegment::Kind::Small, dev_addr_base, copy_amount, false});
+        };
+        auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            const DAddr dev_addr_base =
+                (static_cast<DAddr>(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
+            segments.push_back(MappedSegment{MappedSegment::Kind::Big, dev_addr_base, copy_amount,
+                                             IsBigPageContinuous(page_index)});
+        };
+        auto check_short_pages = [&](std::size_t page_index, std::size_t offset,
+                                     std::size_t copy_amount) {
+            GPUVAddr base = (page_index << big_page_bits) + offset;
+            MemoryOperation(base, copy_amount, false, mapped_normal, do_nothing, do_nothing);
+        };
+        MemoryOperation(gpu_addr, size, true, mapped_big, do_nothing, check_short_pages);
+    }
+    bool result{false};
+    for (const auto& segment : segments) {
+        result |= rasterizer->MustFlushRegion(segment.device_addr, segment.size, which);
+        if (result) {
+            break;
+        }
+    }
     return result;
 }
 
@@ -791,6 +939,9 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
 
 void MemoryManager::UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size) {
     // Every entry the operation set lies in these big pages; the walk reads nothing else there.
+    // The walk reads the page table, so it holds its lock; the runs themselves are guarded by
+    // runs_guard, which no path takes before the page table lock.
+    std::scoped_lock page_lock{page_table_mutex};
     const GPUVAddr begin = gpu_addr & ~big_page_mask;
     const GPUVAddr end =
         (std::min)(Common::AlignUp(gpu_addr + size, big_page_size), address_space_size);
@@ -881,6 +1032,9 @@ const MemoryManager::MappingSnapshot& MemoryManager::CurrentSnapshot() const {
 }
 
 size_t MemoryManager::MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const {
+    // The walk reads the page table: it holds the lock for its whole length, so that it sees one
+    // mapping and not a change half applied.
+    std::scoped_lock lock{page_table_mutex};
     std::optional<DAddr> old_page_addr{};
     size_t range_so_far = 0;
     bool result{false};
@@ -975,23 +1129,34 @@ size_t MemoryManager::GetMemoryLayoutSizeUncached(GPUVAddr gpu_addr) const {
 
 void MemoryManager::InvalidateRegion(GPUVAddr gpu_addr, size_t size,
                                      VideoCommon::CacheType which) const {
-    auto do_nothing = [&]([[maybe_unused]] std::size_t page_index,
-                          [[maybe_unused]] std::size_t offset,
-                          [[maybe_unused]] std::size_t copy_amount) {};
+    // The page table is read under its lock; the invalidations run without it: the rasterizer
+    // takes the cache mutexes the GPU thread holds while it reads the page table.
+    boost::container::small_vector<MappedSegment, 32> segments;
+    {
+        std::scoped_lock lock{page_table_mutex};
+        auto do_nothing = [&]([[maybe_unused]] std::size_t page_index,
+                              [[maybe_unused]] std::size_t offset,
+                              [[maybe_unused]] std::size_t copy_amount) {};
 
-    auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
-        rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
-    };
-    auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
-        rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
-    };
-    auto invalidate_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
-        GPUVAddr base = (page_index << big_page_bits) + offset;
-        MemoryOperation(base, copy_amount, false, mapped_normal, do_nothing, do_nothing);
-    };
-    MemoryOperation(gpu_addr, size, true, mapped_big, do_nothing, invalidate_short_pages);
+        auto mapped_normal = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            const DAddr dev_addr_base = (DAddr(page_table[page_index]) << cpu_page_bits) + offset;
+            segments.push_back(
+                MappedSegment{MappedSegment::Kind::Small, dev_addr_base, copy_amount, false});
+        };
+        auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            const DAddr dev_addr_base = (DAddr(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
+            segments.push_back(MappedSegment{MappedSegment::Kind::Big, dev_addr_base, copy_amount,
+                                             IsBigPageContinuous(page_index)});
+        };
+        auto invalidate_short_pages = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+            GPUVAddr base = (page_index << big_page_bits) + offset;
+            MemoryOperation(base, copy_amount, false, mapped_normal, do_nothing, do_nothing);
+        };
+        MemoryOperation(gpu_addr, size, true, mapped_big, do_nothing, invalidate_short_pages);
+    }
+    for (const auto& segment : segments) {
+        rasterizer->InvalidateRegion(segment.device_addr, segment.size, which);
+    }
 }
 
 void MemoryManager::CopyBlock(GPUVAddr gpu_dest_addr, GPUVAddr gpu_src_addr, std::size_t size,
@@ -1006,6 +1171,7 @@ bool MemoryManager::IsGranularRange(GPUVAddr gpu_addr, std::size_t size) const {
     if (!IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr) {
         return false;
     }
+    std::scoped_lock lock{page_table_mutex};
     if (GetEntry(gpu_addr, true) == EntryType::Mapped) [[likely]] {
         size_t page_index = gpu_addr >> big_page_bits;
         if (IsBigPageContinuous(page_index)) [[likely]] {
@@ -1026,6 +1192,9 @@ bool MemoryManager::IsContinuousRange(GPUVAddr gpu_addr, std::size_t size) const
     if (!IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr) {
         return false;
     }
+    // The walk reads the page table: it holds the lock for its whole length, so that it sees one
+    // mapping and not a change half applied.
+    std::scoped_lock lock{page_table_mutex};
     std::optional<DAddr> old_page_addr{};
     bool result{true};
     auto fail = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset,
@@ -1067,6 +1236,9 @@ bool MemoryManager::IsFullyMappedRange(GPUVAddr gpu_addr, std::size_t size) cons
     if (!IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr) {
         return false;
     }
+    // The walk reads the page table: it holds the lock for its whole length, so that it sees one
+    // mapping and not a change half applied.
+    std::scoped_lock lock{page_table_mutex};
     bool result{true};
     auto fail = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset,
                     [[maybe_unused]] std::size_t copy_amount) {
@@ -1094,6 +1266,9 @@ MemoryManager::GetSubmappedRange(GPUVAddr gpu_addr, std::size_t size) const {
 template <bool is_gpu_address>
 void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, boost::container::small_vector<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result)
     const {
+    // The walk reads the page table: it holds the lock for its whole length, so that it sees one
+    // mapping and not a change half applied.
+    std::scoped_lock lock{page_table_mutex};
     std::optional<std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>> last_segment{};
     std::optional<DAddr> old_page_addr{};
     const auto split = [&last_segment, &result]([[maybe_unused]] std::size_t page_index,
@@ -1157,12 +1332,14 @@ void MemoryManager::GetSubmappedRangeImpl(GPUVAddr gpu_addr, std::size_t size, b
 }
 
 void MemoryManager::FlushCaching() {
+    // The range is collected in a local vector: two threads that flush at the same time would
+    // otherwise share the member and overwrite each other's list.
+    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> invalidated;
     // Flush from the invalidate accumulator
-    if (accumulator.InvalidateAll([this](GPUVAddr addr, size_t size) {
-        GetSubmappedRangeImpl<false>(addr, size, page_stash2);
+    if (accumulator.InvalidateAll([this, &invalidated](GPUVAddr addr, size_t size) {
+        GetSubmappedRangeImpl<false>(addr, size, invalidated);
     })) {
-        rasterizer->InnerInvalidation(page_stash2);
-        page_stash2.clear();
+        rasterizer->InnerInvalidation(invalidated);
     }
 }
 

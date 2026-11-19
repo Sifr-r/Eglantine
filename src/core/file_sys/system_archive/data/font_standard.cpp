@@ -4,6 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+// Embedded Open Sans 1.10 digitized data is copyright 2010–2011 Google Corporation
+// and licensed under Apache-2.0. The merged controller glyphs come from YuzuOSSExtension.
+// See ASSET_PROVENANCE.md for the sources and license notices.
+
 #include "core/file_sys/system_archive/data/font_standard.h"
 
 namespace FileSys::SystemArchive::SharedFontData {

@@ -2032,8 +2032,9 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
     const u64 package_count = ReadLe(super, 0x48, 4);
     if (toc_offset != SuperblockSize || toc_size == 0 || blob_offset % ExtentAlignment != 0 ||
         super_file_size != file_size || package_count != package_total ||
-        toc_offset + toc_size > file_size || toc_offset + toc_size > blob_offset ||
-        blob_offset > file_size) {
+        file_size > static_cast<u64>(std::numeric_limits<s64>::max()) ||
+        blob_offset > file_size || toc_offset > blob_offset ||
+        toc_size > blob_offset - toc_offset || toc_size > std::numeric_limits<size_t>::max()) {
         return fail(EditResult::InvalidSource, "NUP superblock mismatch");
     }
     if (!in.Seek(static_cast<s64>(toc_offset))) {
@@ -2049,31 +2050,66 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
         u32 meta_size{};
     };
     std::vector<RawPackage> raws;
+    std::vector<std::pair<u64, u64>> meta_ranges;
     size_t pos = TocHeaderSize;
     for (size_t i = 0; i < package_count; ++i) {
-        if (pos + PackageRecordSize > toc.size()) {
+        if (pos > toc.size() || PackageRecordSize > toc.size() - pos) {
             return fail(EditResult::InvalidSource, "TOC too small");
         }
         RawPackage raw;
         raw.meta_offset = ReadLe(toc, pos + 0x20, 8);
         raw.meta_size = static_cast<u32>(ReadLe(toc, pos + 0x28, 4));
-        if (raw.meta_size > 0 &&
-            (raw.meta_offset == 0 || raw.meta_offset > file_size ||
-             raw.meta_size > file_size - raw.meta_offset)) {
-            return fail(EditResult::InvalidSource, "bad meta extent");
+        if (raw.meta_size > 0) {
+            if (raw.meta_offset < toc_offset + toc_size || raw.meta_offset > file_size ||
+                raw.meta_size > file_size - raw.meta_offset) {
+                return fail(EditResult::InvalidSource, "bad meta extent");
+            }
+            meta_ranges.emplace_back(raw.meta_offset, raw.meta_offset + raw.meta_size);
         }
         raws.push_back(raw);
         pos += PackageRecordSize;
     }
 
-    u64 meta_start = file_size;
-    for (const auto& raw : raws) {
-        if (raw.meta_size > 0) {
-            meta_start = std::min(meta_start, raw.meta_offset);
+    std::ranges::sort(meta_ranges);
+    // More than one package can reference the same bytes.
+    size_t range_count = 0;
+    for (const auto& range : meta_ranges) {
+        if (range_count > 0 && range.first <= meta_ranges[range_count - 1].second) {
+            auto& previous_end = meta_ranges[range_count - 1].second;
+            previous_end = std::max(previous_end, range.second);
+        } else {
+            meta_ranges[range_count++] = range;
         }
     }
-    if (meta_start < blob_offset || meta_start > file_size) {
-        return fail(EditResult::InvalidSource, "bad meta start");
+    meta_ranges.resize(range_count);
+
+    // Package metadata can precede a file extent. Keep all stored extents at their original
+    // offsets and append the rewritten blocks after the data.
+    const u64 dir_count = ReadLe(toc, 0x08, 8);
+    const u64 file_count = ReadLe(toc, 0x10, 8);
+    if (dir_count > (toc.size() - pos) / DirRecordSize) {
+        return fail(EditResult::InvalidSource, "bad directory table size");
+    }
+    pos += static_cast<size_t>(dir_count * DirRecordSize);
+    if (file_count > (toc.size() - pos) / FileRecordSize) {
+        return fail(EditResult::InvalidSource, "bad file table size");
+    }
+    u64 data_end = std::max(blob_offset, meta_ranges.empty() ? file_size : meta_ranges[0].first);
+    for (u64 i = 0; i < file_count; ++i, pos += FileRecordSize) {
+        const u64 extent = ReadLe(toc, pos + 0x10, 8);
+        const u64 size = ReadLe(toc, pos + 0x18, 8);
+        if (size == 0) {
+            continue;
+        }
+        if (extent < blob_offset || extent > file_size || size > file_size - extent) {
+            return fail(EditResult::InvalidSource, "bad file extent");
+        }
+        const auto next_meta = std::ranges::upper_bound(meta_ranges, extent, {},
+                                                       &std::pair<u64, u64>::second);
+        if (next_meta != meta_ranges.end() && next_meta->first < extent + size) {
+            return fail(EditResult::InvalidSource, "file extent overlaps metadata");
+        }
+        data_end = std::max(data_end, extent + size);
     }
 
     std::vector<std::vector<u8>> new_metas(raws.size());
@@ -2113,7 +2149,7 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
         new_metas[i] = std::move(block);
     }
 
-    u64 cursor = meta_start;
+    u64 cursor = data_end;
     std::vector<std::pair<u64, u32>> meta_addrs(raws.size());
     for (size_t i = 0; i < raws.size(); ++i) {
         if (new_metas[i].empty()) {
@@ -2121,6 +2157,9 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
         } else {
             if (new_metas[i].size() > std::numeric_limits<u32>::max()) {
                 return fail(EditResult::IoError, "package metadata is too large");
+            }
+            if (new_metas[i].size() > static_cast<u64>(std::numeric_limits<s64>::max()) - cursor) {
+                return fail(EditResult::IoError, "edited archive is too large");
             }
             meta_addrs[i] = {cursor, static_cast<u32>(new_metas[i].size())};
             cursor += new_metas[i].size();
@@ -2198,24 +2237,38 @@ EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
             gap -= chunk;
         }
         std::vector<u8> buffer(ReadBufferSize);
-        u64 remaining = meta_start - blob_offset;
+        u64 offset = blob_offset;
+        auto meta = meta_ranges.begin();
         if (!in.Seek(static_cast<s64>(blob_offset))) {
             throw std::runtime_error("cannot seek to blob");
         }
-        while (remaining > 0) {
+        while (offset < data_end) {
             if (cancel && cancel->load()) {
                 out.Close();
                 std::error_code rm_ec;
                 fs::remove(part, rm_ec);
                 return EditResult::Cancelled;
             }
-            const size_t chunk = static_cast<size_t>(std::min<u64>(buffer.size(), remaining));
+            const size_t chunk = static_cast<size_t>(std::min<u64>(buffer.size(), data_end - offset));
             const size_t got = in.ReadSpan(std::span<u8>{buffer.data(), chunk});
             if (got == 0) {
                 throw std::runtime_error("short read of blob");
             }
+            // Clear old metadata in gaps between extents now that the TOC points to the new tail.
+            const u64 end = offset + got;
+            while (meta != meta_ranges.end() && meta->first < end) {
+                if (meta->second > offset) {
+                    const auto start = std::max(meta->first, offset) - offset;
+                    const auto stop = std::min(meta->second, end) - offset;
+                    std::fill(buffer.data() + start, buffer.data() + stop, u8{0});
+                }
+                if (meta->second > end) {
+                    break;
+                }
+                ++meta;
+            }
             write_all(buffer.data(), got);
-            remaining -= got;
+            offset = end;
         }
         for (const auto& block : new_metas) {
             if (!block.empty()) {

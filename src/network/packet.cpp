@@ -39,6 +39,18 @@ void Packet::Read(void* out_data, std::size_t size_in_bytes) {
     }
 }
 
+bool Packet::OverwriteBytes(std::size_t offset, const void* in_data, std::size_t size_in_bytes) {
+    if (in_data == nullptr || size_in_bytes == 0) {
+        return false;
+    }
+    if (offset > data.size() || size_in_bytes > data.size() - offset) {
+        // The bytes do not fit into the packet, the packet is left unchanged.
+        return false;
+    }
+    std::memcpy(&data[offset], in_data, size_in_bytes);
+    return true;
+}
+
 void Packet::Clear() {
     data.clear();
     read_pos = 0;
@@ -50,6 +62,14 @@ const void* Packet::GetData() const {
 }
 
 void Packet::IgnoreBytes(u32 length) {
+    if (static_cast<std::size_t>(length) > RemainingBytes()) {
+        // The peer asked us to skip past the end of the packet. Invalidate the packet and
+        // clamp the read position to the end of the data, so that no later read can run off
+        // the end of the buffer.
+        Invalidate();
+        read_pos = data.size();
+        return;
+    }
     read_pos += length;
 }
 
@@ -61,11 +81,22 @@ bool Packet::EndOfPacket() const {
     return read_pos >= data.size();
 }
 
+std::size_t Packet::RemainingBytes() const {
+    return read_pos < data.size() ? data.size() - read_pos : 0;
+}
+
+void Packet::Invalidate() {
+    is_valid = false;
+}
+
 Packet::operator bool() const {
     return is_valid;
 }
 
 Packet& Packet::Read(bool& out_data) {
+    // The out parameter is always initialized, so that a failed read cannot leave it
+    // uninitialized.
+    out_data = false;
     u8 value{};
     if (Read(value)) {
         out_data = (value != 0);
@@ -74,11 +105,13 @@ Packet& Packet::Read(bool& out_data) {
 }
 
 Packet& Packet::Read(s8& out_data) {
+    out_data = 0;
     Read(&out_data, sizeof(out_data));
     return *this;
 }
 
 Packet& Packet::Read(u8& out_data) {
+    out_data = 0;
     Read(&out_data, sizeof(out_data));
     return *this;
 }
@@ -126,27 +159,53 @@ Packet& Packet::Read(u64& out_data) {
 }
 
 Packet& Packet::Read(float& out_data) {
+    out_data = 0.0F;
     Read(&out_data, sizeof(out_data));
     return *this;
 }
 
 Packet& Packet::Read(double& out_data) {
+    out_data = 0.0;
     Read(&out_data, sizeof(out_data));
     return *this;
 }
 
-Packet& Packet::Read(char* out_data) {
+Packet& Packet::Read(char* out_data, std::size_t buffer_size) {
+    if (out_data == nullptr || buffer_size == 0) {
+        Invalidate();
+        return *this;
+    }
+
     // First extract string length
     u32 length = 0;
     Read(length);
+    if (!is_valid) {
+        out_data[0] = '\0';
+        return *this;
+    }
 
-    if ((length > 0) && CheckSize(length)) {
+    // The payload has to fit into the destination buffer, including the terminating null
+    // character. A peer must not be able to write past the end of the buffer.
+    if (static_cast<std::size_t>(length) > buffer_size - 1) {
+        Invalidate();
+        out_data[0] = '\0';
+        return *this;
+    }
+
+    if (length > 0) {
+        if (!CheckSize(length)) {
+            out_data[0] = '\0';
+            return *this;
+        }
+
         // Then extract characters
         std::memcpy(out_data, &data[read_pos], length);
         out_data[length] = '\0';
 
         // Update reading position
         read_pos += length;
+    } else {
+        out_data[0] = '\0';
     }
 
     return *this;
@@ -254,7 +313,12 @@ Packet& Packet::Write(const std::string& in_data) {
 }
 
 bool Packet::CheckSize(std::size_t size) {
-    is_valid = is_valid && (read_pos + size <= data.size());
+    // The comparison is done without adding to read_pos, so that a large size cannot
+    // overflow the addition.
+    if (read_pos > data.size() || size > data.size() - read_pos) {
+        is_valid = false;
+        return false;
+    }
 
     return is_valid;
 }

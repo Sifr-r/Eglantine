@@ -80,3 +80,31 @@ TEST_CASE("Covered-page tracking preserves queries and never loses registered us
         query(offset, 0);
     }
 }
+
+TEST_CASE("Bounded reset clears sparse ranges on a large buffer", "[video_core][usage_tracker]") {
+    constexpr u64 Page = 4096;
+    constexpr u64 LargeSize = 64ULL * 1024 * 1024;
+    VideoCommon::UsageTracker tracker(LargeSize);
+
+    // Out-of-bounds track leaves bitmap zeroed and resets cleanly.
+    tracker.Track(LargeSize, Page);
+    tracker.Reset();
+    CHECK(std::ranges::all_of(tracker.Pages(), [](u64 word) { return word == 0ULL; }));
+
+    // Sparse low + high page tracks, then Reset clears every dirty word.
+    tracker.Track(128, 256);
+    tracker.Track(LargeSize - Page - 64, Page);
+    CHECK(tracker.IsUsed(128, 64));
+    CHECK(tracker.IsUsed(LargeSize - Page, 64));
+    tracker.Reset();
+    CHECK_FALSE(tracker.IsUsed(0, LargeSize));
+    CHECK(std::ranges::all_of(tracker.Pages(), [](u64 word) { return word == 0ULL; }));
+
+    // Subsequent small-range track after bounded Reset works only for the newly tracked range.
+    tracker.Track(1000 * Page + 64, 3 * Page);
+    CHECK_FALSE(tracker.IsUsed(128, 64));
+    CHECK_FALSE(tracker.IsUsed(LargeSize - Page, 64));
+    CHECK(tracker.IsUsed(1001 * Page, Page));
+    tracker.Reset();
+    CHECK(std::ranges::all_of(tracker.Pages(), [](u64 word) { return word == 0ULL; }));
+}

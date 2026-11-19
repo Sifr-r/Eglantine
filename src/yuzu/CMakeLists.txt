@@ -163,6 +163,10 @@ add_executable(yuzu
     debugger/console.h
     debugger/controller.cpp
     debugger/controller.h
+    diagnostics_dialog.cpp
+    diagnostics_dialog.h
+    diagnostics_log.cpp
+    diagnostics_log.h
 
     game/game_list.cpp game/game_list.h
     game/game_grid.cpp game/game_grid.h
@@ -381,29 +385,18 @@ target_sources(yuzu
         ${LANGUAGES}
         ${THEMES})
 
-# TODO(crueter): Move Assets.car/icon/icns handling to its own Module.
 if (APPLE)
     target_sources(yuzu PRIVATE util/macos_sleep.cpp util/macos_sleep.h)
 
-    # Xcode will automatically generate the Assets.car and icns file for us.
-    set(_dist "${CMAKE_SOURCE_DIR}/dist")
-    if (CMAKE_GENERATOR MATCHES "Xcode")
-        set(_icons "${_dist}/eglantine.icon")
+    set(_macos_icon "${CMAKE_SOURCE_DIR}/dist/eglantine.icns")
+    set_source_files_properties("${_macos_icon}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+    target_sources(yuzu PRIVATE "${_macos_icon}")
 
-        set_target_properties(eden PROPERTIES
-            XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME eglantine
-            MACOSX_BUNDLE_ICON_FILE eglantine
-            # Also force xcode to manage signing for us.
+    if (CMAKE_GENERATOR STREQUAL "Xcode")
+        set_target_properties(yuzu PROPERTIES
             XCODE_ATTRIBUTE_CODE_SIGNING_REQUIRED ON
             XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED ON)
-    # Otherwise, we'll use our own.
-    else()
-        set(_icons "${_dist}/eglantine.icns" "${_dist}/Assets.car")
     endif()
-
-    set_source_files_properties(${_icons} PROPERTIES
-        MACOSX_PACKAGE_LOCATION Resources)
-    target_sources(yuzu PRIVATE ${_icons})
 
     set_target_properties(yuzu PROPERTIES MACOSX_BUNDLE TRUE)
     set_target_properties(yuzu PROPERTIES MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_SOURCE_DIR}/Info.plist)

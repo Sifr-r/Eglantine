@@ -223,7 +223,9 @@ private:
         bool initialised{};
         bool absolute_big_page_limit{}; //!< Switch 2 layout: big-page limit is va_range_end
     } vm;
-    std::unique_ptr<Tegra::MemoryManager> gmmu;
+    /// Shared: the callbacks queued for the GPU thread hold it, so the address space they use
+    /// outlives the device that made them.
+    std::shared_ptr<Tegra::MemoryManager> gmmu;
 
     struct IoctlGetSyncRoMap {
         u64_le base_gpuva;
@@ -243,6 +245,9 @@ private:
         bool heap; ///< Mapped through the session's heap mapper (else an SMMU allocation)
         bool shared{}; ///< A reference to the process's range in Nx2GpuMemoryRegistry
         size_t asid{};
+        /// The id of the heap mapper that made the mapping (0 for an SMMU allocation): it names
+        /// the mapper, which can go away with the session.
+        u64 heap_mapper{};
     };
     std::map<std::pair<u64, u64>, Nx2DeviceRange> nx2_device_ranges;
     void Nx2Release(u64 cpu_address, u64 size);
@@ -253,6 +258,9 @@ private:
     void Nx2BackSparse(u64 gpu_address, u64 cpu_address, u64 size);
     // A tile of a sparse region (nx2:gpu 216): its device pages show process memory, or nothing.
     void Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size);
+    /// Lets the callbacks queued for the GPU thread run before the device and the session they
+    /// use are gone.
+    void DrainGpuCallbacks();
     std::map<u64, std::pair<u64, DAddr>> nx2_sparse_ranges; ///< GPU address -> (size, device)
 };
 

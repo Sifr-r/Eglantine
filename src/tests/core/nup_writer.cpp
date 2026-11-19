@@ -6,6 +6,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -19,11 +20,15 @@
 #include <fmt/format.h>
 #include <openssl/evp.h>
 
+#include "common/fs/file.h"
+#include "common/fs/path_util.h"
+#include "core/core.h"
 #include "core/file_sys/nup_container.h"
 #include "core/file_sys/nup_writer.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/file_sys/vfs/vfs_vector.h"
+#include "core/launch_params.h"
 #include "core/loader/nup.h"
 
 namespace {
@@ -211,7 +216,8 @@ TEST_CASE("NUP packs base, updates and add-ons and reads back through NupContain
     REQUIRE_FALSE(fs::exists(archive.string() + ".part"));
 
     FileSys::RealVfsFilesystem real;
-    NupContainer nup{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+    NupContainer nup{
+        real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
     REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
     REQUIRE(nup.VerifyIntegrity({}) == Loader::ResultStatus::Success);
 
@@ -302,8 +308,9 @@ TEST_CASE("NUP reads zstd members above the memory cache through a temporary fil
     FileSys::RealVfsFilesystem real;
     {
         // Members above 32 KiB do not fit the 64 KiB cache budget and are spilled to disk.
-        NupContainer nup{real.OpenFile(archive.string(), FileSys::OpenMode::Read), 64 * 1024,
-                         spill_dir};
+        NupContainer nup{
+            real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read),
+            64 * 1024, spill_dir};
         REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
         const auto file = nup.GetRomFSDir(0)->GetFile("large.bin");
         REQUIRE(file != nullptr);
@@ -384,7 +391,8 @@ TEST_CASE("NUP marks updates standalone when the dump has no base", "[nup]") {
     REQUIRE(FileSys::Nup::PackDump(root, archive) == FileSys::Nup::PackResult::Success);
 
     FileSys::RealVfsFilesystem real;
-    NupContainer nup{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+    NupContainer nup{
+        real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
     REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
     REQUIRE(nup.GetPackages().size() == 1);
     REQUIRE(nup.GetPackages()[0].kind == NupContainer::PackageKind::Update);
@@ -404,7 +412,8 @@ TEST_CASE("NUP packs a bare exefs/romfs dump as one base", "[nup]") {
     REQUIRE(FileSys::Nup::PackDump(root, archive) == FileSys::Nup::PackResult::Success);
 
     FileSys::RealVfsFilesystem real;
-    NupContainer nup{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+    NupContainer nup{
+        real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
     REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
     REQUIRE(nup.GetPackages().size() == 1);
     REQUIRE(nup.GetPackages()[0].kind == NupContainer::PackageKind::Base);
@@ -456,7 +465,8 @@ TEST_CASE("NUP low storage resumes and deletes the packed sources", "[nup]") {
     REQUIRE_FALSE(fs::exists(root / "Base/RomFS/shared.bin"));
 
     FileSys::RealVfsFilesystem real;
-    NupContainer nup{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+    NupContainer nup{
+        real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
     REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
     REQUIRE(nup.VerifyIntegrity({}) == Loader::ResultStatus::Success);
     REQUIRE(nup.GetPackages().size() == 4);
@@ -532,7 +542,8 @@ TEST_CASE("NUP writes metadata overrides to the base and the newest update", "[n
     REQUIRE(FileSys::Nup::PackDump(root, archive, options) == FileSys::Nup::PackResult::Success);
 
     FileSys::RealVfsFilesystem real;
-    NupContainer nup{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+    NupContainer nup{
+        real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
     REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
     const auto& packages = nup.GetPackages();
     REQUIRE(packages.size() == 4);
@@ -590,8 +601,10 @@ TEST_CASE("NUP extracts a full dump and repacks it", "[nup]") {
     const auto repacked = t.path / "Repacked.nup";
     REQUIRE(FileSys::Nup::PackDump(out, repacked) == FileSys::Nup::PackResult::Success);
     FileSys::RealVfsFilesystem real;
-    FileSys::NupContainer original{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
-    FileSys::NupContainer copy{real.OpenFile(repacked.string(), FileSys::OpenMode::Read)};
+    FileSys::NupContainer original{
+        real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
+    FileSys::NupContainer copy{
+        real.OpenFile(Common::FS::PathToUTF8String(repacked), FileSys::OpenMode::Read)};
     REQUIRE(original.GetStatus() == Loader::ResultStatus::Success);
     REQUIRE(copy.GetStatus() == Loader::ResultStatus::Success);
     REQUIRE(original.GetPackages().size() == copy.GetPackages().size());
@@ -649,18 +662,21 @@ TEST_CASE("NUP edits default-language metadata in place", "[nup]") {
     edit.display_version = "2.0.0";
     edit.icon = std::vector<u8>{0x89, 0x50, 0x4E, 0x47};
     std::string error;
+    INFO(error);
     REQUIRE(FileSys::Nup::EditNupMetadata(archive, edit, &error) ==
             FileSys::Nup::EditResult::Success);
-    INFO(error);
 
-    FileSys::RealVfsFilesystem real;
-    FileSys::NupContainer nup{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
-    REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
-    REQUIRE(nup.VerifyIntegrity({}) == Loader::ResultStatus::Success);
-    REQUIRE(nup.GetPackages()[0].title_name == "After");
-    REQUIRE(nup.GetPackages()[0].publisher == "After Inc");
-    REQUIRE(nup.GetPackages()[0].display_version == "2.0.0");
-    REQUIRE(nup.GetPackages()[0].icon == std::vector<u8>{0x89, 0x50, 0x4E, 0x47});
+    {
+        FileSys::RealVfsFilesystem real;
+        FileSys::NupContainer nup{
+            real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
+        REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
+        REQUIRE(nup.VerifyIntegrity({}) == Loader::ResultStatus::Success);
+        REQUIRE(nup.GetPackages()[0].title_name == "After");
+        REQUIRE(nup.GetPackages()[0].publisher == "After Inc");
+        REQUIRE(nup.GetPackages()[0].display_version == "2.0.0");
+        REQUIRE(nup.GetPackages()[0].icon == std::vector<u8>{0x89, 0x50, 0x4E, 0x47});
+    }
 
     const auto probed = FileSys::Nup::ProbeNupMetadata(archive);
     REQUIRE(probed.title_name == "After");
@@ -672,18 +688,137 @@ TEST_CASE("NUP edits default-language metadata in place", "[nup]") {
     clear.icon = std::vector<u8>{};
     REQUIRE(FileSys::Nup::EditNupMetadata(archive, clear, &error) ==
             FileSys::Nup::EditResult::Success);
-    INFO(error);
-    FileSys::RealVfsFilesystem real2;
-    FileSys::NupContainer cleared{real2.OpenFile(archive.string(), FileSys::OpenMode::Read)};
-    REQUIRE(cleared.GetStatus() == Loader::ResultStatus::Success);
-    REQUIRE(cleared.GetPackages()[0].title_name.empty());
-    REQUIRE(cleared.GetPackages()[0].icon.empty());
-    REQUIRE(cleared.VerifyIntegrity({}) == Loader::ResultStatus::Success);
+    {
+        FileSys::RealVfsFilesystem real2;
+        FileSys::NupContainer cleared{
+            real2.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
+        REQUIRE(cleared.GetStatus() == Loader::ResultStatus::Success);
+        REQUIRE(cleared.GetPackages()[0].title_name.empty());
+        REQUIRE(cleared.GetPackages()[0].icon.empty());
+        REQUIRE(cleared.VerifyIntegrity({}) == Loader::ResultStatus::Success);
+    }
     REQUIRE(ReadAll(archive) != before);
 
     FileSys::Nup::MetadataEdit noop;
     REQUIRE(FileSys::Nup::EditNupMetadata(archive, noop, &error) ==
             FileSys::Nup::EditResult::NoChange);
+}
+
+TEST_CASE("NUP metadata edits preserve file extents when metadata precedes them", "[nup]") {
+    TempDir t;
+    const auto root = t.path / "Game";
+    MakeDump(root);
+    const auto archive = t.path / "Game.nup";
+    constexpr std::string_view original_title = "Original title";
+    constexpr std::string_view new_title = "New title";
+    FileSys::Nup::PackOptions options;
+    options.metadata.title_name = original_title;
+    REQUIRE(FileSys::Nup::PackDump(root, archive, options) == FileSys::Nup::PackResult::Success);
+
+    auto bytes = ReadAll(archive);
+    const auto toc = Le(bytes, 0x08, 8);
+    const auto package_count = Le(bytes, toc + 0x04, 4);
+    const auto dir_count = Le(bytes, toc + 0x08, 8);
+    const auto file_count = Le(bytes, toc + 0x10, 8);
+    const auto blob_offset = Le(bytes, 0x38, 8);
+    const auto first_package = toc + 0x30;
+    const auto old_meta_offset = Le(bytes, first_package + 0x20, 8);
+    const auto meta_size = Le(bytes, first_package + 0x28, 4);
+    REQUIRE(meta_size > 0);
+    REQUIRE(old_meta_offset > blob_offset);
+    const auto meta = bytes.substr(old_meta_offset, meta_size);
+
+    u64 insert_at = blob_offset;
+    bool shared_meta = false;
+    SECTION("Metadata between TOC and blob region") {}
+    SECTION("Shared metadata between TOC and blob region") {
+        shared_meta = true;
+    }
+    SECTION("Metadata between file extents") {
+        insert_at = old_meta_offset;
+        for (const auto& file : RawFiles(bytes)) {
+            if (file.extent_offset > blob_offset) {
+                insert_at = std::min(insert_at, file.extent_offset);
+            }
+        }
+        REQUIRE(insert_at < old_meta_offset);
+    }
+
+    const auto inserted_size = (meta_size + 15) & ~u64{15};
+    bytes.erase(old_meta_offset, meta_size);
+    bytes.insert(insert_at, inserted_size, '\0');
+    bytes.replace(insert_at, meta_size, meta);
+    SetLe(bytes, first_package + 0x20, insert_at, 8);
+    for (u64 i = 1; i < package_count; ++i) {
+        const auto field = first_package + i * 0x40 + 0x20;
+        const auto offset = Le(bytes, field, 8);
+        if (offset > old_meta_offset) {
+            SetLe(bytes, field, offset - meta_size + inserted_size, 8);
+        }
+    }
+    if (shared_meta) {
+        REQUIRE(package_count > 1);
+        const auto field = first_package + (package_count - 1) * 0x40 + 0x20;
+        SetLe(bytes, field, insert_at, 8);
+        SetLe(bytes, field + 8, meta_size, 4);
+    }
+    const auto first_file = first_package + package_count * 0x40 + dir_count * 0x18;
+    for (u64 i = 0; i < file_count; ++i) {
+        const auto field = first_file + i * 0x50 + 0x10;
+        const auto offset = Le(bytes, field, 8);
+        if (offset >= insert_at) {
+            SetLe(bytes, field, offset + inserted_size, 8);
+        }
+    }
+    if (insert_at == blob_offset) {
+        SetLe(bytes, 0x38, blob_offset + inserted_size, 8);
+    }
+    SetLe(bytes, 0x40, bytes.size(), 8);
+    const auto toc_hash = Sha256(std::string_view{bytes}.substr(toc, Le(bytes, 0x10, 8)));
+    std::copy(toc_hash.begin(), toc_hash.end(), bytes.begin() + 0x18);
+    Put(archive, bytes);
+
+    const auto check_archive = [&](std::string_view title, const std::vector<u8>& icon) {
+        FileSys::RealVfsFilesystem vfs;
+        NupContainer nup{vfs.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
+        REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
+        REQUIRE(nup.GetPackages().front().title_name == title);
+        REQUIRE(nup.GetPackages().front().icon == icon);
+        if (shared_meta) {
+            REQUIRE(nup.GetPackages().back().title_name == original_title);
+            REQUIRE(nup.GetPackages().back().icon.empty());
+        }
+        REQUIRE(nup.VerifyIntegrity({}) == Loader::ResultStatus::Success);
+        const auto actual = ReadAll(archive);
+        REQUIRE(Le(actual, 0x38, 8) == Le(bytes, 0x38, 8));
+        const auto file_records_size = file_count * 0x50;
+        REQUIRE(actual.substr(first_file, file_records_size) ==
+                bytes.substr(first_file, file_records_size));
+        for (const auto& file : RawFiles(bytes)) {
+            REQUIRE(actual.substr(file.extent_offset, file.extent_size) ==
+                    bytes.substr(file.extent_offset, file.extent_size));
+        }
+    };
+    check_archive(original_title, {});
+
+    FileSys::Nup::MetadataEdit edit;
+    const std::vector<u8> icon{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A};
+    edit.icon = icon;
+    std::string error;
+    const auto result = FileSys::Nup::EditNupMetadata(archive, edit, &error);
+    INFO(error);
+    REQUIRE(result == FileSys::Nup::EditResult::Success);
+    check_archive(original_title, icon);
+    const auto size_after_icon = fs::file_size(archive);
+    REQUIRE(ReadAll(archive).substr(insert_at, meta_size) == std::string(meta_size, '\0'));
+
+    edit.title_name = new_title;
+    REQUIRE(FileSys::Nup::EditNupMetadata(archive, edit) == FileSys::Nup::EditResult::Success);
+    check_archive(new_title, icon);
+    REQUIRE(fs::file_size(archive) + original_title.size() - new_title.size() == size_after_icon);
+    const auto edited = ReadAll(archive);
+    REQUIRE(FileSys::Nup::EditNupMetadata(archive, edit) == FileSys::Nup::EditResult::NoChange);
+    REQUIRE(ReadAll(archive) == edited);
 }
 
 TEST_CASE("NUP extract refuses a non-empty directory without touching it", "[nup]") {
@@ -733,7 +868,8 @@ TEST_CASE("NUP edit propagates display version to the newest update", "[nup]") {
 
     FileSys::RealVfsFilesystem real;
     {
-        FileSys::NupContainer before{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+        FileSys::NupContainer before{
+            real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
         REQUIRE(before.GetStatus() == Loader::ResultStatus::Success);
         REQUIRE(before.GetPackages()[1].display_version == "1.1.0");
     }
@@ -741,12 +877,13 @@ TEST_CASE("NUP edit propagates display version to the newest update", "[nup]") {
     FileSys::Nup::MetadataEdit edit;
     edit.display_version = "7.7.7";
     std::string error;
+    INFO(error);
     REQUIRE(FileSys::Nup::EditNupMetadata(archive, edit, &error) ==
             FileSys::Nup::EditResult::Success);
-    INFO(error);
 
     FileSys::RealVfsFilesystem real2;
-    FileSys::NupContainer nup{real2.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+    FileSys::NupContainer nup{
+        real2.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
     REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
     REQUIRE(nup.VerifyIntegrity({}) == Loader::ResultStatus::Success);
     REQUIRE(nup.GetPackages()[0].display_version == "7.7.7");
@@ -772,7 +909,8 @@ TEST_CASE("NUP loader exposes title and publisher through control data", "[nup]"
 
     const auto check = [&](const std::string& title, const std::string& publisher) {
         FileSys::RealVfsFilesystem real;
-        Loader::AppLoader_NUP loader{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+        Loader::AppLoader_NUP loader{
+            real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
         FileSys::NACP control;
         REQUIRE(loader.ReadControlData(control) == Loader::ResultStatus::Success);
         REQUIRE(control.GetApplicationName() == title);
@@ -790,6 +928,30 @@ TEST_CASE("NUP loader exposes title and publisher through control data", "[nup]"
     check("Edited", "Edited Inc");
 }
 
+TEST_CASE("NUP loader rejects program ID when the selected ExeFS is incomplete", "[nup]") {
+    TempDir t;
+    const auto root = t.path / "Game";
+    Put(root / "base/exefs/main", "main");
+    Put(root / "base/exefs/main.npdm", Npdm(TitleId));
+    Put(root / "base/romfs/file", "rom");
+
+    SECTION("Missing main") {
+        Put(root / "updates/65536/exefs/main.npdm", Npdm(TitleId));
+    }
+    SECTION("Missing main.npdm") {
+        Put(root / "updates/65536/exefs/main", "main");
+    }
+
+    const auto archive = t.path / "Game.nup";
+    REQUIRE(FileSys::Nup::PackDump(root, archive) == FileSys::Nup::PackResult::Success);
+
+    FileSys::RealVfsFilesystem real;
+    Loader::AppLoader_NUP loader{
+        real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
+    u64 program_id{};
+    REQUIRE(loader.ReadProgramId(program_id) == Loader::ResultStatus::ErrorNotInitialized);
+}
+
 TEST_CASE("NUP edit applies name/icon/version to a metadata-less dump", "[nup]") {
     TempDir t;
     const auto root = t.path / "Game";
@@ -799,7 +961,8 @@ TEST_CASE("NUP edit applies name/icon/version to a metadata-less dump", "[nup]")
     REQUIRE(FileSys::Nup::PackDump(root, archive) == FileSys::Nup::PackResult::Success);
     {
         FileSys::RealVfsFilesystem real;
-        FileSys::NupContainer packed{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+        FileSys::NupContainer packed{
+            real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
         REQUIRE(packed.GetStatus() == Loader::ResultStatus::Success);
         REQUIRE(packed.GetPackages()[0].title_name.empty());
         REQUIRE(packed.GetPackages()[0].icon.empty());
@@ -811,12 +974,13 @@ TEST_CASE("NUP edit applies name/icon/version to a metadata-less dump", "[nup]")
     edit.publisher = "Nintendo";
     edit.icon = std::vector<u8>{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A};
     std::string error;
+    INFO(error);
     REQUIRE(FileSys::Nup::EditNupMetadata(archive, edit, &error) ==
             FileSys::Nup::EditResult::Success);
-    INFO(error);
 
     FileSys::RealVfsFilesystem real;
-    Loader::AppLoader_NUP loader{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+    Loader::AppLoader_NUP loader{
+        real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
     std::string title;
     REQUIRE(loader.ReadTitle(title) == Loader::ResultStatus::Success);
     REQUIRE(title == "Hyrule Warriors: Age of Imprisonment");
@@ -852,7 +1016,8 @@ TEST_CASE("NUP edits localized titles and keeps the rest", "[nup]") {
 
     FileSys::RealVfsFilesystem real;
     {
-        FileSys::NupContainer nup{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+        FileSys::NupContainer nup{
+            real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
         REQUIRE(nup.GetStatus() == Loader::ResultStatus::Success);
         REQUIRE(nup.VerifyIntegrity({}) == Loader::ResultStatus::Success);
         REQUIRE(nup.GetPackages()[0].title_name == "Default");
@@ -874,7 +1039,150 @@ TEST_CASE("NUP edits localized titles and keeps the rest", "[nup]") {
     clear.localized_titles = std::vector<std::pair<std::string, std::string>>{};
     REQUIRE(FileSys::Nup::EditNupMetadata(archive, clear, &error) ==
             FileSys::Nup::EditResult::Success);
-    FileSys::NupContainer nup{real.OpenFile(archive.string(), FileSys::OpenMode::Read)};
+    FileSys::NupContainer nup{
+        real.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read)};
     REQUIRE(nup.GetPackages()[0].localized_titles.empty());
     REQUIRE(nup.GetPackages()[0].title_name == "Renamed");
+}
+
+TEST_CASE("IOFile, VFS, and NUP handle non-ASCII UTF-8 paths", "[nup][fs]") {
+    TempDir t;
+    const fs::path non_ascii_dir = t.path / std::u8string{u8"Pok\u00e9mon\u2122 Pokopia"};
+    fs::create_directories(non_ascii_dir);
+
+    const fs::path io_file_path = non_ascii_dir / std::u8string{u8"Pok\u00e9mon\u2122.bin"};
+    const std::string utf8_io_path = Common::FS::PathToUTF8String(io_file_path);
+
+    {
+        Common::FS::IOFile out{utf8_io_path, Common::FS::FileAccessMode::Write};
+        REQUIRE(out.IsOpen());
+        const std::string payload = "pokopia-utf8";
+        REQUIRE(out.WriteString(payload) == payload.size());
+    }
+    {
+        Common::FS::IOFile in;
+        in.Open(std::string_view{utf8_io_path}, Common::FS::FileAccessMode::Read);
+        REQUIRE(in.IsOpen());
+        REQUIRE(in.ReadString(in.GetSize()) == "pokopia-utf8");
+    }
+
+    {
+        FileSys::RealVfsFilesystem real;
+        {
+            const auto vfs_file = real.OpenFile(utf8_io_path, FileSys::OpenMode::Read);
+            REQUIRE(vfs_file != nullptr);
+            REQUIRE(Read(vfs_file) == "pokopia-utf8");
+        }
+
+        const auto recreated = real.CreateFile(utf8_io_path, FileSys::OpenMode::ReadWrite);
+        REQUIRE(recreated != nullptr);
+        const std::string replaced = "replaced-utf8";
+        REQUIRE(recreated->Write(reinterpret_cast<const u8*>(replaced.data()), replaced.size(),
+                                 0) == replaced.size());
+    }
+    REQUIRE(ReadAll(io_file_path) == "replaced-utf8");
+
+    const auto root = t.path / "Game";
+    MakeDump(root);
+    const fs::path archive = non_ascii_dir / std::u8string{u8"Pok\u00e9mon\u2122.nup"};
+    REQUIRE(FileSys::Nup::PackDump(root, archive) == FileSys::Nup::PackResult::Success);
+
+    FileSys::Nup::MetadataEdit edit;
+    edit.title_name = "Pokopia UTF-8";
+    std::string error;
+    INFO(error);
+    REQUIRE(FileSys::Nup::EditNupMetadata(archive, edit, &error) ==
+            FileSys::Nup::EditResult::Success);
+    REQUIRE(FileSys::Nup::ProbeNupMetadata(archive).title_name == "Pokopia UTF-8");
+}
+
+TEST_CASE("ParseLaunchParams preserves non-ASCII UTF-8 paths across options and positional args",
+          "[core][launch_params]") {
+    Core::System system;
+    const std::string utf8_game =
+        "D:\\games\\Pok\xC3\xA9mon\xE2\x84\xA2 Pokopia\\Pok\xC3\xA9mon.nup";
+    const std::string utf8_config = "D:\\cfg\\Pok\xC3\xA9mon\xE2\x84\xA2.ini";
+
+    {
+        std::vector<std::string> storage{"eden-cli", "-c", utf8_config, "-g", utf8_game};
+        std::vector<char*> argv;
+        for (auto& s : storage) {
+            argv.push_back(s.data());
+        }
+        argv.push_back(nullptr);
+        const auto lp = Core::ParseLaunchParams(
+            system, static_cast<int>(storage.size()), argv.data(), nullptr);
+        REQUIRE(lp.config_path == utf8_config);
+        REQUIRE(lp.filepath == utf8_game);
+    }
+
+    {
+        // Positional game before an option: getopt_long permutes argv; optind must still match.
+        std::vector<std::string> storage{"eden-cli", utf8_game, "-f"};
+        std::vector<char*> argv;
+        for (auto& s : storage) {
+            argv.push_back(s.data());
+        }
+        argv.push_back(nullptr);
+        const auto lp = Core::ParseLaunchParams(
+            system, static_cast<int>(storage.size()), argv.data(), nullptr);
+        REQUIRE(lp.fullscreen);
+        REQUIRE(lp.filepath == utf8_game);
+    }
+
+#ifdef _WIN32
+    {
+        // Narrow argv is mangled ACP, while argv_w holds the real UTF-16 strings; options and
+        // positional args (even before -f) must all use argv_w without permutation mismatch.
+        std::vector<std::string> narrow_storage{"eden-cli", "D:\\games\\Pok?mon?.nup", "-f",
+                                                "-c",       "D:\\cfg\\Pok?mon?.ini",
+                                                "--nup-name", "Pok?mon?"};
+        std::vector<std::wstring> wide_storage{
+            L"eden-cli",
+            L"D:\\games\\Pok\u00e9mon\u2122 Pokopia\\Pok\u00e9mon.nup",
+            L"-f",
+            L"-c",
+            L"D:\\cfg\\Pok\u00e9mon\u2122.ini",
+            L"--nup-name",
+            L"Pok\u00e9mon\u2122",
+        };
+        std::vector<char*> argv;
+        std::vector<wchar_t*> argv_w;
+        for (auto& s : narrow_storage) {
+            argv.push_back(s.data());
+        }
+        for (auto& ws : wide_storage) {
+            argv_w.push_back(ws.data());
+        }
+        argv.push_back(nullptr);
+        argv_w.push_back(nullptr);
+
+        const auto lp = Core::ParseLaunchParams(
+            system, static_cast<int>(narrow_storage.size()), argv.data(), argv_w.data());
+        REQUIRE(lp.fullscreen);
+        REQUIRE(lp.filepath == utf8_game);
+        REQUIRE(lp.config_path == utf8_config);
+        REQUIRE(lp.edit_nup_name == std::string{"Pok\xC3\xA9mon\xE2\x84\xA2"});
+    }
+
+    {
+        std::vector<std::string> narrow_storage{"eden-cli", "-g", "D:\\games\\Pok?mon?.nup"};
+        std::vector<std::wstring> wide_storage{
+            L"eden-cli", L"-g", L"D:\\games\\Pok\u00e9mon\u2122 Pokopia\\Pok\u00e9mon.nup"};
+        std::vector<char*> argv;
+        std::vector<wchar_t*> argv_w;
+        for (auto& s : narrow_storage) {
+            argv.push_back(s.data());
+        }
+        for (auto& ws : wide_storage) {
+            argv_w.push_back(ws.data());
+        }
+        argv.push_back(nullptr);
+        argv_w.push_back(nullptr);
+
+        const auto lp = Core::ParseLaunchParams(
+            system, static_cast<int>(narrow_storage.size()), argv.data(), argv_w.data());
+        REQUIRE(lp.filepath == utf8_game);
+    }
+#endif
 }

@@ -134,13 +134,13 @@ void GpuSplit::MaybeStart(Core::System& system_) {
                                                           : Settings::IsDMALevelSafe();
     const bool allowed = !safe_reads && !Settings::IsGPULevelHigh() &&
                          Settings::values.renderer_backend.GetValue() == Settings::RendererBackend::Vulkan;
-    if (active && !allowed) {
+    if (active.load(std::memory_order_acquire) && !allowed) {
         Drain();
         Stop();
         LOG_INFO(HW_GPU, "GPU thread split: stopped, the accuracy settings need the caches on the front");
         return;
     }
-    if (active || !allowed) {
+    if (active.load(std::memory_order_acquire) || !allowed) {
         return;
     }
     system = &system_;
@@ -148,7 +148,7 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     ring = std::make_unique<u64[]>(RingWords);
     verify_repeats = Nx2Perf::Verify() && Nx2Perf::On(Nx2Perf::Opt::DrawBeginCoalesce);
     back_thread = std::jthread([this](std::stop_token stop_token) { BackLoop(stop_token); });
-    active = true;
+    active.store(true, std::memory_order_release);
     eager_publish = Nx2Perf::On(Nx2Perf::Opt::EagerPublish);
 #ifdef ARCHITECTURE_x86_64
     // Front macros run compiled (macro_turing_jit.h) only.
@@ -167,7 +167,7 @@ void GpuSplit::Stop() {
     wake.fetch_add(1, std::memory_order_seq_cst);
     wake.notify_one();
     back_thread.join();
-    active = false;
+    active.store(false, std::memory_order_release);
     // The split is static and outlives the emulation session. The next session's back thread
     // starts reading at 0: with the old positions kept it skipped through the new, empty ring a
     // wrap at a time and never reached the old write position (the next game's first GPU work
@@ -245,7 +245,7 @@ void GpuSplit::Publish() {
 }
 
 void GpuSplit::Drain(DrainSite site) {
-    if (!active) {
+    if (!active.load(std::memory_order_acquire)) {
         return;
     }
     consumed_cache = consumed.load(std::memory_order_acquire);

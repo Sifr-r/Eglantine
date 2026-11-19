@@ -254,10 +254,15 @@ std::optional<s64> CoreTiming::Advance() {
         const Event& evt = event_queue.top();
 
         if (const auto event_type{evt.type.lock()}) {
+            // The callback runs with the queue unlocked and may unschedule this very event,
+            // which erases its node from the heap. evt therefore dangles as soon as the
+            // callback returns, so everything the code below needs is copied out first.
             const auto evt_time = evt.time;
+            const auto evt_reschedule_time = evt.reschedule_time;
+            const auto evt_handle = evt.handle;
             const auto evt_sequence_num = event_type->sequence_number;
 
-            if (evt.reschedule_time == 0) {
+            if (evt_reschedule_time == 0) {
                 event_queue.pop();
 
                 basic_lock.unlock();
@@ -275,23 +280,24 @@ std::optional<s64> CoreTiming::Advance() {
                 basic_lock.lock();
 
                 if (evt_sequence_num != event_type->sequence_number) {
-                    // Heap handle is invalidated after external modification.
+                    // The event was unscheduled while the callback ran: its node was erased
+                    // from the heap and evt_handle is invalid. Leave the event alone.
                     continue;
                 }
 
                 const auto next_schedule_time{new_schedule_time.has_value()
                                                   ? new_schedule_time.value().count()
-                                                  : evt.reschedule_time};
+                                                  : evt_reschedule_time};
 
                 // If this event was scheduled into a pause, its time now is going to be way
                 // behind. Re-set this event to continue from the end of the pause.
-                auto next_time{evt.time + next_schedule_time};
-                if (evt.time < pause_end_time) {
+                auto next_time{evt_time + next_schedule_time};
+                if (evt_time < pause_end_time) {
                     next_time = pause_end_time + next_schedule_time;
                 }
 
-                event_queue.update(evt.handle, Event{next_time, event_fifo_id++, evt.type,
-                                                     next_schedule_time, evt.handle});
+                event_queue.update(evt_handle, Event{next_time, event_fifo_id++, event_type,
+                                                     next_schedule_time, evt_handle});
             }
         }
 

@@ -5,7 +5,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <optional>
 #include <thread>
+
+#include <QStringList>
+#include <QTimer>
 
 #include "common/assert.h"
 #include "common/settings.h"
@@ -17,6 +21,8 @@
 #include "hid_core/hid_core.h"
 #include "hid_core/hid_types.h"
 #include "hid_core/resources/npad/npad.h"
+#include "input_common/drivers/switch2.h"
+#include "input_common/main.h"
 #include "qt_common/qt_compat.h"
 #include "ui_qt_controller.h"
 #include "yuzu/applets/qt_controller.h"
@@ -216,6 +222,19 @@ QtControllerSelectorDialog::QtControllerSelectorDialog(
     connect(ui->inputConfigButton, &QPushButton::clicked, this,
             &QtControllerSelectorDialog::CallConfigureInputProfileDialog);
 
+    connect(ui->switch2SplitButton, &QPushButton::clicked, this,
+            &QtControllerSelectorDialog::OnSwitch2SplitClicked);
+    connect(ui->switch2MergeButton, &QPushButton::clicked, this,
+            &QtControllerSelectorDialog::OnSwitch2MergeClicked);
+    connect(ui->switch2CalibrateButton, &QPushButton::clicked, this,
+            &QtControllerSelectorDialog::OnSwitch2CalibrateClicked);
+
+    switch2_refresh_timer = new QTimer(this);
+    switch2_refresh_timer->setInterval(500);
+    connect(switch2_refresh_timer, &QTimer::timeout, this,
+            &QtControllerSelectorDialog::RefreshSwitch2Status);
+    RefreshSwitch2Status();
+
     connect(ui->buttonBox, &QDialogButtonBox::accepted, this,
             &QtControllerSelectorDialog::ApplyConfiguration);
 
@@ -239,10 +258,15 @@ QtControllerSelectorDialog::QtControllerSelectorDialog(
         }
     }
 
+    switch2_refresh_timer->start();
+
     resize(0, 0);
 }
 
 QtControllerSelectorDialog::~QtControllerSelectorDialog() {
+    if (switch2_refresh_timer != nullptr) {
+        switch2_refresh_timer->stop();
+    }
     controller_navigation->UnloadController();
     system.HIDCore().DisableAllControllerConfiguration();
 }
@@ -251,7 +275,22 @@ int QtControllerSelectorDialog::exec() {
     if (parameters_met && parameters.enable_single_mode) {
         return QDialog::Accepted;
     }
-    return QDialog::exec();
+    RefreshSwitch2Status();
+    if (switch2_refresh_timer != nullptr && !switch2_refresh_timer->isActive()) {
+        switch2_refresh_timer->start();
+    }
+    const int result = QDialog::exec();
+    if (switch2_refresh_timer != nullptr) {
+        switch2_refresh_timer->stop();
+    }
+    return result;
+}
+
+void QtControllerSelectorDialog::done(int r) {
+    if (switch2_refresh_timer != nullptr) {
+        switch2_refresh_timer->stop();
+    }
+    QDialog::done(r);
 }
 
 void QtControllerSelectorDialog::ApplyConfiguration() {
@@ -752,6 +791,158 @@ void QtControllerSelectorDialog::DisableUnsupportedPlayers() {
         connected_controller_labels[index]->hide();
         connected_controller_checkboxes[index]->hide();
     }
+}
+
+void QtControllerSelectorDialog::RefreshSwitch2Status() {
+    const auto* switch2 = input_subsystem != nullptr ? input_subsystem->GetSwitch2() : nullptr;
+    if (switch2 == nullptr) {
+        ui->switch2StatusLabel->setText(tr("Switch 2 driver unavailable"));
+        ui->switch2SplitButton->setEnabled(false);
+        ui->switch2MergeButton->setEnabled(false);
+        ui->switch2CalibrateButton->setEnabled(false);
+        return;
+    }
+
+    const auto devices = switch2->GetConnectedDevices();
+    if (devices.empty()) {
+        ui->switch2StatusLabel->setText(tr("No Switch 2 controllers connected"));
+        ui->switch2SplitButton->setEnabled(false);
+        ui->switch2MergeButton->setEnabled(false);
+        ui->switch2CalibrateButton->setEnabled(false);
+        return;
+    }
+
+    bool has_dual = false;
+    bool has_left = false;
+    bool has_right = false;
+    bool any_calibrating = false;
+
+    QStringList device_summaries;
+    device_summaries.reserve(static_cast<qsizetype>(devices.size()));
+
+    for (const auto& device : devices) {
+        switch (device.type) {
+        case InputCommon::Switch2::ControllerType::Dual:
+            has_dual = true;
+            break;
+        case InputCommon::Switch2::ControllerType::Left:
+            has_left = true;
+            break;
+        case InputCommon::Switch2::ControllerType::Right:
+            has_right = true;
+            break;
+        case InputCommon::Switch2::ControllerType::Pro:
+        case InputCommon::Switch2::ControllerType::GameCube:
+        case InputCommon::Switch2::ControllerType::None:
+        default:
+            break;
+        }
+
+        if (device.is_calibrating) {
+            any_calibrating = true;
+        }
+
+        QString name;
+        if (!device.display_name.empty()) {
+            name = QString::fromStdString(device.display_name);
+        } else {
+            const auto product_name = InputCommon::Switch2::ProductName(device.product_id);
+            name = !product_name.empty()
+                       ? QString::fromUtf8(product_name.data(),
+                                           static_cast<qsizetype>(product_name.size()))
+                       : tr("Switch 2 Controller");
+        }
+
+        QString transport;
+        switch (device.transport) {
+        case InputCommon::Switch2::TransportType::Ble:
+            transport = tr("BLE");
+            break;
+        case InputCommon::Switch2::TransportType::Usb:
+            transport = tr("USB");
+            break;
+        case InputCommon::Switch2::TransportType::None:
+        default:
+            transport = tr("Unknown");
+            break;
+        }
+
+        const QString battery =
+            QStringLiteral("%1V").arg(static_cast<double>(device.battery_voltage), 0, 'f', 2);
+        const QString status_suffix =
+            device.is_calibrating ? tr(" (Calibrating...)") : QString{};
+
+        device_summaries.push_back(QStringLiteral("P%1: %2 (%3, %4)%5")
+                                       .arg(static_cast<qulonglong>(device.slot_index + 1))
+                                       .arg(name, transport, battery, status_suffix));
+    }
+
+    ui->switch2StatusLabel->setText(device_summaries.join(QStringLiteral(" | ")));
+    ui->switch2SplitButton->setEnabled(has_dual);
+    ui->switch2MergeButton->setEnabled(has_left && has_right);
+    ui->switch2CalibrateButton->setEnabled(!any_calibrating);
+}
+
+void QtControllerSelectorDialog::OnSwitch2SplitClicked() {
+    auto* switch2 = input_subsystem != nullptr ? input_subsystem->GetSwitch2() : nullptr;
+    if (switch2 == nullptr) {
+        return;
+    }
+
+    const auto devices = switch2->GetConnectedDevices();
+    for (const auto& device : devices) {
+        if (device.type == InputCommon::Switch2::ControllerType::Dual) {
+            if (switch2->SplitSlot(device.slot_index)) {
+                break;
+            }
+        }
+    }
+
+    RefreshSwitch2Status();
+}
+
+void QtControllerSelectorDialog::OnSwitch2MergeClicked() {
+    auto* switch2 = input_subsystem != nullptr ? input_subsystem->GetSwitch2() : nullptr;
+    if (switch2 == nullptr) {
+        return;
+    }
+
+    std::optional<std::size_t> left_slot;
+    std::optional<std::size_t> right_slot;
+    const auto devices = switch2->GetConnectedDevices();
+    for (const auto& device : devices) {
+        if (!left_slot.has_value() && device.type == InputCommon::Switch2::ControllerType::Left) {
+            left_slot = device.slot_index;
+        } else if (!right_slot.has_value() &&
+                   device.type == InputCommon::Switch2::ControllerType::Right) {
+            right_slot = device.slot_index;
+        }
+        if (left_slot.has_value() && right_slot.has_value()) {
+            break;
+        }
+    }
+
+    if (left_slot.has_value() && right_slot.has_value()) {
+        switch2->MergeSlots(*left_slot, *right_slot);
+    }
+
+    RefreshSwitch2Status();
+}
+
+void QtControllerSelectorDialog::OnSwitch2CalibrateClicked() {
+    auto* switch2 = input_subsystem != nullptr ? input_subsystem->GetSwitch2() : nullptr;
+    if (switch2 == nullptr) {
+        return;
+    }
+
+    const auto devices = switch2->GetConnectedDevices();
+    for (const auto& device : devices) {
+        if (!device.is_calibrating) {
+            switch2->CalibrateGyro(device.slot_index);
+        }
+    }
+
+    RefreshSwitch2Status();
 }
 
 QtControllerSelector::QtControllerSelector(MainWindow& parent) {

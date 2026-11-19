@@ -1058,32 +1058,40 @@ function(AddCIPackage)
             set(EXTRA_ARGS MODULE_PATH)
         endif()
 
-        # download sha512sum file
-        # TODO: CI pkgs
-        set(sha512sum_url
-            "https://${ARTIFACT_GIT_HOST}/${ARTIFACT_REPO}/releases/download/${ARTIFACT_VERSION}/${ARTIFACT}.sha512sum")
-        set(sha512sum_file
-            "${CMAKE_CURRENT_BINARY_DIR}/.cpmutil_${ARTIFACT}_sha512sum")
+        set(ci_custom_key "${ARTIFACT_VERSION}-${pkgname}")
+        get_cache_path(${ARTIFACT_PACKAGE} "${ci_custom_key}" ci_cache_path)
+        needs_refetch("${ci_cache_path}" "none" ci_cache_invalid)
 
-        file(DOWNLOAD "${sha512sum_url}" "${sha512sum_file}"
-            STATUS sha512sum_status)
-        list(GET sha512sum_status 0 sha512sum_error)
+        if (ci_cache_invalid)
+            # download sha512sum file
+            # TODO: CI pkgs
+            set(sha512sum_url
+                "https://${ARTIFACT_GIT_HOST}/${ARTIFACT_REPO}/releases/download/${ARTIFACT_VERSION}/${ARTIFACT}.sha512sum")
+            set(sha512sum_file
+                "${CMAKE_CURRENT_BINARY_DIR}/.cpmutil_${ARTIFACT}_sha512sum")
 
-        if(sha512sum_error)
-            message(FATAL_ERROR "[CPMUtil] Failed to download sha512sum "
-                "for ${ARTIFACT_NAME} from ${sha512sum_url}")
+            file(DOWNLOAD "${sha512sum_url}" "${sha512sum_file}"
+                STATUS sha512sum_status)
+            list(GET sha512sum_status 0 sha512sum_error)
+
+            if(sha512sum_error)
+                message(FATAL_ERROR "[CPMUtil] Failed to download sha512sum "
+                    "for ${ARTIFACT_NAME} from ${sha512sum_url}")
+            endif()
+
+            file(READ "${sha512sum_file}" sha512sum_hash)
+            string(STRIP "${sha512sum_hash}" sha512sum_hash)
+            file(REMOVE "${sha512sum_file}")
+        else()
+            set(sha512sum_hash "cached")
         endif()
-
-        file(READ "${sha512sum_file}" sha512sum_hash)
-        string(STRIP "${sha512sum_hash}" sha512sum_hash)
-        file(REMOVE "${sha512sum_file}")
 
         AddPackage(
             NAME ${ARTIFACT_PACKAGE}
             REPO ${ARTIFACT_REPO}
             VERSION ${ARTIFACT_VERSION}
             ARTIFACT ${ARTIFACT}
-            CUSTOM_KEY "${ARTIFACT_VERSION}-${pkgname}"
+            CUSTOM_KEY "${ci_custom_key}"
             HASH ${sha512sum_hash}
             FORCE_BUNDLED_PACKAGE ON
             ${EXTRA_ARGS})

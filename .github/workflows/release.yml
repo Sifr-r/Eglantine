@@ -63,6 +63,10 @@ jobs:
           TARGET_SHA: ${{ inputs.sha }}
         run: |
           set -euo pipefail
+          if [[ ! "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Expected a full build commit SHA" >&2
+            exit 1
+          fi
           git fetch --no-tags origin "$TARGET_SHA"
           git fetch --no-tags origin nx2:refs/remotes/origin/nx2 || true
           git cat-file -e "$TARGET_SHA^{commit}"
@@ -71,6 +75,13 @@ jobs:
           if [ "$KIND" = stable ] || [ "$KIND" = rc ]; then
             git show "$TARGET_SHA:CHANGELOG.md" > CHANGELOG.md
           fi
+
+      - name: Check build commit paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          git ls-tree -r --name-only -z "$SHA" | \
+            python3 -I tools/ci/check_release_paths.py --stdin0
 
       - name: Download binaries
         uses: actions/download-artifact@v8
@@ -115,6 +126,39 @@ jobs:
           ((${#files[@]} > 0)) || { echo "Build artifacts contained no release files" >&2; exit 1; }
           printf 'Prepared %s release assets\n' "${#files[@]}"
           ls -la release-assets
+
+      - name: Check release archive member names
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(release-assets/*.zip release-assets/*.tar.gz)
+          ((${#archives[@]} > 0)) || { echo "No ZIP or TAR.GZ release archives to check" >&2; exit 1; }
+          python3 -I tools/ci/check_release_paths.py --archives "${archives[@]}"
+
+      - name: Add project license and asset notices
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git cat-file -e "$SHA:ASSET_PROVENANCE.md"; then
+            for source in LICENSE.txt LICENSES/Apache-2.0.txt ASSET_PROVENANCE.md; do
+              dest="release-assets/${source##*/}"
+              git cat-file blob "$SHA:$source" > "$dest"
+              test -s "$dest"
+            done
+          fi
+
+      - name: Write asset checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(release-assets/*)
+          ((${#files[@]} > 0)) || { echo "No release assets to checksum" >&2; exit 1; }
+          # SHA256SUMS does not exist yet (release-assets is recreated above), so it cannot
+          # list itself.
+          (cd release-assets && sha256sum -- * > SHA256SUMS)
+          cat release-assets/SHA256SUMS
 
       - name: Write release notes
         shell: bash

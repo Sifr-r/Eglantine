@@ -2808,6 +2808,110 @@
              <number>0</number>
             </property>
             <item>
+             <widget class="QGroupBox" name="switch2GroupBox">
+              <property name="title">
+               <string>Switch 2 Controllers</string>
+              </property>
+              <layout class="QGridLayout" name="switch2GridLayout">
+               <item row="0" column="0" colspan="2">
+                <widget class="QCheckBox" name="enable_switch2_driver">
+                 <property name="toolTip">
+                  <string>Requires restarting Eglantine</string>
+                 </property>
+                 <property name="minimumSize">
+                  <size>
+                   <width>0</width>
+                   <height>23</height>
+                  </size>
+                 </property>
+                 <property name="text">
+                  <string>Enable native Switch 2 controller driver (BLE + USB, requires restart)</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="1" column="0" colspan="2">
+                <widget class="QCheckBox" name="switch2_combine_joycons">
+                 <property name="minimumSize">
+                  <size>
+                   <width>0</width>
+                   <height>23</height>
+                  </size>
+                 </property>
+                 <property name="text">
+                  <string>Auto-combine Switch 2 Joy-Cons</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="2" column="0" colspan="2">
+                <widget class="QCheckBox" name="switch2_optical_mouse">
+                 <property name="minimumSize">
+                  <size>
+                   <width>0</width>
+                   <height>23</height>
+                  </size>
+                 </property>
+                 <property name="text">
+                  <string>Enable Switch 2 Joy-Con optical mouse mode</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="3" column="0">
+                <widget class="QLabel" name="switch2_gyro_mouse_mode_label">
+                 <property name="text">
+                  <string>Gyro mouse mode</string>
+                 </property>
+                 <property name="buddy">
+                  <cstring>switch2_gyro_mouse_mode</cstring>
+                 </property>
+                </widget>
+               </item>
+               <item row="3" column="1">
+                <widget class="QComboBox" name="switch2_gyro_mouse_mode">
+                 <item>
+                  <property name="text">
+                   <string>Off</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>Yaw</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>Roll</string>
+                  </property>
+                 </item>
+                </widget>
+               </item>
+               <item row="4" column="0">
+                <widget class="QLabel" name="switch2_gyro_activation_mode_label">
+                 <property name="text">
+                  <string>Gyro activation mode</string>
+                 </property>
+                 <property name="buddy">
+                  <cstring>switch2_gyro_activation_mode</cstring>
+                 </property>
+                </widget>
+               </item>
+               <item row="4" column="1">
+                <widget class="QComboBox" name="switch2_gyro_activation_mode">
+                 <item>
+                  <property name="text">
+                   <string>Hold</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>Toggle</string>
+                  </property>
+                 </item>
+                </widget>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <item>
              <spacer name="mainVerticalSpacer">
               <property name="orientation">
                <enum>Qt::Vertical</enum>

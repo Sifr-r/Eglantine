@@ -93,8 +93,11 @@ public:
 
     /**
      * Gets the room information of the room.
+     *
+     * The information is returned by value, because the room network thread may update it
+     * concurrently with this call.
      */
-    const RoomInformation& GetRoomInformation() const;
+    RoomInformation GetRoomInformation() const;
 
     /**
      * Gets the verify UID of this room.

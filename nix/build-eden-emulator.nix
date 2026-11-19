@@ -106,15 +106,16 @@ let
             ".claude"
             ".forgejo"
             ".github"
+            ".lab"
             ".tx"
             "docs"
             "hooks"
+            "ignore"
             "nix"
           ])
           && !(lib.hasSuffix ".md" base)
           && !(builtins.elem base [
             ".mcp.json"
-            "relower_words.cpp"
             ".clang-format"
             ".clang-tidy"
             ".editorconfig"

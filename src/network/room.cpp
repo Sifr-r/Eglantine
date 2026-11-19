@@ -7,11 +7,13 @@
 #include <atomic>
 #include <iomanip>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <regex>
 #include <shared_mutex>
 #include <sstream>
 #include <thread>
+#include <vector>
 #include "common/polyfill_thread.h"
 #include "common/logging.h"
 #include "enet/enet.h"
@@ -21,12 +23,19 @@
 
 namespace Network {
 
+/// Maximum size of a payload that a member may relay to the other members of a room. This is
+/// sized for the largest UDP datagram that can be sent over IPv4.
+constexpr std::size_t MaxRelayedPayloadSize = 65507;
+
 class Room::RoomImpl {
 public:
     ENetHost* server = nullptr; ///< Network interface.
 
     std::atomic<State> state{State::Closed}; ///< Current state of the room.
     RoomInformation room_information;        ///< Information about this room.
+    /// Mutex for locking room_information. The room information is read by the UI thread and
+    /// written by the room network thread, so every access has to be guarded by this mutex.
+    mutable std::mutex room_information_mutex;
 
     std::string verify_uid;              ///< A GUID which may be used for verification.
     mutable std::mutex verify_uid_mutex; ///< Mutex for verify_uid
@@ -49,13 +58,22 @@ public:
     IPBanList ip_ban_list;             ///< List of banned IP addresses
     mutable std::mutex ban_list_mutex; ///< Mutex for the ban lists
 
-    RoomImpl() {}
-
-    /// Thread that receives and dispatches network packets
-    std::optional<std::jthread> room_thread;
-
     /// Verification backend of the room
     std::unique_ptr<VerifyUser::Backend> verify_backend;
+
+    /// Thread that receives and dispatches network packets.
+    /// Declared last so it is stopped and joined before any state it accesses is destroyed.
+    std::optional<std::jthread> room_thread;
+
+    RoomImpl() = default;
+    ~RoomImpl() {
+        state = State::Closed;
+        room_thread.reset();
+        if (server) {
+            enet_host_destroy(server);
+            server = nullptr;
+        }
+    }
 
     void StartLoop();
 
@@ -105,6 +123,17 @@ public:
      * Returns whether a user has mod permissions.
      */
     bool HasModPermission(const ENetPeer* client) const;
+
+    /**
+     * Returns whether the given peer is a member of this room.
+     */
+    bool IsMember(const ENetPeer* client) const;
+
+    /**
+     * Returns the fake ip address that was assigned to the member with the given peer, or
+     * std::nullopt if the peer is not a member of this room.
+     */
+    std::optional<IPv4Address> GetMemberFakeIp(const ENetPeer* client) const;
 
     /**
      * Sends a ID_ROOM_IS_FULL message telling the client that the room is full.
@@ -233,16 +262,63 @@ public:
      * to all other clients.
      */
     void HandleClientDisconnection(ENetPeer* client);
+
+    /**
+     * Returns a snapshot of the room information.
+     *
+     * The room information is shared between the room network thread and the thread that owns
+     * the Room object, so it must never be read or written without holding
+     * room_information_mutex.
+     */
+    RoomInformation GetRoomInformationSnapshot() const {
+        std::lock_guard lock(room_information_mutex);
+        return room_information;
+    }
+
+    /**
+     * Returns the maximum number of members that may join this room.
+     */
+    u32 GetMemberSlots() const {
+        std::lock_guard lock(room_information_mutex);
+        return room_information.member_slots;
+    }
+
+    /**
+     * Returns the forum username of the host of this room.
+     */
+    std::string GetHostUsername() const {
+        std::lock_guard lock(room_information_mutex);
+        return room_information.host_username;
+    }
 };
 
 // RoomImpl
 void Room::RoomImpl::StartLoop() {
     room_thread.emplace([&](std::stop_token stoken) {
-        while (state != State::Closed) {
+        // The stop token has to be honoured, because the destruction of the thread joins it.
+        // Without it, a Room that was created but never destroyed would block the process
+        // forever, because the loop would only ever end when the room is closed explicitly.
+        while (state != State::Closed && !stoken.stop_requested()) {
             ENetEvent event;
             if (enet_host_service(server, &event, 5) > 0) {
                 switch (event.type) {
                 case ENET_EVENT_TYPE_RECEIVE:
+                    if (event.packet->dataLength == 0) {
+                        LOG_WARNING(Network, "Received an empty packet from a peer. Ignoring it.");
+                        enet_packet_destroy(event.packet);
+                        break;
+                    }
+                    // Every message except the join request requires the sender to be a
+                    // member of the room. A peer that never joined must not be able to
+                    // relay traffic or to use the moderation requests.
+                    if (event.packet->data[0] != IdJoinRequest && !IsMember(event.peer)) {
+                        LOG_WARNING(Network,
+                                    "Received a packet of type {} from a peer that is not a member "
+                                    "of the room. Ignoring it.",
+                                    static_cast<u32>(event.packet->data[0]));
+                        enet_packet_destroy(event.packet);
+                        break;
+                    }
                     switch (event.packet->data[0]) {
                     case IdJoinRequest:
                         HandleJoinRequest(&event);
@@ -290,9 +366,12 @@ void Room::RoomImpl::StartLoop() {
 }
 
 void Room::RoomImpl::HandleJoinRequest(const ENetEvent* event) {
+    // The member limit is read before the member list is locked, so that the two locks are
+    // never held at the same time.
+    const u32 member_slots = GetMemberSlots();
     {
         std::lock_guard lock(member_mutex);
-        if (members.size() >= room_information.member_slots) {
+        if (members.size() >= member_slots) {
             SendRoomIsFull(event->peer);
             return;
         }
@@ -356,9 +435,12 @@ void Room::RoomImpl::HandleJoinRequest(const ENetEvent* event) {
     if (verify_backend != nullptr)
      member.user_data = verify_backend->LoadUserData(uid, token);
 
-    if (nickname == room_information.host_username) {
-        member.user_data.moderator = true;
-        LOG_INFO(Network, "User {} is a moderator", std::string(room_information.host_username));
+    // Moderator rights are only granted by the verification backend, which authenticates the
+    // user. The nickname is client supplied and must never be used for that. The room host is
+    // recognized by its authenticated username instead, see HasModPermission.
+    if (member.user_data.moderator) {
+        LOG_INFO(Network, "User {} ({}) has been granted moderator permissions", member.nickname,
+                 member.user_data.username);
     }
 
     std::string ip;
@@ -571,6 +653,9 @@ bool Room::RoomImpl::IsValidFakeIPAddress(const IPv4Address& address) const {
 }
 
 bool Room::RoomImpl::HasModPermission(const ENetPeer* client) const {
+    // The host username is read before the member list is locked, so that the two locks are
+    // never held at the same time.
+    const std::string host_username = GetHostUsername();
     std::lock_guard lock(member_mutex);
     const auto sending_member =
         std::find_if(members.begin(), members.end(),
@@ -582,12 +667,29 @@ bool Room::RoomImpl::HasModPermission(const ENetPeer* client) const {
 
         return true;
     }
-    if (!room_information.host_username.empty() &&
-        sending_member->user_data.username == room_information.host_username) { // Room host
+    if (!host_username.empty() &&
+        sending_member->user_data.username == host_username) { // Room host
 
         return true;
     }
     return false;
+}
+
+bool Room::RoomImpl::IsMember(const ENetPeer* client) const {
+    std::lock_guard lock(member_mutex);
+    return std::any_of(members.begin(), members.end(),
+                       [client](const auto& member) { return member.peer == client; });
+}
+
+std::optional<IPv4Address> Room::RoomImpl::GetMemberFakeIp(const ENetPeer* client) const {
+    std::lock_guard lock(member_mutex);
+    const auto sending_member =
+        std::find_if(members.begin(), members.end(),
+                     [client](const auto& member) { return member.peer == client; });
+    if (sending_member == members.end()) {
+        return std::nullopt;
+    }
+    return sending_member->fake_ip;
 }
 
 void Room::RoomImpl::SendNameCollision(ENetPeer* client) {
@@ -773,28 +875,34 @@ void Room::RoomImpl::SendStatusMessage(StatusMessageTypes type, const std::strin
 }
 
 void Room::RoomImpl::BroadcastRoomInformation() {
-    Packet packet;
-    packet.Write(static_cast<u8>(IdRoomInformation));
-    packet.Write(room_information.name);
-    packet.Write(room_information.description);
-    packet.Write(room_information.member_slots);
-    packet.Write(room_information.port);
-    packet.Write(room_information.preferred_game.name);
-    packet.Write(room_information.host_username);
-
-    packet.Write(static_cast<u32>(members.size()));
+    // Copy the member list under the lock, so that the packet is built from a consistent
+    // snapshot of the room.
+    MemberList member_snapshot;
     {
         std::lock_guard lock(member_mutex);
-        for (const auto& member : members) {
-            packet.Write(member.nickname);
-            packet.Write(member.fake_ip);
-            packet.Write(member.game_info.name);
-            packet.Write(member.game_info.id);
-            packet.Write(member.game_info.version);
-            packet.Write(member.user_data.username);
-            packet.Write(member.user_data.display_name);
-            packet.Write(member.user_data.avatar_url);
-        }
+        member_snapshot = members;
+    }
+
+    Packet packet;
+    packet.Write(static_cast<u8>(IdRoomInformation));
+    const RoomInformation info = GetRoomInformationSnapshot();
+    packet.Write(info.name);
+    packet.Write(info.description);
+    packet.Write(info.member_slots);
+    packet.Write(info.port);
+    packet.Write(info.preferred_game.name);
+    packet.Write(info.host_username);
+
+    packet.Write(static_cast<u32>(member_snapshot.size()));
+    for (const auto& member : member_snapshot) {
+        packet.Write(member.nickname);
+        packet.Write(member.fake_ip);
+        packet.Write(member.game_info.name);
+        packet.Write(member.game_info.id);
+        packet.Write(member.game_info.version);
+        packet.Write(member.user_data.username);
+        packet.Write(member.user_data.display_name);
+        packet.Write(member.user_data.avatar_url);
     }
 
     ENetPacket* enet_packet =
@@ -821,22 +929,78 @@ void Room::RoomImpl::HandleProxyPacket(const ENetEvent* event) {
     in_packet.Append(event->packet->data, event->packet->dataLength);
     in_packet.IgnoreBytes(sizeof(u8)); // Message type
 
-    in_packet.IgnoreBytes(sizeof(u8));          // Domain
-    in_packet.IgnoreBytes(sizeof(IPv4Address)); // IP
-    in_packet.IgnoreBytes(sizeof(u16));         // Port
+    u8 local_family = 0;
+    in_packet.Read(local_family); // Domain
+    IPv4Address local_ip{};
+    in_packet.Read(local_ip);     // IP
+    u16 local_port = 0;
+    in_packet.Read(local_port); // Port
 
-    in_packet.IgnoreBytes(sizeof(u8)); // Domain
-    IPv4Address remote_ip;
-    in_packet.Read(remote_ip);          // IP
-    in_packet.IgnoreBytes(sizeof(u16)); // Port
+    u8 remote_family = 0;
+    in_packet.Read(remote_family); // Domain
+    IPv4Address remote_ip{};
+    in_packet.Read(remote_ip);      // IP
+    u16 remote_port = 0;
+    in_packet.Read(remote_port); // Port
 
-    in_packet.IgnoreBytes(sizeof(u8)); // Protocol
+    u8 protocol = 0;
+    in_packet.Read(protocol); // Protocol
 
-    bool broadcast;
+    bool broadcast = false;
     in_packet.Read(broadcast); // Broadcast
+
+    // The payload is relayed exactly as it was received, so it is not copied here. Its length
+    // is read to validate the structure of the packet and to cap the amount of data that a
+    // member can make the room relay.
+    u32 payload_size = 0;
+    in_packet.Read(payload_size);
+    if (!in_packet) {
+        LOG_WARNING(Network, "Received a malformed proxy packet. Ignoring it.");
+        return;
+    }
+    if (payload_size > MaxRelayedPayloadSize) {
+        LOG_WARNING(Network,
+                    "Received a proxy packet with a payload of {} bytes, which is larger than the "
+                    "maximum of {} bytes. Ignoring it.",
+                    payload_size, MaxRelayedPayloadSize);
+        return;
+    }
+    in_packet.IgnoreBytes(payload_size);
+    if (!in_packet || !in_packet.EndOfPacket()) {
+        // The packet has to end with the payload. A member must not be able to send more data
+        // than it announced, because the whole packet is relayed.
+        LOG_WARNING(Network, "Received a malformed proxy packet. Ignoring it.");
+        return;
+    }
+
+    // A member may only relay traffic that comes from the address that the room assigned to
+    // it. The source address of the relayed packet is therefore overwritten with the assigned
+    // one, so that a member cannot make traffic appear to come from another member.
+    const auto sender_fake_ip = GetMemberFakeIp(event->peer);
+    if (!sender_fake_ip) {
+        LOG_WARNING(Network,
+                    "Received a proxy packet from a peer that is not a member of the room. "
+                    "Ignoring it.");
+        return;
+    }
 
     Packet out_packet;
     out_packet.Append(event->packet->data, event->packet->dataLength);
+    if (local_ip != *sender_fake_ip) {
+        LOG_DEBUG(Network,
+                  "The source address {}.{}.{}.{} of a proxy packet was corrected to "
+                  "{}.{}.{}.{}.",
+                  local_ip[0], local_ip[1], local_ip[2], local_ip[3], (*sender_fake_ip)[0],
+                  (*sender_fake_ip)[1], (*sender_fake_ip)[2], (*sender_fake_ip)[3]);
+    }
+    if (!out_packet.OverwriteBytes(RelaySourceIpOffset, sender_fake_ip->data(), sender_fake_ip->size())) {
+        // The packet is too short to carry a source address. Relaying it would relay the
+        // address that the member claimed, which must never happen.
+        LOG_WARNING(Network,
+                    "Received a proxy packet that is too short to carry a source address. "
+                    "Ignoring it.");
+        return;
+    }
     ENetPacket* enet_packet = enet_packet_create(out_packet.GetData(), out_packet.GetDataSize(),
                                                  ENET_PACKET_FLAG_RELIABLE);
 
@@ -880,17 +1044,69 @@ void Room::RoomImpl::HandleLdnPacket(const ENetEvent* event) {
 
     in_packet.IgnoreBytes(sizeof(u8)); // Message type
 
-    in_packet.IgnoreBytes(sizeof(u8));          // LAN packet type
-    in_packet.IgnoreBytes(sizeof(IPv4Address)); // Local IP
+    u8 packet_type = 0;
+    in_packet.Read(packet_type); // LAN packet type
+    IPv4Address local_ip{};
+    in_packet.Read(local_ip); // Local IP
 
-    IPv4Address remote_ip;
+    IPv4Address remote_ip{};
     in_packet.Read(remote_ip); // Remote IP
 
-    bool broadcast;
+    bool broadcast = false;
     in_packet.Read(broadcast); // Broadcast
+
+    // The payload is relayed exactly as it was received, so it is not copied here. Its length
+    // is read to validate the structure of the packet and to cap the amount of data that a
+    // member can make the room relay.
+    u32 payload_size = 0;
+    in_packet.Read(payload_size);
+    if (!in_packet) {
+        LOG_WARNING(Network, "Received a malformed LDN packet. Ignoring it.");
+        return;
+    }
+    if (payload_size > MaxRelayedPayloadSize) {
+        LOG_WARNING(Network,
+                    "Received an LDN packet with a payload of {} bytes, which is larger than the "
+                    "maximum of {} bytes. Ignoring it.",
+                    payload_size, MaxRelayedPayloadSize);
+        return;
+    }
+    in_packet.IgnoreBytes(payload_size);
+    if (!in_packet || !in_packet.EndOfPacket()) {
+        // The packet has to end with the payload. A member must not be able to send more data
+        // than it announced, because the whole packet is relayed.
+        LOG_WARNING(Network, "Received a malformed LDN packet. Ignoring it.");
+        return;
+    }
+
+    // A member may only relay traffic that comes from the address that the room assigned to
+    // it. The source address of the relayed packet is therefore overwritten with the assigned
+    // one, so that a member cannot make traffic appear to come from another member.
+    const auto sender_fake_ip = GetMemberFakeIp(event->peer);
+    if (!sender_fake_ip) {
+        LOG_WARNING(Network,
+                    "Received an LDN packet from a peer that is not a member of the room. "
+                    "Ignoring it.");
+        return;
+    }
 
     Packet out_packet;
     out_packet.Append(event->packet->data, event->packet->dataLength);
+    if (local_ip != *sender_fake_ip) {
+        LOG_DEBUG(Network,
+                  "The source address {}.{}.{}.{} of an LDN packet was corrected to "
+                  "{}.{}.{}.{}.",
+                  local_ip[0], local_ip[1], local_ip[2], local_ip[3], (*sender_fake_ip)[0],
+                  (*sender_fake_ip)[1], (*sender_fake_ip)[2], (*sender_fake_ip)[3]);
+    }
+    if (!out_packet.OverwriteBytes(RelaySourceIpOffset, sender_fake_ip->data(), sender_fake_ip->size())) {
+        // The packet is too short to carry a source address. Relaying it would relay the
+        // address that the member claimed, which must never happen.
+        LOG_WARNING(Network,
+                    "Received an LDN packet that is too short to carry a source address. "
+                    "Ignoring it.");
+        return;
+    }
     ENetPacket* enet_packet = enet_packet_create(out_packet.GetData(), out_packet.GetDataSize(),
                                                  ENET_PACKET_FLAG_RELIABLE);
 
@@ -942,7 +1158,8 @@ void Room::RoomImpl::HandleChatPacket(const ENetEvent* event) {
     std::lock_guard lock(member_mutex);
     const auto sending_member = std::find_if(members.begin(), members.end(), CompareNetworkAddress);
     if (sending_member == members.end()) {
-        return; // Received a chat message from a unknown sender
+        LOG_WARNING(Network, "Received a chat message from an unknown sender. Ignoring it.");
+        return;
     }
 
     // Limit the size of chat messages to MaxMessageSize
@@ -1044,7 +1261,9 @@ void Room::RoomImpl::HandleClientDisconnection(ENetPeer* client) {
 // Room
 Room::Room() : room_impl{std::make_unique<RoomImpl>()} {}
 
-Room::~Room() = default;
+Room::~Room() {
+    Destroy();
+}
 
 bool Room::Create(const std::string& name, const std::string& description,
                   const std::string& server_address, u16 server_port, const std::string& password,
@@ -1067,12 +1286,15 @@ bool Room::Create(const std::string& name, const std::string& description,
     }
     room_impl->state = State::Open;
 
-    room_impl->room_information.name = name;
-    room_impl->room_information.description = description;
-    room_impl->room_information.member_slots = max_connections;
-    room_impl->room_information.port = server_port;
-    room_impl->room_information.preferred_game = preferred_game;
-    room_impl->room_information.host_username = host_username;
+    {
+        std::lock_guard lock(room_impl->room_information_mutex);
+        room_impl->room_information.name = name;
+        room_impl->room_information.description = description;
+        room_impl->room_information.member_slots = max_connections;
+        room_impl->room_information.port = server_port;
+        room_impl->room_information.preferred_game = preferred_game;
+        room_impl->room_information.host_username = host_username;
+    }
     room_impl->password = password;
     room_impl->verify_backend = std::move(verify_backend);
     room_impl->username_ban_list = ban_list.first;
@@ -1086,8 +1308,8 @@ Room::State Room::GetState() const {
     return room_impl->state;
 }
 
-const RoomInformation& Room::GetRoomInformation() const {
-    return room_impl->room_information;
+RoomInformation Room::GetRoomInformation() const {
+    return room_impl->GetRoomInformationSnapshot();
 }
 
 std::string Room::GetVerifyUID() const {
@@ -1132,14 +1354,15 @@ void Room::Destroy() {
     if (room_impl->server) {
         enet_host_destroy(room_impl->server);
     }
-    room_impl->room_information = {};
+    {
+        std::lock_guard lock(room_impl->room_information_mutex);
+        room_impl->room_information = {};
+    }
     room_impl->server = nullptr;
     {
         std::lock_guard lock(room_impl->member_mutex);
         room_impl->members.clear();
     }
-    room_impl->room_information.member_slots = 0;
-    room_impl->room_information.name.clear();
 }
 
 } // namespace Network

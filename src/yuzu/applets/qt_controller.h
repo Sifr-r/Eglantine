@@ -17,6 +17,7 @@ class QComboBox;
 class QDialogButtonBox;
 class QGroupBox;
 class QLabel;
+class QTimer;
 
 class InputProfiles;
 
@@ -50,6 +51,8 @@ public:
     ~QtControllerSelectorDialog() override;
 
     int exec() override;
+
+    void done(int r) override;
 
     void keyPressEvent(QKeyEvent* evt) override;
 
@@ -110,6 +113,18 @@ private:
     // Disables and disconnects unsupported players based on the given parameters.
     void DisableUnsupportedPlayers();
 
+    // Refreshes the Switch 2 controller status bar and action buttons.
+    void RefreshSwitch2Status();
+
+    // Splits a connected Dual Joy-Con 2 slot into separate Left and Right slots.
+    void OnSwitch2SplitClicked();
+
+    // Merges an unpaired Left and Right Joy-Con 2 pair into a Dual slot.
+    void OnSwitch2MergeClicked();
+
+    // Starts stationary gyro bias calibration on connected Switch 2 controllers.
+    void OnSwitch2CalibrateClicked();
+
     std::unique_ptr<Ui::QtControllerSelectorDialog> ui;
 
     // Parameters sent in from the backend HLE applet.
@@ -122,6 +137,8 @@ private:
     Core::System& system;
 
     ControllerNavigation* controller_navigation = nullptr;
+
+    QTimer* switch2_refresh_timer = nullptr;
 
     // This is true if and only if all parameters are met. Otherwise, this is false.
     // This determines whether the "OK" button can be clicked to exit the applet.

@@ -16,24 +16,8 @@ typedef struct Emulator {
     Common::FS::EmuPath e_config_dir;
     Common::FS::EmuPath e_cache_dir;
 
-    const std::string get_user_dir() const {
-        return Common::FS::GetLegacyPath(e_user_dir).string();
-    }
-
-    const std::string get_config_dir() const {
-        return Common::FS::GetLegacyPath(e_config_dir).string();
-    }
-
-    const std::string get_cache_dir() const {
-        return Common::FS::GetLegacyPath(e_cache_dir).string();
-    }
-
     const QString name() const {
         return QObject::tr(m_name);
-    }
-
-    const QString lower_name() const {
-        return name().toLower();
     }
 } Emulator;
 

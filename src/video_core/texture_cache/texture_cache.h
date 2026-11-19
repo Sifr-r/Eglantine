@@ -1171,33 +1171,36 @@ typename P::Framebuffer* TextureCache<P>::GetFramebuffer() {
 }
 
 template <class P>
-bool TextureCache<P>::ColorTargetWrittenBefore(bool require_uncleared) noexcept {
+ImageId TextureCache<P>::FindColorTargetImage() noexcept {
     if (!maxwell3d) {
-        return false;
+        return ImageId{};
     }
     const auto& regs = maxwell3d->regs;
     if (regs.rt_control.count == 0) {
-        return false;
+        return ImageId{};
     }
     const auto& rt = regs.rt[0];
     const GPUVAddr gpu_addr = rt.Address();
     if (gpu_addr == 0 || rt.format == Tegra::RenderTargetFormat::NONE) {
-        return false;
+        return ImageId{};
     }
-    std::scoped_lock lock{mutex};
-    ImageId image_id{};
     if (!maxwell3d->dirty.flags[VideoCommon::Dirty::RenderTargets] &&
         !maxwell3d->dirty.flags[VideoCommon::Dirty::ColorBuffer0]) {
-        image_id = rt_image_id[0];
-    } else {
-        const ImageInfo info(rt, regs.anti_alias_samples_mode);
-        if (info.format == PixelFormat::Invalid || info.size.width == 0 || info.size.height == 0 ||
-            info.size.depth == 0 || info.size.width > 65536 || info.size.height > 65536 ||
-            info.size.depth > 2048 || info.resources.layers <= 0 || info.resources.layers > 2048) {
-            return false;
-        }
-        image_id = FindImage(info, gpu_addr, RelaxedOptions{});
+        return rt_image_id[0];
     }
+    const ImageInfo info(rt, regs.anti_alias_samples_mode);
+    if (info.format == PixelFormat::Invalid || info.size.width == 0 || info.size.height == 0 ||
+        info.size.depth == 0 || info.size.width > 65536 || info.size.height > 65536 ||
+        info.size.depth > 2048 || info.resources.layers <= 0 || info.resources.layers > 2048) {
+        return ImageId{};
+    }
+    return FindImage(info, gpu_addr, RelaxedOptions{});
+}
+
+template <class P>
+bool TextureCache<P>::ColorTargetWrittenBefore(bool require_uncleared) noexcept {
+    std::scoped_lock lock{mutex};
+    const ImageId image_id = FindColorTargetImage();
     if (!image_id) {
         return false;
     }
@@ -1215,6 +1218,17 @@ bool TextureCache<P>::ColorTargetHasPriorFrameOutput() noexcept {
 template <class P>
 bool TextureCache<P>::ColorTargetWrittenBeforeThisFrame() noexcept {
     return ColorTargetWrittenBefore(false);
+}
+
+template <class P>
+bool TextureCache<P>::ColorTargetRedrawnEveryFrame() noexcept {
+    std::scoped_lock lock{mutex};
+    const ImageId image_id = FindColorTargetImage();
+    if (!image_id) {
+        return false;
+    }
+    const ImageBase& image = slot_images[image_id];
+    return image.RedrawnEveryFrame(frame_tick + 1);
 }
 
 

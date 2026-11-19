@@ -122,6 +122,10 @@ class IOFile final {
 public:
     IOFile();
 
+    explicit IOFile(const char* path, FileAccessMode mode,
+                    FileType type = FileType::BinaryFile,
+                    FileShareFlag flag = FileShareFlag::ShareReadOnly);
+
     explicit IOFile(const std::string& path, FileAccessMode mode,
                     FileType type = FileType::BinaryFile,
                     FileShareFlag flag = FileShareFlag::ShareReadOnly);
@@ -182,22 +186,18 @@ public:
      * @param type File type, default is BinaryFile. Use TextFile to open the file as a text file
      * @param flag (Windows only) File-share access flag, default is ShareReadOnly
      */
+    void Open(const char* path, FileAccessMode mode, FileType type = FileType::BinaryFile,
+              FileShareFlag flag = FileShareFlag::ShareReadOnly);
+
+    void Open(const std::string& path, FileAccessMode mode, FileType type = FileType::BinaryFile,
+              FileShareFlag flag = FileShareFlag::ShareReadOnly);
+
+    void Open(std::string_view path, FileAccessMode mode, FileType type = FileType::BinaryFile,
+              FileShareFlag flag = FileShareFlag::ShareReadOnly);
+
     void Open(const std::filesystem::path& path, FileAccessMode mode,
               FileType type = FileType::BinaryFile,
               FileShareFlag flag = FileShareFlag::ShareReadOnly);
-
-// #ifdef _WIN32
-//     template <typename Path>
-//     void Open(const Path& path, FileAccessMode mode, FileType type = FileType::BinaryFile,
-//               FileShareFlag flag = FileShareFlag::ShareReadOnly) {
-//         using ValueType = typename Path::value_type;
-//         if constexpr (IsChar<ValueType>) {
-//             Open(ToU8String(path), mode, type, flag);
-//         } else {
-//             Open(std::filesystem::path{path}, mode, type, flag);
-//         }
-//     }
-// #endif
 
     /// Closes the file if it is opened.
     void Close();

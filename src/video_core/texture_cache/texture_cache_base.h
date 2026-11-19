@@ -321,9 +321,15 @@ public:
     /// Whether render target 0 was first written in an earlier frame (cleared this frame or not):
     /// a target the title draws every frame rather than one it fills once.
     [[nodiscard]] bool ColorTargetWrittenBeforeThisFrame() noexcept;
+    /// Whether render target 0 is redrawn every frame: written in this frame or the one before it,
+    /// and not cleared this frame. A draw skipped now is submitted again in the next frame, so
+    /// nothing is left missing (EDEN_NX2_NATIVE_REDRAW).
+    [[nodiscard]] bool ColorTargetRedrawnEveryFrame() noexcept;
 
 private:
     [[nodiscard]] bool ColorTargetWrittenBefore(bool require_uncleared) noexcept;
+    /// The image behind render target 0, or ImageId{} when there is none. The caller holds mutex.
+    [[nodiscard]] ImageId FindColorTargetImage() noexcept;
 
 public:
 

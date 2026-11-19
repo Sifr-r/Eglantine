@@ -237,6 +237,13 @@ struct System::Impl {
         : kernel{system}, fs_controller{system}, hid_core{kernel}, cpu_manager{system},
           reporter{system}, applet_manager{system}, frontend_applets{system}, profile_manager{} {}
 
+    ~Impl() {
+        // The kernel's slab objects live in the guest RAM arena. The member destructors below
+        // free that arena before the kernel is destroyed, so the kernel's object list has to
+        // be emptied while the arena is still alive.
+        kernel.ClearObjectList();
+    }
+
     u64 program_id;
 
     void Initialize(System& system) {
@@ -576,15 +583,20 @@ struct System::Impl {
             gpu_core->NotifyShutdown();
 
         stop_event.request_stop();
-        core_timing.SyncPause(false);
+        // Keep the timer thread paused for the whole teardown: it is the thread that runs the
+        // timing event callbacks, and those callbacks reach into the services, the guest
+        // processes and the cheat engine that are destroyed below.
+        core_timing.SyncPause(true);
         Network::CancelPendingSocketOperations();
         kernel.SuspendEmulation(true);
+        // The cheat engine's event callback dereferences the guest process, so it has to go
+        // before the kernel releases the processes.
+        cheat_engine.reset();
         kernel.CloseServices();
         kernel.ShutdownCores();
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
-        cheat_engine.reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
         audio_core.reset();

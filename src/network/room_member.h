@@ -130,7 +130,7 @@ public:
     /**
      * Returns information about the members in the room we're currently connected to.
      */
-    const MemberList& GetMemberInformation() const;
+    MemberList GetMemberInformation() const;
 
     /**
      * Returns the nickname of the RoomMember.
@@ -139,13 +139,16 @@ public:
 
     /**
      * Returns the username of the RoomMember.
+     *
+     * The username is returned by value, because the network thread may update it concurrently
+     * with this call.
      */
-    const std::string& GetUsername() const;
+    std::string GetUsername() const;
 
     /**
      * Returns the MAC address of the RoomMember.
      */
-    const IPv4Address& GetFakeIpAddress() const;
+    IPv4Address GetFakeIpAddress() const;
 
     /**
      * Returns information about the room we're currently connected to.

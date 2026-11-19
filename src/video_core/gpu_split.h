@@ -82,7 +82,7 @@ public:
 
     /// Whether the front sends work to the back (front thread only).
     [[nodiscard]] bool Active() const {
-        return active;
+        return active.load(std::memory_order_acquire);
     }
     /// Whether the front runs the engines' macros (EDEN_NX2_SPLIT=2).
     [[nodiscard]] bool FrontMacros() const {
@@ -212,7 +212,7 @@ public:
     /// its idle hook, so the front never touches that state itself.
     template <typename Func>
     void Run(const Func& func, DrainSite site = DrainSite::Other) {
-        if (on_back_thread || !active) {
+        if (on_back_thread || !active.load(std::memory_order_acquire)) {
             func();
             return;
         }
@@ -413,15 +413,17 @@ private:
     void VerifyRepeat(u64 head);
 
     Core::System* system{};
-    bool active{};
+    /// Whether the front sends work to the back. The front writes it, the GPU thread, the
+    /// fencing thread and the CPU threads read it, so it is atomic.
+    std::atomic<bool> active{};
     bool eager_publish{}; ///< Nx2Perf::Opt::EagerPublish, read once at Start
     /// Nx2Perf::Verify() with draw_begin_coalesce, read once at Start before the back starts
     bool verify_repeats{};
     bool front_macros{};
     std::unique_ptr<u64[]> ring;
 
-    // Front side.
-    u64 write_position{};
+    // Keep the front's ring bookkeeping separate from the setup fields the back reads.
+    alignas(128) u64 write_position{};
     u64 last_writer_position{};
     u64 last_sync_position{};
     u64 last_function_position{};
@@ -449,8 +451,8 @@ private:
     size_t publish_every{PublishEvery};
     Tegra::Engines::EngineInterface* front_engine{};
 
-    // Back side.
-    Tegra::Engines::EngineInterface* back_engine{};
+    // Give the back's engine switches a separate 128-byte block from the front's ring state.
+    alignas(128) Tegra::Engines::EngineInterface* back_engine{};
     /// VerifyRepeat: the last entry's word, the Repeatable entries seen and those that did not
     /// follow the same word, since the last report
     u64 verify_previous{};

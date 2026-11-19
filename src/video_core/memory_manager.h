@@ -243,7 +243,10 @@ private:
         }
     }
 
+    /// The big page's host continuity. Reads and writes the page table's state: the caller holds
+    /// page_table_mutex.
     inline bool IsBigPageContinuous(size_t big_page_index) const;
+    /// Sets the big page's host continuity: the caller holds page_table_mutex.
     inline void SetBigPageContinuous(size_t big_page_index, bool value);
 
     template <bool is_gpu_address>
@@ -283,7 +286,10 @@ private:
     GPUVAddr PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, EntryType entry_type);
     GPUVAddr BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, EntryType entry_type);
 
+    /// The kind of a page. Reads and writes the page table's state: the caller holds
+    /// page_table_mutex.
     inline EntryType GetEntry(size_t position, bool is_big_page) const;
+    /// Sets the kind of a page: the caller holds page_table_mutex.
     inline void SetEntry(size_t position, EntryType entry, bool is_big_page);
 
     Common::MultiLevelPageTable<u32> page_table;
@@ -291,11 +297,18 @@ private:
     Common::SparseLargeVector<u32> big_page_table_dev;
 
     std::vector<u64> big_page_continuous;
-    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash{};
-    boost::container::small_vector<std::pair<DAddr, std::size_t>, 32> page_stash2{};
 
     bool native_tiling{};
     mutable std::mutex guard;
+    /// Guards the page table itself: entries, page_table, big_entries, big_page_table_dev and
+    /// big_page_continuous. Every read and every write of that state happens under this lock, so
+    /// a mapping change is never seen half applied: a reader sees the old table or the new one.
+    ///
+    /// The lock is never held while calling into the rasterizer. The rasterizer takes the cache
+    /// mutexes, and the GPU thread holds them while it reads the page table, so the order is
+    /// always cache mutex, then this lock. Holding it across a rasterizer call would invert
+    /// that order.
+    mutable std::mutex page_table_mutex;
     /// Bumped after each page table change; readers keep their MappingSnapshot until then.
     std::atomic<u64> map_serial{};
 

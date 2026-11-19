@@ -235,6 +235,7 @@
     <addaction name="action_Report_Compatibility"/>
     <addaction name="action_Open_Mods_Page"/>
     <addaction name="action_Open_UserHandbook"/>
+    <addaction name="action_Diagnostics"/>
     <addaction name="separator"/>
     <addaction name="action_Check_For_Updates"/>
     <addaction name="action_About"/>
@@ -295,6 +296,11 @@
   <action name="action_About">
    <property name="text">
     <string>&amp;About Eglantine</string>
+   </property>
+  </action>
+  <action name="action_Diagnostics">
+   <property name="text">
+    <string>&amp;Diagnostics…</string>
    </property>
   </action>
   <action name="action_Single_Window_Mode">

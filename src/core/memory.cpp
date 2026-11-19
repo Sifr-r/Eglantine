@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <span>
@@ -1074,12 +1075,20 @@ bool Memory::IsValidVirtualAddress(const Common::ProcessAddress vaddr) const {
 }
 
 bool Memory::IsValidVirtualAddressRange(Common::ProcessAddress base, u64 size) const {
-    Common::ProcessAddress end = base + size;
-    Common::ProcessAddress page = Common::AlignDown(GetInteger(base), YUZU_PAGESIZE);
-
-    for (; page < end; page += YUZU_PAGESIZE) {
+    if (size == 0) {
+        return true;
+    }
+    const u64 base_addr = GetInteger(base);
+    if (size > std::numeric_limits<u64>::max() - base_addr) {
+        return false;
+    }
+    const u64 last_page = Common::AlignDown(base_addr + (size - 1), YUZU_PAGESIZE);
+    for (u64 page = Common::AlignDown(base_addr, YUZU_PAGESIZE);; page += YUZU_PAGESIZE) {
         if (!IsValidVirtualAddress(page)) {
             return false;
+        }
+        if (page == last_page) {
+            break;
         }
     }
 

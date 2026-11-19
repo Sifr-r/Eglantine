@@ -77,6 +77,57 @@ Result SaveDataController::OpenSaveDataSpace(FileSys::VirtualDir* out_save_data_
     return ResultSuccess;
 }
 
+std::vector<FileSys::SaveDataEntry> SaveDataController::EnumerateSaveData(
+    FileSys::SaveDataSpaceId space) {
+    LOG_TRACE(Service_FS, "Enumerating the save data of the space_id={:01X}", space);
+    return factory->Enumerate(space);
+}
+
+Result SaveDataController::DeleteSaveData(FileSys::SaveDataSpaceId space,
+                                          const FileSys::SaveDataAttribute& attribute) {
+    LOG_TRACE(Service_FS, "Deleting the save data of the space_id={:01X}, save_struct={}", space,
+              attribute.DebugInfo());
+    return factory->Delete(space, attribute);
+}
+
+Result SaveDataController::DeleteSaveDataMatching(FileSys::SaveDataSpaceId space,
+                                                  const FileSys::SaveDataFilter& filter,
+                                                  u64* out_deleted) {
+    LOG_TRACE(Service_FS, "Deleting the save data of the space_id={:01X} that match a filter",
+              space);
+    return factory->DeleteMatching(space, filter, out_deleted);
+}
+
+Result SaveDataController::DeleteCacheStorage(u16 index) {
+    LOG_TRACE(Service_FS, "Deleting the cache storage with the index={}", index);
+    return factory->DeleteCacheStorage(index);
+}
+
+s64 SaveDataController::GetFreeSpace(FileSys::SaveDataSpaceId space) {
+    LOG_TRACE(Service_FS, "Getting the free space of the space_id={:01X}", space);
+    return factory->GetFreeSpace(space);
+}
+
+u64 SaveDataController::GetCommitId(FileSys::SaveDataSpaceId space, u64 save_data_id) {
+    LOG_TRACE(Service_FS, "Getting the commit id of the save data {:016X} of the space_id={:01X}",
+              save_data_id, space);
+    return factory->GetCommitId(space, save_data_id);
+}
+
+FileSys::VirtualFile SaveDataController::OpenMetaFile(FileSys::SaveDataSpaceId space,
+                                                      const FileSys::SaveDataAttribute& attribute,
+                                                      FileSys::SaveDataMetaType meta_type) {
+    LOG_TRACE(Service_FS, "Opening the meta file of the save data of the space_id={:01X}, "
+                          "save_struct={}",
+              space, attribute.DebugInfo());
+    return factory->OpenMetaFile(space, attribute, meta_type);
+}
+
+s64 SaveDataController::QueryTotalSize(FileSys::SaveDataSpaceId space) {
+    LOG_TRACE(Service_FS, "Getting the total size of the space_id={:01X}", space);
+    return factory->QueryTotalSize(space);
+}
+
 FileSys::SaveDataSize SaveDataController::ReadSaveDataSize(FileSys::SaveDataType type, u64 title_id,
                                                            u128 user_id) {
     const auto value = factory->ReadSaveDataSize(type, title_id, user_id);

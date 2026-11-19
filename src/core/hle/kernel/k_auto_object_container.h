@@ -24,7 +24,13 @@ public:
     KAutoObjectWithListContainer(KernelCore& kernel) : m_lock(), m_object_list() {}
 
     void Initialize() {}
-    void Finalize() {}
+
+    /// Empties the list and refuses any further registration.
+    ///
+    /// The registered objects live in the guest RAM arena. The system frees that arena before
+    /// the kernel is destroyed, so the list has to be emptied while the arena is still alive:
+    /// a container that walks its list afterwards reads freed memory.
+    void Finalize();
 
     void Register(KAutoObjectWithList* obj);
     void Unregister(KAutoObjectWithList* obj);
@@ -33,6 +39,7 @@ public:
 private:
     KSpinLock m_lock;
     ListType m_object_list;
+    bool m_finalized{false};
 };
 
 } // namespace Kernel

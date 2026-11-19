@@ -168,6 +168,8 @@ ENUM(SpeedMode, Standard, Turbo, Slow);
 ENUM(FrameGenType, Lsfg, Fsr3);
 ENUM(ColdHintMode, Off, WhenRamIsLow, Always);
 ENUM(UpdateChannel, Unset, Stable, ReleaseCandidate, Daily);
+ENUM(Switch2GyroMouseMode, Off, Yaw, Roll);
+ENUM(Switch2GyroActivationMode, Hold, Toggle);
 
 template <typename Type>
 inline std::string_view CanonicalizeEnum(Type id) {

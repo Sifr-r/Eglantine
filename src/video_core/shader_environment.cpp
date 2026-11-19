@@ -729,7 +729,7 @@ GraphicsEnvironment::GraphicsEnvironment(Tegra::Engines::Maxwell3D& maxwell3d_,
     const bool native{maxwell3d->GetNativeMacroEngine().native_turing};
     static const bool geometry_enabled = [] {
         const char* value = std::getenv("EDEN_NX2_EXPERIMENTAL_GEOMETRY");
-        return !value || std::string_view{value} != "0";
+        return value != nullptr && std::string_view{value} == "1";
     }();
     const bool geometry{native && program == Maxwell::ShaderType::Geometry && geometry_enabled};
     // Task and mesh programs: the task in the vertex slot, its mesh program in the tessellation

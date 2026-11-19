@@ -82,9 +82,20 @@ public:
     // Backing memory [cpu_address, +size) is about to be freed (its GPU mappings are gone): each
     // address space drops its SMMU mapping of it, in GPU-thread order.
     void ReleaseBacking(u64 cpu_address, u64 size) {
+        if (size == 0) {
+            return;
+        }
         {
             std::scoped_lock lk{device_mutex};
-            device_ranges.erase(cpu_address);
+            auto it = device_ranges.lower_bound(cpu_address);
+            while (it != device_ranges.end() && it->first - cpu_address < size) {
+                const u64 offset = it->first - cpu_address;
+                if (it->second.first <= size - offset) {
+                    it = device_ranges.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
         std::scoped_lock lk{mutex};
         for (auto& [owner, listener] : listeners) {

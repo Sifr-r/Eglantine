@@ -7,11 +7,14 @@
 
 #pragma once
 
+#include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include "common/container/unordered_map.h"
 
 #include "core/device_memory_manager.h"
+#include "core/hle/service/nvdrv/core/heap_mapper.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 
 namespace Kernel {
@@ -24,7 +27,6 @@ class Host1x;
 
 namespace Service::Nvidia::NvCore {
 
-class HeapMapper;
 class NvMap;
 class SyncpointManager;
 
@@ -61,6 +63,22 @@ public:
     void CloseSession(SessionId id);
 
     Session* GetSession(SessionId id);
+
+    /// Identifies a session's heap mapper. The mapper itself can go away with the session, so it
+    /// is named by its id, not by a pointer that would dangle.
+    using HeapMapperId = uintptr_t;
+
+    /// The id of a heap mapper, or 0 for none.
+    static HeapMapperId IdOf(const HeapMapper* mapper) {
+        return reinterpret_cast<HeapMapperId>(mapper);
+    }
+
+    /// Runs func on the session's heap mapper while the session cannot close, so the mapper stays
+    /// alive for the call. Does nothing when the session has no mapper, or when its mapper is not
+    /// the one the id names: the session was closed (and maybe opened again) since the id was
+    /// taken, and that mapper went with it.
+    void WithSessionMapper(SessionId id, HeapMapperId mapper,
+                           const std::function<void(HeapMapper&)>& func);
 
     NvMap& GetNvMapFile();
 

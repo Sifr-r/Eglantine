@@ -13,6 +13,7 @@
 #include <map>
 #include <random>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 
 #include <fmt/format.h>
@@ -250,7 +251,7 @@ private:
     }
 
     void DecompressToFile(NupSpillFile& spill) const {
-        const auto fail = [&](const char* reason) {
+        const auto fail = [&](std::string_view reason) {
             LOG_ERROR(Loader, "NUP zstd decompression of {} to a temporary file failed: {}", name,
                       reason);
             spill.file.Close();
@@ -266,6 +267,10 @@ private:
         std::random_device random;
         std::error_code ec;
         std::filesystem::create_directories(cache->spill_dir, ec);
+        if (ec) {
+            return fail(fmt::format("cannot create temporary directory {}: {}",
+                                    Common::FS::PathToUTF8String(cache->spill_dir), ec.message()));
+        }
         spill.path =
             cache->spill_dir / fmt::format("{:08x}{:08x}-{}.tmp", random(), random(), cache_index);
         Common::FS::IOFile out{spill.path, Common::FS::FileAccessMode::Write};

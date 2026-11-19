@@ -6,8 +6,10 @@
 
 #pragma once
 
+#include <optional>
 #include <vector>
 #include "common/common_types.h"
+#include "core/file_sys/fs_save_data_types.h"
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/service.h"
 
@@ -19,7 +21,8 @@ class ISaveDataInfoReader final : public ServiceFramework<ISaveDataInfoReader> {
 public:
     explicit ISaveDataInfoReader(Core::System& system_,
                                  std::shared_ptr<SaveDataController> save_data_controller_,
-                                 FileSys::SaveDataSpaceId space);
+                                 FileSys::SaveDataSpaceId space,
+                                 std::optional<FileSys::SaveDataFilter> filter = std::nullopt);
     ~ISaveDataInfoReader() override;
 
     struct SaveDataInfo {
@@ -44,8 +47,11 @@ private:
     void FindAllSaves(FileSys::SaveDataSpaceId space);
     void FindNormalSaves(FileSys::SaveDataSpaceId space, const FileSys::VirtualDir& type);
     void FindTemporaryStorageSaves(FileSys::SaveDataSpaceId space, const FileSys::VirtualDir& type);
+    /// Drops every entry that does not match the filter, when one was given.
+    void ApplyFilter();
 
     std::shared_ptr<SaveDataController> save_data_controller;
+    std::optional<FileSys::SaveDataFilter> filter;
     std::vector<SaveDataInfo> info;
     u64 next_entry_index = 0;
 };

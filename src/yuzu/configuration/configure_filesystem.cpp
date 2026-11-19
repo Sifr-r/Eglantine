@@ -78,12 +78,23 @@ void ConfigureFilesystem::SetConfiguration() {
 }
 
 void ConfigureFilesystem::ApplyConfiguration() {
+    const bool save_follows_nand =
+        ui->save_directory_edit->text().toStdString() ==
+        Common::FS::GetEdenPathString(Common::FS::EdenPath::NANDDir);
+
     Common::FS::SetEdenPath(Common::FS::EdenPath::NANDDir,
                             ui->nand_directory_edit->text().toStdString());
     Common::FS::SetEdenPath(Common::FS::EdenPath::SDMCDir,
                             ui->sdmc_directory_edit->text().toStdString());
-    Common::FS::SetEdenPath(Common::FS::EdenPath::SaveDir,
-                            ui->save_directory_edit->text().toStdString());
+    if (save_follows_nand) {
+        const auto& nand_path = Common::FS::GetEdenPath(Common::FS::EdenPath::NANDDir);
+        Common::FS::SetEdenPath(Common::FS::EdenPath::SaveDir, nand_path);
+        ui->save_directory_edit->setText(
+            QString::fromStdString(Common::FS::GetEdenPathString(Common::FS::EdenPath::SaveDir)));
+    } else {
+        Common::FS::SetEdenPath(Common::FS::EdenPath::SaveDir,
+                               ui->save_directory_edit->text().toStdString());
+    }
     Common::FS::SetEdenPath(Common::FS::EdenPath::DumpDir,
                             ui->dump_path_edit->text().toStdString());
     Common::FS::SetEdenPath(Common::FS::EdenPath::LoadDir,

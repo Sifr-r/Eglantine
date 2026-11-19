@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <limits>
 #include <memory>
 
 #include "common/common_types.h"
@@ -21,8 +22,17 @@ public:
     ~HeapMapper();
 
     bool IsInBounds(VAddr start, size_t size) const {
-        VAddr end = start + size;
-        return start >= m_vaddress && end <= (m_vaddress + m_size);
+        return RangeInBounds(start, size, m_vaddress, m_size);
+    }
+
+    /// Whether [start, start + size) lies inside [base, base + region_size). A size that makes
+    /// the end of the range wrap below its start is not inside anything.
+    static bool RangeInBounds(VAddr start, size_t size, VAddr base, size_t region_size) {
+        if (size > std::numeric_limits<VAddr>::max() - start) {
+            return false;
+        }
+        const VAddr end = start + size;
+        return start >= base && end <= (base + region_size);
     }
 
     DAddr Map(VAddr start, size_t size);

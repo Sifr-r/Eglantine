@@ -144,6 +144,19 @@ Session* Container::GetSession(SessionId session_id) {
     return &impl->sessions[session_id.id];
 }
 
+void Container::WithSessionMapper(SessionId session_id, HeapMapperId mapper,
+                                  const std::function<void(HeapMapper&)>& func) {
+    // The session cannot close while this is held, so the mapper stays alive for the call.
+    std::scoped_lock lk(impl->session_guard);
+    const auto& session = impl->sessions[session_id.id];
+    // The session was closed while the caller waited, and its mapper went with it: that mapper
+    // unmapped what was left of it when it died, so there is nothing left to do here.
+    if (session.mapper.get() == nullptr || IdOf(session.mapper.get()) != mapper) {
+        return;
+    }
+    func(*session.mapper);
+}
+
 NvMap& Container::GetNvMapFile() {
     return impl->file;
 }

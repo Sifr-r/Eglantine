@@ -28,12 +28,12 @@
 #include "common/settings_enums.h"
 #include "core/file_sys/nup_writer.h"
 #include "frontend_common/content_manager.h"
+#include "input_common/drivers/switch2_auto_pair.h"
 #include "input_common/drivers/tas_input.h"
 #include "qt_common/config/qt_config.h"
 #include "qt_common/qt_common.h"
 #include "qt_common/util/game.h"
 #include "yuzu/hotkeys.h"
-#include "yuzu/user_data_migration.h"
 
 #ifdef __unix__
 #include <QDBusObjectPath>
@@ -410,6 +410,7 @@ private slots:
     void OnOpenSDMCFolder();
     void OnOpenModFolder();
     void OnOpenLogFolder();
+    void OnDiagnostics();
     void OnVerifyInstalledContents();
     void OnInstallFirmware();
     void OnInstallFirmwareFromZIP();
@@ -454,6 +455,7 @@ private slots:
 #endif
     void OnLanguageChanged(const QString& locale);
     void OnMouseActivity();
+    void UpdateSwitch2Controllers();
     bool OnShutdownBegin();
     void OnShutdownBeginDialog();
     void OnEmulationStopped();
@@ -572,7 +574,6 @@ private:
     // Stores what suffix to add to the FPS counter, e.g. Unlocked.
     QString m_fpsSuffix{};
 
-    UserDataMigrator user_data_migrator;
     std::unique_ptr<QtConfig> config;
 
     // Whether emulation is currently running in yuzu.
@@ -634,6 +635,12 @@ private:
 #endif
     QTimer mouse_hide_timer;
     QTimer update_input_timer;
+    /// Polls the Switch 2 driver for controllers that appeared while the app is running.
+    QTimer switch2_auto_pair_timer;
+    /// The Switch 2 auto-pair pass keeps the state of the controllers it saw: a controller is
+    /// only reported as gone after it was missing for several passes. The pass has to run on
+    /// the same object every time, a local would lose that state on every poll.
+    InputCommon::Switch2::Switch2AutoPair switch2_auto_pair;
 
     QString startup_icon_theme;
 

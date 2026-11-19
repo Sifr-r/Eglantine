@@ -67,6 +67,9 @@ SWITCHABLE(FrameGenType, false);
 SWITCHABLE(SpirvOptimizeMode, true);
 SWITCHABLE(TimeZone, true);
 SETTING(VSyncMode, true);
+SETTING(Switch2GyroMouseMode, false);
+SETTING(Switch2GyroActivationMode, false);
+SETTING(u32, true);
 SWITCHABLE(bool, false);
 SWITCHABLE(int, false);
 SWITCHABLE(int, true);
@@ -83,6 +86,9 @@ SWITCHABLE(ConfirmStop, true);
 #undef SETTING
 #undef SWITCHABLE
 #endif
+
+Values::Values() = default;
+Values::~Values() = default;
 
 Values values;
 

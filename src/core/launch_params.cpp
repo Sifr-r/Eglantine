@@ -4,8 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include <regex>
 #include <cctype>
+#include <cstring>
+#include <regex>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/logging.h"
@@ -37,6 +39,35 @@ static std::optional<u16> ParsePort(const char* text) {
 /// Parses the command line options into a LaunchParams.
 LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wchar_t *argv_w[]) noexcept {
     LaunchParams p{};
+    if (argc <= 0 || argv == nullptr) {
+        return p;
+    }
+
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset = 1;
+    optind = 1;
+#else
+    optind = 0;
+#endif
+
+    char** parse_argv = argv;
+#ifdef _WIN32
+    std::vector<std::string> utf8_args;
+    std::vector<char*> utf8_argv;
+    if (argv_w != nullptr) {
+        utf8_args.reserve(static_cast<std::size_t>(argc));
+        utf8_argv.reserve(static_cast<std::size_t>(argc) + 1);
+        for (int i = 0; i < argc; ++i) {
+            utf8_args.push_back(argv_w[i] != nullptr ? Common::UTF16ToUTF8(argv_w[i])
+                                                     : std::string{});
+            utf8_argv.push_back(utf8_args.back().data());
+        }
+        utf8_argv.push_back(nullptr);
+        parse_argv = utf8_argv.data();
+    }
+#else
+    (void)argv_w;
+#endif
 
     int option_index = 0;
     static struct option long_options[] = {
@@ -72,171 +103,172 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
         // clang-format on
     };
 
-    while (optind < argc) {
+    while (true) {
         // -d takes an optional port (-d1234); -i takes the input profile. Both read optarg but
         // were declared without arguments, so optarg was null and they crashed.
-        if (int arg = getopt_long(argc, argv, "d::c:fhg:m:p:u:vi:nsx", long_options, &option_index); arg != -1) {
-            switch (arg) {
-            case 'd':
-                // Without a port, the configured one is used (the config is not loaded yet).
-                p.enable_gdbstub = true;
-                if (optarg != nullptr) {
-                    if (const auto port = ParsePort(optarg)) {
-                        p.override_gdb_port = *port;
-                    } else {
-                        LOG_ERROR(Frontend, "Invalid --debug port '{}', using the configured port",
-                                  optarg);
-                    }
-                }
-                break;
-            case 'c':
-                p.config_path = optarg;
-                break;
-            case 'f':
-                p.fullscreen = true;
-                LOG_INFO(Frontend, "Starting in fullscreen mode...");
-                break;
-            case 'h':
-                p.print_help = true;
-                break;
-            case 'g':
-                p.filepath = std::string(optarg);
-                break;
-            case 'M':
-                p.mcp_enable = true;
-                break;
-            case 'P':
-                p.mcp_enable = true;
+        const int arg =
+            getopt_long(argc, parse_argv, "d::c:fhg:m:p:u:vi:nsx", long_options, &option_index);
+        if (arg == -1) {
+            break;
+        }
+        switch (arg) {
+        case 'd':
+            // Without a port, the configured one is used (the config is not loaded yet).
+            p.enable_gdbstub = true;
+            if (optarg != nullptr) {
                 if (const auto port = ParsePort(optarg)) {
-                    p.mcp_port = *port;
+                    p.override_gdb_port = *port;
                 } else {
-                    LOG_ERROR(Frontend, "Invalid --mcp-port '{}', using the configured port",
+                    LOG_ERROR(Frontend, "Invalid --debug port '{}', using the configured port",
                               optarg);
                 }
-                break;
-            case 'W':
-                p.mcp_allow_writes = true;
-                break;
-            case 'N':
-                p.pack_nup_source = std::string(optarg);
-                break;
-            case 'U':
-                p.unpack_nup_source = std::string(optarg);
-                break;
-            case 'E':
-                p.edit_nup_source = std::string(optarg);
-                break;
-            case 0x100:
-                p.edit_nup_name = std::string(optarg);
-                break;
-            case 0x101:
-                p.edit_nup_icon = std::string(optarg);
-                break;
-            case 0x102:
-                p.edit_nup_version = std::string(optarg);
-                break;
-            case 0x103:
-                p.edit_nup_publisher = std::string(optarg);
-                break;
-            case 0x104:
-                p.edit_nup_name = std::string{};
-                break;
-            case 0x105:
-                p.edit_nup_icon = std::string{};
-                break;
-            case 0x106:
-                p.edit_nup_version = std::string{};
-                break;
-            case 0x107:
-                p.edit_nup_publisher = std::string{};
-                break;
-            case 'i': {
-                p.input_profile = std::string(optarg);
-                break;
             }
-            case 'm': {
-                p.use_multiplayer = true;
-                const std::string str_arg(optarg);
-                // regex to check if the format is nickname:password@ip:port
-                // with optional :password
-                const std::regex re("^([^:]+)(?::(.+))?@([^:]+)(?::([0-9]+))?$");
-                if (std::regex_match(str_arg, re)) {
-                    std::smatch match;
-                    std::regex_search(str_arg, match, re);
-                    ASSERT(match.size() == 5);
-                    p.nickname = match[1];
-                    p.password = match[2];
-                    p.address = match[3];
-                    if (!match[4].str().empty()) {
-                        p.port = u16(std::strtoul(match[4].str().c_str(), nullptr, 0));
-                    }
-                    std::regex nickname_re("^[a-zA-Z0-9._\\- ]+$");
-                    ASSERT(std::regex_match(p.nickname, nickname_re) && "Nickname is not valid. Must be 4 to 20 alphanumeric characters");
-                    ASSERT(!p.address.empty() && "Address is empty");
-                }
-                break;
-            }
-            case 'p':
-                p.program_args = argv[optind];
-                ++optind;
-                break;
-            case 'u': {
-                // Launch game with a specific user
-                bool argument_ok = isdigit(optarg[0]) != 0;
-                p.selected_user = atoi(optarg);
-                if (!argument_ok) {
-                    // try to look it up by username, only finds the first username that matches.
-                    auto const user_idx = system.GetProfileManager().GetUserIndex(optarg);
-                    if (user_idx != std::nullopt) {
-                        p.selected_user = user_idx.value();
-                    } else {
-                        LOG_ERROR(Frontend, "Invalid user argument '{}'", optarg);
-                        break;
-                    }
-                }
-                if (system.GetProfileManager().UserExistsIndex(*p.selected_user)) {
-                    Settings::values.current_user = s32(*p.selected_user);
-                } else {
-                    LOG_ERROR(Frontend, "Selected user {} doesn't exist", *p.selected_user);
-                }
-                break;
-            }
-            case 'v':
-                p.print_version = true;
-                break;
-            case 'n':
-                p.force_null_render = true;
-                break;
-            case 's':
-                p.force_single_core = true;
-                break;
-            case 'x':
-                p.log_filter = argv[optind];
-                ++optind;
-                break;
-            }
-        } else {
-            // only kept due to shortcuts made by Qt frontend which use "-qlaunch"
-            if (strcmp(argv[optind], "-hlaunch") == 0) {
-                p.launch_hlaunch = true;
-            } else if (strcmp(argv[optind], "-qlaunch") == 0) {
-                p.launch_qlaunch = true;
-            } else if (strcmp(argv[optind], "-setup") == 0) {
-                p.launch_setup = true;
+            break;
+        case 'c':
+            p.config_path = optarg;
+            break;
+        case 'f':
+            p.fullscreen = true;
+            LOG_INFO(Frontend, "Starting in fullscreen mode...");
+            break;
+        case 'h':
+            p.print_help = true;
+            break;
+        case 'g':
+            p.filepath = std::string(optarg);
+            break;
+        case 'M':
+            p.mcp_enable = true;
+            break;
+        case 'P':
+            p.mcp_enable = true;
+            if (const auto port = ParsePort(optarg)) {
+                p.mcp_port = *port;
             } else {
-                // qt feeds utf8 data, sdl frontend feeds raw utf16 data
-#ifdef _WIN32
-                p.filepath = argv_w != nullptr
-                    ? Common::UTF16ToUTF8(argv_w[optind])
-                    : argv[optind];
-#else
-                p.filepath = argv[optind];
-#endif
+                LOG_ERROR(Frontend, "Invalid --mcp-port '{}', using the configured port", optarg);
             }
-            optind++;
+            break;
+        case 'W':
+            p.mcp_allow_writes = true;
+            break;
+        case 'N':
+            p.pack_nup_source = std::string(optarg);
+            break;
+        case 'U':
+            p.unpack_nup_source = std::string(optarg);
+            break;
+        case 'E':
+            p.edit_nup_source = std::string(optarg);
+            break;
+        case 0x100:
+            p.edit_nup_name = std::string(optarg);
+            break;
+        case 0x101:
+            p.edit_nup_icon = std::string(optarg);
+            break;
+        case 0x102:
+            p.edit_nup_version = std::string(optarg);
+            break;
+        case 0x103:
+            p.edit_nup_publisher = std::string(optarg);
+            break;
+        case 0x104:
+            p.edit_nup_name = std::string{};
+            break;
+        case 0x105:
+            p.edit_nup_icon = std::string{};
+            break;
+        case 0x106:
+            p.edit_nup_version = std::string{};
+            break;
+        case 0x107:
+            p.edit_nup_publisher = std::string{};
+            break;
+        case 'i': {
+            p.input_profile = std::string(optarg);
+            break;
+        }
+        case 'm': {
+            p.use_multiplayer = true;
+            const std::string str_arg(optarg);
+            // regex to check if the format is nickname:password@ip:port
+            // with optional :password
+            const std::regex re("^([^:]+)(?::(.+))?@([^:]+)(?::([0-9]+))?$");
+            if (std::regex_match(str_arg, re)) {
+                std::smatch match;
+                std::regex_search(str_arg, match, re);
+                ASSERT(match.size() == 5);
+                p.nickname = match[1];
+                p.password = match[2];
+                p.address = match[3];
+                if (!match[4].str().empty()) {
+                    p.port = u16(std::strtoul(match[4].str().c_str(), nullptr, 0));
+                }
+                std::regex nickname_re("^[a-zA-Z0-9._\\- ]+$");
+                ASSERT(std::regex_match(p.nickname, nickname_re) &&
+                       "Nickname is not valid. Must be 4 to 20 alphanumeric characters");
+                ASSERT(!p.address.empty() && "Address is empty");
+            }
+            break;
+        }
+        case 'p':
+            if (optind < argc) {
+                p.program_args = parse_argv[optind];
+                ++optind;
+            }
+            break;
+        case 'u': {
+            // Launch game with a specific user
+            bool argument_ok = isdigit(optarg[0]) != 0;
+            p.selected_user = atoi(optarg);
+            if (!argument_ok) {
+                // try to look it up by username, only finds the first username that matches.
+                auto const user_idx = system.GetProfileManager().GetUserIndex(optarg);
+                if (user_idx != std::nullopt) {
+                    p.selected_user = user_idx.value();
+                } else {
+                    LOG_ERROR(Frontend, "Invalid user argument '{}'", optarg);
+                    break;
+                }
+            }
+            if (system.GetProfileManager().UserExistsIndex(*p.selected_user)) {
+                Settings::values.current_user = s32(*p.selected_user);
+            } else {
+                LOG_ERROR(Frontend, "Selected user {} doesn't exist", *p.selected_user);
+            }
+            break;
+        }
+        case 'v':
+            p.print_version = true;
+            break;
+        case 'n':
+            p.force_null_render = true;
+            break;
+        case 's':
+            p.force_single_core = true;
+            break;
+        case 'x':
+            if (optind < argc) {
+                p.log_filter = parse_argv[optind];
+                ++optind;
+            }
+            break;
         }
     }
-    p.argv0 = argv[0];
+    while (optind < argc) {
+        // only kept due to shortcuts made by Qt frontend which use "-qlaunch"
+        if (strcmp(parse_argv[optind], "-hlaunch") == 0) {
+            p.launch_hlaunch = true;
+        } else if (strcmp(parse_argv[optind], "-qlaunch") == 0) {
+            p.launch_qlaunch = true;
+        } else if (strcmp(parse_argv[optind], "-setup") == 0) {
+            p.launch_setup = true;
+        } else {
+            p.filepath = parse_argv[optind];
+        }
+        optind++;
+    }
+    p.argv0 = parse_argv[0] != nullptr ? parse_argv[0] : "";
     return p;
 }
 

@@ -1,0 +1,143 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+#include <catch2/catch_test_macros.hpp>
+
+#include <array>
+
+#include "common/scope_exit.h"
+#include "core/core.h"
+#include "core/core_timing.h"
+#include "core/file_sys/program_metadata.h"
+#include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/kernel.h"
+#include "core/hle/service/os/process.h"
+#include "core/loader/loader.h"
+#include "core/memory/cheat_engine.h"
+#include "tests/core/system_test_context.h"
+
+namespace {
+
+/// Brings a guest process up far enough for the kernel to take ownership of it.
+class TestProcessLoader final : public Loader::AppLoader {
+public:
+    TestProcessLoader() : AppLoader(nullptr) {}
+
+    Loader::FileType GetFileType() const override {
+        return Loader::FileType::Unknown;
+    }
+
+    LoadResult Load(Kernel::KProcess& process, Core::System& system) override {
+        const auto metadata = FileSys::ProgramMetadata::GetDefault();
+        REQUIRE(process.LoadFromMetadata(system.Kernel(), metadata, Kernel::PageSize, {}, 0)
+                    .IsSuccess());
+        REQUIRE(process.IsInitialized());
+        return {Loader::ResultStatus::Success, LoadParameters{0x2c, 0x100000}};
+    }
+};
+
+} // Anonymous namespace
+
+TEST_CASE("ShutdownMainProcess keeps the timing thread paused", "[core][shutdown-ordering]") {
+    const ScopedSystemTestContext context;
+    // The timing thread only exists when the emulation runs on more than one core.
+    Settings::values.use_multi_core.SetValue(true);
+
+    Core::System system;
+    system.Initialize();
+    auto& kernel = system.Kernel();
+    kernel.Initialize();
+
+    auto& core_timing = system.CoreTiming();
+
+    // The timing thread is the one that runs the event callbacks. It has to be running when
+    // the shutdown starts, otherwise the shutdown cannot restart it.
+    core_timing.SyncPause(false);
+    REQUIRE(core_timing.IsRunning());
+
+    system.ShutdownMainProcess();
+
+    // The teardown destroys the services, the guest processes and the cheat engine. A timing
+    // callback running at that point uses freed objects, so the timing thread has to stay
+    // paused for the whole teardown.
+    CHECK_FALSE(core_timing.IsRunning());
+}
+
+TEST_CASE("Cheat callbacks do not use a process the kernel released",
+          "[core][shutdown-ordering]") {
+    const ScopedSystemTestContext context;
+    Core::System system;
+    system.Initialize();
+    auto& kernel = system.Kernel();
+    kernel.Initialize();
+    SCOPE_EXIT { system.ShutdownMainProcess(); };
+
+    Service::Process process{system};
+    Loader::ResultStatus status = Loader::ResultStatus::Success;
+    TestProcessLoader loader;
+    REQUIRE(process.Initialize(loader, status));
+    REQUIRE(process.IsInitialized());
+
+    // Hold a reference to the process, so that it stays alive after the kernel released it.
+    // The test then observes the state of a process that the cheat callbacks must not touch.
+    Kernel::KScopedAutoObject<Kernel::KProcess> handle =
+        kernel.GetProcessByProcessId(process.GetProcessId());
+    REQUIRE(handle.IsNotNull());
+
+    Core::Memory::CheatProcessMetadata metadata{};
+    metadata.process_id = process.GetProcessId();
+    Core::Memory::StandardVmCallbacks callbacks{system, metadata};
+
+    // Reach the process while the kernel still owns it. The cheat callbacks used to cache the
+    // process pointer here.
+    std::array<u8, 16> buffer{};
+    callbacks.MemoryReadUnsafe(0, buffer.data(), buffer.size());
+
+    // The kernel releases the process: it does not know about it any more.
+    kernel.RemoveProcess(handle.GetPointerUnsafe());
+    REQUIRE(kernel.GetProcessList().empty());
+
+    // The callbacks resolve the process through the kernel on every use, so they do not touch
+    // the process the kernel released. A callback that used a cached pointer would have paused
+    // it here.
+    callbacks.PauseProcess();
+    CHECK_FALSE(handle->IsSuspended());
+    callbacks.ResumeProcess();
+    CHECK_FALSE(handle->IsSuspended());
+}
+
+TEST_CASE("The kernel empties its object list before the guest memory goes away",
+          "[core][shutdown-ordering]") {
+    const ScopedSystemTestContext context;
+    Core::System system;
+    system.Initialize();
+    auto& kernel = system.Kernel();
+    kernel.Initialize();
+
+    // The objects in the kernel's object list live in the guest RAM arena. The system frees
+    // that arena before it destroys the kernel, so the list has to be emptied while the arena
+    // is still alive: a container that walks its list afterwards reads freed memory.
+    REQUIRE(kernel.ObjectListContainer().GetOwnedCount(nullptr) > 0);
+    kernel.Shutdown();
+    CHECK(kernel.ObjectListContainer().GetOwnedCount(nullptr) == 0);
+
+    // The container itself stays alive after the shutdown, so an object that is closed later
+    // still finds it and unregisters itself from it.
+    CHECK_NOTHROW(kernel.ObjectListContainer().GetOwnedCount(nullptr));
+}
+
+TEST_CASE("The kernel object list survives a system that is destroyed without a shutdown",
+          "[core][shutdown-ordering]") {
+    const ScopedSystemTestContext context;
+
+    // The system is destroyed without a shutdown: the kernel's object list still holds the
+    // objects that live in the guest RAM arena, and that arena is gone by the time the kernel
+    // is destroyed. The teardown has to empty the list first.
+    REQUIRE_NOTHROW([] {
+        Core::System system;
+        system.Initialize();
+        auto& kernel = system.Kernel();
+        kernel.Initialize();
+        REQUIRE(kernel.ObjectListContainer().GetOwnedCount(nullptr) > 0);
+    }());
+}

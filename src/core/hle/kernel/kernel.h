@@ -179,6 +179,13 @@ public:
 
     const KAutoObjectWithListContainer& ObjectListContainer() const;
 
+    /// Empties the kernel's object list.
+    ///
+    /// The registered objects live in the guest RAM arena. The system frees that arena before
+    /// the kernel is destroyed, so the list has to be emptied while the arena is still alive.
+    /// Calling this more than once is harmless.
+    void ClearObjectList();
+
     /// Registers all kernel objects with the global emulation state, this is purely for tracking
     /// leaks after emulation has been shutdown.
     void RegisterKernelObject(KAutoObject* object);
@@ -307,6 +314,15 @@ private:
     friend class KProcess;
     friend class KThread;
 
+    /// Helper to encapsulate all slab heaps in a single heap allocated container
+    struct SlabHeapContainer;
+
+    /// The slab heaps have to outlive the kernel implementation: the objects that the
+    /// implementation owns are freed into their slab heap when the implementation is
+    /// destroyed. The member is therefore declared before the implementation, so that it is
+    /// destroyed after it.
+    std::unique_ptr<SlabHeapContainer> slab_heap_container;
+
     /// Creates a new object ID, incrementing the internal object ID counter.
     u32 CreateNewObjectID();
 
@@ -329,12 +345,6 @@ private:
     std::unique_ptr<Impl> impl;
 
     bool exception_exited{};
-
-private:
-    /// Helper to encapsulate all slab heaps in a single heap allocated container
-    struct SlabHeapContainer;
-
-    std::unique_ptr<SlabHeapContainer> slab_heap_container;
 };
 
 } // namespace Kernel

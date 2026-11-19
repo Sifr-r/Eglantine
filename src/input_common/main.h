@@ -36,6 +36,7 @@ class Android;
 class Camera;
 class Keyboard;
 class Mouse;
+class Switch2Controllers;
 class TouchScreen;
 class VirtualAmiibo;
 class VirtualGamepad;
@@ -124,6 +125,12 @@ public:
 
     /// Retrieves the underlying virtual gamepad input device.
     [[nodiscard]] const VirtualGamepad* GetVirtualGamepad() const;
+
+    /// Retrieves the underlying switch2 input device.
+    [[nodiscard]] Switch2Controllers* GetSwitch2();
+
+    /// Retrieves the underlying switch2 input device.
+    [[nodiscard]] const Switch2Controllers* GetSwitch2() const;
 
     /**
      * Returns all available input devices that this Factory can create a new device with.

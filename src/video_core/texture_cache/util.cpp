@@ -40,6 +40,7 @@
 #include "video_core/textures/astc.h"
 #include "video_core/textures/bcn.h"
 #include "video_core/textures/decoders.h"
+#include "video_core/textures/etc2.h"
 
 namespace VideoCommon {
 
@@ -68,6 +69,32 @@ using VideoCore::Surface::IsViewCompatible;
 using VideoCore::Surface::PixelFormatFromDepthFormat;
 using VideoCore::Surface::PixelFormatFromRenderTargetFormat;
 using VideoCore::Surface::SurfaceType;
+
+/// The ETC2 and EAC formats the texture cache can transcode to. The sRGB variants decode like
+/// their linear counterparts, the host applies the transfer function when it samples them.
+[[nodiscard]] std::optional<Tegra::Texture::ETC2::Format> Etc2Format(PixelFormat pixel_format) {
+    switch (pixel_format) {
+    case PixelFormat::ETC2_RGB_UNORM:
+    case PixelFormat::ETC2_RGB_SRGB:
+        return Tegra::Texture::ETC2::Format::RGB;
+    case PixelFormat::ETC2_RGB_PTA_UNORM:
+    case PixelFormat::ETC2_RGB_PTA_SRGB:
+        return Tegra::Texture::ETC2::Format::RGB_PTA;
+    case PixelFormat::ETC2_RGBA_UNORM:
+    case PixelFormat::ETC2_RGBA_SRGB:
+        return Tegra::Texture::ETC2::Format::RGBA;
+    case PixelFormat::EAC_R11_UNORM:
+        return Tegra::Texture::ETC2::Format::R11;
+    case PixelFormat::EAC_R11_SNORM:
+        return Tegra::Texture::ETC2::Format::R11_SNORM;
+    case PixelFormat::EAC_R11G11_UNORM:
+        return Tegra::Texture::ETC2::Format::R11G11;
+    case PixelFormat::EAC_R11G11_SNORM:
+        return Tegra::Texture::ETC2::Format::R11G11_SNORM;
+    default:
+        return std::nullopt;
+    }
+}
 
 struct LevelInfo {
     Extent3D size;
@@ -632,6 +659,11 @@ u32 CalculateConvertedSizeBytes(const ImageInfo& info) noexcept {
             output_size += (plane_dim * info.size.depth * info.resources.layers) / bpp_div;
         }
         return output_size;
+    }
+    if (const auto format = Etc2Format(info.format)) {
+        // The colour formats decode to four bytes per texel, the EAC formats to one or two.
+        return NumBlocksPerLayer(info, TILE_SIZE) * info.resources.layers *
+               Tegra::Texture::ETC2::BytesPerTexel(*format);
     }
     return NumBlocksPerLayer(info, TILE_SIZE) * info.resources.layers *
            ConvertedBytesPerBlock(info.format);
@@ -1309,6 +1341,7 @@ void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies) {
     // Same offsets and sizes as ConvertImage below.
     const auto recompression = Settings::GetAstcRecompression();
     const bool astc = IsPixelFormatASTC(info.format);
+    const auto etc2 = Etc2Format(info.format);
     u64 output_offset = 0;
     for (BufferImageCopy& copy : copies) {
         const Extent3D mip_size = AdjustMipSize(info.size, copy.image_subresource.base_level);
@@ -1322,6 +1355,9 @@ void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies) {
                 recompression == Settings::AstcRecompression::Bc1 || info.astc_opaque ? 2 : 1;
             size = u64{Common::AlignUp(copy.image_extent.width, 4U)} *
                    Common::AlignUp(copy.image_extent.height, 4U) * layers / bpp_div;
+        } else if (etc2) {
+            size = u64{copy.image_extent.width} * copy.image_extent.height * layers *
+                   Tegra::Texture::ETC2::BytesPerTexel(*etc2);
         } else {
             size = u64{copy.image_extent.width} * copy.image_extent.height * layers *
                    ConvertedBytesPerBlock(info.format);
@@ -1354,6 +1390,7 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
 
         const auto recompression_setting = Settings::GetAstcRecompression();
         const bool astc = IsPixelFormatASTC(info.format);
+        const auto etc2 = Etc2Format(info.format);
 
         if (astc && recompression_setting == Settings::AstcRecompression::Uncompressed) {
             Tegra::Texture::ASTC::Decompress(
@@ -1395,6 +1432,17 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
                 (aligned_plane_dim * copy.image_extent.depth * copy.image_subresource.num_layers) /
                 bpp_div;
             output_offset += static_cast<u32>(copy.buffer_size);
+        } else if (etc2) {
+            const u32 bytes_per_texel = Tegra::Texture::ETC2::BytesPerTexel(*etc2);
+            const u32 layers = copy.image_subresource.num_layers * copy.image_extent.depth;
+            Tegra::Texture::ETC2::Decompress(input_offset, *etc2, copy.image_extent.width,
+                                             copy.image_extent.height, layers,
+                                             output.subspan(output_offset));
+
+            const u32 level_size =
+                copy.image_extent.width * copy.image_extent.height * layers * bytes_per_texel;
+            copy.buffer_size = level_size;
+            output_offset += level_size;
         } else {
             DecompressBCn(input_offset, output.subspan(output_offset), copy, info.format);
             output_offset += copy.image_extent.width * copy.image_extent.height *

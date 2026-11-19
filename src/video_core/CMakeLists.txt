@@ -318,6 +318,8 @@ add_library(video_core STATIC
     textures/bcn.h
     textures/decoders.cpp
     textures/decoders.h
+    textures/etc2.cpp
+    textures/etc2.h
     textures/texture.cpp
     textures/texture.h
     textures/workers.cpp

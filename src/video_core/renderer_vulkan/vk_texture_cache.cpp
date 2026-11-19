@@ -62,6 +62,7 @@ using VideoCommon::SubresourceRange;
 using VideoCore::Surface::BytesPerBlock;
 using VideoCore::Surface::HasAlpha;
 using VideoCore::Surface::IsPixelFormatASTC;
+using VideoCore::Surface::IsPixelFormatETC2;
 using VideoCore::Surface::IsPixelFormatInteger;
 using VideoCore::Surface::IsPixelFormatSRGB;
 using VideoCore::Surface::SurfaceType;
@@ -203,7 +204,8 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
     const bool layer_uploads =
         IsHugeAstcArray(device, info) ||
         (!IsPixelFormatASTC(info.format) &&
-         (!IsPixelFormatBCn(info.format) || device.IsOptimalBcnSupported()));
+         (!IsPixelFormatBCn(info.format) || device.IsOptimalBcnSupported()) &&
+         (!IsPixelFormatETC2(info.format) || device.IsOptimalEtc2Supported()));
     const u64 size = VideoCommon::CalculateGuestSizeInBytes(info);
     return layer_uploads && size >= (32U << 20) && Tegra::Nx2InSparseRegion(gpu_addr, size);
 }
@@ -3100,6 +3102,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
         flags |= VideoCommon::ImageFlagBits::CostlyLoad;
     }
     if (IsPixelFormatBCn(info.format) && !runtime->device.IsOptimalBcnSupported()) {
+        flags |= VideoCommon::ImageFlagBits::Converted;
+        flags |= VideoCommon::ImageFlagBits::CostlyLoad;
+    }
+    if (IsPixelFormatETC2(info.format) && !runtime->device.IsOptimalEtc2Supported()) {
         flags |= VideoCommon::ImageFlagBits::Converted;
         flags |= VideoCommon::ImageFlagBits::CostlyLoad;
     }

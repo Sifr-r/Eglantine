@@ -361,6 +361,14 @@ void ThreadManager::Run(std::function<void()>&& func, bool is_async, bool before
 }
 
 void ThreadManager::InvalidateRegion(DAddr addr, u64 size) {
+    if (VideoCommon::GpuSplit::Get().Active()) {
+        // The split's back owns the rasterizer's caches while it runs, so the invalidation is
+        // handed to the GPU thread like the other commands (the queue's handling defers it to
+        // the back), instead of touching the rasterizer from this CPU thread. The caller waits
+        // for it, as it did when it called the rasterizer itself.
+        PushCommand(InvalidateRegionCommand(addr, size), false, false);
+        return;
+    }
     rasterizer->OnCacheInvalidation(addr, size);
 }
 

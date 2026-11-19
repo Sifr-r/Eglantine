@@ -102,9 +102,10 @@ std::vector<Feature> FeaturesFor(Platform platform) {
     const auto none = [](const Context&) { return Verdict{}; };
     features.push_back(
         {"EDEN_NX2_SPLIT", "2", QT_TR_NOOP("Run the GPU commands on a second thread"),
-         QT_TR_NOOP("The GPU thread parses command lists and a back thread runs the engine "
-                    "methods, macros and draws in order. Up to +54% FPS in Switch 2 games. "
-                    "Already on by default; listed so it stays on."),
+         QT_TR_NOOP("Splits command parsing and execution across two threads. Requires a native "
+                    "Switch 2 game, the Vulkan renderer, GPU Mode set to Fast, and DMA Accuracy "
+                    "set to Default or Unsafe (fast). The default desktop GPU Mode is Accurate, "
+                    "which keeps the split off."),
          true, none});
     features.push_back(
         {"EDEN_NX2_FENCE_BATCH", "1", QT_TR_NOOP("Release GPU fences in batches"),

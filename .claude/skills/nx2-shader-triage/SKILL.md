@@ -48,7 +48,7 @@ same on every GPU. The repo vendors an older copy of this skill under `.claude/s
   AGENTS.md says.
 - **A running Qt build with `EDEN_NX2_DEBUG_SERVER` answers live** (`tools/nx2/debug_mcp.py --call`:
   screenshot, `reject_shaders`, `capture_frame`, `read_memory`, `input_sequence`;
-  `docs/nx2/debug-mcp.md`). Use it before asking for a relaunch, and restore every reject.
+  `docs/content/nx2/debug-mcp.mdx`). Use it before asking for a relaunch, and restore every reject.
 - **Visual bugs (tint, missing effect): drive the game yourself** with `lab_ctl.py` (hidden
   `eden-cli`, scripted keys, capture plus RGB stats), not by asking the user for runs. Load
   `nx2-lab-automation` for the run mechanics; the investigation procedure is in
@@ -58,7 +58,7 @@ same on every GPU. The repo vendors an older copy of this skill under `.claude/s
   Ask before long series of runs if the user may be using the PC.
 - **Never suggest `EDEN_NATIVE_SHADER_OVERRIDE_DIR`.** It pauses the GPU thread for up to 30 min per
   rejected shader.
-- Commits are local only and carry the `Assisted-by:` trailer (repo `docs/policies/AI.md`).
+- Commits are local only and carry the `Assisted-by:` trailer (repo `docs/content/policies/AI.mdx`).
 
 ## Procedure
 

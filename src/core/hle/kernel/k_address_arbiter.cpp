@@ -7,6 +7,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
+
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_address_arbiter.h"
@@ -326,7 +328,8 @@ Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool 
         bool succeeded{};
         if (is_64_bit) {
             auto& memory = GetCurrentMemory(system.Kernel());
-            succeeded = memory.IsValidVirtualAddressRange(addr, sizeof(s64));
+            succeeded = addr <= std::numeric_limits<u64>::max() - sizeof(s64) &&
+                        memory.IsValidVirtualAddressRange(addr, sizeof(s64));
             if (succeeded) {
                 user_value = static_cast<s64>(memory.Read64(addr));
             }

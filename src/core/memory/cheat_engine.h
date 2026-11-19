@@ -11,6 +11,7 @@
 #include <memory>
 #include <vector>
 #include "common/common_types.h"
+#include "core/hle/kernel/k_auto_object.h"
 #include "core/memory/dmnt_cheat_types.h"
 #include "core/memory/dmnt_cheat_vm.h"
 
@@ -45,12 +46,13 @@ public:
 private:
     bool IsAddressInRange(VAddr address) const;
 
-    Kernel::KProcess* GetProcess() const;
+    /// Looks the cheated process up in the kernel. The kernel can release the process at any
+    /// time, so it is resolved on every use; the returned handle keeps a reference to it for
+    /// as long as it is used.
+    Kernel::KScopedAutoObject<Kernel::KProcess> GetProcess() const;
 
     const CheatProcessMetadata& metadata;
     Core::System& system;
-    mutable Kernel::KProcess* cached_process{};
-    mutable u64 cached_process_id{};
 };
 
 // Intermediary class that parses a text file or other disk format for storing cheats into a

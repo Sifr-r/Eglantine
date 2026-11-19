@@ -269,6 +269,14 @@ jobs:
           test -s "$LDAI_OUTPUT"
           ls -la "$LDAI_OUTPUT"
 
+      - name: Check AppImage staging paths
+        if: hashFiles('tools/ci/check_release_paths.py') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          find AppDir -mindepth 1 -printf '%P\0' | \
+            python3 -I tools/ci/check_release_paths.py --stdin0
+
       # Both Linux files go in one artifact: the tar.gz and the AppImage.
       - name: Upload Linux binary
         uses: actions/upload-artifact@v7

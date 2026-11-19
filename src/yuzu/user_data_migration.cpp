@@ -21,24 +21,21 @@
 #include <filesystem>
 #include <QButtonGroup>
 #include <QCheckBox>
-#include <QGuiApplication>
+#include <QEventLoop>
 #include <QProgressDialog>
 #include <QRadioButton>
 #include <QThread>
 
-UserDataMigrator::UserDataMigrator(QMainWindow* main_window) {
+bool UserDataMigrator::MigrateIfNeeded() {
     // NOTE: Logging is not initialized yet, do not produce logs here.
 
-    // Check migration if config directory does not exist
-    // TODO: ProfileManager messes with us a bit here, and force-creates the
-    // /nand/system/save/8000000000000010/su/avators/profiles.dat file. Find a way to reorder
-    // operations and have it create after this guy runs.
     if (!std::filesystem::is_directory(Common::FS::GetEdenPath(Common::FS::EdenPath::ConfigDir))) {
-        ShowMigrationPrompt(main_window);
+        return ShowMigrationPrompt();
     }
+    return true;
 }
 
-void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
+bool UserDataMigrator::ShowMigrationPrompt() {
     namespace fs = std::filesystem;
     using namespace QtCommon::StringLookup;
 
@@ -74,11 +71,11 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
     std::vector<Emulator> found{};
 
     for (const Emulator& emu : legacy_emus)
-        if (fs::is_directory(emu.get_user_dir()))
+        if (fs::is_directory(Common::FS::GetLegacyPath(emu.e_user_dir)))
             found.emplace_back(emu);
 
     if (found.empty()) {
-        return;
+        return true;
     }
 
     // makes my life easier
@@ -106,56 +103,73 @@ void UserDataMigrator::ShowMigrationPrompt(QMainWindow* main_window) {
 
     QAbstractButton* button = migration_prompt.clickedButton();
 
-    if (button->text() == QObject::tr("No")) {
-        return ShowMigrationCancelledMessage(main_window);
+    if (!button || button->text() == QObject::tr("No")) {
+        ShowMigrationCancelledMessage();
+        return true;
     }
 
     MigrationWorker::MigrationStrategy strategy =
         static_cast<MigrationWorker::MigrationStrategy>(group->checkedId());
 
-    selected_emu = button->property("emulator").value<Emulator>();
-
-    MigrateUserData(main_window, clear_shaders->isChecked(), strategy);
+    return MigrateUserData(button->property("emulator").value<Emulator>(),
+                           clear_shaders->isChecked(), strategy);
 }
 
-void UserDataMigrator::ShowMigrationCancelledMessage(QMainWindow* main_window) {
-    QMessageBox::information(main_window, QObject::tr("Migration"),
-                             QObject::tr("You can manually re-trigger this prompt by deleting the "
-                                         "new config directory:\n%1")
-                                 .arg(QString::fromStdString(Common::FS::GetEdenPathString(
-                                     Common::FS::EdenPath::ConfigDir))),
-                             QMessageBox::Ok);
+void UserDataMigrator::ShowMigrationCancelledMessage() {
+    using Common::FS::EdenPath;
+    using Common::FS::GetEdenPathString;
+    QMessageBox::information(
+        nullptr, QObject::tr("Migration"),
+        QObject::tr("Migration was skipped. This prompt appears when the configuration directory "
+                    "is absent. Migration requires the destination data and cache directories to "
+                    "be empty or absent to preserve existing files.\n\n"
+                    "Configuration: %1\nData: %2\nCache: %3")
+            .arg(QString::fromStdString(GetEdenPathString(EdenPath::ConfigDir)),
+                 QString::fromStdString(GetEdenPathString(EdenPath::EdenDir)),
+                 QString::fromStdString(GetEdenPathString(EdenPath::CacheDir))),
+        QMessageBox::Ok);
 }
 
-void UserDataMigrator::MigrateUserData(QMainWindow* main_window, const bool clear_shader_cache,
-                                       const MigrationWorker::MigrationStrategy strategy) {
-    // Create a dialog to let the user know it's migrating
-    QProgressDialog* progress = new QProgressDialog(main_window);
-    progress->setWindowTitle(QObject::tr("Migrating"));
-    progress->setLabelText(QObject::tr("Migrating, this may take a while..."));
-    progress->setRange(0, 0);
-    progress->setCancelButton(nullptr);
-    progress->setWindowModality(Qt::WindowModality::ApplicationModal);
+bool UserDataMigrator::MigrateUserData(Emulator selected_emu, bool clear_shader_cache,
+                                       MigrationWorker::MigrationStrategy strategy) {
+    QProgressDialog progress;
+    progress.setWindowTitle(QObject::tr("Migrating"));
+    progress.setLabelText(QObject::tr("Migrating, this may take a while..."));
+    progress.setRange(0, 0);
+    progress.setCancelButton(nullptr);
+    progress.setWindowModality(Qt::WindowModality::ApplicationModal);
 
-    QThread* thread = new QThread(main_window);
-    MigrationWorker* worker = new MigrationWorker(selected_emu, clear_shader_cache, strategy);
-    worker->moveToThread(thread);
+    QEventLoop completion;
+    QThread thread;
+    auto* worker = new MigrationWorker(selected_emu, clear_shader_cache, strategy);
+    worker->moveToThread(&thread);
+    bool succeeded = false;
+    QString success_message;
+    QString error_message;
+    QObject::connect(&thread, &QThread::started, worker, &MigrationWorker::process);
+    QObject::connect(&thread, &QThread::finished, worker, &QObject::deleteLater);
+    QObject::connect(worker, &MigrationWorker::finished, &completion,
+                     [&](const QString& message) {
+                         success_message = message;
+                         succeeded = true;
+                         completion.quit();
+                     });
+    QObject::connect(worker, &MigrationWorker::error, &completion, [&](const QString& message) {
+        error_message = message;
+        completion.quit();
+    });
 
-    thread->connect(thread, &QThread::started, worker, &MigrationWorker::process);
-
-    thread->connect(worker, &MigrationWorker::finished, progress,
-                    [=, this](const QString& success_text, const std::string& path) {
-                        progress->close();
-                        QMessageBox::information(main_window, QObject::tr("Migration"),
-                                                 success_text, QMessageBox::Ok);
-
-                        migrated = true;
-                        thread->quit();
-                    });
-
-    thread->connect(worker, &MigrationWorker::finished, worker, &QObject::deleteLater);
-    thread->connect(thread, &QThread::finished, thread, &QObject::deleteLater);
-
-    thread->start();
-    progress->exec();
+    progress.show();
+    thread.start();
+    completion.exec();
+    thread.quit();
+    thread.wait();
+    progress.close();
+    if (!succeeded) {
+        QMessageBox::critical(nullptr, QObject::tr("Migration Failed"), error_message,
+                              QMessageBox::Ok);
+        return false;
+    }
+    QMessageBox::information(nullptr, QObject::tr("Migration"), success_message, QMessageBox::Ok);
+    return true;
 }

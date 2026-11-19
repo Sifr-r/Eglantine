@@ -84,3 +84,31 @@ TEST_CASE("Ampere F2I applies abs and neg to constant-buffer sources", "[video_c
         }
     }
 }
+
+TEST_CASE("Ampere guarded absolute F2I keeps nearest rounding to U16", "[video_core][ampere]") {
+    using Shader::Ampere::Instruction;
+    using Shader::Ampere::LowerToMaxwell;
+    constexpr u32 NegatedP4 = 8 | 4;
+    constexpr u32 Destination = 17;
+    constexpr u32 Bank = 3;
+    constexpr u32 ByteOffset = 0x44;
+    const Instruction convert{{0xb05 | (NegatedP4 << 12) | (Destination << 16),
+                               (ByteOffset << 6) | (Bank << 22) | (1U << 30), 0x00212800, 0}};
+    const Instruction exit{{0x0000794d, 0, 0x03800000, 0}};
+    const auto lowered = LowerToMaxwell(std::array{convert, exit});
+    INFO(lowered.error);
+    REQUIRE(lowered);
+    REQUIRE(lowered.source_instruction_offsets.size() == 2);
+    const auto conversion_end = lowered.instructions.begin() + lowered.source_instruction_offsets[1];
+    const auto conversion = std::find_if(lowered.instructions.begin(), conversion_end, [](u64 word) {
+        return (word >> 52) == 0x5cb;
+    });
+    REQUIRE(conversion != conversion_end);
+    CHECK((*conversion & 255) == Destination);
+    CHECK(((*conversion >> 8) & 3) == 1); // U16 destination width
+    CHECK(((*conversion >> 12) & 1) == 0); // Unsigned destination
+    CHECK(((*conversion >> 39) & 3) == 0); // Round to nearest
+    CHECK(std::all_of(lowered.instructions.begin(), conversion_end, [](u64 word) {
+        return ((word >> 16) & 15) == NegatedP4;
+    }));
+}

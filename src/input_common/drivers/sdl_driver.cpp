@@ -541,6 +541,26 @@ void SDLDriver::InitJoystick(SDL_JoystickID joystick_id) {
         }
     }
 
+    if (Settings::values.enable_switch2_driver) {
+        const u16 vendor_id = SDL_GetJoystickVendor(sdl_joystick);
+        const u16 product_id = SDL_GetJoystickProduct(sdl_joystick);
+        const bool is_switch2_guid =
+            guid.uuid[5] == 0x05 && guid.uuid[4] == 0x7e && guid.uuid[9] == 0x20 &&
+            (guid.uuid[8] == 0x66 || guid.uuid[8] == 0x67 || guid.uuid[8] == 0x69 ||
+             guid.uuid[8] == 0x73);
+        const bool is_switch2_vid_pid =
+            vendor_id == 0x057e && (product_id == 0x2066 || product_id == 0x2067 ||
+                                    product_id == 0x2069 || product_id == 0x2073);
+        if (is_switch2_guid || is_switch2_vid_pid) {
+            LOG_WARNING(Input, "Preferring switch2 driver for device index {}", joystick_id);
+            if (sdl_gamecontroller != nullptr) {
+                SDL_CloseGamepad(sdl_gamecontroller);
+            }
+            SDL_CloseJoystick(sdl_joystick);
+            return;
+        }
+    }
+
     std::scoped_lock lock{joystick_map_mutex};
     if (joystick_map.find(guid) == joystick_map.end()) {
         auto joystick = std::make_shared<SDLJoystick>(guid, 0, sdl_joystick, sdl_gamecontroller);
@@ -704,6 +724,14 @@ SDLDriver::SDLDriver(std::string input_engine_) : InputEngine(std::move(input_en
         SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH, "1");
         SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH_HOME_LED, "0");
     }
+
+#ifdef SDL_HINT_JOYSTICK_HIDAPI_SWITCH2
+    if (Settings::values.enable_switch2_driver) {
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH2, "0");
+    } else {
+        SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH2, "1");
+    }
+#endif
 
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH_PLAYER_LED, "1");
     // Disable hidapi driver for xbox. Already default on Windows, this causes conflict with native

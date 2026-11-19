@@ -4,10 +4,31 @@
 #pragma once
 
 #include <array>
+#include <limits>
+#include <string>
 #include <vector>
 #include "common/common_types.h"
 
 namespace Network {
+
+/// The minimum number of bytes that a single element of type T occupies in a packet. This is
+/// used to bound the amount of data that a peer controlled element count can make us read.
+template <typename T>
+struct PacketElementMinSize {
+    static constexpr std::size_t value = sizeof(T);
+};
+
+/// Strings are stored as a length prefix followed by the characters themselves, so a string
+/// occupies at least the size of that length prefix.
+template <>
+struct PacketElementMinSize<std::string> {
+    static constexpr std::size_t value = sizeof(u32);
+};
+
+/// The offset of the source ip address inside a relayed proxy or LDN packet. Both wire formats
+/// start with the message type, followed by the family or the packet type, followed by the four
+/// bytes of the source ip address of the sender.
+constexpr std::size_t RelaySourceIpOffset = 2;
 
 /// A class that serializes data for network transfer. It also handles endianness
 class Packet {
@@ -21,6 +42,16 @@ public:
      * @param size_in_bytes Number of bytes to append
      */
     void Append(const void* data, std::size_t size_in_bytes);
+
+    /**
+     * Overwrites a part of the packet with the given bytes.
+     * The packet is not changed when the bytes do not fit into it.
+     * @param offset         The offset of the first byte that is overwritten
+     * @param in_data        Pointer to the sequence of bytes to write
+     * @param size_in_bytes Number of bytes to write
+     * @return True if the bytes were written, false if they do not fit into the packet
+     */
+    bool OverwriteBytes(std::size_t offset, const void* in_data, std::size_t size_in_bytes);
 
     /**
      * Reads data from the current read position of the packet
@@ -61,6 +92,17 @@ public:
      */
     bool EndOfPacket() const;
 
+    /**
+     * Returns the number of bytes that have not been read yet.
+     * @return The number of bytes left in the packet
+     */
+    std::size_t RemainingBytes() const;
+
+    /**
+     * Marks the packet as invalid. Every following read will fail.
+     */
+    void Invalidate();
+
     explicit operator bool() const;
 
     /// Overloads of read function to read data from the packet
@@ -75,7 +117,14 @@ public:
     Packet& Read(u64& out_data);
     Packet& Read(float& out_data);
     Packet& Read(double& out_data);
-    Packet& Read(char* out_data);
+    /**
+     * Reads a null terminated string into the given buffer.
+     * The payload has to fit into the buffer, including the terminating null character.
+     * The packet is invalidated when it does not fit.
+     * @param out_data      Pointer to the buffer the string should get written to
+     * @param buffer_size   Size of the buffer, in bytes
+     */
+    Packet& Read(char* out_data, std::size_t buffer_size);
     Packet& Read(std::string& out_data);
     template <typename T>
     Packet& Read(std::vector<T>& out_data);
@@ -121,12 +170,39 @@ Packet& Packet::Read(std::vector<T>& out_data) {
     // First extract the size
     u32 size = 0;
     Read(size);
+    if (!is_valid) {
+        out_data.clear();
+        return *this;
+    }
+
+    // The element count is controlled by the peer, so the amount of data that those elements
+    // need has to be checked against the amount of data that is left in the packet before
+    // anything is allocated.
+    constexpr std::size_t element_size = PacketElementMinSize<T>::value;
+    if (element_size != 0 &&
+        static_cast<std::size_t>(size) > (std::numeric_limits<std::size_t>::max)() / element_size) {
+        Invalidate();
+        out_data.clear();
+        return *this;
+    }
+
+    const std::size_t required_size = static_cast<std::size_t>(size) * element_size;
+    if (required_size > RemainingBytes()) {
+        Invalidate();
+        out_data.clear();
+        return *this;
+    }
+
     out_data.resize(size);
 
     // Then extract the data
     for (std::size_t i = 0; i < out_data.size(); ++i) {
-        T character;
+        T character{};
         Read(character);
+        if (!is_valid) {
+            out_data.clear();
+            return *this;
+        }
         out_data[i] = character;
     }
     return *this;
@@ -135,7 +211,7 @@ Packet& Packet::Read(std::vector<T>& out_data) {
 template <typename T, std::size_t S>
 Packet& Packet::Read(std::array<T, S>& out_data) {
     for (std::size_t i = 0; i < out_data.size(); ++i) {
-        T character;
+        T character{};
         Read(character);
         out_data[i] = character;
     }

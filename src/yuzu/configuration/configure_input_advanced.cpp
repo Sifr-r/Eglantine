@@ -4,14 +4,33 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <iterator>
 #include <QColorDialog>
 #include "common/settings.h"
+#include "common/settings_enums.h"
 #include "core/core.h"
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
 #include "qt_common/qt_compat.h"
 #include "ui_configure_input_advanced.h"
 #include "yuzu/configuration/configure_input_advanced.h"
+
+namespace {
+
+constexpr std::array<Settings::Switch2GyroMouseMode, 3> GyroMouseModes{
+    Settings::Switch2GyroMouseMode::Off,
+    Settings::Switch2GyroMouseMode::Yaw,
+    Settings::Switch2GyroMouseMode::Roll,
+};
+
+constexpr std::array<Settings::Switch2GyroActivationMode, 2> GyroActivationModes{
+    Settings::Switch2GyroActivationMode::Hold,
+    Settings::Switch2GyroActivationMode::Toggle,
+};
+
+} // namespace
 
 ConfigureInputAdvanced::ConfigureInputAdvanced(Core::HID::HIDCore& hid_core_, QWidget* parent)
     : QWidget(parent), ui(std::make_unique<Ui::ConfigureInputAdvanced>()), hid_core{hid_core_} {
@@ -147,6 +166,23 @@ void ConfigureInputAdvanced::ApplyConfiguration() {
     Settings::values.enable_ir_sensor = ui->enable_ir_sensor->isChecked();
     Settings::values.enable_joycon_driver = ui->enable_joycon_driver->isChecked();
     Settings::values.enable_procon_driver = ui->enable_procon_driver->isChecked();
+    Settings::values.enable_switch2_driver = ui->enable_switch2_driver->isChecked();
+    Settings::values.switch2_combine_joycons = ui->switch2_combine_joycons->isChecked();
+    Settings::values.switch2_optical_mouse = ui->switch2_optical_mouse->isChecked();
+
+    const int gyro_mouse_idx = ui->switch2_gyro_mouse_mode->currentIndex();
+    if (gyro_mouse_idx >= 0 && static_cast<std::size_t>(gyro_mouse_idx) < GyroMouseModes.size()) {
+        Settings::values.switch2_gyro_mouse_mode =
+            GyroMouseModes[static_cast<std::size_t>(gyro_mouse_idx)];
+    }
+
+    const int gyro_activation_idx = ui->switch2_gyro_activation_mode->currentIndex();
+    if (gyro_activation_idx >= 0 &&
+        static_cast<std::size_t>(gyro_activation_idx) < GyroActivationModes.size()) {
+        Settings::values.switch2_gyro_activation_mode =
+            GyroActivationModes[static_cast<std::size_t>(gyro_activation_idx)];
+    }
+
     Settings::values.random_amiibo_id = ui->random_amiibo_id->isChecked();
 }
 
@@ -183,6 +219,26 @@ void ConfigureInputAdvanced::LoadConfiguration() {
     ui->enable_ir_sensor->setChecked(Settings::values.enable_ir_sensor.GetValue());
     ui->enable_joycon_driver->setChecked(Settings::values.enable_joycon_driver.GetValue());
     ui->enable_procon_driver->setChecked(Settings::values.enable_procon_driver.GetValue());
+    ui->enable_switch2_driver->setChecked(Settings::values.enable_switch2_driver.GetValue());
+    ui->switch2_combine_joycons->setChecked(Settings::values.switch2_combine_joycons.GetValue());
+    ui->switch2_optical_mouse->setChecked(Settings::values.switch2_optical_mouse.GetValue());
+
+    const auto gyro_mouse_mode = Settings::values.switch2_gyro_mouse_mode.GetValue();
+    const auto gyro_mouse_it =
+        std::find(GyroMouseModes.begin(), GyroMouseModes.end(), gyro_mouse_mode);
+    ui->switch2_gyro_mouse_mode->setCurrentIndex(
+        gyro_mouse_it != GyroMouseModes.end()
+            ? static_cast<int>(std::distance(GyroMouseModes.begin(), gyro_mouse_it))
+            : 0);
+
+    const auto gyro_activation_mode = Settings::values.switch2_gyro_activation_mode.GetValue();
+    const auto gyro_activation_it =
+        std::find(GyroActivationModes.begin(), GyroActivationModes.end(), gyro_activation_mode);
+    ui->switch2_gyro_activation_mode->setCurrentIndex(
+        gyro_activation_it != GyroActivationModes.end()
+            ? static_cast<int>(std::distance(GyroActivationModes.begin(), gyro_activation_it))
+            : 0);
+
     ui->random_amiibo_id->setChecked(Settings::values.random_amiibo_id.GetValue());
 
     UpdateUIEnabled();

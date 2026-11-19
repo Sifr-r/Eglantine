@@ -595,7 +595,7 @@ public:
             {6, nullptr, "FlushSessionCache"},
             {7, nullptr, "SetDebugOption"},
             {8, nullptr, "GetDebugOption"},
-            {8, nullptr, "ClearTls12FallbackFlag"},
+            {9, nullptr, "ClearTls12FallbackFlag"},
         };
         // clang-format on
 

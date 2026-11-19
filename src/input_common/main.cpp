@@ -28,6 +28,7 @@
 #ifdef HAVE_SDL3
 #include "input_common/drivers/joycon.h"
 #include "input_common/drivers/sdl_driver.h"
+#include "input_common/drivers/switch2.h"
 #endif
 
 #ifdef __ANDROID__
@@ -59,11 +60,11 @@ private:
 };
 
 struct InputSubsystem::Impl {
-    template <typename Engine>
-    void RegisterEngine(std::string name, std::shared_ptr<Engine>& engine) {
+    template <typename Engine, typename... Args>
+    void RegisterEngine(std::string name, std::shared_ptr<Engine>& engine, Args&&... args) {
         MappingCallback mapping_callback{[this](const MappingData& data) { RegisterInput(data); }};
 
-        engine = std::make_shared<Engine>(name);
+        engine = std::make_shared<Engine>(std::move(name), std::forward<Args>(args)...);
         engine->SetMappingCallback(mapping_callback);
 
         std::shared_ptr<InputFactory> input_factory = std::make_shared<InputFactory>(engine);
@@ -93,6 +94,7 @@ struct InputSubsystem::Impl {
 #ifdef HAVE_SDL3
         RegisterEngine("sdl", sdl);
         RegisterEngine("joycon", joycon);
+        RegisterEngine("switch2", switch2, mouse.get());
 #endif
 
         Common::Input::RegisterInputFactory("touch_from_button",
@@ -111,6 +113,11 @@ struct InputSubsystem::Impl {
     void Shutdown() {
         UnregisterEngine(update_engine);
         UnregisterEngine(keyboard);
+#ifdef HAVE_SDL3
+        UnregisterEngine(switch2);
+        UnregisterEngine(sdl);
+        UnregisterEngine(joycon);
+#endif
         UnregisterEngine(mouse);
         UnregisterEngine(touch_screen);
 #ifdef ENABLE_LIBUSB
@@ -124,10 +131,6 @@ struct InputSubsystem::Impl {
 #endif
         UnregisterEngine(virtual_amiibo);
         UnregisterEngine(virtual_gamepad);
-#ifdef HAVE_SDL3
-        UnregisterEngine(sdl);
-        UnregisterEngine(joycon);
-#endif
 
         Common::Input::UnregisterInputFactory("touch_from_button");
         Common::Input::UnregisterInputFactory("analog_from_button");
@@ -155,6 +158,8 @@ struct InputSubsystem::Impl {
         auto udp_devices = udp_client->GetInputDevices();
         devices.insert(devices.end(), udp_devices.begin(), udp_devices.end());
 #ifdef HAVE_SDL3
+        auto switch2_devices = switch2->GetInputDevices();
+        devices.insert(devices.end(), switch2_devices.begin(), switch2_devices.end());
         auto joycon_devices = joycon->GetInputDevices();
         devices.insert(devices.end(), joycon_devices.begin(), joycon_devices.end());
         auto sdl_devices = sdl->GetInputDevices();
@@ -195,6 +200,9 @@ struct InputSubsystem::Impl {
         }
         if (engine == joycon->GetEngineName()) {
             return joycon;
+        }
+        if (engine == switch2->GetEngineName()) {
+            return switch2;
         }
 #endif
         return nullptr;
@@ -287,6 +295,9 @@ struct InputSubsystem::Impl {
         if (engine == joycon->GetEngineName()) {
             return true;
         }
+        if (engine == switch2->GetEngineName()) {
+            return true;
+        }
 #endif
         return false;
     }
@@ -304,6 +315,7 @@ struct InputSubsystem::Impl {
 #ifdef HAVE_SDL3
         sdl->BeginConfiguration();
         joycon->BeginConfiguration();
+        switch2->BeginConfiguration();
 #endif
     }
 
@@ -320,6 +332,7 @@ struct InputSubsystem::Impl {
 #ifdef HAVE_SDL3
         sdl->EndConfiguration();
         joycon->EndConfiguration();
+        switch2->EndConfiguration();
 #endif
     }
 
@@ -353,6 +366,7 @@ struct InputSubsystem::Impl {
 #ifdef HAVE_SDL3
     std::shared_ptr<SDLDriver> sdl;
     std::shared_ptr<Joycons> joycon;
+    std::shared_ptr<Switch2Controllers> switch2;
 #endif
 
 #ifdef __ANDROID__
@@ -436,6 +450,22 @@ VirtualGamepad* InputSubsystem::GetVirtualGamepad() {
 
 const VirtualGamepad* InputSubsystem::GetVirtualGamepad() const {
     return impl->virtual_gamepad.get();
+}
+
+Switch2Controllers* InputSubsystem::GetSwitch2() {
+#ifdef HAVE_SDL3
+    return impl->switch2.get();
+#else
+    return nullptr;
+#endif
+}
+
+const Switch2Controllers* InputSubsystem::GetSwitch2() const {
+#ifdef HAVE_SDL3
+    return impl->switch2.get();
+#else
+    return nullptr;
+#endif
 }
 
 std::vector<Common::ParamPackage> InputSubsystem::GetInputDevices() const {

@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+@_CPACK_OTHER_VARIABLES_@
+
+if(NOT CPACK_PROPERTIES_FILE)
+    set(CPACK_PROPERTIES_FILE "@CMAKE_BINARY_DIR@/CPackProperties.cmake")
+endif()
+if(EXISTS "${CPACK_PROPERTIES_FILE}")
+    include("${CPACK_PROPERTIES_FILE}")
+endif()
+
+# CPack matches absolute paths. Keep nested public directories of the same name.
+string(REGEX REPLACE [=[([][+.*()^$|?\\])]=] [=[\\\1]=]
+    _eglantine_source_root [==[@CMAKE_SOURCE_DIR@]==])
+list(APPEND CPACK_SOURCE_IGNORE_FILES "^${_eglantine_source_root}/(ignore|[.]lab)(/|$)")
+list(APPEND CPACK_IGNORE_FILES "^${_eglantine_source_root}/(ignore|[.]lab)(/|$)")
+unset(_eglantine_source_root)

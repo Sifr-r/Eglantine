@@ -9,6 +9,7 @@
 #include "common/assert.h"
 #include "common/fs/file.h"
 #include "common/fs/fs.h"
+#include "common/fs/fs_util.h"
 #ifdef __ANDROID__
 #include "common/fs/fs_android.h"
 #endif
@@ -201,6 +202,10 @@ size_t AppendStringToFile(const std::filesystem::path& path, FileType type,
 
 IOFile::IOFile() = default;
 
+IOFile::IOFile(const char* path, FileAccessMode mode, FileType type, FileShareFlag flag) {
+    Open(path, mode, type, flag);
+}
+
 IOFile::IOFile(const std::string& path, FileAccessMode mode, FileType type, FileShareFlag flag) {
     Open(path, mode, type, flag);
 }
@@ -242,6 +247,22 @@ FileAccessMode IOFile::GetAccessMode() const {
 
 FileType IOFile::GetType() const {
     return file_type;
+}
+
+void IOFile::Open(const char* path, FileAccessMode mode, FileType type, FileShareFlag flag) {
+    Open(path != nullptr ? std::string_view{path} : std::string_view{}, mode, type, flag);
+}
+
+void IOFile::Open(const std::string& path, FileAccessMode mode, FileType type, FileShareFlag flag) {
+    Open(std::string_view{path}, mode, type, flag);
+}
+
+void IOFile::Open(std::string_view path, FileAccessMode mode, FileType type, FileShareFlag flag) {
+#ifdef _WIN32
+    Open(fs::path{ToU8String(path)}, mode, type, flag);
+#else
+    Open(fs::path{path}, mode, type, flag);
+#endif
 }
 
 void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, FileShareFlag flag) {

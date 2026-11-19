@@ -32,6 +32,7 @@ public:
     explicit UsageTracker(size_t size) {
         const size_t num_pages = (size >> BUFFER_PAGE_SHIFT) + 1;
         pages.resize(num_pages, 0ULL);
+        dirty_begin = pages.size();
     }
 
     void Reset() noexcept {
@@ -39,7 +40,11 @@ public:
             return;
         }
         touched = false;
-        std::ranges::fill(pages, 0ULL);
+        if (dirty_begin < dirty_end) {
+            std::fill(pages.begin() + dirty_begin, pages.begin() + dirty_end, 0ULL);
+        }
+        dirty_begin = pages.size();
+        dirty_end = 0;
         recent.fill({~u64{0}, 0});
         full_begin = 0;
         full_end = 0;
@@ -111,6 +116,8 @@ private:
         if (begin >= end) {
             return;
         }
+        dirty_begin = (std::min)(dirty_begin, begin);
+        dirty_end = (std::max)(dirty_end, end);
         // Pages in [full_begin, full_end) are all ones already (only Reset clears a page): fill
         // around that run and grow it. Keeps tracking a multi-megabyte binding O(1) once filled.
         if (!Nx2Perf::On(Nx2Perf::Opt::UsageTracker) || end < full_begin || begin > full_end) {
@@ -163,6 +170,8 @@ private:
 
     void TrackPage(u64 page, u64 offset, u64 size) noexcept {
         pages[page] |= PageMask(offset, size);
+        dirty_begin = (std::min)(dirty_begin, static_cast<size_t>(page));
+        dirty_end = (std::max)(dirty_end, static_cast<size_t>(page) + 1);
     }
 
     bool IsPageUsed(u64 page, u64 offset, u64 size) const noexcept {
@@ -175,6 +184,9 @@ private:
     std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
     size_t recent_cursor{};
     bool touched{}; ///< Tracked since the last Reset (Reset skips untouched trackers)
+    /// Half-open page span [dirty_begin, dirty_end) touched since the last Reset.
+    size_t dirty_begin{};
+    size_t dirty_end{};
     /// Pages known to be all ones (FillPages).
     size_t full_begin{};
     size_t full_end{};

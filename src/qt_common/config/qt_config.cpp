@@ -7,6 +7,8 @@
 // SPDX-FileCopyrightText: 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "common/game_presets.h"
 #include "common/logging.h"
 #include "input_common/main.h"
@@ -253,6 +255,7 @@ void QtConfig::ReadPathValues() {
 void QtConfig::ReadShortcutValues() {
     BeginGroup(Settings::TranslateCategory(Settings::Category::Shortcuts));
 
+    UISettings::values.shortcuts.clear();
     for (const auto& [name, group, shortcut] : UISettings::default_hotkeys) {
         BeginGroup(group);
         BeginGroup(name);
@@ -491,19 +494,24 @@ void QtConfig::SavePathValues() {
 void QtConfig::SaveShortcutValues() {
     BeginGroup(Settings::TranslateCategory(Settings::Category::Shortcuts));
 
-    // Lengths of UISettings::values.shortcuts & default_hotkeys are same.
-    // However, their ordering must also be the same.
-    for (std::size_t i = 0; i < UISettings::default_hotkeys.size(); i++) {
-        const auto& [name, group, shortcut] = UISettings::values.shortcuts[i];
-        const auto& default_hotkey = UISettings::default_hotkeys[i].shortcut;
+    const auto& shortcuts = UISettings::values.shortcuts;
+    for (const auto& [name, group, default_hotkey] : UISettings::default_hotkeys) {
+        const auto entry = std::ranges::find_if(shortcuts, [&](const UISettings::Shortcut& hotkey) {
+            return hotkey.name == name && hotkey.group == group;
+        });
+        if (entry == shortcuts.end()) {
+            continue;
+        }
+        const auto& shortcut = entry->shortcut;
 
         BeginGroup(group);
         BeginGroup(name);
 
-        WriteStringSetting(std::string("KeySeq"), shortcut.keyseq,
-                           std::make_optional(default_hotkey.keyseq));
-        WriteStringSetting(std::string("Controller_KeySeq"), shortcut.controller_keyseq,
-                           std::make_optional(default_hotkey.controller_keyseq));
+        WriteBooleanSetting("KeySeq\\default", shortcut.keyseq == default_hotkey.keyseq);
+        WriteStringSetting("KeySeq", shortcut.keyseq);
+        WriteBooleanSetting("Controller_KeySeq\\default",
+                            shortcut.controller_keyseq == default_hotkey.controller_keyseq);
+        WriteStringSetting("Controller_KeySeq", shortcut.controller_keyseq);
         WriteIntegerSetting(std::string("Context"), shortcut.context,
                             std::make_optional(default_hotkey.context));
         WriteBooleanSetting(std::string("Repeat"), shortcut.repeat,

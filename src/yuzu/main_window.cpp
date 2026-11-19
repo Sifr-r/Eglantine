@@ -38,6 +38,7 @@
 #include "about_dialog.h"
 #include "data_dialog.h"
 #include "deps_dialog.h"
+#include "diagnostics_dialog.h"
 #include "install_dialog.h"
 
 #include "bootmanager.h"
@@ -188,7 +189,9 @@ static FileSys::VirtualFile VfsDirectoryCreateFileWrapper(const FileSys::Virtual
 // Input //
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
+#include "input_common/drivers/switch2_auto_pair.h"
 #include "input_common/drivers/virtual_amiibo.h"
+#include "input_common/main.h"
 
 // Video Core //
 #include "video_core/gpu.h"
@@ -342,6 +345,7 @@ __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
 
 constexpr int default_mouse_hide_timeout = 2500;
 constexpr int default_input_update_timeout = 1;
+constexpr int default_switch2_auto_pair_timeout = 1000;
 constexpr int EmuThreadStopTimeoutMs = 10'000;
 
 constexpr size_t CopyBufferSize = 1_MiB;
@@ -404,7 +408,7 @@ static Settings::UpdateChannel ToSettingsChannel(UpdateChecker::Channel channel)
 
 MainWindow::MainWindow(bool has_broken_vulkan)
     : ui{std::make_unique<Ui::MainWindow>()},
-      input_subsystem{std::make_shared<InputCommon::InputSubsystem>()}, user_data_migrator{this} {
+      input_subsystem{std::make_shared<InputCommon::InputSubsystem>()} {
     QtCommon::Init(this);
 
     Common::FS::CreateEdenPaths();
@@ -414,24 +418,6 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     Common::Log::Filter filter;
     filter.ParseFilterString(Settings::values.log_filter.GetValue());
     Common::Log::SetGlobalFilter(filter);
-
-    if (user_data_migrator.migrated) {
-        // Sort-of hack whereby we only move the old dir if it's a subfolder of the user dir
-
-        using namespace Common::FS;
-
-        static constexpr const std::array<const EdenPath, 4> paths = {
-            EdenPath::NANDDir, EdenPath::SDMCDir, EdenPath::DumpDir, EdenPath::LoadDir};
-
-        for (const EdenPath& path : paths) {
-            std::string str_path = Common::FS::GetEdenPathString(path);
-            if (str_path.starts_with(user_data_migrator.selected_emu.get_user_dir())) {
-                boost::replace_all(
-                    str_path, user_data_migrator.selected_emu.lower_name().toStdString(), "eden");
-                Common::FS::SetEdenPath(path, str_path);
-            }
-        }
-    }
 
 #ifdef __unix__
     SetupSigInterrupts();
@@ -528,6 +514,12 @@ MainWindow::MainWindow(bool has_broken_vulkan)
     connect(&update_input_timer, &QTimer::timeout, this, &MainWindow::UpdateInputDrivers);
     update_input_timer.start();
 
+    // Pick up Switch 2 controllers that are plugged in (or paired) while the app runs.
+    switch2_auto_pair_timer.setInterval(default_switch2_auto_pair_timeout);
+    connect(&switch2_auto_pair_timer, &QTimer::timeout, this,
+            &MainWindow::UpdateSwitch2Controllers);
+    switch2_auto_pair_timer.start();
+
     if (has_broken_vulkan) {
         UISettings::values.has_broken_vulkan = true;
 
@@ -598,9 +590,9 @@ MainWindow::MainWindow(bool has_broken_vulkan)
         } else if (lp.launch_qlaunch) {
             LaunchFirmwareApplet(u64(Service::AM::AppletProgramId::QLaunch), std::nullopt);
         } else if (lp.launch_hlaunch) {
-            std::filesystem::path const sd_dir =
-                Common::FS::GetEdenPathString(Common::FS::EdenPath::SDMCDir);
-            auto const hbl_path = (sd_dir / "atmosphere" / "hbl.nsp").string();
+            const auto& sd_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::SDMCDir);
+            auto const hbl_path =
+                Common::FS::PathToUTF8String(sd_dir / "atmosphere" / "hbl.nsp");
             BootGame(
                 QString::fromStdString(hbl_path),
                 LibraryAppletParameters(0x010000000000100Dull, Service::AM::AppletId::QLaunch));
@@ -992,6 +984,8 @@ void MainWindow::UpdateMcpStatusLabel() {
 
 /// Cancels pending work, releases the MCP server and frees the render window.
 MainWindow::~MainWindow() {
+    // Normally stopped in closeEvent already; this is the fallback.
+    switch2_auto_pair_timer.stop();
     if (nup_cancel) {
         nup_cancel->store(true);
     }
@@ -2097,6 +2091,7 @@ void MainWindow::ConnectMenuEvents() {
     connect_menu(ui->action_SDMC_Folder, &MainWindow::OnOpenSDMCFolder);
     connect_menu(ui->action_Mod_Folder, &MainWindow::OnOpenModFolder);
     connect_menu(ui->action_Log_Folder, &MainWindow::OnOpenLogFolder);
+    connect_menu(ui->action_Diagnostics, &MainWindow::OnDiagnostics);
 
     connect_menu(ui->action_Verify_installed_contents, &MainWindow::OnVerifyInstalledContents);
     connect_menu(ui->action_Firmware_From_Folder, &MainWindow::OnInstallFirmware);
@@ -4585,6 +4580,11 @@ void MainWindow::OnOpenLogFolder() {
     QtCommon::Game::OpenLogFolder();
 }
 
+void MainWindow::OnDiagnostics() {
+    DiagnosticsDialog dialog(this);
+    dialog.exec();
+}
+
 void MainWindow::OnVerifyInstalledContents() {
     QtCommon::Content::VerifyInstalledContents();
 }
@@ -5550,6 +5550,40 @@ void MainWindow::UpdateInputDrivers() {
     input_subsystem->PumpEvents();
 }
 
+/// Binds Switch 2 controllers that showed up while the app was running to player slots.
+void MainWindow::UpdateSwitch2Controllers() {
+    if (!input_subsystem || config == nullptr || controller_applet != nullptr)
+        return;
+    auto* switch2 = input_subsystem->GetSwitch2();
+    if (switch2 == nullptr)
+        return;
+
+    const auto changed = switch2_auto_pair.Apply(*switch2);
+    if (changed.empty())
+        return;
+
+    for (const auto& entry : changed) {
+        config->SaveQtControlPlayerValues(entry.player_index);
+    }
+
+    // Let a running game pick up the new bindings.
+    if (QtCommon::system != nullptr) {
+        QtCommon::system->HIDCore().ReloadInputDevices();
+    }
+
+    for (const auto& entry : changed) {
+        const QString device_name = QString::fromStdString(entry.device_name);
+        const int player_number = static_cast<int>(entry.player_index) + 1;
+        if (entry.disconnected) {
+            statusBar()->showMessage(
+                tr("%1 disconnected from Player %2").arg(device_name).arg(player_number), 15000);
+        } else {
+            statusBar()->showMessage(
+                tr("%1 connected as Player %2").arg(device_name).arg(player_number), 15000);
+        }
+    }
+}
+
 void MainWindow::HideMouseCursor() {
     if (QtCommon::emu_thread == nullptr && UISettings::values.hide_mouse) {
         mouse_hide_timer.stop();
@@ -5813,6 +5847,8 @@ void MainWindow::closeEvent(QCloseEvent* event) {
 
     render_window->close();
     multiplayer_state->Close();
+    // The auto-pair poll must not touch the input devices while they are being unloaded.
+    switch2_auto_pair_timer.stop();
     QtCommon::system->HIDCore().UnloadInputDevices();
     Network::Shutdown();
 

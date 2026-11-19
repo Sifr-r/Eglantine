@@ -781,23 +781,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
             const auto dest = surface(*replacement_output);
             if (source && dest) {
                 // Does the program decode sRGB itself? (Ocarina's movie network does.)
-                const bool decodes_srgb = [&] {
-                    const GPUVAddr program = regs.code_loc.Address();
-                    std::array<u32, 0x400> block{};
-                    bool threshold = false, exponent = false;
-                    for (u64 offset = 0; offset < 0x20000 && !(threshold && exponent);
-                         offset += sizeof(block)) {
-                        if (!memory_manager.IsFullyMappedRange(program + offset, sizeof(block)))
-                            break;
-                        memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
-                        for (size_t word = 0; word < block.size(); word += 4) {
-                            const u32 opcode = block[word] & 0xfff;
-                            threshold |= opcode == 0x434 && block[word + 1] == 0x292d292d;
-                            exponent |= opcode == 0x832 && block[word + 1] == 0x40cc40cc;
-                        }
-                    }
-                    return threshold && exponent;
-                }();
+                const bool decodes_srgb = NativeProgramDecodesSrgb(regs.code_loc.Address());
                 const Fermi2D::Config config{
                     .operation = decodes_srgb ? Fermi2D::Operation::SrcCopySrgbToLinear
                                               : Fermi2D::Operation::SrcCopy,
@@ -813,10 +797,16 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
                     .src_y1 = static_cast<s32>(replacement_input->Height()),
                 };
                 const bool done = rasterizer->AccelerateSurfaceCopy(*source, *dest, config);
-                LOG_INFO(HW_GPU,
-                         "Native network pass {:#x} replaced by input copy {}->{} ({}): {}",
-                         regs.code_loc.Address(), replacement_input->Address(),
-                         replacement_output->Address(), decodes_srgb ? "sRGB" : "plain", done);
+                if (logged_native_network_copies
+                        .emplace(regs.code_loc.Address(), replacement_input->Address(),
+                                 replacement_output->Address())
+                        .second &&
+                    logged_native_network_copies.size() <= 64) {
+                    LOG_INFO(HW_GPU,
+                             "Native network pass {:#x} replaced by input copy {}->{} ({}): {}",
+                             regs.code_loc.Address(), replacement_input->Address(),
+                             replacement_output->Address(), decodes_srgb ? "sRGB" : "plain", done);
+                }
                 native_upscale_input.reset();
                 network_skip_remaining = 0;
                 return true;
@@ -1345,6 +1335,37 @@ const std::pair<std::vector<u32>, std::vector<u32>>& KeplerCompute::NativeImageH
     return cache.emplace(program, std::move(handles)).first->second;
 }
 
+bool KeplerCompute::NativeProgramDecodesSrgb(GPUVAddr program, bool* newly_cached) {
+    const u64 map_serial = memory_manager.GetMapSerial();
+    if (const auto it = native_srgb_cache.find(program);
+        it != native_srgb_cache.end() && it->second.map_serial == map_serial) {
+        if (newly_cached != nullptr) {
+            *newly_cached = false;
+        }
+        return it->second.decodes_srgb;
+    }
+    bool threshold = false;
+    bool exponent = false;
+    std::array<u32, 0x400> block{};
+    for (u64 offset = 0; offset < 0x20000 && !(threshold && exponent); offset += sizeof(block)) {
+        if (!memory_manager.IsFullyMappedRange(program + offset, sizeof(block))) {
+            break;
+        }
+        memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
+        for (size_t word = 0; word < block.size(); word += 4) {
+            const u32 opcode = block[word] & 0xfff;
+            threshold |= opcode == 0x434 && block[word + 1] == 0x292d292d;
+            exponent |= opcode == 0x832 && block[word + 1] == 0x40cc40cc;
+        }
+    }
+    const bool decodes = threshold && exponent;
+    native_srgb_cache[program] = {.map_serial = map_serial, .decodes_srgb = decodes};
+    if (newly_cached != nullptr) {
+        *newly_cached = true;
+    }
+    return decodes;
+}
+
 void KeplerCompute::RememberNativeUpscaleInput() {
     const auto& [reads, stores] = NativeImageHandles(regs.code_loc.Address());
     // An image-fed matrix pass writes its intermediate results to buffers. Retain its colour
@@ -1494,30 +1515,18 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
     // and the 2.4 exponent as half-precision immediates of HSETP2 and HMUL2). The copy of its
     // sRGB input left the frame gamma-encoded twice, washed out: decode in the copy when the
     // program does.
-    static std::unordered_map<GPUVAddr, bool> decodes_srgb;
     const GPUVAddr program = regs.code_loc.Address();
-    const auto [known, inserted] = decodes_srgb.try_emplace(program, false);
-    if (inserted) {
-        bool threshold = false, exponent = false;
-        std::array<u32, 0x400> block{};
-        for (u64 offset = 0; offset < 0x20000 && !(threshold && exponent); offset += sizeof(block)) {
-            if (!memory_manager.IsFullyMappedRange(program + offset, sizeof(block))) break;
-            memory_manager.ReadBlock(program + offset, block.data(), sizeof(block));
-            for (size_t word = 0; word < block.size(); word += 4) {
-                const u32 opcode = block[word] & 0xfff;
-                threshold |= opcode == 0x434 && block[word + 1] == 0x292d292d;
-                exponent |= opcode == 0x832 && block[word + 1] == 0x40cc40cc;
-            }
-        }
-        known->second = threshold && exponent;
+    bool newly_cached = false;
+    const bool decodes_srgb = NativeProgramDecodesSrgb(program, &newly_cached);
+    if (newly_cached) {
         LOG_INFO(HW_GPU, "Upscale fallback for program {:#x}: {}", program,
-                 known->second ? "decodes sRGB like the program" : "plain copy");
+                 decodes_srgb ? "decodes sRGB like the program" : "plain copy");
     }
     const Fermi2D::Config config{
         .operation = (shared_exponent_input && output->format == Texture::TextureFormat::B10G11R11)
                          ? Fermi2D::Operation::SrcCopySquare
-                     : known->second ? Fermi2D::Operation::SrcCopySrgbToLinear
-                                     : Fermi2D::Operation::SrcCopy,
+                     : decodes_srgb ? Fermi2D::Operation::SrcCopySrgbToLinear
+                                    : Fermi2D::Operation::SrcCopy,
         .filter = Fermi2D::Filter::Bilinear,
         .must_accelerate = true,
         .dst_x0 = 0,
