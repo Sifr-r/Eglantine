@@ -1039,6 +1039,10 @@ void MainWindow::AmiiboSettingsRequestExit() {
 
 void MainWindow::ControllerSelectorReconfigureControllers(
     const Core::Frontend::ControllerParameters& parameters) {
+    if (parameters.enable_single_mode) {
+        UpdateSwitch2Controllers();
+    }
+
     controller_applet =
         new QtControllerSelectorDialog(this, parameters, input_subsystem.get(), *QtCommon::system);
     SCOPE_EXIT {
@@ -4138,6 +4142,10 @@ void MainWindow::OpenConfigureDialog(bool select_profiles) {
     const bool old_mcp_writes = Settings::values.mcp_allow_writes.GetValue();
 #endif
 
+    is_configuring = true;
+    SCOPE_EXIT {
+        is_configuring = false;
+    };
     Settings::SetConfiguringGlobal(true);
     ConfigureDialog configure_dialog(this, hotkey_registry, input_subsystem.get(),
                                      vk_device_records, *QtCommon::system,
@@ -4445,6 +4453,10 @@ void MainWindow::OnConfigurePerGame() {
 }
 
 void MainWindow::OpenPerGameConfiguration(u64 title_id, const std::string& file_name) {
+    is_configuring = true;
+    SCOPE_EXIT {
+        is_configuring = false;
+    };
     const auto v_file = Core::GetGameFileFromPath(QtCommon::vfs, file_name);
 
     Settings::SetConfiguringGlobal(false);
@@ -4581,8 +4593,14 @@ void MainWindow::OnOpenLogFolder() {
 }
 
 void MainWindow::OnDiagnostics() {
-    DiagnosticsDialog dialog(this);
-    dialog.exec();
+    auto* dialog = findChild<DiagnosticsDialog*>(QString{}, Qt::FindDirectChildrenOnly);
+    if (!dialog) {
+        dialog = new DiagnosticsDialog(this);
+    }
+    dialog->setWindowState(dialog->windowState() & ~Qt::WindowMinimized);
+    dialog->show();
+    dialog->raise();
+    dialog->activateWindow();
 }
 
 void MainWindow::OnVerifyInstalledContents() {
@@ -5552,13 +5570,17 @@ void MainWindow::UpdateInputDrivers() {
 
 /// Binds Switch 2 controllers that showed up while the app was running to player slots.
 void MainWindow::UpdateSwitch2Controllers() {
-    if (!input_subsystem || config == nullptr || controller_applet != nullptr)
+    if (is_configuring || !input_subsystem || config == nullptr || controller_applet != nullptr)
         return;
     auto* switch2 = input_subsystem->GetSwitch2();
     if (switch2 == nullptr)
         return;
 
-    const auto changed = switch2_auto_pair.Apply(*switch2);
+    static const auto keyboard_defaults = InputCommon::MakeDefaultKeyboardPlayer(
+        QtConfig::default_buttons, QtConfig::default_analogs, QtConfig::default_stick_mod,
+        QtConfig::default_motions);
+    const auto changed = switch2_auto_pair.Apply(
+        *switch2, InputCommon::PlayerOneUsesDefaultKeyboard(keyboard_defaults));
     if (changed.empty())
         return;
 

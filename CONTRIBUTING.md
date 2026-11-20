@@ -35,7 +35,7 @@ Search the [open issues](https://github.com/Djihads80/Eglantine/issues) and [pul
 Submit a pull request to [Djihads80/Eglantine](https://github.com/Djihads80/Eglantine). You need a GitHub account; the Eden Forgejo account registration process does not apply here.
 
 1. Fork the Eglantine repository to your GitHub account.
-2. Clone your fork and create a branch for your change based on Eglantine's `nx2` branch.
+2. Clone your fork and create a branch for your change based on Eglantine's `nx2` branch. To read the documentation locally, run `git submodule update --init docs` from the repository root.
 3. Make a focused change, following the policies above and the [coding guidelines][coding-policy].
 4. Review and test your changes. For code changes, follow the [build documentation][build-docs] for your platform and verify the affected behavior. For documentation changes, preview the Markdown and check the instructions and links.
 5. Commit your changes and push your branch to your fork.
@@ -58,3 +58,4 @@ If you have an external tool/page that you believe would be handy to integrate/l
 [build-docs]: https://github.com/Eglantine-Community/docs/blob/master/content/Build.mdx
 [code-owners]: https://github.com/Eglantine-Community/docs/blob/master/content/CODEOWNERS
 [coding-policy]: https://github.com/Eglantine-Community/docs/blob/master/content/policies/Coding.mdx
+[ai-policy]: https://github.com/Eglantine-Community/docs/blob/master/content/policies/AI.mdx

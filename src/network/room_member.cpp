@@ -137,7 +137,7 @@ public:
      * Extracts a MAC Address from a received ENet packet.
      * @param event The ENet event that was received.
      */
-    void HandleJoinPacket(const ENetEvent* event);
+    bool HandleJoinPacket(const ENetEvent* event);
     /**
      * Extracts RoomInformation and MemberInformation from a received ENet packet.
      * @param event The ENet event that was received.
@@ -222,18 +222,35 @@ void RoomMember::RoomMemberImpl::StartLoop() {
                         HandleRoomInformationPacket(&event);
                         break;
                     case IdJoinSuccess:
-                    case IdJoinSuccessAsMod:
+                    case IdJoinSuccessAsMod: {
+                        if (event.packet->dataLength < sizeof(u8) + sizeof(IPv4Address)) {
+                            LOG_WARNING(Network,
+                                        "Received a malformed join success packet. Ignoring it.");
+                            break;
+                        }
                         // The join request was successful, we are now in the room.
                         // If we joined successfully, there must be at least one client in the room: us.
-                        ASSERT_MSG(member_information.size() > 0,
-                                "We have not yet received member information.");
-                        HandleJoinPacket(&event); // Get the MAC Address for the client
+                        bool has_member_information = false;
+                        {
+                            std::lock_guard state_lock(state_mutex);
+                            has_member_information = !member_information.empty();
+                        }
+                        if (!has_member_information) {
+                            LOG_WARNING(Network,
+                                        "We have not yet received member information. Ignoring "
+                                        "join success packet.");
+                            break;
+                        }
+                        if (!HandleJoinPacket(&event)) { // Get the MAC Address for the client
+                            break;
+                        }
                         if (event.packet->data[0] == IdJoinSuccessAsMod) {
                             SetState(State::Moderator);
                         } else {
                             SetState(State::Joined);
                         }
                         break;
+                    }
                     case IdModBanListResponse:
                         HandleModBanListResponsePacket(&event);
                         break;
@@ -289,7 +306,8 @@ void RoomMember::RoomMemberImpl::StartLoop() {
                 case ENET_EVENT_TYPE_CONNECT:
                     // The ENET_EVENT_TYPE_CONNECT event can not possibly happen here because we're
                     // already connected
-                    ASSERT_MSG(false, "Received unexpected connect event while already connected");
+                    LOG_WARNING(Network,
+                                "Received unexpected connect event while already connected");
                     break;
                 }
             }
@@ -413,7 +431,7 @@ void RoomMember::RoomMemberImpl::HandleRoomInformationPacket(const ENetEvent* ev
     Invoke(info);
 }
 
-void RoomMember::RoomMemberImpl::HandleJoinPacket(const ENetEvent* event) {
+bool RoomMember::RoomMemberImpl::HandleJoinPacket(const ENetEvent* event) {
     Packet packet;
     packet.Append(event->packet->data, event->packet->dataLength);
 
@@ -423,9 +441,14 @@ void RoomMember::RoomMemberImpl::HandleJoinPacket(const ENetEvent* event) {
     // Parse the MAC Address from the packet
     IPv4Address new_fake_ip{};
     packet.Read(new_fake_ip);
+    if (!packet) {
+        LOG_WARNING(Network, "Received a malformed join packet. Ignoring it.");
+        return false;
+    }
 
     std::lock_guard lock(state_mutex);
     fake_ip = new_fake_ip;
+    return true;
 }
 
 void RoomMember::RoomMemberImpl::HandleProxyPackets(const ENetEvent* event) {
@@ -437,24 +460,28 @@ void RoomMember::RoomMemberImpl::HandleProxyPackets(const ENetEvent* event) {
     packet.IgnoreBytes(sizeof(u8)); // Ignore the message type
 
     // Parse the ProxyPacket from the packet
-    u8 local_family;
+    u8 local_family{};
     packet.Read(local_family);
     proxy_packet.local_endpoint.family = static_cast<Domain>(local_family);
     packet.Read(proxy_packet.local_endpoint.ip);
     packet.Read(proxy_packet.local_endpoint.portno);
 
-    u8 remote_family;
+    u8 remote_family{};
     packet.Read(remote_family);
     proxy_packet.remote_endpoint.family = static_cast<Domain>(remote_family);
     packet.Read(proxy_packet.remote_endpoint.ip);
     packet.Read(proxy_packet.remote_endpoint.portno);
 
-    u8 protocol_type;
+    u8 protocol_type{};
     packet.Read(protocol_type);
     proxy_packet.protocol = static_cast<Protocol>(protocol_type);
 
     packet.Read(proxy_packet.broadcast);
     packet.Read(proxy_packet.data);
+    if (!packet) {
+        LOG_WARNING(Network, "Received a malformed proxy packet. Ignoring it.");
+        return;
+    }
 
     Invoke<ProxyPacket>(proxy_packet);
 }
@@ -467,7 +494,7 @@ void RoomMember::RoomMemberImpl::HandleLdnPackets(const ENetEvent* event) {
     // Ignore the first byte, which is the message id.
     packet.IgnoreBytes(sizeof(u8)); // Ignore the message type
 
-    u8 packet_type;
+    u8 packet_type{};
     packet.Read(packet_type);
     ldn_packet.type = static_cast<LDNPacketType>(packet_type);
 
@@ -476,6 +503,10 @@ void RoomMember::RoomMemberImpl::HandleLdnPackets(const ENetEvent* event) {
     packet.Read(ldn_packet.broadcast);
 
     packet.Read(ldn_packet.data);
+    if (!packet) {
+        LOG_WARNING(Network, "Received a malformed LDN packet. Ignoring it.");
+        return;
+    }
 
     Invoke<LDNPacket>(ldn_packet);
 }
@@ -491,6 +522,10 @@ void RoomMember::RoomMemberImpl::HandleChatPacket(const ENetEvent* event) {
     packet.Read(chat_entry.nickname);
     packet.Read(chat_entry.username);
     packet.Read(chat_entry.message);
+    if (!packet) {
+        LOG_WARNING(Network, "Received a malformed chat packet. Ignoring it.");
+        return;
+    }
     Invoke<ChatEntry>(chat_entry);
 }
 
@@ -507,6 +542,10 @@ void RoomMember::RoomMemberImpl::HandleStatusMessagePacket(const ENetEvent* even
     status_message_entry.type = static_cast<StatusMessageTypes>(type);
     packet.Read(status_message_entry.nickname);
     packet.Read(status_message_entry.username);
+    if (!packet) {
+        LOG_WARNING(Network, "Received a malformed status message packet. Ignoring it.");
+        return;
+    }
     Invoke<StatusMessageEntry>(status_message_entry);
 }
 
@@ -520,6 +559,10 @@ void RoomMember::RoomMemberImpl::HandleModBanListResponsePacket(const ENetEvent*
     Room::BanList ban_list = {};
     packet.Read(ban_list.first);
     packet.Read(ban_list.second);
+    if (!packet) {
+        LOG_WARNING(Network, "Received a malformed ban list response packet. Ignoring it.");
+        return;
+    }
     Invoke<Room::BanList>(ban_list);
 }
 

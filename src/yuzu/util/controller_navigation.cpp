@@ -93,7 +93,7 @@ void ControllerNavigation::ControllerUpdateButton() {
 void ControllerNavigation::ControllerUpdateStick() {
     const auto controller_type = player1_controller->GetNpadStyleIndex();
     const auto& player1_sticks = player1_controller->GetSticksValues();
-    const auto& handheld_sticks = player1_controller->GetSticksValues();
+    const auto& handheld_sticks = handheld_controller->GetSticksValues();
     bool update = false;
 
     for (std::size_t i = 0; i < player1_sticks.size(); ++i) {

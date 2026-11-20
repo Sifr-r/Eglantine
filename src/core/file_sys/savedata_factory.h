@@ -7,6 +7,8 @@
 #pragma once
 
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 #include <vector>
 #include "common/common_funcs.h"
@@ -45,6 +47,13 @@ struct SaveDataEntry {
     /// Path of the save, relative to the root of its space.
     std::string relative_path;
 };
+
+/// Stable guest-visible identity; hash collisions are rejected by FindSaveDataEntryById.
+[[nodiscard]] u64 GetSaveDataId(const SaveDataEntry& entry);
+
+/// Resolves a unique identity, or an unambiguous legacy title id scoped to the active account.
+[[nodiscard]] const SaveDataEntry* FindSaveDataEntryById(
+    std::span<const SaveDataEntry> entries, u64 save_data_id, std::optional<UserId> active_user);
 
 
 /// File system interface to the SaveData archive

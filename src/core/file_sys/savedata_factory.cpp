@@ -10,17 +10,20 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <fmt/format.h>
 
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/fs/path_util.h"
 #include "common/hex_util.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "common/uuid.h"
 #include "core/core.h"
 #include "core/file_sys/errors.h"
 #include "core/file_sys/savedata_factory.h"
 #include "core/file_sys/vfs/vfs.h"
+#include "core/hle/service/acc/profile_manager.h"
 
 namespace FileSys {
 
@@ -63,14 +66,31 @@ std::string GetFutureSaveDataPath(SaveDataSpaceId space_id, SaveDataType type, u
     }
 }
 
-// The side-car file that holds the commit id of a save data. It lives inside the save directory,
-// next to the data it describes.
-constexpr const char* SaveDataCommitIdFileName = ".yuzu_save_commit_id";
-
 // The emulator does not enforce a quota on the save data directory, so the free space that is
 // reported to the guest is derived from a nominal size of the space. It matches the default size
 // of a title save.
 constexpr s64 NominalSpaceSize = 0xF0000000;
+
+std::optional<UserId> GetActiveUserId(const Core::System& system) {
+    const s32 current_user = Settings::values.current_user.GetValue();
+    if (current_user < 0) {
+        return std::nullopt;
+    }
+
+    const auto& manager = system.GetProfileManager();
+    const auto index = static_cast<std::size_t>(current_user);
+
+    if (!manager.UserExistsIndex(index)) {
+        return std::nullopt;
+    }
+
+    const auto user_id = manager.GetUser(index);
+    if (!user_id.has_value() || !user_id->IsValid()) {
+        return std::nullopt;
+    }
+
+    return user_id->AsU128();
+}
 
 // The state that is persisted next to a save data to track its commit id.
 struct SaveDataCommitRecord {
@@ -106,9 +126,14 @@ bool IsSupportedType(SaveDataType type) {
     }
 }
 
+bool IsHexString(std::string_view text) {
+    return !text.empty() &&
+           std::ranges::all_of(text, [](unsigned char ch) { return std::isxdigit(ch) != 0; });
+}
+
 /// Parses a 16 character hexadecimal directory name into the number it holds.
 u64 ParseSaveId(std::string_view name) {
-    if (name.size() != 16) {
+    if (name.size() != 16 || !IsHexString(name)) {
         return 0;
     }
 
@@ -125,17 +150,13 @@ u64 ParseSaveId(std::string_view name) {
 ///
 /// The directory holds the user id as two big endian halves, the high half first.
 UserId ParseUserId(std::string_view name) {
-    if (name.size() != 0x20) {
+    if (name.size() != 0x20 || !IsHexString(name)) {
         return InvalidUserId;
     }
 
     const u64 high = ParseSaveId(name.substr(0, 16));
     const u64 low = ParseSaveId(name.substr(16, 16));
     return UserId{low, high};
-}
-
-bool IsHexString(std::string_view text) {
-    return std::ranges::all_of(text, [](unsigned char ch) { return std::isxdigit(ch) != 0; });
 }
 
 std::optional<u16> ParseCacheIndex(std::string_view text) {
@@ -250,8 +271,9 @@ SaveDataCommitRecord GetSaveContents(const VirtualDir& save_dir) {
     SaveDataCommitRecord contents{};
 
     for (const auto& file : save_dir->GetFiles()) {
-        if (file->GetName() == SaveDataCommitIdFileName) {
-            // The commit id tracks the save data, it is not part of it.
+        const auto& name = file->GetName();
+        if (name == GetSaveDataCommitIdFileName() || name == GetSaveDataSizeFileName()) {
+            // Sidecar metadata tracks the save data, it is not part of it.
             continue;
         }
         contents.file_count++;
@@ -311,10 +333,14 @@ void EnumerateNormalSaves(SaveDataSpaceId space, const VirtualDir& save_dir,
             continue;
         }
 
+        if (save_id_name.size() != 16 || !IsHexString(save_id_name)) {
+            continue;
+        }
+
         const auto system_save_data_id = ParseSaveId(save_id_name);
         for (const auto& user_dir : save_id->GetSubdirectories()) {
             const auto& user_id_name = user_dir->GetName();
-            if (user_id_name.size() != 0x20) {
+            if (user_id_name.size() != 0x20 || !IsHexString(user_id_name)) {
                 // Not a user id directory.
                 continue;
             }
@@ -361,14 +387,14 @@ void EnumerateNormalSaves(SaveDataSpaceId space, const VirtualDir& save_dir,
 void EnumerateTemporarySaves(SaveDataSpaceId space, const VirtualDir& save_id_dir,
                              std::vector<SaveDataEntry>& out) {
     const auto& save_id_name = save_id_dir->GetName();
-    if (save_id_name.size() != 16) {
-        // Not a save id directory.
+    if (save_id_name != "0000000000000000") {
+        // Temporary saves have no system save id; GetFullPath always addresses the zero root.
         return;
     }
 
     for (const auto& user_dir : save_id_dir->GetSubdirectories()) {
         const auto& user_id_name = user_dir->GetName();
-        if (user_id_name.size() != 0x20) {
+        if (user_id_name.size() != 0x20 || !IsHexString(user_id_name)) {
             // Not a user id directory.
             continue;
         }
@@ -394,6 +420,49 @@ void EnumerateTemporarySaves(SaveDataSpaceId space, const VirtualDir& save_id_di
 }
 
 } // Anonymous namespace
+
+u64 GetSaveDataId(const SaveDataEntry& entry) {
+    if (entry.type == SaveDataType::System) {
+        return entry.system_save_data_id;
+    }
+
+    // Encode each field explicitly so IDs do not depend on padding, endianness or directory order.
+    u64 hash = 0xCBF29CE484222325ULL;
+    for (const u64 field : {static_cast<u64>(entry.space), static_cast<u64>(entry.type),
+                            static_cast<u64>(entry.rank),
+                            entry.title_id, entry.user_id[0], entry.user_id[1],
+                            static_cast<u64>(entry.index)}) {
+        for (unsigned shift = 0; shift < 64; shift += 8) {
+            hash ^= (field >> shift) & 0xFF;
+            hash *= 0x100000001B3ULL;
+        }
+    }
+    return 0x4000000000000000ULL | (hash & 0x0FFFFFFFFFFFFFFFULL);
+}
+
+const SaveDataEntry* FindSaveDataEntryById(std::span<const SaveDataEntry> entries,
+                                         u64 save_data_id, std::optional<UserId> active_user) {
+    if (save_data_id == 0) {
+        return nullptr;
+    }
+
+    const SaveDataEntry* matched = nullptr;
+    for (const auto& entry : entries) {
+        const bool exact_match = GetSaveDataId(entry) == save_data_id;
+        const bool legacy_match =
+            entry.type != SaveDataType::System && entry.title_id == save_data_id &&
+            (entry.type != SaveDataType::Account || !active_user.has_value() ||
+             entry.user_id == *active_user);
+        if (!exact_match && !legacy_match) {
+            continue;
+        }
+        if (matched != nullptr) {
+            return nullptr;
+        }
+        matched = &entry;
+    }
+    return matched;
+}
 
 SaveDataFactory::SaveDataFactory(Core::System& system_, ProgramId program_id_,
                                  VirtualDir save_directory_)
@@ -561,6 +630,15 @@ Result SaveDataFactory::Delete(SaveDataSpaceId space, const SaveDataAttribute& m
         LOG_ERROR(Service_FS, "Unsupported save data type: {:02X}", static_cast<u8>(meta.type));
         return FileSys::ResultInvalidArgument;
     }
+    if (meta.type == SaveDataType::System &&
+        meta.system_save_data_id == InvalidSystemSaveDataId) {
+        LOG_ERROR(Service_FS, "Refusing to delete system save data with id 0");
+        return FileSys::ResultInvalidArgument;
+    }
+    if (meta.type != SaveDataType::System && meta.program_id == 0 && program_id == 0) {
+        LOG_ERROR(Service_FS, "Refusing to delete save data with title id 0");
+        return FileSys::ResultInvalidArgument;
+    }
 
     const auto path = GetSaveDataPath(program_id, dir, space, meta);
     if (!IsWithinSpace(space, path)) {
@@ -639,8 +717,8 @@ s64 SaveDataFactory::GetFreeSpace(SaveDataSpaceId space) const {
 
     const auto root = GetSaveDataSpaceDirectory(space);
     if (root == nullptr) {
-        // The space does not exist yet.
-        return 0;
+        // The space does not exist yet, so all of its nominal capacity is free.
+        return NominalSpaceSize;
     }
 
     const auto used = static_cast<s64>(root->GetSize());
@@ -659,18 +737,8 @@ u64 SaveDataFactory::GetCommitId(SaveDataSpaceId space, u64 save_data_id) const 
         return 0;
     }
 
-    // The commit id belongs to the save the id points at. The layout stores the system save id of
-    // a system save and the title id of every other kind of save.
     const auto entries = Enumerate(space);
-    const SaveDataEntry* entry = nullptr;
-    for (const auto& candidate : entries) {
-        const auto id = candidate.type == SaveDataType::System ? candidate.system_save_data_id
-                                                               : candidate.title_id;
-        if (id == save_data_id) {
-            entry = &candidate;
-            break;
-        }
-    }
+    const auto* entry = FindSaveDataEntryById(entries, save_data_id, GetActiveUserId(system));
 
     if (entry == nullptr) {
         LOG_TRACE(Service_FS, "No save data with the id {:016X} in the space {:02X}", save_data_id,
@@ -684,7 +752,7 @@ u64 SaveDataFactory::GetCommitId(SaveDataSpaceId space, u64 save_data_id) const 
     }
 
     SaveDataCommitRecord record{};
-    if (const auto counter_file = save_dir->GetFile(SaveDataCommitIdFileName);
+    if (const auto counter_file = save_dir->GetFile(GetSaveDataCommitIdFileName());
         counter_file != nullptr && counter_file->GetSize() >= sizeof(record)) {
         if (counter_file->ReadObject(&record) != sizeof(record)) {
             LOG_ERROR(Service_FS, "Failed to read the commit id of the save data: {}",
@@ -700,7 +768,7 @@ u64 SaveDataFactory::GetCommitId(SaveDataSpaceId space, u64 save_data_id) const 
         record.file_count = contents.file_count;
         record.total_size = contents.total_size;
 
-        const auto counter_file = save_dir->CreateFile(SaveDataCommitIdFileName);
+        const auto counter_file = save_dir->CreateFile(GetSaveDataCommitIdFileName());
         if (counter_file == nullptr) {
             LOG_ERROR(Service_FS, "Failed to store the commit id of the save data: {}",
                       entry->relative_path);

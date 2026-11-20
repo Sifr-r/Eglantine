@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: 2017 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <QMenu>
 #include <QMessageBox>
 #include <QStandardItemModel>
@@ -22,6 +23,24 @@
 constexpr int name_column = 0;
 constexpr int hotkey_column = 1;
 constexpr int controller_column = 2;
+
+namespace {
+
+[[nodiscard]] const UISettings::Shortcut* FindDefaultHotkey(const std::string& group_name,
+                                                            const std::string& action_name) {
+    const auto it = std::ranges::find_if(UISettings::default_hotkeys, [&](const auto& s) {
+        return s.group == group_name && s.name == action_name;
+    });
+    return it != UISettings::default_hotkeys.end() ? &*it : nullptr;
+}
+
+[[nodiscard]] const UISettings::Shortcut* FindDefaultHotkey(const QModelIndex& index) {
+    return FindDefaultHotkey(
+        index.parent().data(Qt::UserRole + 1).toString().toStdString(),
+        index.siblingAtColumn(name_column).data(Qt::UserRole + 1).toString().toStdString());
+}
+
+} // namespace
 
 ConfigureHotkeys::ConfigureHotkeys(Core::HID::HIDCore& hid_core, QWidget* parent)
     : QWidget(parent), ui(std::make_unique<Ui::ConfigureHotkeys>()),
@@ -337,22 +356,24 @@ void ConfigureHotkeys::ApplyConfiguration(HotkeyRegistry& registry) {
 void ConfigureHotkeys::RestoreDefaults() {
     for (int r = 0; r < model->rowCount(); ++r) {
         const QStandardItem* parent = model->item(r, 0);
-        const int hotkey_size = static_cast<int>(UISettings::default_hotkeys.size());
-
-        if (hotkey_size != parent->rowCount()) {
-            QMessageBox::warning(this, tr("Invalid hotkey settings"),
-                                 tr("An error occurred. Please report this issue on github."));
-            return;
-        }
+        const std::string group_name = parent->data().toString().toStdString();
 
         for (int r2 = 0; r2 < parent->rowCount(); ++r2) {
-            model->item(r, 0)
-                ->child(r2, hotkey_column)
-                ->setText(QString::fromStdString(UISettings::default_hotkeys[r2].shortcut.keyseq));
-            model->item(r, 0)
-                ->child(r2, controller_column)
-                ->setText(QString::fromStdString(
-                    UISettings::default_hotkeys[r2].shortcut.controller_keyseq));
+            const std::string action_name =
+                parent->child(r2, name_column)->data().toString().toStdString();
+            const auto* shortcut = FindDefaultHotkey(group_name, action_name);
+
+            if (shortcut != nullptr) {
+                const QKeySequence default_keyseq = QKeySequence::fromString(
+                    QString::fromStdString(shortcut->shortcut.keyseq), QKeySequence::PortableText);
+                parent->child(r2, hotkey_column)
+                    ->setText(default_keyseq.toString(QKeySequence::NativeText));
+                parent->child(r2, controller_column)
+                    ->setText(QString::fromStdString(shortcut->shortcut.controller_keyseq));
+            } else {
+                parent->child(r2, hotkey_column)->setText(QString{});
+                parent->child(r2, controller_column)->setText(QString{});
+            }
         }
     }
 }
@@ -397,11 +418,13 @@ void ConfigureHotkeys::PopupContextMenu(const QPoint& menu_location) {
 }
 
 void ConfigureHotkeys::RestoreControllerHotkey(QModelIndex index) {
-    const QString& default_key_sequence =
-        QString::fromStdString(UISettings::default_hotkeys[index.row()].shortcut.controller_keyseq);
+    const auto* shortcut = FindDefaultHotkey(index);
+    const QString default_key_sequence =
+        shortcut ? QString::fromStdString(shortcut->shortcut.controller_keyseq) : QString{};
     const auto [key_sequence_used, used_action] = IsUsedControllerKey(default_key_sequence);
 
-    if (key_sequence_used && default_key_sequence != model->data(index).toString()) {
+    if (!default_key_sequence.isEmpty() && key_sequence_used &&
+        default_key_sequence != model->data(index).toString()) {
         QMessageBox::warning(
             this, tr("Conflicting Button Sequence"),
             tr("The default button sequence is already assigned to: %1").arg(used_action));
@@ -411,12 +434,16 @@ void ConfigureHotkeys::RestoreControllerHotkey(QModelIndex index) {
 }
 
 void ConfigureHotkeys::RestoreHotkey(QModelIndex index) {
-    const QKeySequence& default_key_sequence = QKeySequence::fromString(
-        QString::fromStdString(UISettings::default_hotkeys[index.row()].shortcut.keyseq),
-        QKeySequence::NativeText);
+    const auto* shortcut = FindDefaultHotkey(index);
+    const QKeySequence default_key_sequence =
+        shortcut ? QKeySequence::fromString(QString::fromStdString(shortcut->shortcut.keyseq),
+                                            QKeySequence::PortableText)
+                 : QKeySequence{};
     const auto [key_sequence_used, used_action] = IsUsedKey(default_key_sequence);
 
-    if (key_sequence_used && default_key_sequence != QKeySequence(model->data(index).toString())) {
+    if (!default_key_sequence.isEmpty() && key_sequence_used &&
+        default_key_sequence !=
+            QKeySequence::fromString(model->data(index).toString(), QKeySequence::NativeText)) {
         QMessageBox::warning(
             this, tr("Conflicting Key Sequence"),
             tr("The default key sequence is already assigned to: %1").arg(used_action));

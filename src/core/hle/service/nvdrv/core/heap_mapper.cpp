@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <atomic>
 #include <mutex>
 
 #include "common/range_sets.h"
@@ -9,6 +10,9 @@
 #include "video_core/host1x/host1x.h"
 
 namespace Service::Nvidia::NvCore {
+namespace {
+std::atomic<u64> g_next_heap_mapper_id{1};
+} // Anonymous namespace
 
 struct HeapMapper::HeapMapperInternal {
     HeapMapperInternal(Tegra::Host1x::Host1x& host1x) : m_device_memory{host1x.MemoryManager()} {}
@@ -22,7 +26,8 @@ struct HeapMapper::HeapMapperInternal {
 
 HeapMapper::HeapMapper(VAddr start_vaddress, DAddr start_daddress, size_t size, Core::Asid asid,
                        Tegra::Host1x::Host1x& host1x)
-    : m_vaddress{start_vaddress}, m_daddress{start_daddress}, m_size{size}, m_asid{asid} {
+    : m_vaddress{start_vaddress}, m_daddress{start_daddress}, m_size{size}, m_asid{asid},
+      m_id{g_next_heap_mapper_id.fetch_add(1, std::memory_order_relaxed)} {
     m_internal = std::make_unique<HeapMapperInternal>(host1x);
 }
 

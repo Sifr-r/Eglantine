@@ -4,9 +4,11 @@
 // SPDX-FileCopyrightText: 2017 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <memory>
 #include "common/input.h"
 #include "common/param_package.h"
+#include "common/settings.h"
 #include "input_common/drivers/camera.h"
 #include "input_common/drivers/keyboard.h"
 #include "input_common/drivers/mouse.h"
@@ -541,5 +543,41 @@ std::string GenerateAnalogParamFromKeys(int key_up, int key_down, int key_left, 
         {"modifier_scale", std::to_string(modifier_scale)},
     };
     return circle_pad_param.Serialize();
+}
+
+Settings::PlayerInput MakeDefaultKeyboardPlayer(
+    const std::array<int, Settings::NativeButton::NumButtons>& buttons,
+    const std::array<std::array<int, 4>, Settings::NativeAnalog::NumAnalogs>& analogs,
+    const std::array<int, Settings::NativeAnalog::NumAnalogs>& stick_modifiers,
+    const std::array<int, Settings::NativeMotion::NumMotions>& motions) {
+    Settings::PlayerInput player{};
+    player.connected = true;
+    player.controller_type = Settings::ControllerType::ProController;
+    std::ranges::transform(buttons, player.buttons.begin(), GenerateKeyboardParam);
+    std::ranges::transform(motions, player.motions.begin(), GenerateKeyboardParam);
+    for (std::size_t index = 0; index < analogs.size(); ++index) {
+        const auto& keys = analogs[index];
+        player.analogs[index] = GenerateAnalogParamFromKeys(keys[0], keys[1], keys[2], keys[3],
+                                                          stick_modifiers[index], 0.5f);
+    }
+    return player;
+}
+
+bool PlayerOneUsesDefaultKeyboard(const Settings::PlayerInput& defaults) {
+    const auto bindings_equal = [](const std::string& actual, const std::string& expected) {
+        return actual == expected ||
+               (!actual.empty() && Common::ParamPackage(actual) == Common::ParamPackage(expected));
+    };
+    const auto matches_defaults = [&](const Settings::PlayerInput& player) {
+        return player.connected && player.controller_type == defaults.controller_type &&
+               player.profile_name.empty() &&
+               std::ranges::equal(player.buttons, defaults.buttons, bindings_equal) &&
+               std::ranges::equal(player.analogs, defaults.analogs, bindings_equal) &&
+               std::ranges::equal(player.motions, defaults.motions, bindings_equal);
+    };
+
+    auto& players = Settings::values.players;
+    return matches_defaults(players.GetValue().front()) &&
+           (players.UsingGlobal() || matches_defaults(players.GetValue(true).front()));
 }
 } // namespace InputCommon

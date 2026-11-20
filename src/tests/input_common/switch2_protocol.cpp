@@ -15,8 +15,10 @@
 
 #include "common/common_types.h"
 #include "common/input.h"
+#include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "input_common/drivers/mouse.h"
 #include "input_common/drivers/switch2.h"
 #include "input_common/helpers/switch2_protocol/switch2_driver.h"
 #include "input_common/helpers/switch2_protocol/switch2_transport.h"
@@ -637,7 +639,7 @@ TEST_CASE("GyroMouseProcessor handles calibration, activation modes, Yaw, Roll, 
         const auto mid_out = processor.Process(report, ControllerType::Pro, false, true, Mode::Roll,
                                                Activation::Hold, 1.5f, t0);
         REQUIRE(mid_out.active);
-        REQUIRE(mid_out.left_click);
+        REQUIRE_FALSE(mid_out.left_click);
         REQUIRE_FALSE(mid_out.right_click);
         REQUIRE(mid_out.velocity_x == 0.0f);
         REQUIRE(mid_out.velocity_y == 0.0f);
@@ -854,6 +856,10 @@ private:
 TEST_CASE("Switch2Controllers slot auto-combine, split, merge, and gyro calibration", "[switch2]") {
     const bool prev_enable = Settings::values.enable_switch2_driver.GetValue();
     const bool prev_combine = Settings::values.switch2_combine_joycons.GetValue();
+    SCOPE_EXIT {
+        Settings::values.enable_switch2_driver = prev_enable;
+        Settings::values.switch2_combine_joycons = prev_combine;
+    };
     Settings::values.enable_switch2_driver = false;
     Settings::values.switch2_combine_joycons = true;
 
@@ -903,9 +909,6 @@ TEST_CASE("Switch2Controllers slot auto-combine, split, merge, and gyro calibrat
 
     engine.UnregisterDriver("usb:1:2");
     REQUIRE(engine.GetConnectedDevices().size() == 1U);
-
-    Settings::values.enable_switch2_driver = prev_enable;
-    Settings::values.switch2_combine_joycons = prev_combine;
 }
 
 namespace {
@@ -952,6 +955,10 @@ TEST_CASE("Switch2Controllers single Joy-Con FireInputReport drives NPad-compati
           "[switch2]") {
     const bool prev_enable = Settings::values.enable_switch2_driver.GetValue();
     const bool prev_combine = Settings::values.switch2_combine_joycons.GetValue();
+    SCOPE_EXIT {
+        Settings::values.enable_switch2_driver = prev_enable;
+        Settings::values.switch2_combine_joycons = prev_combine;
+    };
     Settings::values.enable_switch2_driver = false;
     Settings::values.switch2_combine_joycons = false;
 
@@ -1041,15 +1048,16 @@ TEST_CASE("Switch2Controllers single Joy-Con FireInputReport drives NPad-compati
         REQUIRE(ReadMappedAxis(engine, axis_map, Settings::NativeAnalog::RStick, true) ==
                 Catch::Approx(1000.0 / 1500.0));
     }
-
-    Settings::values.enable_switch2_driver = prev_enable;
-    Settings::values.switch2_combine_joycons = prev_combine;
 }
 
 TEST_CASE("Switch2Controllers handles FireDisconnect, early disconnect, and post-Stop callbacks",
           "[switch2]") {
     const bool prev_enable = Settings::values.enable_switch2_driver.GetValue();
     const bool prev_combine = Settings::values.switch2_combine_joycons.GetValue();
+    SCOPE_EXIT {
+        Settings::values.enable_switch2_driver = prev_enable;
+        Settings::values.switch2_combine_joycons = prev_combine;
+    };
     Settings::values.enable_switch2_driver = false;
     Settings::values.switch2_combine_joycons = true;
 
@@ -1145,7 +1153,421 @@ TEST_CASE("Switch2Controllers handles FireDisconnect, early disconnect, and post
         REQUIRE(devices[0].type == ControllerType::Left);
         REQUIRE(devices[1].type == ControllerType::Right);
     }
+}
 
-    Settings::values.enable_switch2_driver = prev_enable;
-    Settings::values.switch2_combine_joycons = prev_combine;
+TEST_CASE("Switch2Controllers GyroMouseMode::Roll in Dual Joy-Con mode drives LeftStickX",
+          "[switch2]") {
+    const bool prev_enable = Settings::values.enable_switch2_driver.GetValue();
+    const bool prev_combine = Settings::values.switch2_combine_joycons.GetValue();
+    const auto prev_gyro_mode = Settings::values.switch2_gyro_mouse_mode.GetValue();
+    const auto prev_gyro_act = Settings::values.switch2_gyro_activation_mode.GetValue();
+    const auto prev_gyro_sens = Settings::values.switch2_gyro_sensitivity.GetValue();
+    SCOPE_EXIT {
+        Settings::values.enable_switch2_driver = prev_enable;
+        Settings::values.switch2_combine_joycons = prev_combine;
+        Settings::values.switch2_gyro_mouse_mode = prev_gyro_mode;
+        Settings::values.switch2_gyro_activation_mode = prev_gyro_act;
+        Settings::values.switch2_gyro_sensitivity = prev_gyro_sens;
+    };
+
+    Settings::values.enable_switch2_driver = false;
+    Settings::values.switch2_combine_joycons = true;
+    Settings::values.switch2_gyro_mouse_mode = Settings::Switch2GyroMouseMode::Roll;
+    Settings::values.switch2_gyro_activation_mode = Settings::Switch2GyroActivationMode::Hold;
+    Settings::values.switch2_gyro_sensitivity = 10;
+
+    InputCommon::Switch2Controllers engine{"switch2", nullptr};
+    auto left_transport = std::make_shared<MockSwitch2Transport>(
+        ProductId::JoyCon2Left, "AA:BB:CC:DD:EE:61", TransportType::Ble);
+    auto right_transport = std::make_shared<MockSwitch2Transport>(
+        ProductId::JoyCon2Right, "AA:BB:CC:DD:EE:62", TransportType::Ble);
+
+    engine.RegisterDriver(std::make_shared<Switch2Driver>(left_transport));
+    engine.RegisterDriver(std::make_shared<Switch2Driver>(right_transport));
+
+    const auto bindings = engine.GetDeviceBindings();
+    REQUIRE(bindings.size() == 1U);
+    REQUIRE(bindings[0].info.type == ControllerType::Dual);
+    const auto axis_map = engine.GetAnalogMappingForDevice(bindings[0].params);
+
+    auto right_roll = MakeNativeInputReport(static_cast<u32>(PadButton::RightSL), 2048U, 2048U,
+                                            2048U, 2048U);
+    WriteS16LE(right_roll, 48, 1000);
+    right_transport->FireInputReport(right_roll);
+    REQUIRE(ReadMappedAxis(engine, axis_map, Settings::NativeAnalog::LStick, false) ==
+            Catch::Approx(-0.5));
+
+    // Subsequent Left Joy-Con reports must preserve active roll steering on LeftStickX.
+    const auto left_stick = MakeNativeInputReport(0U, 3048U, 2048U, 2048U, 2048U);
+    left_transport->FireInputReport(left_stick);
+    REQUIRE(ReadMappedAxis(engine, axis_map, Settings::NativeAnalog::LStick, false) ==
+            Catch::Approx(-0.5));
+
+    // Releasing the gyro trigger immediately restores LeftStickX to Left's last stick reading.
+    const auto right_idle = MakeNativeInputReport(0U, 2048U, 2048U, 2048U, 2048U);
+    right_transport->FireInputReport(right_idle);
+    REQUIRE(ReadMappedAxis(engine, axis_map, Settings::NativeAnalog::LStick, false) ==
+            Catch::Approx(1000.0 / 1500.0));
+
+    // Splitting the Dual slot while roll steering is active also restores LeftStickX immediately.
+    right_transport->FireInputReport(right_roll);
+    REQUIRE(ReadMappedAxis(engine, axis_map, Settings::NativeAnalog::LStick, false) ==
+            Catch::Approx(-0.5));
+    REQUIRE(engine.SplitSlot(0U));
+    REQUIRE(ReadMappedAxis(engine, axis_map, Settings::NativeAnalog::LStick, false) ==
+            Catch::Approx(1000.0 / 1500.0));
+}
+
+TEST_CASE("Switch2Controllers isolates mouse ownership across multiple controllers", "[switch2]") {
+    const bool prev_enable = Settings::values.enable_switch2_driver.GetValue();
+    const bool prev_combine = Settings::values.switch2_combine_joycons.GetValue();
+    const auto prev_gyro_mode = Settings::values.switch2_gyro_mouse_mode.GetValue();
+    const auto prev_gyro_act = Settings::values.switch2_gyro_activation_mode.GetValue();
+    const bool prev_optical = Settings::values.switch2_optical_mouse.GetValue();
+    SCOPE_EXIT {
+        Settings::values.enable_switch2_driver = prev_enable;
+        Settings::values.switch2_combine_joycons = prev_combine;
+        Settings::values.switch2_gyro_mouse_mode = prev_gyro_mode;
+        Settings::values.switch2_gyro_activation_mode = prev_gyro_act;
+        Settings::values.switch2_optical_mouse = prev_optical;
+    };
+
+    Settings::values.enable_switch2_driver = false;
+    Settings::values.switch2_combine_joycons = false;
+    Settings::values.switch2_gyro_mouse_mode = Settings::Switch2GyroMouseMode::Yaw;
+    Settings::values.switch2_gyro_activation_mode = Settings::Switch2GyroActivationMode::Hold;
+    Settings::values.switch2_optical_mouse = false;
+
+    InputCommon::Mouse mouse_engine{"mouse"};
+    InputCommon::Switch2Controllers engine{"switch2", &mouse_engine};
+
+    auto t1 = std::make_shared<MockSwitch2Transport>(ProductId::ProController2, "usb:1:1",
+                                                     TransportType::Usb);
+    auto t2 = std::make_shared<MockSwitch2Transport>(ProductId::ProController2, "usb:1:2",
+                                                     TransportType::Usb);
+    engine.RegisterDriver(std::make_shared<Switch2Driver>(t1));
+    engine.RegisterDriver(std::make_shared<Switch2Driver>(t2));
+
+    const PadIdentifier real_mouse_id{
+        .guid = Common::UUID{},
+        .port = 1,
+        .pad = 0,
+    };
+    const int left_btn = static_cast<int>(InputCommon::MouseButton::Left);
+
+    const auto active_click = MakeNativeInputReport(
+        static_cast<u32>(PadButton::GR) | static_cast<u32>(PadButton::ZR), 2048U, 2048U, 2048U,
+        2048U);
+    const auto active_no_click =
+        MakeNativeInputReport(static_cast<u32>(PadButton::GR), 2048U, 2048U, 2048U, 2048U);
+    const auto idle_report = MakeNativeInputReport(0U, 2048U, 2048U, 2048U, 2048U);
+
+    t1->FireInputReport(active_click);
+    REQUIRE(mouse_engine.GetButton(real_mouse_id, left_btn));
+
+    // A second controller activating mouse while t1 owns it must not steal ownership mid-drag.
+    t2->FireInputReport(active_no_click);
+    REQUIRE(mouse_engine.GetButton(real_mouse_id, left_btn));
+
+    // Idle input or disconnect from a non-owner controller must not release the active mouse.
+    t2->FireInputReport(idle_report);
+    REQUIRE(mouse_engine.GetButton(real_mouse_id, left_btn));
+    engine.UnregisterDriver("usb:1:2");
+    REQUIRE(mouse_engine.GetButton(real_mouse_id, left_btn));
+
+    // Only the owner going idle or disconnecting clears the mouse state.
+    t1->FireInputReport(idle_report);
+    REQUIRE_FALSE(mouse_engine.GetButton(real_mouse_id, left_btn));
+
+    t1->FireInputReport(active_click);
+    REQUIRE(mouse_engine.GetButton(real_mouse_id, left_btn));
+    engine.UnregisterDriver("usb:1:1");
+    REQUIRE_FALSE(mouse_engine.GetButton(real_mouse_id, left_btn));
+
+    SECTION("Dual Joy-Con Left optical mouse releases ownership and buttons when lifted") {
+        Settings::values.switch2_combine_joycons = true;
+        Settings::values.switch2_optical_mouse = true;
+
+        auto left_t = std::make_shared<MockSwitch2Transport>(
+            ProductId::JoyCon2Left, "AA:BB:CC:DD:EE:71", TransportType::Ble);
+        auto right_t = std::make_shared<MockSwitch2Transport>(
+            ProductId::JoyCon2Right, "AA:BB:CC:DD:EE:72", TransportType::Ble);
+        engine.RegisterDriver(std::make_shared<Switch2Driver>(left_t));
+        engine.RegisterDriver(std::make_shared<Switch2Driver>(right_t));
+        REQUIRE(engine.GetConnectedDevices().size() == 1U);
+        REQUIRE(engine.GetConnectedDevices()[0].type == ControllerType::Dual);
+
+        auto left_optical = MakeNativeInputReport(static_cast<u32>(PadButton::L), 2048U, 2048U,
+                                                  2048U, 2048U);
+        WriteU16LE(left_optical, 16, 100U);
+        WriteU16LE(left_optical, 18, 200U);
+        WriteU16LE(left_optical, 20, 500U);
+        WriteU16LE(left_optical, 22, 300U);
+
+        left_t->FireInputReport(left_optical);
+        REQUIRE(mouse_engine.GetButton(real_mouse_id, left_btn));
+
+        // Lifting the Left Joy-Con (distance = 0) in Dual mode must immediately release the
+        // mouse button and clear ownership so Right can claim mouse next.
+        left_t->FireInputReport(idle_report);
+        REQUIRE_FALSE(mouse_engine.GetButton(real_mouse_id, left_btn));
+
+        const auto right_gyro_click = MakeNativeInputReport(
+            static_cast<u32>(PadButton::RightSL) | static_cast<u32>(PadButton::ZR), 2048U, 2048U,
+            2048U, 2048U);
+        right_t->FireInputReport(right_gyro_click);
+        REQUIRE(mouse_engine.GetButton(real_mouse_id, left_btn));
+        right_t->FireInputReport(idle_report);
+        REQUIRE_FALSE(mouse_engine.GetButton(real_mouse_id, left_btn));
+    }
+}
+
+TEST_CASE("Switch2Controllers GetUIName recognizes analog axis_x and axis_y mappings",
+          "[switch2]") {
+    const bool prev_enable = Settings::values.enable_switch2_driver.GetValue();
+    SCOPE_EXIT {
+        Settings::values.enable_switch2_driver = prev_enable;
+    };
+    Settings::values.enable_switch2_driver = false;
+
+    InputCommon::Switch2Controllers engine{"switch2", nullptr};
+    auto transport = std::make_shared<MockSwitch2Transport>(ProductId::ProController2, "usb:1:3",
+                                                            TransportType::Usb);
+    engine.RegisterDriver(std::make_shared<Switch2Driver>(transport));
+
+    const auto bindings = engine.GetDeviceBindings();
+    REQUIRE(bindings.size() == 1U);
+    const auto analog_map = engine.GetAnalogMappingForDevice(bindings[0].params);
+    REQUIRE(engine.GetUIName(analog_map.at(Settings::NativeAnalog::LStick)) ==
+            Common::Input::ButtonNames::Value);
+    REQUIRE(engine.GetUIName(analog_map.at(Settings::NativeAnalog::RStick)) ==
+            Common::Input::ButtonNames::Value);
+    REQUIRE(engine.GetUIName(Common::ParamPackage{{"engine", "switch2"}, {"axis", "0"}}) ==
+            Common::Input::ButtonNames::Value);
+    REQUIRE(engine.GetUIName(Common::ParamPackage{{"engine", "switch2"}, {"axis_y", "1"}}) ==
+            Common::Input::ButtonNames::Value);
+    REQUIRE(engine.GetUIName(Common::ParamPackage{{"engine", "switch2"}}) ==
+            Common::Input::ButtonNames::Invalid);
+}
+
+TEST_CASE("Switch2Controllers Dual Joy-Con Roll steering handles disconnect, MergeSlots, and mouse "
+          "isolation",
+          "[switch2]") {
+    const bool prev_enable = Settings::values.enable_switch2_driver.GetValue();
+    const bool prev_combine = Settings::values.switch2_combine_joycons.GetValue();
+    const auto prev_gyro_mode = Settings::values.switch2_gyro_mouse_mode.GetValue();
+    const auto prev_gyro_act = Settings::values.switch2_gyro_activation_mode.GetValue();
+    const auto prev_gyro_sens = Settings::values.switch2_gyro_sensitivity.GetValue();
+    const bool prev_optical = Settings::values.switch2_optical_mouse.GetValue();
+    SCOPE_EXIT {
+        Settings::values.enable_switch2_driver = prev_enable;
+        Settings::values.switch2_combine_joycons = prev_combine;
+        Settings::values.switch2_gyro_mouse_mode = prev_gyro_mode;
+        Settings::values.switch2_gyro_activation_mode = prev_gyro_act;
+        Settings::values.switch2_gyro_sensitivity = prev_gyro_sens;
+        Settings::values.switch2_optical_mouse = prev_optical;
+    };
+
+    Settings::values.enable_switch2_driver = false;
+    Settings::values.switch2_combine_joycons = true;
+    Settings::values.switch2_gyro_mouse_mode = Settings::Switch2GyroMouseMode::Roll;
+    Settings::values.switch2_gyro_activation_mode = Settings::Switch2GyroActivationMode::Hold;
+    Settings::values.switch2_gyro_sensitivity = 10;
+    Settings::values.switch2_optical_mouse = false;
+
+    InputCommon::Mouse mouse_engine{"mouse"};
+    InputCommon::Switch2Controllers engine{"switch2", &mouse_engine};
+
+    const PadIdentifier real_mouse_id{
+        .guid = Common::UUID{},
+        .port = 1,
+        .pad = 0,
+    };
+    const int left_btn = static_cast<int>(InputCommon::MouseButton::Left);
+
+    const auto left_stick = MakeNativeInputReport(0U, 3048U, 2048U, 2048U, 2048U);
+    auto right_roll = MakeNativeInputReport(
+        static_cast<u32>(PadButton::RightSL) | static_cast<u32>(PadButton::ZR), 2048U, 2048U,
+        2048U, 2048U);
+    WriteS16LE(right_roll, 48, 1000);
+    const auto idle_report = MakeNativeInputReport(0U, 2048U, 2048U, 2048U, 2048U);
+
+    SECTION("Right Joy-Con disconnect during active Roll steering restores LeftStickX and never "
+            "presses mouse buttons") {
+        auto left_transport = std::make_shared<MockSwitch2Transport>(
+            ProductId::JoyCon2Left, "AA:BB:CC:DD:EE:81", TransportType::Ble);
+        auto right_transport = std::make_shared<MockSwitch2Transport>(
+            ProductId::JoyCon2Right, "AA:BB:CC:DD:EE:82", TransportType::Ble);
+
+        engine.RegisterDriver(std::make_shared<Switch2Driver>(left_transport));
+        engine.RegisterDriver(std::make_shared<Switch2Driver>(right_transport));
+
+        const auto bindings = engine.GetDeviceBindings();
+        REQUIRE(bindings.size() == 1U);
+        REQUIRE(bindings[0].info.type == ControllerType::Dual);
+        const auto axis_map = engine.GetAnalogMappingForDevice(bindings[0].params);
+
+        left_transport->FireInputReport(left_stick);
+        REQUIRE(ReadMappedAxis(engine, axis_map, Settings::NativeAnalog::LStick, false) ==
+                Catch::Approx(1000.0 / 1500.0));
+
+        right_transport->FireInputReport(right_roll);
+        REQUIRE(ReadMappedAxis(engine, axis_map, Settings::NativeAnalog::LStick, false) ==
+                Catch::Approx(-0.5));
+        REQUIRE_FALSE(mouse_engine.GetButton(real_mouse_id, left_btn));
+
+        engine.UnregisterDriver(right_transport->GetAddress());
+        const auto post_bindings = engine.GetDeviceBindings();
+        REQUIRE(post_bindings.size() == 1U);
+        REQUIRE(post_bindings[0].info.type == ControllerType::Left);
+        const auto post_axis_map = engine.GetAnalogMappingForDevice(post_bindings[0].params);
+        REQUIRE(ReadMappedAxis(engine, post_axis_map, Settings::NativeAnalog::LStick, false) ==
+                Catch::Approx(1000.0 / 1500.0));
+        REQUIRE_FALSE(mouse_engine.GetButton(real_mouse_id, left_btn));
+    }
+
+    SECTION("Right Joy-Con disconnect with slot reorder restores LeftStickX on the new slot") {
+        Settings::values.switch2_combine_joycons = false;
+
+        auto pro_transport = std::make_shared<MockSwitch2Transport>(
+            ProductId::ProController2, "usb:pro", TransportType::Usb);
+        auto left_transport = std::make_shared<MockSwitch2Transport>(
+            ProductId::JoyCon2Left, "AA:BB:CC:DD:EE:83", TransportType::Ble);
+        auto right_transport = std::make_shared<MockSwitch2Transport>(
+            ProductId::JoyCon2Right, "AA:BB:CC:DD:EE:84", TransportType::Ble);
+
+        engine.RegisterDriver(std::make_shared<Switch2Driver>(pro_transport));
+        engine.RegisterDriver(std::make_shared<Switch2Driver>(left_transport));
+        engine.RegisterDriver(std::make_shared<Switch2Driver>(right_transport));
+        REQUIRE(engine.MergeSlots(1U, 2U));
+
+        const auto bindings = engine.GetDeviceBindings();
+        REQUIRE(bindings.size() == 2U);
+        REQUIRE(bindings[0].info.type == ControllerType::Pro);
+        REQUIRE(bindings[1].info.type == ControllerType::Dual);
+        REQUIRE(bindings[1].info.slot_index == 1U);
+        const auto dual_axis_map = engine.GetAnalogMappingForDevice(bindings[1].params);
+
+        left_transport->FireInputReport(left_stick);
+        REQUIRE(ReadMappedAxis(engine, dual_axis_map, Settings::NativeAnalog::LStick, false) ==
+                Catch::Approx(1000.0 / 1500.0));
+
+        right_transport->FireInputReport(right_roll);
+        REQUIRE(ReadMappedAxis(engine, dual_axis_map, Settings::NativeAnalog::LStick, false) ==
+                Catch::Approx(-0.5));
+        REQUIRE_FALSE(mouse_engine.GetButton(real_mouse_id, left_btn));
+
+        engine.UnregisterDriver("usb:pro");
+        const auto reordered_bindings = engine.GetDeviceBindings();
+        REQUIRE(reordered_bindings.size() == 1U);
+        REQUIRE(reordered_bindings[0].info.type == ControllerType::Dual);
+        REQUIRE(reordered_bindings[0].info.slot_index == 0U);
+
+        engine.UnregisterDriver(right_transport->GetAddress());
+        const auto post_bindings = engine.GetDeviceBindings();
+        REQUIRE(post_bindings.size() == 1U);
+        REQUIRE(post_bindings[0].info.type == ControllerType::Left);
+        REQUIRE(post_bindings[0].info.slot_index == 0U);
+        const auto slot0_axis_map = engine.GetAnalogMappingForDevice(post_bindings[0].params);
+        REQUIRE(ReadMappedAxis(engine, slot0_axis_map, Settings::NativeAnalog::LStick, false) ==
+                Catch::Approx(1000.0 / 1500.0));
+    }
+
+    SECTION("MergeSlots and SplitSlot preserve pre-merge LeftStickX across Right-then-Left "
+            "registration") {
+        Settings::values.switch2_combine_joycons = false;
+
+        auto right_transport = std::make_shared<MockSwitch2Transport>(
+            ProductId::JoyCon2Right, "AA:BB:CC:DD:EE:85", TransportType::Ble);
+        auto left_transport = std::make_shared<MockSwitch2Transport>(
+            ProductId::JoyCon2Left, "AA:BB:CC:DD:EE:86", TransportType::Ble);
+
+        engine.RegisterDriver(std::make_shared<Switch2Driver>(right_transport));
+        engine.RegisterDriver(std::make_shared<Switch2Driver>(left_transport));
+
+        // ReorderSlotsLocked() sorts Left (priority 3) ahead of Right (priority 4).
+        const auto pre_bindings = engine.GetDeviceBindings();
+        REQUIRE(pre_bindings.size() == 2U);
+        REQUIRE(pre_bindings[0].info.type == ControllerType::Left);
+        REQUIRE(pre_bindings[1].info.type == ControllerType::Right);
+        const auto left_pre_axis_map = engine.GetAnalogMappingForDevice(pre_bindings[0].params);
+
+        left_transport->FireInputReport(left_stick);
+        REQUIRE(ReadMappedAxis(engine, left_pre_axis_map, Settings::NativeAnalog::LStick, false) ==
+                Catch::Approx(1000.0 / 1500.0));
+
+        REQUIRE(engine.MergeSlots(0U, 1U));
+        const auto dual_bindings = engine.GetDeviceBindings();
+        REQUIRE(dual_bindings.size() == 1U);
+        REQUIRE(dual_bindings[0].info.type == ControllerType::Dual);
+        const auto dual_axis_map = engine.GetAnalogMappingForDevice(dual_bindings[0].params);
+
+        right_transport->FireInputReport(right_roll);
+        REQUIRE(ReadMappedAxis(engine, dual_axis_map, Settings::NativeAnalog::LStick, false) ==
+                Catch::Approx(-0.5));
+        REQUIRE_FALSE(mouse_engine.GetButton(real_mouse_id, left_btn));
+
+        right_transport->FireInputReport(idle_report);
+        REQUIRE(ReadMappedAxis(engine, dual_axis_map, Settings::NativeAnalog::LStick, false) ==
+                Catch::Approx(1000.0 / 1500.0));
+
+        right_transport->FireInputReport(right_roll);
+        REQUIRE(ReadMappedAxis(engine, dual_axis_map, Settings::NativeAnalog::LStick, false) ==
+                Catch::Approx(-0.5));
+
+        REQUIRE(engine.SplitSlot(0U));
+        const auto split_bindings = engine.GetDeviceBindings();
+        REQUIRE(split_bindings.size() == 2U);
+        const auto split_left =
+            std::find_if(split_bindings.begin(), split_bindings.end(),
+                         [](const auto& b) { return b.info.type == ControllerType::Left; });
+        REQUIRE(split_left != split_bindings.end());
+        const auto split_left_axis_map = engine.GetAnalogMappingForDevice(split_left->params);
+        REQUIRE(
+            ReadMappedAxis(engine, split_left_axis_map, Settings::NativeAnalog::LStick, false) ==
+            Catch::Approx(1000.0 / 1500.0));
+    }
+
+    SECTION("Auto-combined Right-primary Dual Joy-Con restores LeftStickX on SplitSlot with slot "
+            "reorder") {
+        auto right1 = std::make_shared<MockSwitch2Transport>(
+            ProductId::JoyCon2Right, "AA:BB:CC:DD:EE:87", TransportType::Ble);
+        auto left1 = std::make_shared<MockSwitch2Transport>(
+            ProductId::JoyCon2Left, "AA:BB:CC:DD:EE:88", TransportType::Ble);
+        auto left2 = std::make_shared<MockSwitch2Transport>(
+            ProductId::JoyCon2Left, "AA:BB:CC:DD:EE:89", TransportType::Ble);
+        auto right2 = std::make_shared<MockSwitch2Transport>(
+            ProductId::JoyCon2Right, "AA:BB:CC:DD:EE:8A", TransportType::Ble);
+
+        engine.RegisterDriver(std::make_shared<Switch2Driver>(right1));
+        engine.RegisterDriver(std::make_shared<Switch2Driver>(left1));
+        engine.RegisterDriver(std::make_shared<Switch2Driver>(left2));
+        engine.RegisterDriver(std::make_shared<Switch2Driver>(right2));
+
+        const auto bindings = engine.GetDeviceBindings();
+        REQUIRE(bindings.size() == 2U);
+        REQUIRE(bindings[0].info.type == ControllerType::Dual);
+        REQUIRE(bindings[0].info.address == "AA:BB:CC:DD:EE:87 + AA:BB:CC:DD:EE:88");
+        const auto dual_axis_map = engine.GetAnalogMappingForDevice(bindings[0].params);
+
+        left1->FireInputReport(left_stick);
+        right1->FireInputReport(right_roll);
+        REQUIRE(ReadMappedAxis(engine, dual_axis_map, Settings::NativeAnalog::LStick, false) ==
+                Catch::Approx(-0.5));
+        REQUIRE_FALSE(mouse_engine.GetButton(real_mouse_id, left_btn));
+
+        REQUIRE(engine.SplitSlot(0U));
+        const auto split_bindings = engine.GetDeviceBindings();
+        REQUIRE(split_bindings.size() == 3U);
+        const auto split_left =
+            std::find_if(split_bindings.begin(), split_bindings.end(),
+                         [](const auto& b) { return b.info.address == "AA:BB:CC:DD:EE:88"; });
+        REQUIRE(split_left != split_bindings.end());
+        REQUIRE(split_left->info.type == ControllerType::Left);
+        REQUIRE(split_left->info.slot_index == 1U);
+        const auto split_left_axis_map = engine.GetAnalogMappingForDevice(split_left->params);
+        REQUIRE(
+            ReadMappedAxis(engine, split_left_axis_map, Settings::NativeAnalog::LStick, false) ==
+            Catch::Approx(1000.0 / 1500.0));
+    }
 }

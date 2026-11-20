@@ -212,24 +212,28 @@ LaunchParams ParseLaunchParams(Core::System& system, int argc, char *argv[], wch
             break;
         }
         case 'p':
-            if (optind < argc) {
-                p.program_args = parse_argv[optind];
-                ++optind;
+            if (optarg && optarg[0] != '\0') {
+                p.program_args = std::string(optarg);
             }
             break;
         case 'u': {
             // Launch game with a specific user
-            bool argument_ok = isdigit(optarg[0]) != 0;
-            p.selected_user = atoi(optarg);
-            if (!argument_ok) {
+            const bool is_number =
+                optarg != nullptr && optarg[0] != '\0' &&
+                std::isdigit(static_cast<unsigned char>(optarg[0])) != 0;
+            if (is_number) {
+                p.selected_user = std::atoi(optarg);
+            } else if (optarg != nullptr) {
                 // try to look it up by username, only finds the first username that matches.
                 auto const user_idx = system.GetProfileManager().GetUserIndex(optarg);
                 if (user_idx != std::nullopt) {
-                    p.selected_user = user_idx.value();
+                    p.selected_user = static_cast<int>(user_idx.value());
                 } else {
                     LOG_ERROR(Frontend, "Invalid user argument '{}'", optarg);
                     break;
                 }
+            } else {
+                break;
             }
             if (system.GetProfileManager().UserExistsIndex(*p.selected_user)) {
                 Settings::values.current_user = s32(*p.selected_user);

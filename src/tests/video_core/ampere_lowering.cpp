@@ -252,4 +252,98 @@ TEST_CASE("Ampere three-input IADD3 retains register source negation", "[video_c
     CHECK(((adds[0] >> 49) & 1) == 1);
     CHECK(((adds[1] >> 48) & 1) == 1);
 }
+
+TEST_CASE("Ampere SHF.R.U64 immediate shifts emit unclamped SHF.R", "[video_core][ampere]") {
+    for (const u32 shift : {1U, 12U, 32U}) {
+        CAPTURE(shift);
+        const Instruction insn{{0x819U | (7U << 12) | (4U << 16) | (6U << 24), shift, 0x1200U | 8U, 0}};
+        const auto lowered = LowerToMaxwell(std::array{insn, EXIT});
+        INFO(lowered.error);
+        REQUIRE(static_cast<bool>(lowered));
+        const u64 shf = FindMaxwell(lowered, 0x38f8, 48);
+        REQUIRE(shf != 0);
+        CHECK((shf & 255) == 4);
+        CHECK(((shf >> 8) & 255) == 6);
+        CHECK(((shf >> 20) & 0x7ffff) == shift);
+        CHECK(((shf >> 39) & 255) == 8);
+    }
+    const Instruction too_wide{{0x819U | (7U << 12) | (4U << 16) | (6U << 24), 33U, 0x1200U | 8U, 0}};
+    CHECK_FALSE(static_cast<bool>(LowerToMaxwell(std::array{too_wide, EXIT})));
+}
+
+TEST_CASE("Ampere ProgramCaptureState continues past EXIT to capture called helpers",
+          "[video_core][ampere]") {
+    const std::array<Instruction, 4> program{{
+        {{0x00097802, 0x20, 0x00000f00, 0}},       // MOV R9, 0x20 (return PC after CALL at index 1)
+        {{0x00007944, 0x10, 0x03c00000, 0}},       // CALL.REL.NOINC -> index 3
+        EXIT,                                      // main EXIT before callee
+        {{0x09007950, 0xffffffc0, 0x03c3ffff, 0}}, // RET.REL.NODEC R9
+    }};
+    ProgramCaptureState capture;
+    CHECK(capture.Observe(program[0], 0) == ProgramCaptureState::Result::Continue);
+    CHECK(capture.Observe(program[1], 1) == ProgramCaptureState::Result::Continue);
+    CHECK(capture.Observe(program[2], 2) == ProgramCaptureState::Result::Continue);
+    CHECK(capture.Observe(program[3], 3) == ProgramCaptureState::Result::Complete);
+    const auto lowered = LowerToMaxwell(program);
+    INFO(lowered.error);
+    REQUIRE(static_cast<bool>(lowered));
+}
+
+TEST_CASE("Ampere USEL, UBREV, UFLO, and UPOPC uniform operations lower cleanly",
+          "[video_core][ampere]") {
+    // USEL UR4, UR6, UR8, UP1 (0x287) + USEL UR10, UR6, 0x42, UP2 (0x887)
+    const Instruction usel_reg{{0x287U | (7U << 12) | (4U << 16) | (6U << 24), 8U, 0x08000000U | (1U << 23), 0}};
+    const Instruction usel_imm{{0x887U | (7U << 12) | (10U << 16) | (6U << 24), 0x42U, 0x08000000U | (2U << 23), 0}};
+    // UBREV UR12, UR6; UFLO.U32.SH UR14, UR6; UPOPC UR16, ~UR6
+    const Instruction ubrev{{0x2beU | (7U << 12) | (12U << 16), 6U, 0x08000000U, 0}};
+    const Instruction uflo{{0x2bdU | (7U << 12) | (14U << 16), 6U, 0x080e0400U, 0}};
+    const Instruction upopc{{0x2bfU | (7U << 12) | (16U << 16), 6U | (1U << 31), 0x08000000U, 0}};
+
+    const auto lowered = LowerToMaxwell(std::array{usel_reg, usel_imm, ubrev, uflo, upopc, EXIT});
+    INFO(lowered.error);
+    REQUIRE(static_cast<bool>(lowered));
+
+    CHECK(CountMaxwell(lowered, 0x5ca, 52) == 2); // Two SELs (P5 and P4)
+    const u64 brev = FindMaxwell(lowered, 0x3828, 48);
+    REQUIRE(brev != 0);
+    CHECK((brev & 255) == 228); // UR12
+    CHECK(((brev >> 8) & 255) == 222); // UR6
+    CHECK(((brev >> 39) & 3) == 3);
+
+    const u64 flo = FindMaxwell(lowered, 0x5c30, 48);
+    REQUIRE(flo != 0);
+    CHECK((flo & 255) == 230); // UR14
+    CHECK(((flo >> 20) & 255) == 222);
+    CHECK(((flo >> 41) & 1) == 1); // .SH
+
+    const u64 popc = FindMaxwell(lowered, 0x5c08, 48);
+    REQUIRE(popc != 0);
+    CHECK((popc & 255) == 232); // UR16
+    CHECK(((popc >> 20) & 255) == 222);
+    CHECK(((popc >> 40) & 1) == 1); // inverted source
+}
+
+TEST_CASE("Ampere three-input IADD3 keeps negative immediates unnegated", "[video_core][ampere]") {
+    for (const bool negate_c : {false, true}) {
+        CAPTURE(negate_c);
+        // IADD3 R4, R6, -4 (0xfffffffc), [-]R8: bit 63 is the negative literal's sign bit.
+        const Instruction add{{0x810U | (7U << 12) | (4U << 16) | (6U << 24), 0xfffffffcU,
+                               0x07ffe008U | (u32{negate_c} << 11), 0}};
+        const auto lowered = LowerToMaxwell(std::array{add, EXIT});
+        INFO(lowered.error);
+        REQUIRE(static_cast<bool>(lowered));
+        const u64 mov = FindMaxwell(lowered, 0x01, 56);
+        REQUIRE(mov != 0);
+        CHECK((mov & 255) == 251);
+        CHECK(((mov >> 20) & 0xffffffffU) == 0xfffffffcU);
+        std::vector<u64> adds;
+        for (const u64 word : lowered.instructions) {
+            if ((word >> 52) == 0x5c1) adds.push_back(word);
+        }
+        REQUIRE(adds.size() == 2);
+        CHECK(((adds[0] >> 48) & 1) == 0);
+        CHECK(((adds[0] >> 49) & 1) == 0);
+        CHECK(((adds[1] >> 48) & 1) == u64{negate_c});
+    }
+}
 } // namespace

@@ -66,11 +66,11 @@ public:
 
     /// Identifies a session's heap mapper. The mapper itself can go away with the session, so it
     /// is named by its id, not by a pointer that would dangle.
-    using HeapMapperId = uintptr_t;
+    using HeapMapperId = u64;
 
     /// The id of a heap mapper, or 0 for none.
     static HeapMapperId IdOf(const HeapMapper* mapper) {
-        return reinterpret_cast<HeapMapperId>(mapper);
+        return mapper != nullptr ? mapper->GetId() : 0;
     }
 
     /// Runs func on the session's heap mapper while the session cannot close, so the mapper stays

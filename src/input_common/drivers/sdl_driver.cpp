@@ -507,13 +507,8 @@ std::shared_ptr<SDLJoystick> SDLDriver::GetSDLJoystickByGamepadID(SDL_JoystickID
 
 void SDLDriver::InitJoystick(SDL_JoystickID joystick_id) {
     SDL_Joystick* sdl_joystick = SDL_OpenJoystick(joystick_id);
-    SDL_Gamepad* sdl_gamecontroller = nullptr;
     int battery_percent = -1;
     SDL_PowerState battery_state = SDL_POWERSTATE_UNKNOWN;
-
-    if (SDL_IsGamepad(joystick_id)) {
-        sdl_gamecontroller = SDL_OpenGamepad(joystick_id);
-    }
 
     if (!sdl_joystick) {
         LOG_ERROR(Input, "Failed to open joystick {}", joystick_id);
@@ -541,6 +536,7 @@ void SDLDriver::InitJoystick(SDL_JoystickID joystick_id) {
         }
     }
 
+#if defined(_WIN32) || defined(ENABLE_LIBUSB)
     if (Settings::values.enable_switch2_driver) {
         const u16 vendor_id = SDL_GetJoystickVendor(sdl_joystick);
         const u16 product_id = SDL_GetJoystickProduct(sdl_joystick);
@@ -551,15 +547,21 @@ void SDLDriver::InitJoystick(SDL_JoystickID joystick_id) {
         const bool is_switch2_vid_pid =
             vendor_id == 0x057e && (product_id == 0x2066 || product_id == 0x2067 ||
                                     product_id == 0x2069 || product_id == 0x2073);
-        if (is_switch2_guid || is_switch2_vid_pid) {
+#if defined(_WIN32)
+        const bool handled_by_native_switch2 = true;
+#else
+        const bool handled_by_native_switch2 = guid.uuid[0] != 0x05;
+#endif
+        if (handled_by_native_switch2 && (is_switch2_guid || is_switch2_vid_pid)) {
             LOG_WARNING(Input, "Preferring switch2 driver for device index {}", joystick_id);
-            if (sdl_gamecontroller != nullptr) {
-                SDL_CloseGamepad(sdl_gamecontroller);
-            }
             SDL_CloseJoystick(sdl_joystick);
             return;
         }
     }
+#endif
+
+    SDL_Gamepad* sdl_gamecontroller =
+        SDL_IsGamepad(joystick_id) ? SDL_OpenGamepad(joystick_id) : nullptr;
 
     std::scoped_lock lock{joystick_map_mutex};
     if (joystick_map.find(guid) == joystick_map.end()) {
@@ -595,6 +597,10 @@ void SDLDriver::InitJoystick(SDL_JoystickID joystick_id) {
 }
 
 void SDLDriver::CloseJoystick(SDL_Joystick* sdl_joystick) {
+    if (!sdl_joystick) {
+        return;
+    }
+
     const auto guid = GetGUID(sdl_joystick);
 
     std::scoped_lock lock{joystick_map_mutex};
@@ -726,11 +732,15 @@ SDLDriver::SDLDriver(std::string input_engine_) : InputEngine(std::move(input_en
     }
 
 #ifdef SDL_HINT_JOYSTICK_HIDAPI_SWITCH2
+#if defined(_WIN32)
     if (Settings::values.enable_switch2_driver) {
         SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH2, "0");
     } else {
         SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH2, "1");
     }
+#else
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH2, "1");
+#endif
 #endif
 
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH_PLAYER_LED, "1");

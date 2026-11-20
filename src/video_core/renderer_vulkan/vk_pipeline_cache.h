@@ -180,7 +180,8 @@ private:
                                                   bool is_indexed) noexcept;
 
     void RecordSkippedGeometry(bool is_indexed, const GraphicsPipeline* pipeline) noexcept;
-    [[nodiscard]] bool ShouldSkipDepthOnlyGeometry(bool is_indexed) noexcept;
+    [[nodiscard]] bool ShouldSkipDepthOnlyGeometry(bool is_indexed,
+                                                   const GraphicsPipeline& pipeline) noexcept;
     void ClearSkippedGeometryIfDrawn(bool is_indexed) noexcept;
 
     void DrainReadyDiskPipelines();

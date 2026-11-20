@@ -16,6 +16,7 @@
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 
 namespace {
@@ -363,4 +364,52 @@ TEST_CASE("Cooperative HMMA self-test shader runs one lowering on one warp",
                        static_cast<std::streamsize>(code.size() * sizeof(u32)));
         }
     }
+}
+
+TEST_CASE("Synthetic HMMA.16816.F16 lowering covers inline, compact, and guarded fallback",
+          "[video_core][tensor][ampere]") {
+    using Shader::Ampere::Instruction;
+    using Shader::Ampere::LowerToMaxwellWith;
+
+    constexpr Instruction Exit{{0x0000794d, 0, 0x03800000, 0}};
+    // Synthetic HMMA.16816.F16 (opcode 0x23c, depth=16 via 0x800 in word[2]):
+    // D=R8..R9, A=R12..R15, B=R16..R17, C=R20..R21.
+    constexpr Instruction HmmaUnpred{
+        {0x23cU | (7U << 12) | (8U << 16) | (12U << 24), 16U, 0x800U | 20U, 0}};
+    constexpr Instruction HmmaGuarded{
+        {0x23cU | (1U << 12) | (8U << 16) | (12U << 24), 16U, 0x800U | 20U, 0}};
+
+    // Disabled tensor lowering rejects HMMA unless EDEN_NX2_TENSOR is forced.
+    if (std::getenv("EDEN_NX2_TENSOR") == nullptr) {
+        const auto disabled = LowerToMaxwellWith(std::array{HmmaUnpred, Exit}, 0, {.tensor = false});
+        CHECK_FALSE(static_cast<bool>(disabled));
+    }
+
+    const auto expanded = LowerToMaxwellWith(std::array{HmmaUnpred, Exit}, 0,
+                                             {.tensor = true, .compact_tensor = false});
+    INFO(expanded.error);
+    REQUIRE(static_cast<bool>(expanded));
+    CHECK(std::ranges::none_of(expanded.instructions,
+                               [](u64 word) { return (word >> 52) == 0x5d3; }));
+    CHECK(std::ranges::any_of(expanded.instructions,
+                              [](u64 word) { return (word >> 52) == 0x598; }));
+
+    const auto compact = LowerToMaxwellWith(std::array{HmmaUnpred, Exit}, 0,
+                                            {.tensor = true, .compact_tensor = true});
+    INFO(compact.error);
+    REQUIRE(static_cast<bool>(compact));
+    REQUIRE(compact.instructions.size() == 2);
+    CHECK((compact.instructions[0] >> 52) == 0x5d3);
+    CHECK(((compact.instructions[0] >> 48) & 3) == 1);
+
+    // Predicated HMMA falls back to the inline expansion even when compact_tensor is true.
+    const auto guarded = LowerToMaxwellWith(std::array{HmmaGuarded, Exit}, 0,
+                                            {.tensor = true, .compact_tensor = true});
+    INFO(guarded.error);
+    REQUIRE(static_cast<bool>(guarded));
+    CHECK(std::ranges::none_of(guarded.instructions,
+                               [](u64 word) { return (word >> 52) == 0x5d3; }));
+    CHECK(std::ranges::any_of(guarded.instructions, [](u64 word) {
+        return (word >> 52) == 0x598 && ((word >> 16) & 15) == 1;
+    }));
 }

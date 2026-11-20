@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <thread>
@@ -10,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "common/scope_exit.h"
 #include "network/network.h"
 #include "network/room.h"
 #include "network/room_member.h"
@@ -134,6 +136,76 @@ TEST_CASE("Room information", "[network]") {
         Room room;
         const bool created = room.Create("test room", "a description", "127.0.0.1", 0);
         REQUIRE(created);
+    }
+
+    SECTION("A connected member caps oversized game info and does not duplicate on rejoin") {
+        Room room;
+        u16 port = 0;
+        for (u16 candidate = 24879; candidate <= 24899; ++candidate) {
+            if (room.Create("test room", "a description", "127.0.0.1", candidate)) {
+                port = candidate;
+                break;
+            }
+        }
+        REQUIRE(port != 0);
+
+        const auto wait_until = [](auto&& predicate) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (std::chrono::steady_clock::now() < deadline) {
+                if (predicate()) {
+                    return true;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            return predicate();
+        };
+
+        RoomMember member;
+        SCOPE_EXIT {
+            member.Leave();
+        };
+        const IPv4Address preferred_ip{192, 168, 7, 42};
+        member.Join("player_one", "127.0.0.1", port, 0, preferred_ip);
+        REQUIRE(wait_until([&] { return member.GetState() == RoomMember::State::Joined; }));
+        REQUIRE(room.GetRoomMemberList().size() == 1);
+        REQUIRE(member.GetMemberInformation().size() == 1);
+        REQUIRE(member.GetFakeIpAddress() == preferred_ip);
+
+        member.SendGameInfo(GameInfo{
+            .name = std::string(1024, 'A'),
+            .id = 1,
+            .version = std::string(1024, 'B'),
+        });
+        REQUIRE(wait_until([&] {
+            const auto current_members = room.GetRoomMemberList();
+            return current_members.size() == 1 && !current_members[0].game.name.empty();
+        }));
+        const auto members_after_game_info = room.GetRoomMemberList();
+        REQUIRE(members_after_game_info.size() == 1);
+        REQUIRE(members_after_game_info[0].game.name.size() == 256);
+        REQUIRE(members_after_game_info[0].game.version.size() == 256);
+
+        RoomMember colliding_member;
+        std::atomic<bool> saw_name_collision{false};
+        const auto error_handle = colliding_member.BindOnError([&](const RoomMember::Error& error) {
+            if (error == RoomMember::Error::NameCollision) {
+                saw_name_collision.store(true, std::memory_order_release);
+            }
+        });
+        SCOPE_EXIT {
+            colliding_member.Unbind(error_handle);
+            colliding_member.Leave();
+        };
+        colliding_member.Join("player_one", "127.0.0.1", port);
+        REQUIRE(wait_until([&] {
+            return saw_name_collision.load(std::memory_order_acquire) &&
+                   colliding_member.GetState() == RoomMember::State::Idle;
+        }));
+        REQUIRE(colliding_member.GetMemberInformation().empty());
+
+        member.Join("player_one", "127.0.0.1", port);
+        REQUIRE(wait_until([&] { return member.GetState() == RoomMember::State::Joined; }));
+        REQUIRE(room.GetRoomMemberList().size() == 1);
     }
 }
 

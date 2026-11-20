@@ -47,6 +47,7 @@ add_executable(tests
     common/unique_function.cpp
     common/zstd_compression.cpp
     core/core_timing.cpp
+    core/launch_params.cpp
     core/ldn.cpp
     core/memory_range.cpp
     core/internal_network/socket_proxy.cpp

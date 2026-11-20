@@ -108,7 +108,9 @@ void NvMap::UnmapHandle(Handle& handle_description) {
     }
     const VAddr vaddress = handle_description.address;
     auto* session = core.GetSession(handle_description.session_id);
-    session->mapper->Unmap(vaddress, map_size);
+    if (session != nullptr && session->mapper != nullptr) {
+        session->mapper->Unmap(vaddress, map_size);
+    }
     handle_description.d_address = 0;
     handle_description.in_heap = false;
 }
@@ -167,6 +169,11 @@ DAddr NvMap::PinHandle(NvMap::Handle::Id handle, bool low_area_pin) {
     }
 
     std::scoped_lock lock(handle_description->mutex);
+    auto* session = core.GetSession(handle_description->session_id);
+    if (session == nullptr) {
+        LOG_ERROR(Service_NVDRV, "Cannot pin nvmap handle {} without an active session", handle);
+        return 0;
+    }
     const auto map_low_area = [&] {
         if (handle_description->pin_virt_address == 0) {
             u32 address = host1x.Allocator().Allocate(u32(handle_description->aligned_size));
@@ -200,10 +207,10 @@ DAddr NvMap::PinHandle(NvMap::Handle::Id handle, bool low_area_pin) {
         // If not then allocate some space and map it
         DAddr address{};
         auto& smmu = host1x.MemoryManager();
-        auto* session = core.GetSession(handle_description->session_id);
         const VAddr vaddress = handle_description->address;
         const size_t map_size = handle_description->aligned_size;
-        if (session->has_preallocated_area && session->mapper->IsInBounds(vaddress, map_size)) {
+        if (session->has_preallocated_area && session->mapper != nullptr &&
+            session->mapper->IsInBounds(vaddress, map_size)) {
             handle_description->d_address = session->mapper->Map(vaddress, map_size);
             handle_description->in_heap = true;
         } else {

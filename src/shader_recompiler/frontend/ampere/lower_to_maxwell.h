@@ -2685,15 +2685,32 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                                 return fail(index, "native per-tap gather offset clobber");
                             continue;
                         }
+                        if (op == 0xb6c || op == 0xf6c) {
+                            const u32 channels = static_cast<u32>(std::popcount(def.Bits(72, 4)));
+                            const u32 first_count = (std::min)((std::max)(channels, 1U), 2U);
+                            const u32 second = def.Bits(64, 8);
+                            const u32 second_count = channels > 2 ? channels - 2 : 0U;
+                            if ((target != 255 && reg >= target && reg < target + first_count) ||
+                                (second != 255 && reg >= second && reg < second + second_count))
+                                return fail(index, "native per-tap gather offset clobber");
+                            continue;
+                        }
                         if (op == 0xb9b || op == 0x59f || op == 0x386 || op == 0x986 ||
                             op == 0x388 || op == 0x988 || op == 0x992 || op == 0xb1d ||
                             op == 0x948 || op == 0x348 || op == 0x941 || op == 0x942 ||
                             op == 0x95b) {
                             continue;
                         }
-                        const u32 count = (op == 0x225 || op == 0x625 || op == 0x825 || op == 0x805) ? 2U
-                                        : (op == 0x305 && def.Bits(75, 2) == 3) ? 2U
-                                        : 1U;
+                        const u32 width = def.Bits(73, 3);
+                        const u32 count =
+                            (op == 0x225 || op == 0x625 || op == 0x825 || op == 0x805 || op == 0x23c) ? 2U
+                            : (op == 0x305 && def.Bits(75, 2) == 3) ? 2U
+                            : (op == 0x381 || op == 0x981 || op == 0x983 || op == 0x984)
+                                ? (width == 6 ? 4U : width == 5 ? 2U : 1U)
+                            : (op == 0x321) ? (def.Bits(74, 2) + 1U)
+                            : (op == 0x83b) ? (1U << def.Bits(72, 2))
+                            : (op == 0xb82) ? (width == 5 ? 2U : 1U)
+                            : 1U;
                         if (target == 255 || reg < target || reg >= target + count)
                             continue;
                         const bool move = op == 0x802 && !def.Bits(24, 8) && def.words[2] == 0xf00;

@@ -178,23 +178,29 @@ void WriteEntries(Raw& raw, const Mapping& mapping) {
 /// pointed at the keyboard or at another device is left alone. Returns true when the slot was
 /// changed.
 template <typename Raw, typename Mapping>
-bool RewriteEntries(Raw& raw, const Mapping& mapping) {
+bool RewriteEntries(Raw& raw, const Mapping& mapping, bool restore_missing) {
     using Key = typename Mapping::key_type;
     bool changed = false;
 
     for (std::size_t index = 0; index < raw.size(); ++index) {
+        const auto entry = mapping.find(static_cast<Key>(static_cast<int>(index)));
+        if (raw[index].empty() || raw[index] == EmptyBinding()) {
+            if (restore_missing && entry != mapping.end()) {
+                raw[index] = entry->second.Serialize();
+                changed = true;
+            }
+            continue;
+        }
+
         const auto stored = ParseBinding(raw[index]);
         if (!IsSwitch2Engine(stored)) {
             continue;
         }
 
-        const auto entry = mapping.find(static_cast<Key>(static_cast<int>(index)));
         if (entry == mapping.end()) {
             // The controller does not provide this input anymore.
-            if (raw[index] != EmptyBinding()) {
-                raw[index] = EmptyBinding();
-                changed = true;
-            }
+            raw[index] = EmptyBinding();
+            changed = true;
             continue;
         }
 
@@ -209,20 +215,25 @@ bool RewriteEntries(Raw& raw, const Mapping& mapping) {
 
 /// Rewrites the Switch 2 entries of a player slot. Returns true when the slot was changed.
 bool RewriteSwitch2Entries(Settings::PlayerInput& player, const DeviceContext& context) {
+    const bool type_changed =
+        player.controller_type != Switch2AutoPair::ControllerTypeFor(context.type);
     bool changed = false;
-    changed |= RewriteEntries(player.buttons, context.buttons);
-    changed |= RewriteEntries(player.analogs, context.analogs);
-    changed |= RewriteEntries(player.motions, context.motions);
+    changed |= RewriteEntries(player.buttons, context.buttons, type_changed);
+    changed |= RewriteEntries(player.analogs, context.analogs, type_changed);
+    changed |= RewriteEntries(player.motions, context.motions, type_changed);
     return changed;
 }
 
-/// Returns the slot a controller without an owner should use: the lowest unconnected slot that
-/// is not claimed and that no other controller owns. If none is free, a slot bound to a gone
-/// Switch 2 controller is reused before falling back to an actively connected non-Switch 2 slot.
 std::optional<std::size_t> FindTargetSlot(const std::vector<bool>& claimed,
                                            const std::vector<bool>& bound,
                                            const std::vector<bool>& owned_by_present,
-                                           const std::vector<Settings::PlayerInput>& players) {
+                                           const std::vector<Settings::PlayerInput>& players,
+                                           bool player_one_uses_default_keyboard) {
+    if (player_one_uses_default_keyboard && !claimed.empty() && !claimed.front() &&
+        !bound.front()) {
+        return 0;
+    }
+
     for (std::size_t index = 0; index < claimed.size(); ++index) {
         if (!claimed[index] && !bound[index] && !players[index].connected) {
             return index;
@@ -246,7 +257,8 @@ std::optional<std::size_t> FindTargetSlot(const std::vector<bool>& claimed,
 
 /// The pairing policy on the given controllers and player slots.
 std::vector<AutoPairPlayer> ApplyContexts(const std::vector<DeviceContext>& contexts,
-                                          std::vector<Settings::PlayerInput>& players) {
+                                          std::vector<Settings::PlayerInput>& players,
+                                          bool player_one_uses_default_keyboard) {
     std::vector<AutoPairPlayer> changed;
 
     // The owners are resolved before anything is written, so that a controller that takes over
@@ -279,18 +291,21 @@ std::vector<AutoPairPlayer> ApplyContexts(const std::vector<DeviceContext>& cont
         if (owner) {
             claimed[*owner] = true;
             auto& player = players[*owner];
+            const bool was_connected = player.connected;
             if (RewriteSwitch2Entries(player, context)) {
                 player.controller_type = Switch2AutoPair::ControllerTypeFor(context.type);
                 player.connected = true;
-                changed.push_back({*owner, context.name, context.identity, false, false});
+                changed.push_back({*owner, context.name, context.identity, !was_connected, false});
             } else if (!player.connected) {
+                player.controller_type = Switch2AutoPair::ControllerTypeFor(context.type);
                 player.connected = true;
                 changed.push_back({*owner, context.name, context.identity, true, false});
             }
             continue;
         }
 
-        const auto target = FindTargetSlot(claimed, bound, owned_by_present, players);
+        const auto target =
+            FindTargetSlot(claimed, bound, owned_by_present, players, player_one_uses_default_keyboard);
         if (!target) {
             LOG_WARNING(Input, "Switch 2 auto pair: no free player slot for {} ({})", context.name,
                         context.identity);
@@ -358,7 +373,8 @@ std::string SlotIdentity(const Settings::PlayerInput& player, std::size_t slot,
 
 } // namespace
 
-std::vector<AutoPairPlayer> Switch2AutoPair::Apply(Switch2Controllers& engine) {
+std::vector<AutoPairPlayer> Switch2AutoPair::Apply(Switch2Controllers& engine,
+                                                 bool player_one_uses_default_keyboard) {
     if (!Settings::values.switch2_auto_pair.GetValue()) {
         return {};
     }
@@ -380,7 +396,7 @@ std::vector<AutoPairPlayer> Switch2AutoPair::Apply(Switch2Controllers& engine) {
         },
     };
 
-    auto changed = ApplyDevices(devices, mappings, players);
+    auto changed = ApplyDevices(devices, mappings, players, player_one_uses_default_keyboard);
 
     // Store the result in the active as well as in the global configuration, so that the running
     // game and the persisted configuration agree.
@@ -412,14 +428,14 @@ std::vector<AutoPairPlayer> Switch2AutoPair::Apply(Switch2Controllers& engine) {
 
 std::vector<AutoPairPlayer> Switch2AutoPair::ApplyDevices(
     const std::vector<Switch2DeviceBinding>& devices, const DeviceMappings& mappings,
-    std::vector<Settings::PlayerInput>& players) {
+    std::vector<Settings::PlayerInput>& players, bool player_one_uses_default_keyboard) {
     if (!mappings.buttons || !mappings.analogs || !mappings.motions) {
         LOG_WARNING(Input, "Switch 2 auto pair: the input engine did not provide the mappings");
         return {};
     }
 
     const auto contexts = BuildDeviceContexts(devices, mappings);
-    auto changed = ApplyContexts(contexts, players);
+    auto changed = ApplyContexts(contexts, players, player_one_uses_default_keyboard);
 
     // Rebuild the map of controller identity to player slot.
     std::vector<std::optional<std::size_t>> owners;
@@ -484,13 +500,14 @@ std::vector<AutoPairPlayer> Switch2AutoPair::ApplyDevices(
 
 std::vector<AutoPairPlayer> Switch2AutoPair::ApplyToPlayers(
     const std::vector<Switch2DeviceBinding>& devices, const DeviceMappings& mappings,
-    std::vector<Settings::PlayerInput>& players) {
+    std::vector<Settings::PlayerInput>& players, bool player_one_uses_default_keyboard) {
     if (!mappings.buttons || !mappings.analogs || !mappings.motions) {
         LOG_WARNING(Input, "Switch 2 auto pair: the input engine did not provide the mappings");
         return {};
     }
 
-    return ApplyContexts(BuildDeviceContexts(devices, mappings), players);
+    return ApplyContexts(BuildDeviceContexts(devices, mappings), players,
+                         player_one_uses_default_keyboard);
 }
 
 bool Switch2AutoPair::IsSwitch2Player(const Settings::PlayerInput& player) {

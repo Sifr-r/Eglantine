@@ -12,6 +12,7 @@ struct Snapshot {
     QString driver;
     QString log_tail;
     QString recent_errors;
+    QString actionable_items;
     bool readable = false;
     bool truncated = false;
 };

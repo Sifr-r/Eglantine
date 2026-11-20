@@ -763,7 +763,6 @@ void Image::UploadMemory(GLuint buffer_handle, size_t buffer_offset,
         ScaleDown(true);
     }
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer_handle);
-    glFlushMappedBufferRange(GL_PIXEL_UNPACK_BUFFER, buffer_offset, unswizzled_size_bytes);
 
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
@@ -791,6 +790,10 @@ void Image::UploadMemory(GLuint buffer_handle, size_t buffer_offset,
 
 void Image::UploadMemory(const StagingBufferMap& map,
                          std::span<const VideoCommon::BufferImageCopy> copies) {
+    if (!map.mapped_span.empty()) {
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, map.buffer);
+        glFlushMappedBufferRange(GL_PIXEL_UNPACK_BUFFER, map.offset, map.mapped_span.size());
+    }
     UploadMemory(map.buffer, map.offset, copies);
 }
 

@@ -8,12 +8,14 @@
 #include <cinttypes>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/hex_util.h"
@@ -87,8 +89,13 @@ bool IsSupportedSaveDataType(FileSys::SaveDataType type) {
 
 /// Returns the user id of the currently selected user, if there is one.
 std::optional<FileSys::UserId> GetCurrentUserId(Core::System& system) {
+    const s32 current_user = Settings::values.current_user.GetValue();
+    if (current_user < 0) {
+        return std::nullopt;
+    }
+
     const auto& manager = system.GetProfileManager();
-    const auto index = static_cast<std::size_t>((std::max)(Settings::values.current_user.GetValue(), 0));
+    const auto index = static_cast<std::size_t>(current_user);
 
     if (!manager.UserExistsIndex(index)) {
         return std::nullopt;
@@ -102,11 +109,37 @@ std::optional<FileSys::UserId> GetCurrentUserId(Core::System& system) {
     return user_id->AsU128();
 }
 
-/// Builds the attribute of a system save owned by the given title and user.
-FileSys::SaveDataAttribute MakeSystemSaveAttribute(u64 program_id, FileSys::UserId user_id,
-                                                   u64 save_data_id) {
-    return FileSys::SaveDataAttribute::Make(program_id, FileSys::SaveDataType::System, user_id,
-                                            save_data_id);
+/// Resolves an unambiguous save identity, retaining active-account scoping for legacy title IDs.
+Result ResolveSaveDataAttributeById(SaveDataController& controller, Core::System& system,
+                                    FileSys::SaveDataSpaceId space_id, u64 save_data_id,
+                                    FileSys::SaveDataAttribute* out_attribute) {
+    R_UNLESS(out_attribute != nullptr, FileSys::ResultInvalidArgument);
+    R_UNLESS(save_data_id != 0, FileSys::ResultInvalidArgument);
+
+    const auto entries = controller.EnumerateSaveData(space_id);
+    const auto* matched =
+        FileSys::FindSaveDataEntryById(entries, save_data_id, GetCurrentUserId(system));
+    R_UNLESS(matched != nullptr, FileSys::ResultTargetNotFound);
+
+    FileSys::SaveDataAttribute attribute{};
+    attribute.type = matched->type;
+    attribute.user_id = matched->user_id;
+    attribute.rank = matched->rank;
+    attribute.index = matched->index;
+    if (matched->type == FileSys::SaveDataType::System) {
+        attribute.system_save_data_id = matched->system_save_data_id;
+    } else {
+        attribute.program_id = matched->title_id;
+    }
+    *out_attribute = attribute;
+    return ResultSuccess;
+}
+
+Result DeleteSaveDataById(SaveDataController& controller, Core::System& system,
+                          FileSys::SaveDataSpaceId space_id, u64 save_data_id) {
+    FileSys::SaveDataAttribute attribute{};
+    R_TRY(ResolveSaveDataAttributeById(controller, system, space_id, save_data_id, &attribute));
+    return controller.DeleteSaveData(space_id, attribute);
 }
 
 /// Sanitizes a guest supplied path into a relative subdirectory path.
@@ -485,30 +518,44 @@ Result FSP_SRV::CreateSaveDataFileSystemWithCreationInfo2(
 Result FSP_SRV::DeleteSaveDataFileSystem(u64 save_data_id) {
     LOG_DEBUG(Service_FS, "called, save_data_id={:016X}", save_data_id);
 
-    const auto user_id = GetCurrentUserId(system);
-    R_UNLESS(user_id.has_value(), FileSys::ResultInvalidArgument);
-
-    const auto attribute = MakeSystemSaveAttribute(program_id, *user_id, save_data_id);
-
-    R_RETURN(save_data_controller->DeleteSaveData(FileSys::SaveDataSpaceId::User, attribute));
+    R_RETURN(DeleteSaveDataById(*save_data_controller, system, FileSys::SaveDataSpaceId::User,
+                                save_data_id));
 }
 
 Result FSP_SRV::RegisterSaveDataFileSystemAtomicDeletion(
     InBuffer<BufferAttr_HipcMapAlias> save_data_id_buffer) {
-    R_UNLESS(save_data_id_buffer.size() >= sizeof(u64), FileSys::ResultInvalidArgument);
+    R_UNLESS(save_data_id_buffer.size() >= sizeof(u64) &&
+                 (save_data_id_buffer.size() % sizeof(u64)) == 0,
+             FileSys::ResultInvalidArgument);
 
-    u64 save_data_id{};
-    std::memcpy(&save_data_id, save_data_id_buffer.data(), sizeof(save_data_id));
+    const std::size_t count = save_data_id_buffer.size() / sizeof(u64);
+    std::vector<FileSys::SaveDataAttribute> attributes;
+    attributes.reserve(count);
 
-    LOG_DEBUG(Service_FS, "called, save_data_id={:016X}", save_data_id);
+    for (std::size_t i = 0; i < count; ++i) {
+        u64 save_data_id{};
+        std::memcpy(&save_data_id, save_data_id_buffer.data() + i * sizeof(u64),
+                    sizeof(save_data_id));
 
-    const auto user_id = GetCurrentUserId(system);
-    R_UNLESS(user_id.has_value(), FileSys::ResultInvalidArgument);
+        LOG_DEBUG(Service_FS, "called, index={}, save_data_id={:016X}", i, save_data_id);
 
-    const auto attribute = MakeSystemSaveAttribute(program_id, *user_id, save_data_id);
+        FileSys::SaveDataAttribute attribute{};
+        R_TRY(ResolveSaveDataAttributeById(*save_data_controller, system,
+                                           FileSys::SaveDataSpaceId::User, save_data_id,
+                                           &attribute));
 
-    // The console defers this deletion until the next boot, we delete the save right away.
-    R_RETURN(save_data_controller->DeleteSaveData(FileSys::SaveDataSpaceId::User, attribute));
+        if (std::ranges::find(attributes, attribute) == attributes.end()) {
+            attributes.push_back(attribute);
+        }
+    }
+
+    // The console defers this deletion until the next boot, we delete the saves right away
+    // once every requested id has been validated.
+    for (const auto& attribute : attributes) {
+        R_TRY(save_data_controller->DeleteSaveData(FileSys::SaveDataSpaceId::User, attribute));
+    }
+
+    R_SUCCEED();
 }
 
 Result FSP_SRV::DeleteSaveDataFileSystemBySaveDataSpaceId(FileSys::SaveDataSpaceId space_id,
@@ -517,12 +564,7 @@ Result FSP_SRV::DeleteSaveDataFileSystemBySaveDataSpaceId(FileSys::SaveDataSpace
 
     R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
 
-    const auto user_id = GetCurrentUserId(system);
-    R_UNLESS(user_id.has_value(), FileSys::ResultInvalidArgument);
-
-    const auto attribute = MakeSystemSaveAttribute(program_id, *user_id, save_data_id);
-
-    R_RETURN(save_data_controller->DeleteSaveData(space_id, attribute));
+    R_RETURN(DeleteSaveDataById(*save_data_controller, system, space_id, save_data_id));
 }
 
 Result FSP_SRV::DeleteSaveDataFileSystemBySaveDataAttribute(FileSys::SaveDataSpaceId space_id,
@@ -531,6 +573,9 @@ Result FSP_SRV::DeleteSaveDataFileSystemBySaveDataAttribute(FileSys::SaveDataSpa
 
     R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
     R_UNLESS(IsSupportedSaveDataType(attribute.type), FileSys::ResultInvalidArgument);
+    R_UNLESS(attribute.type != FileSys::SaveDataType::System ||
+                 attribute.system_save_data_id != FileSys::InvalidSystemSaveDataId,
+             FileSys::ResultInvalidArgument);
 
     R_RETURN(save_data_controller->DeleteSaveData(space_id, attribute));
 }
@@ -671,6 +716,10 @@ Result FSP_SRV::OpenSaveDataInfoReaderBySaveDataFilter(
         R_UNLESS(IsSupportedSaveDataType(filter.attribute.type), FileSys::ResultInvalidArgument);
     }
 
+    if (filter.use_program_id && filter.attribute.program_id == 0 && program_id != 0) {
+        filter.attribute.program_id = program_id;
+    }
+
     *out_interface =
         std::make_shared<ISaveDataInfoReader>(system, save_data_controller, space_id, filter);
 
@@ -678,18 +727,18 @@ Result FSP_SRV::OpenSaveDataInfoReaderBySaveDataFilter(
 }
 
 Result FSP_SRV::OpenSaveDataMetaFile(OutInterface<IFile> out_interface,
-                                     FileSys::SaveDataSpaceId space_id, FileSys::SaveDataMetaType meta_type,
+                                     FileSys::SaveDataSpaceId space_id, u32 meta_type_raw,
                                      FileSys::SaveDataAttribute attribute) {
-    LOG_DEBUG(Service_FS, "called, space_id={}, meta_type={:02X}, {}", space_id,
-              static_cast<u8>(meta_type), attribute.DebugInfo());
+    LOG_DEBUG(Service_FS, "called, space_id={}, meta_type={:08X}, {}", space_id, meta_type_raw,
+              attribute.DebugInfo());
 
     R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
     R_UNLESS(IsSupportedSaveDataType(attribute.type), FileSys::ResultInvalidArgument);
-    R_UNLESS(meta_type == FileSys::SaveDataMetaType::None ||
-                 meta_type == FileSys::SaveDataMetaType::Thumbnail ||
-                 meta_type == FileSys::SaveDataMetaType::ExtensionContext,
+    R_UNLESS(meta_type_raw == static_cast<u32>(FileSys::SaveDataMetaType::Thumbnail) ||
+                 meta_type_raw == static_cast<u32>(FileSys::SaveDataMetaType::ExtensionContext),
              FileSys::ResultInvalidArgument);
 
+    const auto meta_type = static_cast<FileSys::SaveDataMetaType>(meta_type_raw);
     auto meta_file = save_data_controller->OpenMetaFile(space_id, attribute, meta_type);
     R_UNLESS(meta_file != nullptr, FileSys::ResultTargetNotFound);
 
@@ -700,10 +749,14 @@ Result FSP_SRV::OpenSaveDataMetaFile(OutInterface<IFile> out_interface,
 
 Result FSP_SRV::OpenSaveDataInfoReaderOnlyCacheStorage(
     OutInterface<ISaveDataInfoReader> out_interface) {
-    LOG_WARNING(Service_FS, "(STUBBED) called");
+    LOG_DEBUG(Service_FS, "called");
 
-    *out_interface = std::make_shared<ISaveDataInfoReader>(system, save_data_controller,
-                                                           FileSys::SaveDataSpaceId::Temporary);
+    FileSys::SaveDataFilter filter{};
+    filter.use_save_data_type = true;
+    filter.attribute.type = FileSys::SaveDataType::Cache;
+
+    *out_interface = std::make_shared<ISaveDataInfoReader>(
+        system, save_data_controller, FileSys::SaveDataSpaceId::User, filter);
 
     R_SUCCEED();
 }
@@ -976,7 +1029,20 @@ Result FSP_SRV::GetCacheStorageSize(s32 index, Out<s64> out_data_size, Out<s64> 
 Result FSP_SRV::QuerySaveDataTotalSize(s64 data_size, s64 journal_size, Out<s64> out_total_size) {
     LOG_DEBUG(Service_FS, "called, data_size={:#x}, journal_size={:#x}", data_size, journal_size);
 
-    *out_total_size = save_data_controller->QueryTotalSize(FileSys::SaveDataSpaceId::User);
+    R_UNLESS(data_size >= 0 && journal_size >= 0, FileSys::ResultInvalidArgument);
+
+    if (data_size == 0 && journal_size == 0) {
+        *out_total_size = save_data_controller->QueryTotalSize(FileSys::SaveDataSpaceId::User);
+        R_SUCCEED();
+    }
+
+    constexpr s64 Overhead = 0x40000;
+    constexpr s64 MaxSize =
+        Common::AlignDown<s64>((std::numeric_limits<s64>::max() - Overhead) / 2, 0x4000);
+    R_UNLESS(data_size <= MaxSize && journal_size <= MaxSize, FileSys::ResultInvalidArgument);
+
+    *out_total_size = Common::AlignUp<s64>(data_size, 0x4000) +
+                      Common::AlignUp<s64>(journal_size, 0x4000) + Overhead;
 
     R_SUCCEED();
 }
@@ -996,7 +1062,20 @@ Result FSP_SRV::QuerySaveDataInternalStorageTotalSize(s64 data_size, s64 journal
                                                       Out<s64> out_total_size) {
     LOG_DEBUG(Service_FS, "called, data_size={:#x}, journal_size={:#x}", data_size, journal_size);
 
-    *out_total_size = save_data_controller->QueryTotalSize(FileSys::SaveDataSpaceId::System);
+    R_UNLESS(data_size >= 0 && journal_size >= 0, FileSys::ResultInvalidArgument);
+
+    if (data_size == 0 && journal_size == 0) {
+        *out_total_size = save_data_controller->QueryTotalSize(FileSys::SaveDataSpaceId::System);
+        R_SUCCEED();
+    }
+
+    constexpr s64 Overhead = 0x40000;
+    constexpr s64 MaxSize =
+        Common::AlignDown<s64>((std::numeric_limits<s64>::max() - Overhead) / 2, 0x4000);
+    R_UNLESS(data_size <= MaxSize && journal_size <= MaxSize, FileSys::ResultInvalidArgument);
+
+    *out_total_size = Common::AlignUp<s64>(data_size, 0x4000) +
+                      Common::AlignUp<s64>(journal_size, 0x4000) + Overhead;
 
     R_SUCCEED();
 }
@@ -1015,6 +1094,7 @@ Result FSP_SRV::GetSaveDataCommitId(FileSys::SaveDataSpaceId space_id, u64 save_
 Result FSP_SRV::SetSaveDataSize(s64 data_size, s64 journal_size) {
     LOG_DEBUG(Service_FS, "called, data_size={:#x}, journal_size={:#x}", data_size, journal_size);
 
+    R_UNLESS(data_size >= 0 && journal_size >= 0, FileSys::ResultInvalidArgument);
     R_UNLESS(program_id != 0, FileSys::ResultInvalidArgument);
 
     const auto user_id = GetCurrentUserId(system);

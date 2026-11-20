@@ -7,6 +7,7 @@
 #include <QByteArrayView>
 #include <QFile>
 #include <QFileInfo>
+#include <QHash>
 #include <QRegularExpression>
 #include <QStringView>
 
@@ -20,6 +21,30 @@ constexpr qint64 TailBytes = 256 * 1024;
 
 enum class Renderer { Unknown, Vulkan, OpenGL };
 
+struct ActionableRecord {
+    QStringView latest;
+    qsizetype latest_offset{};
+    qsizetype count{};
+};
+
+bool IsActionable(QStringView level, QStringView category, QStringView file_name,
+                  QStringView message) {
+    if (level == u"Critical") {
+        return true;
+    }
+    if (category == u"HW.GPU") {
+        return (file_name == u"shader_cache.cpp" &&
+                message.startsWith(u"Native graphics shader rejected: ")) ||
+               (file_name == u"kepler_compute.cpp" &&
+                message.startsWith(u"Native compute shader rejected: "));
+    }
+    return category == u"Render.Vulkan" &&
+           ((file_name == u"vk_pipeline_cache.cpp" &&
+             message.startsWith(u"Graphics pipeline translation failed: ")) ||
+            (file_name == u"vk_graphics_pipeline.cpp" &&
+             message.startsWith(u"Graphics pipeline build failed: ")));
+}
+
 QString CompleteLines(QByteArrayView bytes) {
     const auto last_newline = bytes.lastIndexOf('\n');
     return QString::fromUtf8(bytes.first(last_newline + 1))
@@ -32,7 +57,20 @@ void ReadRecords(QStringView text, Snapshot& snapshot, bool collect_errors) {
         R"(^\[ *[0-9]+\.[0-9]{6}\] ([A-Za-z0-9_.?]+) <(Trace|Debug|Info|Warning|Error|Critical|\?)> ((?:[A-Za-z]:)?[^:\r\n]+):[0-9]+:((?:[^:\r\n]|::)+): )")};
     Renderer renderer = Renderer::Unknown;
     bool error_record = false;
+    QHash<QStringView, ActionableRecord> actionable;
+    qsizetype record_start = 0;
+    qsizetype identity_start = 0;
+    bool actionable_record = false;
+    const auto append_record = [&](qsizetype end) {
+        if (actionable_record) {
+            auto& record = actionable[text.sliced(identity_start, end - identity_start)];
+            record.latest = text.sliced(record_start, end - record_start);
+            record.latest_offset = record_start;
+            ++record.count;
+        }
+    };
     for (qsizetype start = 0; start < text.size();) {
+        const auto line_start = start;
         const auto end = text.indexOf(u'\n', start) + 1;
         const auto line = text.sliced(start, end - start);
         start = end;
@@ -45,12 +83,14 @@ void ReadRecords(QStringView text, Snapshot& snapshot, bool collect_errors) {
             continue;
         }
 
+        append_record(line_start);
+        actionable_record = false;
         const auto level = match.capturedView(2);
         error_record = level == u"Error" || level == u"Critical";
         if (collect_errors && error_record) {
             snapshot.recent_errors += line;
         }
-        if (level != u"Info") {
+        if (level != u"Info" && !(collect_errors && error_record)) {
             continue;
         }
 
@@ -58,8 +98,15 @@ void ReadRecords(QStringView text, Snapshot& snapshot, bool collect_errors) {
         const auto source = match.capturedView(3);
         const auto file_name =
             source.sliced(std::max(source.lastIndexOf(u'/'), source.lastIndexOf(u'\\')) + 1);
-        const auto function = match.capturedView(4);
         const auto message = line.sliced(match.capturedEnd());
+        if (error_record) {
+            actionable_record = IsActionable(level, category, file_name, message);
+            record_start = line_start;
+            identity_start = line_start + match.capturedStart(1);
+            continue;
+        }
+
+        const auto function = match.capturedView(4);
         Renderer record_renderer;
         QStringView gpu_prefix;
         QStringView driver_prefix;
@@ -89,6 +136,18 @@ void ReadRecords(QStringView text, Snapshot& snapshot, bool collect_errors) {
             snapshot.gpu = message.sliced(gpu_prefix.size()).trimmed().toString();
             renderer = record_renderer;
         }
+    }
+    append_record(text.size());
+
+    auto records = actionable.values();
+    std::ranges::sort(records, std::ranges::greater{}, &ActionableRecord::latest_offset);
+    for (const auto& record : records) {
+        const auto first_line_end = record.latest.indexOf(u'\n');
+        snapshot.actionable_items += record.latest.first(first_line_end);
+        if (record.count > 1) {
+            snapshot.actionable_items += QStringLiteral(" [×%1]").arg(record.count);
+        }
+        snapshot.actionable_items += record.latest.sliced(first_line_end);
     }
 }
 

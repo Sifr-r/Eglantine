@@ -75,6 +75,7 @@ private:
         u32 right_buttons{0};
         bool left_gyro_trigger{false};
         bool right_gyro_trigger{false};
+        f32 last_left_stick_x{0.0f};
         std::optional<f32> dual_roll_steer_x{};
         std::chrono::steady_clock::time_point last_left_motion{};
         std::chrono::steady_clock::time_point last_right_motion{};

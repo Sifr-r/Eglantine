@@ -45,8 +45,6 @@ public:
 
 private:
     void FindAllSaves(FileSys::SaveDataSpaceId space);
-    void FindNormalSaves(FileSys::SaveDataSpaceId space, const FileSys::VirtualDir& type);
-    void FindTemporaryStorageSaves(FileSys::SaveDataSpaceId space, const FileSys::VirtualDir& type);
     /// Drops every entry that does not match the filter, when one was given.
     void ApplyFilter();
 

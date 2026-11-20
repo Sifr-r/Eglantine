@@ -9,6 +9,8 @@
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/file_sys/program_metadata.h"
+#include "core/hle/kernel/k_auto_object_container.h"
+#include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/service/os/process.h"
@@ -140,4 +142,42 @@ TEST_CASE("The kernel object list survives a system that is destroyed without a 
         kernel.Initialize();
         REQUIRE(kernel.ObjectListContainer().GetOwnedCount(nullptr) > 0);
     }());
+}
+
+TEST_CASE("KAutoObjectWithListContainer Finalize is idempotent and refuses post-finalize registration",
+          "[core][shutdown-ordering]") {
+    const ScopedSystemTestContext context;
+    Core::System system;
+    system.Initialize();
+    auto& kernel = system.Kernel();
+
+    Kernel::KAutoObjectWithListContainer container{kernel};
+    container.Initialize();
+    SCOPE_EXIT {
+        container.Finalize();
+    };
+
+    Kernel::KEvent event_a{kernel};
+    Kernel::KEvent event_b{kernel};
+
+    container.Register(&event_a);
+    CHECK(event_a.is_linked());
+    CHECK(container.GetOwnedCount(nullptr) == 1);
+
+    container.Finalize();
+    CHECK_FALSE(event_a.is_linked());
+    CHECK(container.GetOwnedCount(nullptr) == 0);
+
+    container.Finalize();
+    CHECK(container.GetOwnedCount(nullptr) == 0);
+
+    container.Register(&event_b);
+    CHECK_FALSE(event_b.is_linked());
+    CHECK(container.GetOwnedCount(nullptr) == 0);
+
+    container.Unregister(&event_a);
+    container.Unregister(&event_b);
+    CHECK_FALSE(event_a.is_linked());
+    CHECK_FALSE(event_b.is_linked());
+    CHECK(container.GetOwnedCount(nullptr) == 0);
 }

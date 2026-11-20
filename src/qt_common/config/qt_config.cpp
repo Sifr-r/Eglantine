@@ -11,6 +11,7 @@
 
 #include "common/game_presets.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "input_common/main.h"
 #include "qt_config.h"
 #include "uisettings.h"
@@ -636,6 +637,13 @@ void QtConfig::SaveQtControlPlayerValues(std::size_t player_index) {
     BeginGroup(Settings::TranslateCategory(Settings::Category::Controls));
 
     LOG_DEBUG(Config, "Saving players control configuration values");
+    const bool players_were_global = Settings::values.players.UsingGlobal();
+    SCOPE_EXIT {
+        Settings::values.players.SetGlobal(players_were_global);
+    };
+    if (global) {
+        Settings::values.players.SetGlobal(true);
+    }
     SavePlayerValues(player_index);
     SaveQtPlayerValues(player_index);
 

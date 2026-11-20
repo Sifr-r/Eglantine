@@ -92,7 +92,7 @@ private:
                                                   FileSys::SaveDataFilter filter);
     Result OpenSaveDataInfoReaderOnlyCacheStorage(OutInterface<ISaveDataInfoReader> out_interface);
     Result OpenSaveDataMetaFile(OutInterface<IFile> out_interface, FileSys::SaveDataSpaceId space_id,
-                                FileSys::SaveDataMetaType meta_type, FileSys::SaveDataAttribute attribute);
+                                u32 meta_type_raw, FileSys::SaveDataAttribute attribute);
     Result FindSaveDataWithFilter(Out<s64> out_count, OutBuffer<BufferAttr_HipcMapAlias> out_buffer,
                                   FileSys::SaveDataSpaceId space_id,
                                   FileSys::SaveDataFilter filter);

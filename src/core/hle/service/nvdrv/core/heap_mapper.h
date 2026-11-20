@@ -47,12 +47,17 @@ public:
         return m_size;
     }
 
+    u64 GetId() const {
+        return m_id;
+    }
+
 private:
     struct HeapMapperInternal;
     VAddr m_vaddress;
     DAddr m_daddress;
     size_t m_size;
     Core::Asid m_asid;
+    u64 m_id{};
     std::unique_ptr<HeapMapperInternal> m_internal;
 };
 

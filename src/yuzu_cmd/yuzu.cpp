@@ -1005,7 +1005,11 @@ static void CheckSwitch2AutoPair(SdlState* state) {
         return;
     }
 
-    const auto changed = state->switch2_auto_pair.Apply(*switch2);
+    static const auto keyboard_defaults = InputCommon::MakeDefaultKeyboardPlayer(
+        SdlConfig::default_buttons, SdlConfig::default_analogs, SdlConfig::default_stick_mod,
+        SdlConfig::default_motions);
+    const auto changed = state->switch2_auto_pair.Apply(
+        *switch2, InputCommon::PlayerOneUsesDefaultKeyboard(keyboard_defaults));
     if (changed.empty()) {
         return;
     }

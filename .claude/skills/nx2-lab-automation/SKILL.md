@@ -50,7 +50,7 @@ all without the user. Built on `eden-cli` (SDL frontend) and the shader lab's di
   frames. Check the setting before bisecting commits; the lab is GPU-bound, so measure the front as
   `frame - fence - pacing` rather than by frame time.
 
-## Tooling (repo `tools/nx2/lab_ctl.py`, branch `scratch/oot-shader-lab`)
+## Tooling (`tools/nx2/lab_ctl.py`)
 
 ```bash
 L="python3 -I tools/nx2/lab_ctl.py -d $D"       # $D: a scratch diag dir, run from the repo root
@@ -80,7 +80,7 @@ $L stop
 
 ## Procedure
 
-1. Build `eden-cli` (`ninja -C build eden-cli`). The Qt `yuzu` target doesn't rebuild it.
+1. Build the `yuzu-cmd` target (`cmake --build build --target yuzu-cmd`) to produce `build/bin/eden-cli`.
 2. Prepare `$D/qt-copy.ini` as above, once per session.
 3. Launch, wait for the title (title-specific timing in references), and press through to the
    scene. Write the sequence as a small script in `$D` so later runs repeat it exactly.
@@ -102,10 +102,10 @@ $L stop
    <tag> <N> [launch args]` boots, bursts and stops; `scripts/flash_scan.py <dir> <sheet.png>` finds
    pixels >0.3 brighter than the median of the 8 frames around them and makes a sheet of the worst
    event. 400-600 frames (20-30 s in the lab) caught ~1 flash per run in OoT.
-9. **A/B a fix against the build without it** when the symptom is intermittent: save the fix
-   (`git diff <files> > fix.patch`), `git checkout -- <files>`, build `eden-cli`, copy it to scratch,
-   `git apply fix.patch`, rebuild, then run both with `launch --binary <path>` and the same script.
-   Compare a counter (verifier differences, luma spread, stall lines), not just "didn't crash".
+9. **A/B a fix against a baseline build** when the symptom is intermittent. Use binaries from
+   separate build directories or a previously saved baseline. Run each with
+   `launch --binary <path>` and the same script, then compare verifier differences, luma spread,
+   or stall counts.
 
 ### A crash the user reports from the Qt app
 

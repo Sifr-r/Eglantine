@@ -242,32 +242,7 @@ void Switch2Controllers::Shutdown() {
     }
 
     std::scoped_lock mouse_lock{mouse_mutex};
-    mouse_active = false;
-    mouse_vel_x = 0.0f;
-    mouse_vel_y = 0.0f;
-    mouse_pos_x = 0.5f;
-    mouse_pos_y = 0.5f;
-    if (mouse_engine != nullptr) {
-        bool released_any = false;
-        if (prev_mouse_left) {
-            mouse_engine->ReleaseButton(MouseButton::Left);
-            released_any = true;
-        }
-        if (prev_mouse_middle) {
-            mouse_engine->ReleaseButton(MouseButton::Wheel);
-            released_any = true;
-        }
-        if (prev_mouse_right) {
-            mouse_engine->ReleaseButton(MouseButton::Right);
-            released_any = true;
-        }
-        if (released_any) {
-            mouse_engine->NotifyChanged();
-        }
-    }
-    prev_mouse_left = false;
-    prev_mouse_middle = false;
-    prev_mouse_right = false;
+    ResetMouseStateLocked(true);
 }
 
 void Switch2Controllers::OnTransportDiscovered(
@@ -351,6 +326,7 @@ void Switch2Controllers::RegisterDriver(std::shared_ptr<Switch2::Switch2Driver> 
                 slot.right_buttons = 0;
                 slot.left_gyro_trigger = false;
                 slot.right_gyro_trigger = false;
+                slot.dual_roll_steer_x.reset();
                 slot.primary->SetHorizontalHold(false);
                 slot.secondary->SetHorizontalHold(false);
             } else {
@@ -404,6 +380,10 @@ void Switch2Controllers::RegisterDriver(std::shared_ptr<Switch2::Switch2Driver> 
 void Switch2Controllers::UnregisterDriver(const std::string& address) {
     std::shared_ptr<Switch2::Switch2Driver> removed_driver;
     std::vector<std::pair<std::size_t, std::shared_ptr<Switch2::Switch2Driver>>> rebind_list;
+    std::size_t old_slot_idx = 0;
+    bool had_dual_roll = false;
+    f32 restored_left_x = 0.0f;
+    std::optional<std::size_t> new_left_slot;
 
     {
         std::scoped_lock lock{slots_mutex};
@@ -412,7 +392,12 @@ void Switch2Controllers::UnregisterDriver(const std::string& address) {
             return;
         }
 
-        auto& slot = slots[*found_slot];
+        old_slot_idx = *found_slot;
+        auto& slot = slots[old_slot_idx];
+        had_dual_roll = slot.dual_roll_steer_x.has_value();
+        restored_left_x = slot.last_left_stick_x;
+        std::string remaining_left_address;
+
         if (slot.primary && slot.primary->GetAddress() == address) {
             removed_driver = std::move(slot.primary);
             if (slot.secondary) {
@@ -426,6 +411,12 @@ void Switch2Controllers::UnregisterDriver(const std::string& address) {
                 slot.right_buttons = 0;
                 slot.left_gyro_trigger = false;
                 slot.right_gyro_trigger = false;
+                slot.dual_roll_steer_x.reset();
+                if (remaining_type == Switch2::ControllerType::Left) {
+                    remaining_left_address = slot.primary->GetAddress();
+                } else {
+                    slot.last_left_stick_x = 0.0f;
+                }
             } else {
                 slot = LogicalSlot{};
             }
@@ -440,10 +431,28 @@ void Switch2Controllers::UnregisterDriver(const std::string& address) {
             slot.right_buttons = 0;
             slot.left_gyro_trigger = false;
             slot.right_gyro_trigger = false;
+            slot.dual_roll_steer_x.reset();
+            if (remaining_type == Switch2::ControllerType::Left) {
+                remaining_left_address = slot.primary->GetAddress();
+            } else {
+                slot.last_left_stick_x = 0.0f;
+            }
         }
 
         ReorderSlotsLocked();
+        if (!remaining_left_address.empty()) {
+            new_left_slot = FindSlotByAddressLocked(remaining_left_address);
+        }
         CollectActiveSlotDriversLocked(rebind_list);
+    }
+
+    if (had_dual_roll) {
+        SetAxis(GetIdentifier(old_slot_idx, Switch2::ControllerType::Left),
+                static_cast<int>(Switch2::PadAxes::LeftStickX), restored_left_x);
+        if (new_left_slot.has_value() && *new_left_slot != old_slot_idx) {
+            SetAxis(GetIdentifier(*new_left_slot, Switch2::ControllerType::Left),
+                    static_cast<int>(Switch2::PadAxes::LeftStickX), restored_left_x);
+        }
     }
 
     if (removed_driver) {
@@ -454,32 +463,9 @@ void Switch2Controllers::UnregisterDriver(const std::string& address) {
 
     {
         std::scoped_lock mouse_lock{mouse_mutex};
-        mouse_active = false;
-        mouse_vel_x = 0.0f;
-        mouse_vel_y = 0.0f;
-        mouse_pos_x = 0.5f;
-        mouse_pos_y = 0.5f;
-        if (mouse_engine != nullptr) {
-            bool released_any = false;
-            if (prev_mouse_left) {
-                mouse_engine->ReleaseButton(MouseButton::Left);
-                released_any = true;
-            }
-            if (prev_mouse_middle) {
-                mouse_engine->ReleaseButton(MouseButton::Wheel);
-                released_any = true;
-            }
-            if (prev_mouse_right) {
-                mouse_engine->ReleaseButton(MouseButton::Right);
-                released_any = true;
-            }
-            if (released_any) {
-                mouse_engine->NotifyChanged();
-            }
+        if (mouse_owner_address == address) {
+            ResetMouseStateLocked(true);
         }
-        prev_mouse_left = false;
-        prev_mouse_middle = false;
-        prev_mouse_right = false;
     }
 
     LOG_INFO(Input, "Unregistered Switch 2 controller {}", address);
@@ -577,6 +563,7 @@ void Switch2Controllers::HandleDriverInputReport(const std::string& address,
     u64 delta_us = 4000;
     bool shared_gyro_trigger = false;
     u32 merged_dual_buttons = 0;
+    std::optional<f32> dual_roll_steer;
     const auto now = std::chrono::steady_clock::now();
 
     {
@@ -604,6 +591,7 @@ void Switch2Controllers::HandleDriverInputReport(const std::string& address,
         if (driver_type == Switch2::ControllerType::Left) {
             slot.left_buttons = report.buttons;
             slot.left_gyro_trigger = own_trigger;
+            slot.last_left_stick_x = report.left_x;
             delta_us = ComputeDeltaMicroseconds(slot.last_left_motion, now);
         } else if (driver_type == Switch2::ControllerType::Right) {
             slot.right_buttons = report.buttons;
@@ -618,6 +606,7 @@ void Switch2Controllers::HandleDriverInputReport(const std::string& address,
         if (slot_type == Switch2::ControllerType::Dual) {
             shared_gyro_trigger = slot.left_gyro_trigger || slot.right_gyro_trigger;
             merged_dual_buttons = slot.left_buttons | slot.right_buttons;
+            dual_roll_steer = slot.dual_roll_steer_x;
         } else {
             shared_gyro_trigger = own_trigger;
             merged_dual_buttons = report.buttons;
@@ -648,8 +637,45 @@ void Switch2Controllers::HandleDriverInputReport(const std::string& address,
 
     const auto optical_mouse = driver->ProcessOpticalMouse(report);
 
-    if (gyro_mouse.active && gyro_mouse.roll_steer_x.has_value()) {
-        if (!is_dual && driver_type == Switch2::ControllerType::Right) {
+    if (is_dual && driver_type == Switch2::ControllerType::Right) {
+        const std::optional<f32> next_roll =
+            (gyro_mouse.active && gyro_mouse.roll_steer_x.has_value()) ? gyro_mouse.roll_steer_x
+                                                                       : std::nullopt;
+        std::size_t roll_slot_idx = slot_idx;
+        bool slot_still_dual = false;
+        bool transitioned_to_inactive = false;
+        f32 restored_x = 0.0f;
+        {
+            std::scoped_lock lock{slots_mutex};
+            const auto found_slot = FindSlotByAddressLocked(address);
+            if (found_slot.has_value()) {
+                auto& slot = slots[*found_slot];
+                if (GetSlotType(slot) == Switch2::ControllerType::Dual &&
+                    (slot.primary == driver || slot.secondary == driver)) {
+                    transitioned_to_inactive =
+                        slot.dual_roll_steer_x.has_value() && !next_roll.has_value();
+                    restored_x = slot.last_left_stick_x;
+                    slot.dual_roll_steer_x = next_roll;
+                    roll_slot_idx = *found_slot;
+                    slot_still_dual = true;
+                }
+            }
+        }
+        if (slot_still_dual) {
+            if (next_roll.has_value()) {
+                SetAxis(GetIdentifier(roll_slot_idx, Switch2::ControllerType::Left),
+                        static_cast<int>(Switch2::PadAxes::LeftStickX), *next_roll);
+            } else if (transitioned_to_inactive) {
+                SetAxis(GetIdentifier(roll_slot_idx, Switch2::ControllerType::Left),
+                        static_cast<int>(Switch2::PadAxes::LeftStickX), restored_x);
+            }
+        }
+    } else if (is_dual && driver_type == Switch2::ControllerType::Left) {
+        if (dual_roll_steer.has_value()) {
+            mapped_lx = *dual_roll_steer;
+        }
+    } else if (gyro_mouse.active && gyro_mouse.roll_steer_x.has_value()) {
+        if (driver_type == Switch2::ControllerType::Right) {
             mapped_rx = *gyro_mouse.roll_steer_x;
         } else {
             mapped_lx = *gyro_mouse.roll_steer_x;
@@ -691,14 +717,27 @@ void Switch2Controllers::HandleDriverInputReport(const std::string& address,
 
     const bool should_update_mouse =
         !is_dual || driver_type == Switch2::ControllerType::Right || optical_mouse.active;
-    if (should_update_mouse) {
-        const f32 optical_sens =
-            static_cast<f32>(Settings::values.switch2_mouse_sensitivity.GetValue()) / 10.0f;
-        const bool any_mouse_active = gyro_mouse.active || optical_mouse.active;
+    const f32 optical_sens =
+        static_cast<f32>(Settings::values.switch2_mouse_sensitivity.GetValue()) / 10.0f;
+    const bool any_mouse_active =
+        (gyro_mouse.active && !gyro_mouse.roll_steer_x.has_value()) || optical_mouse.active;
 
-        std::scoped_lock mouse_lock{mouse_mutex};
-        mouse_active = any_mouse_active;
-        if (any_mouse_active) {
+    std::scoped_lock mouse_lock{mouse_mutex};
+    if (!driver->IsConnected()) {
+        if (mouse_owner_address == address) {
+            ResetMouseStateLocked(false);
+        }
+        return;
+    }
+
+    if (!should_update_mouse && mouse_owner_address != address) {
+        return;
+    }
+
+    if (any_mouse_active) {
+        if (mouse_owner_address.empty() || mouse_owner_address == address) {
+            mouse_owner_address = address;
+            mouse_active = true;
             const f32 gyro_vx = gyro_mouse.active ? gyro_mouse.velocity_x : 0.0f;
             const f32 gyro_vy = gyro_mouse.active ? gyro_mouse.velocity_y : 0.0f;
             const f32 opt_vx =
@@ -711,55 +750,54 @@ void Switch2Controllers::HandleDriverInputReport(const std::string& address,
                     : 0.0f;
             mouse_vel_x = gyro_vx + opt_vx;
             mouse_vel_y = gyro_vy + opt_vy;
-        } else {
-            mouse_vel_x = 0.0f;
-            mouse_vel_y = 0.0f;
-        }
 
-        if (mouse_engine != nullptr) {
-            const bool want_left = (gyro_mouse.active && gyro_mouse.left_click) ||
-                                   (optical_mouse.active && optical_mouse.left_button);
-            const bool want_middle = optical_mouse.active && optical_mouse.middle_button;
-            const bool want_right = (gyro_mouse.active && gyro_mouse.right_click) ||
-                                    (optical_mouse.active && optical_mouse.right_button);
+            if (mouse_engine != nullptr) {
+                const bool want_left = (gyro_mouse.active && gyro_mouse.left_click) ||
+                                       (optical_mouse.active && optical_mouse.left_button);
+                const bool want_middle = optical_mouse.active && optical_mouse.middle_button;
+                const bool want_right = (gyro_mouse.active && gyro_mouse.right_click) ||
+                                        (optical_mouse.active && optical_mouse.right_button);
 
-            bool changed = false;
-            if (want_left != prev_mouse_left) {
-                if (want_left) {
-                    mouse_engine->PressMouseButton(MouseButton::Left);
-                } else {
-                    mouse_engine->ReleaseButton(MouseButton::Left);
+                bool changed = false;
+                if (want_left != prev_mouse_left) {
+                    if (want_left) {
+                        mouse_engine->PressMouseButton(MouseButton::Left);
+                    } else {
+                        mouse_engine->ReleaseButton(MouseButton::Left);
+                    }
+                    prev_mouse_left = want_left;
+                    changed = true;
                 }
-                prev_mouse_left = want_left;
-                changed = true;
-            }
-            if (want_middle != prev_mouse_middle) {
-                if (want_middle) {
-                    mouse_engine->PressMouseButton(MouseButton::Wheel);
-                } else {
-                    mouse_engine->ReleaseButton(MouseButton::Wheel);
+                if (want_middle != prev_mouse_middle) {
+                    if (want_middle) {
+                        mouse_engine->PressMouseButton(MouseButton::Wheel);
+                    } else {
+                        mouse_engine->ReleaseButton(MouseButton::Wheel);
+                    }
+                    prev_mouse_middle = want_middle;
+                    changed = true;
                 }
-                prev_mouse_middle = want_middle;
-                changed = true;
-            }
-            if (want_right != prev_mouse_right) {
-                if (want_right) {
-                    mouse_engine->PressMouseButton(MouseButton::Right);
-                } else {
-                    mouse_engine->ReleaseButton(MouseButton::Right);
+                if (want_right != prev_mouse_right) {
+                    if (want_right) {
+                        mouse_engine->PressMouseButton(MouseButton::Right);
+                    } else {
+                        mouse_engine->ReleaseButton(MouseButton::Right);
+                    }
+                    prev_mouse_right = want_right;
+                    changed = true;
                 }
-                prev_mouse_right = want_right;
-                changed = true;
-            }
-            if (optical_mouse.active && optical_mouse.scroll_y != 0.0f) {
-                mouse_engine->MouseWheelChange(
-                    0, static_cast<int>(std::lround(optical_mouse.scroll_y * 30.0f)));
-                changed = true;
-            }
-            if (changed) {
-                mouse_engine->NotifyChanged();
+                if (optical_mouse.active && optical_mouse.scroll_y != 0.0f) {
+                    mouse_engine->MouseWheelChange(
+                        0, static_cast<int>(std::lround(optical_mouse.scroll_y * 30.0f)));
+                    changed = true;
+                }
+                if (changed) {
+                    mouse_engine->NotifyChanged();
+                }
             }
         }
+    } else if (mouse_owner_address.empty() || mouse_owner_address == address) {
+        ResetMouseStateLocked(false);
     }
 }
 
@@ -777,6 +815,38 @@ void Switch2Controllers::HandleDriverColor(std::size_t slot_index, Switch2::Cont
 
 void Switch2Controllers::HandleDriverDisconnect(const std::string& address) {
     UnregisterDriver(address);
+}
+
+void Switch2Controllers::ResetMouseStateLocked(bool reset_cursor) {
+    mouse_owner_address.clear();
+    mouse_active = false;
+    mouse_vel_x = 0.0f;
+    mouse_vel_y = 0.0f;
+    if (reset_cursor) {
+        mouse_pos_x = 0.5f;
+        mouse_pos_y = 0.5f;
+    }
+    if (mouse_engine != nullptr) {
+        bool released_any = false;
+        if (prev_mouse_left) {
+            mouse_engine->ReleaseButton(MouseButton::Left);
+            released_any = true;
+        }
+        if (prev_mouse_middle) {
+            mouse_engine->ReleaseButton(MouseButton::Wheel);
+            released_any = true;
+        }
+        if (prev_mouse_right) {
+            mouse_engine->ReleaseButton(MouseButton::Right);
+            released_any = true;
+        }
+        if (released_any) {
+            mouse_engine->NotifyChanged();
+        }
+    }
+    prev_mouse_left = false;
+    prev_mouse_middle = false;
+    prev_mouse_right = false;
 }
 
 void Switch2Controllers::MouseInterpolationThread(std::stop_token stop_token) {
@@ -1093,7 +1163,7 @@ Common::Input::ButtonNames Switch2Controllers::GetUIName(const Common::ParamPack
     if (params.Has("button")) {
         return GetUIButtonName(params);
     }
-    if (params.Has("axis")) {
+    if (params.Has("axis") || params.Has("axis_x") || params.Has("axis_y")) {
         return Common::Input::ButtonNames::Value;
     }
     if (params.Has("motion")) {
@@ -1206,6 +1276,9 @@ bool Switch2Controllers::SplitSlot(std::size_t slot_index) {
     }
 
     std::vector<std::pair<std::size_t, std::shared_ptr<Switch2::Switch2Driver>>> rebind_list;
+    bool had_dual_roll = false;
+    f32 restored_left_x = 0.0f;
+    std::optional<std::size_t> new_left_slot;
     {
         std::scoped_lock lock{slots_mutex};
         auto& slot = slots[slot_index];
@@ -1218,6 +1291,15 @@ bool Switch2Controllers::SplitSlot(std::size_t slot_index) {
             return false;
         }
 
+        had_dual_roll = slot.dual_roll_steer_x.has_value();
+        restored_left_x = slot.last_left_stick_x;
+        std::string left_address;
+        if (slot.primary->GetControllerType() == Switch2::ControllerType::Left) {
+            left_address = slot.primary->GetAddress();
+        } else if (slot.secondary->GetControllerType() == Switch2::ControllerType::Left) {
+            left_address = slot.secondary->GetAddress();
+        }
+
         auto second = std::move(slot.secondary);
         slot.secondary.reset();
         slot.horizontal_hold = true;
@@ -1225,16 +1307,35 @@ bool Switch2Controllers::SplitSlot(std::size_t slot_index) {
         slot.right_buttons = 0;
         slot.left_gyro_trigger = false;
         slot.right_gyro_trigger = false;
+        slot.dual_roll_steer_x.reset();
+        if (slot.primary->GetControllerType() != Switch2::ControllerType::Left) {
+            slot.last_left_stick_x = 0.0f;
+        }
         slot.primary->SetHorizontalHold(true);
 
         auto& new_slot = slots[*free_slot];
         new_slot = LogicalSlot{};
         new_slot.primary = std::move(second);
         new_slot.horizontal_hold = true;
+        if (new_slot.primary->GetControllerType() == Switch2::ControllerType::Left) {
+            new_slot.last_left_stick_x = restored_left_x;
+        }
         new_slot.primary->SetHorizontalHold(true);
 
         ReorderSlotsLocked();
+        if (!left_address.empty()) {
+            new_left_slot = FindSlotByAddressLocked(left_address);
+        }
         CollectActiveSlotDriversLocked(rebind_list);
+    }
+
+    if (had_dual_roll) {
+        SetAxis(GetIdentifier(slot_index, Switch2::ControllerType::Left),
+                static_cast<int>(Switch2::PadAxes::LeftStickX), restored_left_x);
+        if (new_left_slot.has_value() && *new_left_slot != slot_index) {
+            SetAxis(GetIdentifier(*new_left_slot, Switch2::ControllerType::Left),
+                    static_cast<int>(Switch2::PadAxes::LeftStickX), restored_left_x);
+        }
     }
 
     ApplyReorderedCallbacksAndLeds(rebind_list);
@@ -1269,6 +1370,9 @@ bool Switch2Controllers::MergeSlots(std::size_t first_slot, std::size_t second_s
             return false;
         }
 
+        if (type2 == Switch2::ControllerType::Left) {
+            slot1.last_left_stick_x = slot2.last_left_stick_x;
+        }
         slot1.secondary = std::move(slot2.primary);
         slot2 = LogicalSlot{};
         slot1.horizontal_hold = false;
@@ -1276,6 +1380,7 @@ bool Switch2Controllers::MergeSlots(std::size_t first_slot, std::size_t second_s
         slot1.right_buttons = 0;
         slot1.left_gyro_trigger = false;
         slot1.right_gyro_trigger = false;
+        slot1.dual_roll_steer_x.reset();
         slot1.primary->SetHorizontalHold(false);
         slot1.secondary->SetHorizontalHold(false);
 

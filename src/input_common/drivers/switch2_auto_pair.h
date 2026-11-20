@@ -40,8 +40,8 @@ struct DeviceMappings {
 
 /// Binds the Switch 2 controllers that the driver found to emulated player slots.
 ///
-/// A controller claims the lowest player slot that no other Switch 2 controller owns, so a
-/// Pro Controller that is plugged in at launch becomes Player 1. The pass is idempotent:
+/// An unassigned controller prefers Player 1 when that slot uses the factory keyboard mapping.
+/// Otherwise, it prefers the lowest available slot. The pass is idempotent:
 /// running it again without a device change reports no change. It only writes
 /// Settings::values.players; reloading the emulated controllers and persisting the
 /// configuration stays with the caller.
@@ -56,7 +56,8 @@ public:
     /// Binds the controllers the engine currently has to player slots and stores the result in
     /// Settings::values.players, in the active as well as in the global configuration.
     /// Returns the player slots that changed.
-    [[nodiscard]] std::vector<AutoPairPlayer> Apply(Switch2Controllers& engine);
+    [[nodiscard]] std::vector<AutoPairPlayer> Apply(
+        Switch2Controllers& engine, bool player_one_uses_default_keyboard = false);
 
     /// Binds the given controllers to the given player slots, in place, and keeps the state of
     /// the controllers between the calls: a controller that is missing for several passes in a
@@ -66,13 +67,13 @@ public:
     /// state, and a controller would then never be reported as gone.
     [[nodiscard]] std::vector<AutoPairPlayer> ApplyDevices(
         const std::vector<Switch2DeviceBinding>& devices, const DeviceMappings& mappings,
-        std::vector<Settings::PlayerInput>& players);
+        std::vector<Settings::PlayerInput>& players, bool player_one_uses_default_keyboard = false);
 
     /// The pairing policy on its own: applies the given controllers to the given player slots.
     /// The player slots are modified in place. Returns the player slots that changed.
     [[nodiscard]] static std::vector<AutoPairPlayer> ApplyToPlayers(
         const std::vector<Switch2DeviceBinding>& devices, const DeviceMappings& mappings,
-        std::vector<Settings::PlayerInput>& players);
+        std::vector<Settings::PlayerInput>& players, bool player_one_uses_default_keyboard = false);
 
     /// Returns true when the player is bound to a Switch 2 controller.
     [[nodiscard]] static bool IsSwitch2Player(const Settings::PlayerInput& player);

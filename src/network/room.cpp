@@ -27,6 +27,9 @@ namespace Network {
 /// sized for the largest UDP datagram that can be sent over IPv4.
 constexpr std::size_t MaxRelayedPayloadSize = 65507;
 
+/// Maximum length of a game name or version string accepted in a game info packet.
+constexpr std::size_t MaxGameInfoStringSize = 256;
+
 class Room::RoomImpl {
 public:
     ENetHost* server = nullptr; ///< Network interface.
@@ -366,6 +369,12 @@ void Room::RoomImpl::StartLoop() {
 }
 
 void Room::RoomImpl::HandleJoinRequest(const ENetEvent* event) {
+    if (IsMember(event->peer)) {
+        LOG_WARNING(Network,
+                    "Received a duplicate join request from an existing member. Ignoring it.");
+        return;
+    }
+
     // The member limit is read before the member list is locked, so that the two locks are
     // never held at the same time.
     const u32 member_slots = GetMemberSlots();
@@ -382,10 +391,10 @@ void Room::RoomImpl::HandleJoinRequest(const ENetEvent* event) {
     std::string nickname;
     packet.Read(nickname);
 
-    IPv4Address preferred_fake_ip;
+    IPv4Address preferred_fake_ip{};
     packet.Read(preferred_fake_ip);
 
-    u32 client_version;
+    u32 client_version = 0;
     packet.Read(client_version);
 
     std::string pass;
@@ -393,6 +402,11 @@ void Room::RoomImpl::HandleJoinRequest(const ENetEvent* event) {
 
     std::string token;
     packet.Read(token);
+
+    if (!packet) {
+        LOG_WARNING(Network, "Received a malformed join request packet. Ignoring it.");
+        return;
+    }
 
     if (pass != password) {
         SendWrongPassword(event->peer);
@@ -496,6 +510,10 @@ void Room::RoomImpl::HandleModKickPacket(const ENetEvent* event) {
 
     std::string nickname;
     packet.Read(nickname);
+    if (!packet) {
+        LOG_WARNING(Network, "Received a malformed mod kick packet. Ignoring it.");
+        return;
+    }
 
     std::string username, ip;
     {
@@ -538,6 +556,10 @@ void Room::RoomImpl::HandleModBanPacket(const ENetEvent* event) {
 
     std::string nickname;
     packet.Read(nickname);
+    if (!packet) {
+        LOG_WARNING(Network, "Received a malformed mod ban packet. Ignoring it.");
+        return;
+    }
 
     std::string username, ip;
     {
@@ -599,6 +621,10 @@ void Room::RoomImpl::HandleModUnbanPacket(const ENetEvent* event) {
 
     std::string address;
     packet.Read(address);
+    if (!packet) {
+        LOG_WARNING(Network, "Received a malformed mod unban packet. Ignoring it.");
+        return;
+    }
 
     bool unbanned = false;
     {
@@ -1151,6 +1177,10 @@ void Room::RoomImpl::HandleChatPacket(const ENetEvent* event) {
     in_packet.IgnoreBytes(sizeof(u8)); // Ignore the message type
     std::string message;
     in_packet.Read(message);
+    if (!in_packet) {
+        LOG_WARNING(Network, "Received a malformed chat packet. Ignoring it.");
+        return;
+    }
     auto CompareNetworkAddress = [event](const Member member) -> bool {
         return member.peer == event->peer;
     };
@@ -1204,6 +1234,17 @@ void Room::RoomImpl::HandleGameInfoPacket(const ENetEvent* event) {
     in_packet.Read(game_info.name);
     in_packet.Read(game_info.id);
     in_packet.Read(game_info.version);
+    if (!in_packet) {
+        LOG_WARNING(Network, "Received a malformed game info packet. Ignoring it.");
+        return;
+    }
+
+    if (game_info.name.size() > MaxGameInfoStringSize) {
+        game_info.name.resize(MaxGameInfoStringSize);
+    }
+    if (game_info.version.size() > MaxGameInfoStringSize) {
+        game_info.version.resize(MaxGameInfoStringSize);
+    }
 
     {
         std::lock_guard lock(member_mutex);

@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <filesystem>
 #include <span>
+#include <string>
+#include <string_view>
 #include <type_traits>
 
 #include "common/concepts.h"

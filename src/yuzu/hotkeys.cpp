@@ -34,14 +34,13 @@ void HotkeyRegistry::LoadHotkeys() {
     // beginGroup()
     for (auto shortcut : UISettings::values.shortcuts) {
         Hotkey& hk = hotkey_groups[shortcut.group][shortcut.name];
-        if (!shortcut.shortcut.keyseq.empty()) {
-            hk.keyseq = QKeySequence::fromString(QString::fromStdString(shortcut.shortcut.keyseq),
-                                                 QKeySequence::NativeText);
-            hk.context = static_cast<Qt::ShortcutContext>(shortcut.shortcut.context);
-        }
-        if (!shortcut.shortcut.controller_keyseq.empty()) {
-            hk.controller_keyseq = shortcut.shortcut.controller_keyseq;
-        }
+        hk.context = static_cast<Qt::ShortcutContext>(shortcut.shortcut.context);
+        hk.keyseq =
+            shortcut.shortcut.keyseq.empty()
+                ? QKeySequence{}
+                : QKeySequence::fromString(QString::fromStdString(shortcut.shortcut.keyseq),
+                                           QKeySequence::NativeText);
+        hk.controller_keyseq = shortcut.shortcut.controller_keyseq;
         if (hk.shortcut) {
             hk.shortcut->disconnect();
             hk.shortcut->setKey(hk.keyseq);

@@ -20,7 +20,6 @@ It's written in C++ with portability in mind, with builds for Windows, Linux and
 </h4>
 
 <p align="center">
-    </a>
     <a href="https://discord.gg/XkS5NVPTUY">
         <img src="https://img.shields.io/discord/1367654015269339267?color=5865F2&label=Eglantine&logo=discord&logoColor=white"
             alt="Discord">
@@ -31,6 +30,7 @@ It's written in C++ with portability in mind, with builds for Windows, Linux and
 <p align="center">
   <a href="#compatibility">Compatibility</a> |
   <a href="#development">Development</a> |
+  <a href="#documentation">Documentation</a> |
   <a href="#building">Building</a> |
   <a href="#download">Download</a> |
   <a href="#support">Support</a> |
@@ -47,17 +47,17 @@ A list of supported games will be available in future. Please be patient.
 
 For development discussions, please join us on [Discord](https://discord.gg/XkS5NVPTUY)
 
-If you would like to contribute, we are open to new developers and pull requests. Please ensure that your work is of a high standard and properly documented. You can also contact any of the developers on Discord or Stoat to learn more about the current state of the emulator.
+See the [contribution guide](CONTRIBUTING.md) for how to get involved. You can also contact any of the developers on Discord or Stoat to learn more about the current state of the emulator.
 
 ## Documentation
 
-We have a user manual! See our [User Handbook](./docs/user/README.md).
+See the [User Handbook](https://github.com/Eglantine-Community/docs/blob/master/content/user/README.mdx) for setup, settings and troubleshooting.
 
 ## Building
 
-See the [General Build Guide](docs/Build.md)
+See the [General Build Guide](https://github.com/Eglantine-Community/docs/blob/master/content/Build.mdx).
 
-For information on provided development tooling, see the [Tools directory](./tools)
+For development tooling, see the [tools guide](tools/README.md).
 
 ## Download
 
@@ -81,4 +81,4 @@ If you would prefer to support us in a different way, please join our [Discord](
 
 ## License
 
-Eglantine is licensed under the GPLv3 (or any later version). Refer to the [LICENSE.txt](https://github.com/Eglantine-Community/Eglantine/blob/nx2/LICENSE.txt) file.
+Eglantine is licensed under the GPLv3 (or any later version). Refer to [LICENSE.txt](LICENSE.txt).

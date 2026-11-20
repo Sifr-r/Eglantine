@@ -49,7 +49,7 @@ SessionId Container::OpenSession(Kernel::KProcess* process) {
 
     std::scoped_lock lk(impl->session_guard);
     for (auto& session : impl->sessions) {
-        if (!session.is_active) {
+        if (!session.is_active || session.ref_count <= 0) {
             continue;
         }
         if (session.process == process) {
@@ -119,12 +119,18 @@ SessionId Container::OpenSession(Kernel::KProcess* process) {
 }
 
 void Container::CloseSession(SessionId session_id) {
-    std::scoped_lock lk(impl->session_guard);
-    auto& session = impl->sessions[session_id.id];
-    if (--session.ref_count > 0) {
-        return;
+    {
+        std::scoped_lock lk(impl->session_guard);
+        if (session_id.id >= impl->sessions.size() || !impl->sessions[session_id.id].is_active) {
+            return;
+        }
+        if (--impl->sessions[session_id.id].ref_count > 0) {
+            return;
+        }
     }
     impl->file.UnmapAllHandles(session_id);
+    std::scoped_lock lk(impl->session_guard);
+    auto& session = impl->sessions[session_id.id];
     auto& smmu = impl->host1x.MemoryManager();
     if (session.has_preallocated_area) {
         const DAddr region_start = session.mapper->GetRegionStart();
@@ -140,7 +146,10 @@ void Container::CloseSession(SessionId session_id) {
 }
 
 Session* Container::GetSession(SessionId session_id) {
-    std::atomic_thread_fence(std::memory_order_acquire);
+    std::scoped_lock lk(impl->session_guard);
+    if (session_id.id >= impl->sessions.size() || !impl->sessions[session_id.id].is_active) {
+        return nullptr;
+    }
     return &impl->sessions[session_id.id];
 }
 
@@ -148,6 +157,9 @@ void Container::WithSessionMapper(SessionId session_id, HeapMapperId mapper,
                                   const std::function<void(HeapMapper&)>& func) {
     // The session cannot close while this is held, so the mapper stays alive for the call.
     std::scoped_lock lk(impl->session_guard);
+    if (session_id.id >= impl->sessions.size() || !impl->sessions[session_id.id].is_active) {
+        return;
+    }
     const auto& session = impl->sessions[session_id.id];
     // The session was closed while the caller waited, and its mapper went with it: that mapper
     // unmapped what was left of it when it died, so there is nothing left to do here.

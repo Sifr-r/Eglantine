@@ -797,11 +797,11 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
                     .src_y1 = static_cast<s32>(replacement_input->Height()),
                 };
                 const bool done = rasterizer->AccelerateSurfaceCopy(*source, *dest, config);
-                if (logged_native_network_copies
+                if (logged_native_network_copies.size() < 64 &&
+                    logged_native_network_copies
                         .emplace(regs.code_loc.Address(), replacement_input->Address(),
                                  replacement_output->Address())
-                        .second &&
-                    logged_native_network_copies.size() <= 64) {
+                        .second) {
                     LOG_INFO(HW_GPU,
                              "Native network pass {:#x} replaced by input copy {}->{} ({}): {}",
                              regs.code_loc.Address(), replacement_input->Address(),
@@ -1337,8 +1337,8 @@ const std::pair<std::vector<u32>, std::vector<u32>>& KeplerCompute::NativeImageH
 
 bool KeplerCompute::NativeProgramDecodesSrgb(GPUVAddr program, bool* newly_cached) {
     const u64 map_serial = memory_manager.GetMapSerial();
-    if (const auto it = native_srgb_cache.find(program);
-        it != native_srgb_cache.end() && it->second.map_serial == map_serial) {
+    const auto it = native_srgb_cache.find(program);
+    if (it != native_srgb_cache.end() && it->second.map_serial == map_serial) {
         if (newly_cached != nullptr) {
             *newly_cached = false;
         }
@@ -1359,9 +1359,10 @@ bool KeplerCompute::NativeProgramDecodesSrgb(GPUVAddr program, bool* newly_cache
         }
     }
     const bool decodes = threshold && exponent;
+    const bool changed = it == native_srgb_cache.end() || it->second.decodes_srgb != decodes;
     native_srgb_cache[program] = {.map_serial = map_serial, .decodes_srgb = decodes};
     if (newly_cached != nullptr) {
-        *newly_cached = true;
+        *newly_cached = changed;
     }
     return decodes;
 }

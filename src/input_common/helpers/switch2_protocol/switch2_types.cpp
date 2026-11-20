@@ -489,14 +489,15 @@ GyroMouseOutput GyroMouseProcessor::Process(
     }
 
     output.active = true;
-    output.left_click = (report.buttons & static_cast<u32>(PadButton::ZR)) != 0;
-    output.right_click = (report.buttons & static_cast<u32>(PadButton::ZL)) != 0;
 
     if (mode == Settings::Switch2GyroMouseMode::Roll) {
         const f32 tilt_normalized = static_cast<f32>(report.accelerometer[0]) / 4000.0f;
         output.roll_steer_x = std::clamp(tilt_normalized * (sensitivity * -2.0f), -1.0f, 1.0f);
         return output;
     }
+
+    output.left_click = (report.buttons & static_cast<u32>(PadButton::ZR)) != 0;
+    output.right_click = (report.buttons & static_cast<u32>(PadButton::ZL)) != 0;
 
     constexpr f32 bias_threshold = 5.0f;
     const f32 bx = std::abs(gyro_bias[0]) > bias_threshold ? gyro_bias[0] : 0.0f;

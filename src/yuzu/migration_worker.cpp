@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <QFile>
 #include <QSaveFile>
+#include <QStringList>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -319,7 +320,7 @@ void MigrationWorker::process() try {
     const fs::path config_path = config_dir / "qt-config.ini";
     std::vector<MigrationDirectory> directories{{legacy_user_dir, eden_dir}};
 
-#ifndef WIN32
+#ifndef _WIN32
     if (cache_dir != eden_dir && fs::is_directory(legacy_cache_dir)) {
         directories.push_back({legacy_cache_dir, cache_dir});
     }
@@ -353,17 +354,19 @@ void MigrationWorker::process() try {
     TransferDirectories(directories, strategy, config_path);
 
     switch (strategy) {
-    case MigrationStrategy::Link:
+    case MigrationStrategy::Link: {
+        QStringList linked_paths;
+        linked_paths.reserve(static_cast<qsizetype>(directories.size()));
+        for (const auto& directory : directories) {
+            linked_paths.push_back(
+                QString::fromStdString(Common::FS::PathToUTF8String(directory.destination)));
+        }
         success_text.append(tr("\n\nNote that your configuration and data will be shared with %1.\n"
-                               "If this is not desirable, delete the following files:\n%2\n%3\n%4")
-                                .arg(selected_emu.name(),
-                                     QString::fromStdString(Common::FS::PathToUTF8String(eden_dir)),
-                                     QString::fromStdString(
-                                         Common::FS::PathToUTF8String(config_dir)),
-                                     QString::fromStdString(
-                                         Common::FS::PathToUTF8String(cache_dir))));
+                               "If this is not desirable, delete the following files:\n%2")
+                                .arg(selected_emu.name(), linked_paths.join(QChar::fromLatin1('\n'))));
 
         break;
+    }
     case MigrationStrategy::Move:
         break;
     case MigrationStrategy::Copy:
@@ -376,7 +379,7 @@ void MigrationWorker::process() try {
     }
 
     // Delete and re-create shader dir
-    if (clear_shader_cache) {
+    if (clear_shader_cache && strategy != MigrationStrategy::Link) {
         const fs::path& cache_root =
             RelativePathWithin(cache_dir, eden_dir).empty() ? cache_dir : eden_dir;
         const std::error_code error = ClearShaderCache(shader_dir, cache_root);

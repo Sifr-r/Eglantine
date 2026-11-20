@@ -60,17 +60,22 @@ agent holds it, see `acquire_control`).
 | `tas_write_script`, `tas_play`, `tas_stop`, `tas_record_start`, `tas_record_stop`, `tas_set_options` (W, L) | Frame-locked TAS scripts (write as steps or raw TAS-nx, play with screenshots at frames, record a human) |
 | `screen_label`, `screen_state`, `screen_labels` | Name screens by fingerprint per game ("title", "loading", "gameplay"), then ask which screen is showing without an image |
 | `probe_save`, `probe_read` | Named game variables (`Module+0xOFF`, pointer chains `->0x10`, value meanings) |
-| `route_save`, `route_list`, `route_run` (W, L) | Per-game recipes: input + waits for a screen / end of a screen / probe value, repeat-until; e.g. `to_gameplay` |
-| `route_status`, `route_stop` (L) | Progress of a running (or background) route; stop a background route |
+| `route_save`, `route_list` | Save, list, or remove per-game routes |
+| `route_run` (W, L) | Run a per-game route with input and waits for screens or probe values |
+| `route_status` | Check progress of the running or last route |
+| `route_stop` (L) | Stop a background route |
 | `route_record_start`, `route_record_stop` | Record what is played into a route (checkpoints at settled screens, timed input otherwise) |
 | `screenshot_raw` | Capture-layer frame: 1280x720, no post-processing, works hidden/paused |
 | `game_info`, `firmware_status` | Running game metadata and icon; installed firmware |
-| `process_info`, `memory_map`, `list_threads`, `backtrace` | Process layout and modules, mapped regions, guest threads with CPU time, symbolized backtraces |
-| `read_memory`, `search_memory`, `write_memory` (W, L) | Guest memory (typed or hex; pattern search with `??`) |
+| `process_info`, `memory_map`, `list_threads` | Process layout and modules, mapped regions, guest threads with CPU time |
+| `backtrace` (L) | Symbolized guest thread backtraces |
+| `read_memory`, `search_memory` | Read or search guest memory |
+| `write_memory` (W, L) | Write typed values or hex bytes to guest memory |
 | `watch_add`, `watch_list`, `watch_remove` | Values sampled every frame; changes become `watch` timeline events |
 | `scan_start`, `scan_next`, `scan_results` | Cheat-Engine-style search for an unknown address |
 | `ipc_trace`, `ipc_summary`, `svc_trace`, `list_services` | Runtime IPC/SVC tracing into the timeline, call summary, registered services |
-| `debugger_status`, `debugger_attach`, `debugger_detach` | The emulator's GDB stub as the MCP's debugger (the stub must be on when the game boots; `boot_game` attaches automatically then) |
+| `debugger_status` | Check the state of the emulator's GDB stub and debugger session |
+| `debugger_attach`, `debugger_detach` (L) | Attach to or detach from the emulator's GDB stub. Enable the stub before booting a game. |
 | `breakpoint_add` (W, L), `breakpoint_list`, `breakpoint_remove` (L) | Exec breakpoints and read/write/access watchpoints by address or `Module+0xoffset`; hits are `break` timeline events with registers and a backtrace (mode `log`), or leave the game paused (mode `stop`) |
 | `debugger_pause`, `debugger_step`, `debugger_continue` (L) | Pause through the debugger, single-step, resume |
 | `dump_set` (W, L), `dump_list`, `dump_read` | Shader (.ash), SPIR-V and macro dumps: turn on, list what was written, read part of a file |
@@ -83,7 +88,7 @@ agent holds it, see `acquire_control`).
 | `baseline_save`, `baseline_check` | Save a known-good frame per game; score the current frame against it |
 | `summarize_since`, `timeline_export`, `compare_runs` | Clustered digest; JSONL export under `<log dir>/mcp`; diff two runs |
 | `settings_list`, `settings_get`, `settings_set` (W, L) | Settings by name (credentials, serials and MCP security settings are hidden) |
-| `debug_knobs`, `set_determinism` (W, L), `env_switches` | A/B knobs, fixed RNG/RTC/language/region, active `EDEN_*` variables |
+| `debug_knobs` (W, L when changing values), `set_determinism` (W, L), `env_switches` | A/B knobs, fixed RNG/RTC/language/region, active `EDEN_*` variables |
 | `tap`, `swipe` (W, L) | Touch screen input (0..1 coordinates) |
 | `set_docked` (W, L) | Docked/handheld live, with the frontend's controller swap |
 | `frame_advance` (L), `capture_frames` | Run N frames then pause (+ screenshot); a screenshot burst every N frames |
@@ -112,7 +117,7 @@ With `mcp_token` set, pass `Authorization: Bearer <token>` (or `?token=` in a br
 
 `eden-cli --mcp [--mcp-port N] [--mcp-allow-writes] -g <game>` serves the same tools for
 unattended runs (no game list: the game is the one on the command line; `stop`/`quit_emulator`
-end the process). eden-cli starts the server only with `--mcp`.
+end the process). Either `--mcp` or `--mcp-port N` enables the server.
 
 ## Code
 

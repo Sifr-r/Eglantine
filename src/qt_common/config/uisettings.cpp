@@ -30,7 +30,7 @@ namespace UISettings {
 
 // This shouldn't have anything except static initializers (no functions). So
 // QKeySequence(...).toString() is NOT ALLOWED HERE.
-// The hotkey editor indexes this array by row when restoring defaults.
+// The hotkey editor looks up entries by (group, name) when restoring defaults.
 // clang-format off
 const std::array<Shortcut, 32> default_hotkeys{{
     {QStringLiteral(QT_TRANSLATE_NOOP("Hotkeys", "Audio Mute/Unmute")).toStdString(),          QStringLiteral(QT_TRANSLATE_NOOP("Hotkeys", "Main Window")).toStdString(), {std::string("Ctrl+M"),  std::string("Home+Dpad_Right"), Qt::WindowShortcut, false}},

@@ -1,7 +1,6 @@
 # ARCHITECTURE.md — Eglantine
 
-Ledger of the core domains, their public contracts and the dependency direction. New work
-should extend this file rather than discover the layout again.
+Ledger of the core domains, their public contracts and their build dependencies.
 
 Baseline generated 2026-11-16 against `upstream/nx2` = `cf6cfe9caa` (v0.1.0-rc4).
 
@@ -9,22 +8,22 @@ Baseline generated 2026-11-16 against `upstream/nx2` = `cf6cfe9caa` (v0.1.0-rc4)
 
 ## 1. What this project is
 
-Eglantine is a Switch / Switch 2 emulator, forked from Yuzu (and before that from Eden).
-The
-`nx2` branch adds native Switch 2 (Ampere / NVN2) support on top of the Switch 1 (Maxwell)
+Eglantine is a Switch / Switch 2 emulator forked from Eden, which descends from Yuzu.
+The `nx2` branch adds native Switch 2 (Ampere / NVN2) support on top of the Switch 1 (Maxwell)
 code base. The two coexist in one tree rather than in separate ports: a title is "native"
 when its GPU runs the Ampere macro engine (`Maxwell3D::GetNativeMacroEngine().native_turing`).
 
-## 2. Layering and dependency direction
+## 2. Domains and build dependencies
 
-Dependencies point **downward only**. A module never includes a header from a module listed
-after it in the table below.
+The table lists domain ownership. The `CMakeLists.txt` files in each domain define target
+dependencies. For example, `core` and `video_core` link to each other, and `video_core` links
+to `shader_recompiler` for shader translation.
 
 | # | Domain | Path | Responsibility |
 |---|---|---|---|
-| 1 | `dynarmic` | `src/dynarmic` | x64 JIT the guest CPU runs on |
+| 1 | `dynarmic` | `src/dynarmic` | JIT recompiler for the guest ARM CPU |
 | 2 | `common` | `src/common` | Types, settings, filesystem, logging, math, path helpers |
-| 3 | `network` | `src/network` | Socket abstraction |
+| 3 | `network` | `src/network` | Multiplayer rooms, room clients and packet serialization |
 | 4 | `core` | `src/core` | The emulated machine: CPU, memory, services (HLE), the system loop |
 | 5 | `audio_core` | `src/audio_core` | Audio output and mixing |
 | 6 | `video_core` | `src/video_core` | GPU state, memory manager, texture cache, shader lowering, renderers |
@@ -33,9 +32,9 @@ after it in the table below.
 | 9 | `frontend_common` | `src/frontend_common` | Frontend-shared config, paths, play time, firmware |
 | 10 | `shader_recompiler` | `src/shader_recompiler` | Maxwell/Ampere shader translation to SPIR-V |
 | 11 | `mcp` | `src/mcp` | Built-in MCP server for AI agents (tools over the emulator) |
-| 12 | `yuzu_cmd` | `src/yuzu_cmd` | The SDL frontend; produces `eden-cli.exe` |
+| 12 | `yuzu_cmd` | `src/yuzu_cmd` | SDL frontend, built as `yuzu-cmd` with executable name `eden-cli` |
 | 13 | `qt_common` | `src/qt_common` | Qt-shared helpers (game list, paths, per-game settings) |
-| 14 | `yuzu` | `src/yuzu` | The Qt frontend; produces `eglantine.exe` |
+| 14 | `yuzu` | `src/yuzu` | Qt frontend, built as `yuzu` with executable name `eglantine` |
 | 15 | `updater` | `src/updater` | The self-update helper |
 | 16 | `web_service` | `src/web_service` | Telemetry and other web services |
 | 17 | `android` | `src/android` | The Android port (JNI glue over `core`) |
@@ -55,8 +54,10 @@ convention.
 
 * `Core::System` owns the CPU, memory and the service dispatcher. Everything else reads the
   machine through it.
-* `Core::LaunchParams` / `ParseLaunchParams` parse the command line (`-c` config, `-g`
-  game, `-u` user, `-d` gdbstub, `--mcp`).
+* `Core::LaunchParams` / `ParseLaunchParams` / `ApplyLaunchParams` (`src/core/launch_params.{h,cpp}`)
+  parse the command line (`-c` config, `-g` game, `-u` user, `-d` gdbstub, `--mcp`, NUP
+  pack/unpack/edit options, Windows `argv_w` UTF-16 args) and apply launch settings; covered by
+  `src/tests/core/launch_params.cpp`.
 * Services live in `src/core/hle/service/`. The Switch 2 additions are `nvdrv/` (GPU
   device), `nx2_gsv.h` (graphics server, frame capture) and `nx2_stub_device.h`.
 * `Core::g_nx2_present_count` is the frame counter the NX2 diagnostics and key scripts use.
@@ -86,7 +87,10 @@ convention.
   saves in `save/cache/<title id>` (or `save/cache/<title id>_<index>` when indexed), temporary saves in `<save id>/<user id>/<title id>` — and it exposes
   it through `Enumerate`, `Delete`, `DeleteMatching`, `DeleteCacheStorage`, `GetFreeSpace`,
   `GetCommitId`, `OpenMetaFile` and `QueryTotalSize`. The service layer must not reach into the
-  layout itself: `ISaveDataInfoReader` and the `fsp-srv` handlers go through the controller.
+  layout itself: `ISaveDataInfoReader` delegates save enumeration to
+  `SaveDataController::EnumerateSaveData` and the `fsp-srv` handlers go through the controller.
+  The save data factory derives stable IDs for non-system saves from their attributes and
+  resolves IDs for deletion and commit queries only when the match is unambiguous.
   A title id of zero in an attribute means "the title of the calling process", resolved by
   `SaveDataFactory::GetFullPath`.
 * **Deleting save data is idempotent.** Deleting a save that does not exist returns
@@ -120,6 +124,9 @@ convention.
   checks live next to the service that reads them. `nx2:gpu` command 214 validates page
   alignment, the advertised GPU address range, and an 8 GiB per-region limit before
   updating mappings or allocating backing metadata.
+* **NVMap pin failures.** `NvMap::PinHandle` rejects handles whose session has closed
+  before allocating a new mapping. GPU and display callers check the pin result before
+  using its address or publishing a preallocated buffer.
 
 ### `video_core` — the GPU
 
@@ -133,7 +140,9 @@ convention.
 * `VideoCore::PipelineCache` (`src/video_core/renderer_vulkan/vk_pipeline_cache.cpp`) owns
   the graphics pipeline cache, its disk format (`CACHE_VERSION`, currently 34) and the
   asynchronous shader build. `BuiltPipeline` decides whether a draw waits for its pipeline
-  or is skipped for the frame.
+  or is skipped for the frame. Geometry consistency preserves depth-only draws that count
+  occlusion samples or may write shader memory. Non-indexed draws without vertex stream 0
+  are excluded from geometry matching.
 * Renderers: `renderer_vulkan/` (the default), `renderer_opengl/`, `renderer_null/`.
 * `src/video_core/gpu_split.h` separates front-thread ring bookkeeping and the back-thread
   engine pointer at 128-byte boundaries. The shared atomics retain their own alignment.
@@ -205,6 +214,14 @@ a change to the wire format has to land in both.
 
 * `InputCommon::InputSubsystem` owns the devices; `GetKeyboard()` is the path the NX2 key
   scripts use, and `GetSwitch2()` exposes `InputCommon::Switch2Controllers`.
+* `src/input_common/main.{h,cpp}` compares Player 1's keyboard bindings with the frontend's
+  factory defaults. `src/common/param_package.h` compares binding keys and values independently
+  of their serialized order.
+* `src/input_common/drivers/sdl_driver.cpp` owns SDL joystick and gamepad handles. It checks
+  native driver preference before opening a gamepad handle and ignores removal events for
+  joysticks SDL has no open handle for.
+* `src/yuzu/util/controller_navigation.cpp` converts Player 1 and handheld button and stick
+  input into Qt navigation key events. It reads each controller's input state independently.
 * Native Nintendo Switch 2 controller support (`src/input_common/drivers/switch2.{h,cpp}`,
   `src/input_common/helpers/switch2_protocol/`):
   * `switch2_types.{h,cpp}` — BLE `0x0553` advertisement parser, 12-bit stick unpacking and
@@ -226,19 +243,23 @@ a change to the wire format has to land in both.
     package under the `device_id` key, so a controller keeps its player assignment when the
     driver re-sorts its slots.
   * `drivers/switch2_auto_pair.{h,cpp}` — `Switch2AutoPair`: binds the controllers the driver
-    found to emulated player slots. `ApplyToPlayers()` is the pure policy (a controller claims
-    the lowest unconnected slot that no other Switch 2 controller owns, reusing a disconnected
-    Switch 2 slot before falling back to an active non-Switch 2 slot; a slot that already
+    found to emulated player slots. `ApplyToPlayers()` is the pure policy (a new controller
+    can claim Player 1 when it uses the factory keyboard bindings. Otherwise it claims the
+    lowest unconnected slot that no other Switch 2 controller owns, reusing a disconnected
+    Switch 2 slot before falling back to an active non-Switch 2 slot. A saved slot that already
     points at the controller is reused; a controller that moved to another driver slot is
-    re-bound; a user remap survives). `ApplyDevices()` is the same policy plus the state of the controllers
+    re-bound; a user remap and explicitly cleared bindings survive while the controller type
+    stays the same). `ApplyDevices()` is the same policy plus the state of the controllers
     between the passes: a controller that is missing for `MissingPassesBeforeDisconnect`
     passes in a row has its player slot marked as disconnected. `Apply()` runs the policy
     against the driver, honours `Settings::values.switch2_auto_pair`, writes
     `Settings::values.players` (active and global) and reports the slots that changed.
-    Reloading the emulated controllers and persisting the configuration belong to the caller:
-    the Qt frontend polls it once a second from `MainWindow::UpdateSwitch2Controllers()`, the
-    SDL frontend from `CheckSwitch2AutoPair()` in `src/yuzu_cmd/yuzu.cpp`. Both frontends keep
-    **one** `Switch2AutoPair` instance for the whole session: the state of the controllers is
+    Reloading the emulated controllers and persisting the configuration belong to the caller.
+    Qt saves the global player bindings without changing the active per-game selection:
+    `src/yuzu/main_window.cpp` polls it once a second and checks again before opening a
+    single-player controller selector. `src/yuzu_cmd/yuzu.cpp` polls from
+    `CheckSwitch2AutoPair()`. Both frontends keep **one** `Switch2AutoPair` instance for the
+    whole session: the state of the controllers is
     what makes a disconnect visible, and a fresh instance per poll would never report one.
   * **The wire protocol follows the reference implementation.** The feature flags, the common
     report, the battery and IMU layouts and the rumble frames follow
@@ -260,16 +281,20 @@ a change to the wire format has to land in both.
 
 ### `mcp` — the agent interface
 
-* `src/mcp/tools/` exposes the emulator's internals (timeline, memory, shaders, input,
-  performance) as MCP tools. `src/mcp_host_cli.cpp` serves them from `eden-cli`.
+* With `ENABLE_MCP_SERVER`, `src/mcp/tools/` supplies emulator tools for both desktop
+  frontends. `src/yuzu_cmd/mcp_host_cli.cpp` and `src/yuzu/mcp_host_qt.cpp` integrate the
+  server into the SDL and Qt frontends, respectively.
 
 ## 4. Frontends
 
 Two frontends share `frontend_common`:
 
-* `yuzu_cmd` → `eden-cli.exe`: the SDL frontend. This is the one the NX2 lab drives, and
-  the one the unattended runs use.
-* `yuzu` → `eglantine.exe`: the Qt frontend.
+| CMake target | Executable in the build's `bin/` directory | Frontend |
+| --- | --- | --- |
+| `yuzu-cmd` | `eden-cli` | SDL frontend used by the NX2 lab for unattended runs |
+| `yuzu` | `eglantine` | Qt frontend |
+
+The executables have an `.exe` suffix on Windows.
 
 Both read `qt-config.ini` / `sdl2-config.ini` from the config directory. The Qt file
 usually binds a gamepad; the SDL file binds the keyboard by default.
@@ -278,31 +303,34 @@ usually binds a gamepad; the SDL file binds the keyboard by default.
 An empty binding can be an explicit override of the default. Android's game scanner and
 launch-by-URI handler share the extension allowlist in `model/Game.kt`. The native NUP
 loader publishes a program ID once the selected ExeFS contains both `main` and `main.npdm`.
-`UPSTREAM_EASY_WINS.md` records the scope and verification for the first upstream fixes.
-`UPSTREAM_NEXT_BATCH.md` records the ownership and acceptance checks for the next upstream fixes.
 
 Qt's legacy-data migration runs before frontend initialization. `src/yuzu/migration_worker.cpp`
 validates source and destination directories, transfers data, and rewrites local storage paths
 in copied or moved Qt configuration files. `src/yuzu/user_data_migration.cpp` waits for the
 worker's result before startup proceeds.
 
-The Qt frontend opens **Help → Diagnostics** through `MainWindow`. The dialog reads the
-current session log and makes its report available for explicit clipboard copying.
+The Qt frontend opens one modeless **Help → Diagnostics** window through `MainWindow`.
+While visible, it refreshes **Actionable issues** every two seconds. The view groups repeated
+critical errors, native shader rejections, and Vulkan graphics pipeline failures from the
+recent emulator log. The 256 KiB tail bounds the results. The live view and manual log report
+each have a clipboard action.
 
 | Path | Responsibility |
 | --- | --- |
 | `src/yuzu/diagnostics_log.h` | Define the snapshot returned to the diagnostics dialog. |
-| `src/yuzu/diagnostics_log.cpp` | Read bounded startup and tail excerpts and extract renderer details and recent errors. |
-| `src/yuzu/diagnostics_dialog.h` | Declare the Qt dialog and its refresh and copy actions. |
-| `src/yuzu/diagnostics_dialog.cpp` | Display the snapshot, refresh it, and copy the report to the clipboard. |
+| `src/yuzu/diagnostics_log.cpp` | Read bounded log excerpts, extract renderer details, and group actionable failures. |
+| `src/yuzu/diagnostics_dialog.h` | Declare the modeless window and its refresh and copy actions. |
+| `src/yuzu/diagnostics_dialog.cpp` | Refresh actionable issues while visible and display and copy diagnostic reports. |
 | `ignore/diagnostics-dialog-plan.md` | Record the research review scope and acceptance checks for the dialog. |
+| `ignore/live-diagnostics-plan.md` | Record the live issue filter, window behavior, and acceptance checks. |
 
 Both frontends poll `InputCommon::Switch2::Switch2AutoPair` about once a second, so a
 native Switch 2 controller that is plugged in or paired while the app runs is bound to a
-player slot without the user configuring it by hand. It prefers the lowest unconnected slot
-(so a controller becomes Player 1 when no active non-Switch 2 controller holds it), reusing a
-disconnected Switch 2 slot before replacing an active non-Switch 2 mapping; set
-`switch2_auto_pair=false` in the config file to keep the manual behaviour.
+player slot without the user configuring it by hand. The first unassigned controller can
+take Player 1 from the factory keyboard mapping. Other assignments prefer the lowest
+unconnected slot, reusing a disconnected Switch 2 slot before replacing an active
+non-Switch 2 mapping. Set `switch2_auto_pair=false` in the config file to keep the manual
+behaviour.
 
 ## 5. The Switch 2 debugging toolchain (`tools/nx2/`)
 
@@ -319,6 +347,8 @@ The skills that describe how to use them live in `.claude/skills/`
 
 ### Local lab and fixture storage
 
+Entries under `ignore/` describe one local archive. Their availability depends on the checkout.
+
 | Path | Responsibility |
 | --- | --- |
 | `ignore/.lab/` | Local Windows bisect harness, tool binaries, configurations and run artifacts. Run `ignore\.lab\build.cmd tests` from the repository root to reconfigure the existing bisect build for the relocated shader compiler. |
@@ -332,16 +362,19 @@ The skills that describe how to use them live in `.claude/skills/`
 | `ignore/RESEARCH_REVIEW.md` | Point-in-time research review snapshot archived out of root. |
 | `ignore/RYUJINX_COMPARISON.md` | Point-in-time Ryubing comparative study snapshot archived out of root. |
 | `ignore/UPSTREAM_ISSUES.md` | Point-in-time upstream issue snapshot archived out of root. |
+| `ignore/UPSTREAM_EASY_WINS.md` | Scope and verification record for the first upstream fixes archived out of root. |
+| `ignore/UPSTREAM_NEXT_BATCH.md` | Ownership and acceptance checks for the next upstream fixes archived out of root. |
 | `.claude/skills/nx2-shader-triage/scripts/relower_words.cpp` | Standalone offline lowering helper used by the shader-triage workflow. |
 
-Git ignores `ignore/`. The Nix source filter and the CPack source configuration also exclude it.
+Git and the Nix source filter exclude the root `ignore/` and `.lab/` directories. The CPack
+template applies the same exclusions when a separate CPack configuration uses it.
 
 ### Source and release checks
 
 | Path | Responsibility |
 | --- | --- |
 | `ASSET_PROVENANCE.md` | Record source evidence, attribution and outstanding redistribution questions for audited assets. |
-| `CPackSourceConfig.cmake.in` | Preserve CPack’s generated defaults and exclude the repository’s root `ignore/` and `.lab/` from source packages. |
+| `CPackSourceConfig.cmake.in` | Source-package exclusion template used when `CPack` is configured with the repository root on `CMAKE_MODULE_PATH`; preserves CPack’s generated defaults and excludes the repository’s root `ignore/` and `.lab/` from source packages. |
 | `tools/ci/check_release_paths.py` | Reject high-confidence private artifact paths in a Git path list or in ZIP and TAR.GZ members. |
 | `tools/ci/test_check_release_paths.py` | Exercise accepted and rejected scanner inputs with synthetic files. |
 | `.github/workflows/source-checks.yml` | Check the candidate tree and run the emulator’s Linux Catch2 suite on pull requests. |
@@ -434,3 +467,20 @@ These are known and deliberately not fixed by the P0 pass; each one names its ow
 * The Qt frontend is built against a **system Qt** here: the bundled Qt 6.11.1 is a
   static-CRT build and cannot be linked into a `/MD` binary (`__std_rotate` is unresolved).
   CI installs Qt 6.8.3 the same way.
+
+### Recorded Wave 2 verification
+
+* The Windows MSVC build produced `tests.exe`, `eden-cli.exe` and `eglantine.exe`.
+  That run passed 587 Catch2 test cases (75,251,757 assertions) and all seven tests in
+  `tools/ci/test_check_release_paths.py`.
+
+### Recorded Test Coverage Expansion Verification
+
+* Expanded unit test coverage across `core` (`src/tests/core/launch_params.cpp`,
+  `src/tests/core/nx2_gsv_bounds.cpp`, `src/tests/core/shutdown_ordering.cpp`), `input_common`
+  (`src/tests/input_common/switch2_protocol.cpp`), and `video_core` / Ampere lowering
+  (`src/tests/video_core/ampere_compute_lowering.cpp`).
+* After rebuilding `tests.exe` with `src/tests/CMakeLists.txt` updated for `core/launch_params.cpp`,
+  all five targeted Catch2 runs passed: `[launch_params]` (6 cases, 202 assertions), `[nx2_gsv]`
+  (12 cases, 114 assertions), `[shutdown-ordering]` (5 cases, 25 assertions), `[switch2]`
+  (30 cases, 574 assertions), and `[ampere]` (70 cases, 60,262 assertions).

@@ -8,8 +8,9 @@
 
 #include <memory>
 #include <string>
-#include "common/container/unordered_map.h"
 #include <vector>
+#include "common/container/unordered_map.h"
+#include "common/settings_input.h"
 
 namespace Common {
 class ParamPackage;
@@ -17,18 +18,6 @@ class ParamPackage;
 
 namespace Common::Input {
 enum class ButtonNames;
-}
-
-namespace Settings::NativeAnalog {
-enum Values : int;
-}
-
-namespace Settings::NativeButton {
-enum Values : int;
-}
-
-namespace Settings::NativeMotion {
-enum Values : int;
 }
 
 namespace InputCommon {
@@ -185,4 +174,14 @@ std::string GenerateKeyboardParam(int key_code);
 /// Generates a serialized param package for creating an analog device taking input from keyboard.
 std::string GenerateAnalogParamFromKeys(int key_up, int key_down, int key_left, int key_right,
                                         int key_modifier, float modifier_scale);
+
+/// Builds the frontend's factory keyboard bindings for Player 1.
+[[nodiscard]] Settings::PlayerInput MakeDefaultKeyboardPlayer(
+    const std::array<int, Settings::NativeButton::NumButtons>& buttons,
+    const std::array<std::array<int, 4>, Settings::NativeAnalog::NumAnalogs>& analogs,
+    const std::array<int, Settings::NativeAnalog::NumAnalogs>& stick_modifiers,
+    const std::array<int, Settings::NativeMotion::NumMotions>& motions);
+
+/// Checks whether both the active and global Player 1 configurations use the factory keyboard.
+[[nodiscard]] bool PlayerOneUsesDefaultKeyboard(const Settings::PlayerInput& defaults);
 } // namespace InputCommon

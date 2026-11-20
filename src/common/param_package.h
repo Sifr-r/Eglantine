@@ -25,6 +25,7 @@ public:
 
     ParamPackage& operator=(const ParamPackage& other) = default;
     ParamPackage& operator=(ParamPackage&& other) = default;
+    bool operator==(const ParamPackage& other) const = default;
 
     [[nodiscard]] std::string Serialize() const;
     [[nodiscard]] std::string Get(const std::string& key, const std::string& default_value) const;

@@ -687,6 +687,9 @@ private:
     // True if TAS recording dialog is visible
     bool is_tas_recording_dialog_active{};
 
+    // True if a settings configuration dialog is open
+    bool is_configuring = false;
+
 #ifdef __unix__
     QSocketNotifier* sig_interrupt_notifier;
     static std::array<int, 3> sig_interrupt_fds;

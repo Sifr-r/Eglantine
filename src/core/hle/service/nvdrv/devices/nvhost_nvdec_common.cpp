@@ -145,6 +145,14 @@ NvResult nvhost_nvdec_common::MapBuffer(IoctlMapBuffer& params, std::span<MapBuf
     const size_t num_entries = (std::min)(params.num_entries, static_cast<u32>(entries.size()));
     for (size_t i = 0; i < num_entries; i++) {
         DAddr pin_address = nvmap.PinHandle(entries[i].map_handle, true);
+        if (pin_address == 0) {
+            for (size_t pinned = 0; pinned < i; ++pinned) {
+                nvmap.UnpinHandle(entries[pinned].map_handle);
+                entries[pinned].map_address = 0;
+            }
+            entries[i].map_address = 0;
+            return NvResult::BadValue;
+        }
         entries[i].map_address = static_cast<u32>(pin_address);
     }
 

@@ -747,9 +747,14 @@ Status BufferQueueProducer::SetPreallocatedBuffer(s32 slot,
 
     std::scoped_lock lock{core->mutex};
 
+    auto graphic_buffer = std::make_shared<GraphicBuffer>(nvmap, buffer);
+    if (buffer && buffer->BufferId() != 0 && graphic_buffer->BufferId() == 0) {
+        return Status::BadValue;
+    }
+
     slots[slot] = {};
     slots[slot].fence = Fence::NoFence();
-    slots[slot].graphic_buffer = std::make_shared<GraphicBuffer>(nvmap, buffer);
+    slots[slot].graphic_buffer = std::move(graphic_buffer);
     slots[slot].frame_number = 0;
 
     // Most games preallocate a buffer and pass a valid buffer here. However, it is possible for

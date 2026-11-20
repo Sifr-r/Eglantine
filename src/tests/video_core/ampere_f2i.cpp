@@ -112,3 +112,39 @@ TEST_CASE("Ampere guarded absolute F2I keeps nearest rounding to U16", "[video_c
         return ((word >> 16) & 15) == NegatedP4;
     }));
 }
+
+TEST_CASE("Ampere F2I rejects unsupported opcodes, source modifiers, bit 74, and src_fmt 0",
+          "[video_core][ampere]") {
+    using Shader::Ampere::Instruction;
+    using Shader::Ampere::LowerToMaxwell;
+    const Instruction exit{{0x0000794d, 0, 0x03800000, 0}};
+    const Instruction base_reg{{0x305U | (7U << 12) | (6U << 16), 9U, 0x0020b000U, 0}};
+    REQUIRE(static_cast<bool>(LowerToMaxwell(std::array{base_reg, exit})));
+
+    // Unimplemented F2I opcodes 0x105 and 0x905 are rejected.
+    for (const u32 opcode : {0x105U, 0x905U}) {
+        const Instruction bad_op{{opcode | (7U << 12) | (6U << 16), 9U, 0x0020b000U, 0}};
+        CHECK_FALSE(static_cast<bool>(LowerToMaxwell(std::array{bad_op, exit})));
+    }
+
+    // Nonzero bits [62:60] on forms that do not accept them are rejected.
+    for (const u32 bit : {28U, 29U}) {
+        Instruction bad_mod = base_reg;
+        bad_mod.words[1] |= 1U << bit; // bits 60 and 61 on F32 register F2I
+        CHECK_FALSE(static_cast<bool>(LowerToMaxwell(std::array{bad_mod, exit})));
+    }
+    const Instruction bad_cbuf_bits{{0xb05U | (7U << 12) | (6U << 16), (0x20U << 6) | (1U << 28), 0x00212800U, 0}};
+    CHECK_FALSE(static_cast<bool>(LowerToMaxwell(std::array{bad_cbuf_bits, exit})));
+    const Instruction bad_ur_abs{{0xd05U | (7U << 12) | (6U << 16), 4U | (1U << 30), 0x0820b000U, 0}};
+    CHECK_FALSE(static_cast<bool>(LowerToMaxwell(std::array{bad_ur_abs, exit})));
+
+    // Nonzero bit 74 (word[2] bit 10) is rejected.
+    Instruction bad_bit74 = base_reg;
+    bad_bit74.words[2] |= 1U << 10;
+    CHECK_FALSE(static_cast<bool>(LowerToMaxwell(std::array{bad_bit74, exit})));
+
+    // src_fmt == 0 (bits [85:84] == 0) is rejected.
+    Instruction bad_src_fmt = base_reg;
+    bad_src_fmt.words[2] &= ~(3U << 20);
+    CHECK_FALSE(static_cast<bool>(LowerToMaxwell(std::array{bad_src_fmt, exit})));
+}

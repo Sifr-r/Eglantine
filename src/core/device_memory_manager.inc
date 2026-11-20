@@ -278,10 +278,13 @@ void DeviceMemoryManager<Traits>::Free(DAddr start, size_t size) {
 template <typename Traits>
 void DeviceMemoryManager<Traits>::Map(DAddr address, VAddr virtual_address, size_t size, Asid asid,
                                       bool track) {
+    std::scoped_lock lk(mapping_guard);
+    if (asid.id >= registered_processes.size() || registered_processes[asid.id] == nullptr) {
+        return;
+    }
     Core::Memory::Memory* process_memory = registered_processes[asid.id];
     size_t start_page_d = address >> Memory::YUZU_PAGEBITS;
     size_t num_pages = Common::AlignUp(size, Memory::YUZU_PAGESIZE) >> Memory::YUZU_PAGEBITS;
-    std::scoped_lock lk(mapping_guard);
 
     tracked_entries.CommitRegion(start_page_d, start_page_d + num_pages);
     CutContinuityAt(start_page_d);
@@ -625,6 +628,7 @@ void DeviceMemoryManager<Traits>::WriteBlockUnsafe(DAddr address, const void* sr
 
 template <typename Traits>
 Asid DeviceMemoryManager<Traits>::RegisterProcess(Memory::Memory* memory_device_inter) {
+    std::scoped_lock lk(mapping_guard);
     size_t new_id{};
     if (!id_pool.empty()) {
         new_id = id_pool.front();
@@ -639,6 +643,10 @@ Asid DeviceMemoryManager<Traits>::RegisterProcess(Memory::Memory* memory_device_
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::UnregisterProcess(Asid asid) {
+    std::scoped_lock lk(mapping_guard);
+    if (asid.id >= registered_processes.size()) {
+        return;
+    }
     registered_processes[asid.id] = nullptr;
     id_pool.push_front(asid.id);
 }
@@ -690,7 +698,8 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
 
         if (asid.id != asid_2.id) [[unlikely]] {
             release_pending();
-            memory_device_inter = registered_processes[asid_2.id];
+            memory_device_inter =
+                asid_2.id < registered_processes.size() ? registered_processes[asid_2.id] : nullptr;
         }
 
         if (vpage != old_vpage + 1) [[unlikely]] {
@@ -709,8 +718,10 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
             }
             uncache_bytes += Memory::YUZU_PAGESIZE;
         } else if (uncache_bytes > 0) {
-            MarkRegionCaching(memory_device_inter, uncache_begin << Memory::YUZU_PAGEBITS,
-                              uncache_bytes, false);
+            if (memory_device_inter != nullptr) {
+                MarkRegionCaching(memory_device_inter, uncache_begin << Memory::YUZU_PAGEBITS,
+                                  uncache_bytes, false);
+            }
             uncache_bytes = 0;
         }
         if (count.load(std::memory_order::relaxed) == 1 && delta > 0) {
@@ -719,8 +730,10 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedCountNoLock(DAddr addr, size_
             }
             cache_bytes += Memory::YUZU_PAGESIZE;
         } else if (cache_bytes > 0) {
-            MarkRegionCaching(memory_device_inter, cache_begin << Memory::YUZU_PAGEBITS,
-                              cache_bytes, true);
+            if (memory_device_inter != nullptr) {
+                MarkRegionCaching(memory_device_inter, cache_begin << Memory::YUZU_PAGEBITS,
+                                  cache_bytes, true);
+            }
             cache_bytes = 0;
         }
     }

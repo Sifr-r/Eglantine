@@ -161,6 +161,22 @@ DeviceMappings MakeMappings(const DeviceIdMap& device_ids, bool partial = false)
         Common::ParamPackage b_params = MappingParams(params, device_ids);
         b_params.Set("button", static_cast<int>(PadButton::B));
         mapping.insert_or_assign(Settings::NativeButton::B, std::move(b_params));
+        const auto pad = static_cast<ControllerType>(params.Get("pad", 0));
+        if (pad == ControllerType::Left) {
+            Common::ParamPackage sl_params = MappingParams(params, device_ids);
+            Common::ParamPackage sr_params = sl_params;
+            sl_params.Set("button", static_cast<int>(PadButton::LeftSL));
+            sr_params.Set("button", static_cast<int>(PadButton::LeftSR));
+            mapping.insert_or_assign(Settings::NativeButton::SLLeft, std::move(sl_params));
+            mapping.insert_or_assign(Settings::NativeButton::SRLeft, std::move(sr_params));
+        } else if (pad == ControllerType::Right) {
+            Common::ParamPackage sl_params = MappingParams(params, device_ids);
+            Common::ParamPackage sr_params = sl_params;
+            sl_params.Set("button", static_cast<int>(PadButton::RightSL));
+            sr_params.Set("button", static_cast<int>(PadButton::RightSR));
+            mapping.insert_or_assign(Settings::NativeButton::SLRight, std::move(sl_params));
+            mapping.insert_or_assign(Settings::NativeButton::SRRight, std::move(sr_params));
+        }
         return mapping;
     };
 
@@ -603,4 +619,128 @@ TEST_CASE("Switch2AutoPair preserves an actively connected non-Switch 2 Player 1
         REQUIRE(players[0].connected);
         REQUIRE(DeviceIdOf(players[0]) == "HAC-001");
     }
+}
+
+TEST_CASE("Switch2AutoPair gives the first controller the factory keyboard's player slot",
+          "[switch2][auto_pair]") {
+    std::vector<Settings::PlayerInput> players(std::size_t{3}, MakePlayer());
+    players[0].connected = true;
+    players[0].profile_name.clear();
+    players[0].buttons[ButtonIndex(Settings::NativeButton::A)] = MakeKeyboardBinding();
+    const std::vector<InputCommon::Switch2DeviceBinding> devices{
+        MakeDevice(std::size_t{0}, ControllerType::Pro, "HAC-001", "Pro Controller"),
+    };
+    const auto mappings = MakeMappings({{std::size_t{0}, "HAC-001"}});
+
+    const auto result = Switch2AutoPair::ApplyToPlayers(devices, mappings, players, true);
+
+    REQUIRE(result.size() == std::size_t{1});
+    REQUIRE(AnyPlayer(result, 0, "HAC-001"));
+    REQUIRE(DeviceIdOf(players[0]) == "HAC-001");
+    REQUIRE_FALSE(players[1].connected);
+    REQUIRE(Switch2AutoPair::ApplyToPlayers(devices, mappings, players, false).empty());
+}
+
+TEST_CASE("Switch2AutoPair keeps an established Player 2 assignment",
+          "[switch2][auto_pair]") {
+    std::vector<Settings::PlayerInput> players(std::size_t{2}, MakePlayer());
+    const auto keyboard_binding = MakeKeyboardBinding();
+    players[0].connected = true;
+    players[0].profile_name.clear();
+    players[0].buttons[ButtonIndex(Settings::NativeButton::A)] = keyboard_binding;
+    players[1].profile_name.clear();
+    const std::vector<InputCommon::Switch2DeviceBinding> devices{
+        MakeDevice(std::size_t{0}, ControllerType::Pro, "HAC-001", "Pro Controller"),
+    };
+    const auto mappings = MakeMappings({{std::size_t{0}, "HAC-001"}});
+    Switch2AutoPair auto_pair;
+    REQUIRE(AnyPlayer(auto_pair.ApplyDevices(devices, mappings, players), 1, "HAC-001"));
+
+    REQUIRE(auto_pair.ApplyDevices(devices, mappings, players, true).empty());
+    REQUIRE(players[0].connected);
+    REQUIRE(players[0].buttons[ButtonIndex(Settings::NativeButton::A)] == keyboard_binding);
+    REQUIRE(players[1].connected);
+    REQUIRE(DeviceIdOf(players[1]) == "HAC-001");
+}
+
+TEST_CASE("Switch2AutoPair restores SLLeft and SRLeft when Dual splits into Left and Right",
+          "[switch2][auto_pair]") {
+    std::vector<Settings::PlayerInput> players(std::size_t{2}, MakePlayer());
+
+    const std::vector<InputCommon::Switch2DeviceBinding> dual_devices{
+        MakeDevice(std::size_t{0}, ControllerType::Dual, "JC-LEFT", "Dual Joy-Con"),
+    };
+    const auto dual_mappings = MakeMappings({{std::size_t{0}, "JC-LEFT"}});
+    REQUIRE(Switch2AutoPair::ApplyToPlayers(dual_devices, dual_mappings, players).size() ==
+            std::size_t{1});
+    REQUIRE(players[0].controller_type == Settings::ControllerType::DualJoyconDetached);
+    REQUIRE(players[0].buttons[ButtonIndex(Settings::NativeButton::SLLeft)] ==
+            Common::ParamPackage{}.Serialize());
+    REQUIRE(players[0].buttons[ButtonIndex(Settings::NativeButton::SRLeft)] ==
+            Common::ParamPackage{}.Serialize());
+
+    const std::vector<InputCommon::Switch2DeviceBinding> split_devices{
+        MakeDevice(std::size_t{0}, ControllerType::Left, "JC-LEFT", "Left Joy-Con"),
+        MakeDevice(std::size_t{1}, ControllerType::Right, "JC-RIGHT", "Right Joy-Con"),
+    };
+    const auto split_mappings =
+        MakeMappings({{std::size_t{0}, "JC-LEFT"}, {std::size_t{1}, "JC-RIGHT"}});
+    const auto split_result =
+        Switch2AutoPair::ApplyToPlayers(split_devices, split_mappings, players);
+
+    REQUIRE(split_result.size() == std::size_t{2});
+    REQUIRE(players[0].controller_type == Settings::ControllerType::LeftJoycon);
+    const Common::ParamPackage sl_left{
+        players[0].buttons[ButtonIndex(Settings::NativeButton::SLLeft)]};
+    const Common::ParamPackage sr_left{
+        players[0].buttons[ButtonIndex(Settings::NativeButton::SRLeft)]};
+    REQUIRE(sl_left.Get("engine", "") == "switch2");
+    REQUIRE(sl_left.Get("button", -1) == static_cast<int>(PadButton::LeftSL));
+    REQUIRE(sr_left.Get("engine", "") == "switch2");
+    REQUIRE(sr_left.Get("button", -1) == static_cast<int>(PadButton::LeftSR));
+
+    REQUIRE(players[1].controller_type == Settings::ControllerType::RightJoycon);
+    const Common::ParamPackage sl_right{
+        players[1].buttons[ButtonIndex(Settings::NativeButton::SLRight)]};
+    REQUIRE(sl_right.Get("engine", "") == "switch2");
+    REQUIRE(sl_right.Get("button", -1) == static_cast<int>(PadButton::RightSL));
+}
+
+TEST_CASE("Switch2AutoPair preserves explicitly cleared inputs for the same controller type",
+          "[switch2][auto_pair]") {
+    std::vector<Settings::PlayerInput> players(std::size_t{1}, MakePlayer());
+    const std::vector<InputCommon::Switch2DeviceBinding> devices{
+        MakeDevice(std::size_t{0}, ControllerType::Pro, "PRO-001", "Pro Controller"),
+    };
+    const auto mappings = MakeMappings({{std::size_t{0}, "PRO-001"}});
+    REQUIRE(Switch2AutoPair::ApplyToPlayers(devices, mappings, players).size() == std::size_t{1});
+
+    const auto empty = Common::ParamPackage{}.Serialize();
+    players[0].buttons[ButtonIndex(Settings::NativeButton::B)] = empty;
+    players[0].analogs[AnalogIndex(Settings::NativeAnalog::RStick)] = empty;
+    players[0].motions[MotionIndex(Settings::NativeMotion::MotionRight)] = empty;
+
+    SECTION("Polling an unchanged controller leaves cleared inputs alone") {
+        REQUIRE(Switch2AutoPair::ApplyToPlayers(devices, mappings, players).empty());
+    }
+
+    SECTION("Reconnecting leaves cleared inputs alone") {
+        players[0].connected = false;
+        REQUIRE(Switch2AutoPair::ApplyToPlayers(devices, mappings, players).size() ==
+                std::size_t{1});
+        REQUIRE(players[0].connected);
+    }
+
+    SECTION("Moving the driver slot leaves cleared inputs alone") {
+        const std::vector<InputCommon::Switch2DeviceBinding> moved_devices{
+            MakeDevice(std::size_t{1}, ControllerType::Pro, "PRO-001", "Pro Controller"),
+        };
+        const auto moved_mappings = MakeMappings({{std::size_t{1}, "PRO-001"}});
+        REQUIRE(Switch2AutoPair::ApplyToPlayers(moved_devices, moved_mappings, players).size() ==
+                std::size_t{1});
+    }
+
+    REQUIRE(players[0].buttons[ButtonIndex(Settings::NativeButton::B)] == empty);
+    REQUIRE(players[0].analogs[AnalogIndex(Settings::NativeAnalog::RStick)] == empty);
+    REQUIRE(players[0].motions[MotionIndex(Settings::NativeMotion::MotionRight)] == empty);
 }

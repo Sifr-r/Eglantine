@@ -8,8 +8,8 @@
 #include <array>
 #include <cstring>
 #include <utility>
-#include "common/hex_util.h"
 #include "core/file_sys/savedata_factory.h"
+#include "core/file_sys/vfs/vfs.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/filesystem/fsp/fs_i_save_data_info_reader.h"
 #include "core/hle/service/filesystem/save_data_controller.h"
@@ -72,18 +72,6 @@ ISaveDataInfoReader::ISaveDataInfoReader(Core::System& system_,
 
 ISaveDataInfoReader::~ISaveDataInfoReader() = default;
 
-static u64 stoull_be(std::string_view str) {
-    if (str.size() != 16) {
-        return 0;
-    }
-
-    const auto bytes = Common::HexStringToArray<0x8>(str);
-    u64 out{};
-    std::memcpy(&out, bytes.data(), sizeof(u64));
-
-    return Common::swap64(out);
-}
-
 Result ISaveDataInfoReader::ReadSaveDataInfo(
     Out<u64> out_count, OutArray<SaveDataInfo, BufferAttr_HipcMapAlias> out_entries) {
     LOG_DEBUG(Service_FS, "called");
@@ -121,100 +109,39 @@ void ISaveDataInfoReader::ApplyFilter() {
 }
 
 void ISaveDataInfoReader::FindAllSaves(FileSys::SaveDataSpaceId space) {
-    FileSys::VirtualDir save_root{};
-    const auto result = save_data_controller->OpenSaveDataSpace(&save_root, space);
-
-    if (result != ResultSuccess || save_root == nullptr) {
-        LOG_ERROR(Service_FS, "The save root for the space_id={:02X} was invalid!", space);
+    const auto entries = save_data_controller->EnumerateSaveData(space);
+    if (entries.empty()) {
         return;
     }
 
-    for (const auto& type : save_root->GetSubdirectories()) {
-        if (type->GetName() == "save") {
-            FindNormalSaves(space, type);
-        } else if (space == FileSys::SaveDataSpaceId::Temporary) {
-            FindTemporaryStorageSaves(space, type);
-        }
+    FileSys::VirtualDir save_root{};
+    if (const auto result = save_data_controller->OpenSaveDataSpace(&save_root, space);
+        result != ResultSuccess || save_root == nullptr) {
+        LOG_ERROR(Service_FS, "The save root for the space_id={:02X} was invalid!", space);
+        save_root.reset();
     }
-}
 
-void ISaveDataInfoReader::FindNormalSaves(FileSys::SaveDataSpaceId space,
-                                          const FileSys::VirtualDir& type) {
-    for (const auto& save_id : type->GetSubdirectories()) {
-        for (const auto& user_id : save_id->GetSubdirectories()) {
-            // Skip non user id subdirectories
-            if (user_id->GetName().size() != 0x20) {
-                continue;
-            }
-
-            const auto save_id_numeric = stoull_be(save_id->GetName());
-            auto user_id_numeric = Common::HexStringToArray<0x10>(user_id->GetName());
-            std::reverse(user_id_numeric.begin(), user_id_numeric.end());
-
-            if (save_id_numeric != 0) {
-                // System Save Data
-                info.emplace_back(SaveDataInfo{
-                    0,
-                    space,
-                    FileSys::SaveDataType::System,
-                    {},
-                    user_id_numeric,
-                    save_id_numeric,
-                    0,
-                    user_id->GetSize(),
-                    {},
-                    {},
-                });
-
-                continue;
-            }
-
-            for (const auto& title_id : user_id->GetSubdirectories()) {
-                const auto device = std::all_of(user_id_numeric.begin(), user_id_numeric.end(),
-                                                [](u8 val) { return val == 0; });
-                info.emplace_back(SaveDataInfo{
-                    0,
-                    space,
-                    device ? FileSys::SaveDataType::Device : FileSys::SaveDataType::Account,
-                    {},
-                    user_id_numeric,
-                    save_id_numeric,
-                    stoull_be(title_id->GetName()),
-                    title_id->GetSize(),
-                    {},
-                    {},
-                });
+    info.reserve(entries.size());
+    for (const auto& entry : entries) {
+        u64 save_image_size = 0;
+        if (save_root != nullptr) {
+            if (const auto save_dir = save_root->GetDirectoryRelative(entry.relative_path);
+                save_dir != nullptr) {
+                save_image_size = save_dir->GetSize();
             }
         }
-    }
-}
 
-void ISaveDataInfoReader::FindTemporaryStorageSaves(FileSys::SaveDataSpaceId space,
-                                                    const FileSys::VirtualDir& type) {
-    for (const auto& user_id : type->GetSubdirectories()) {
-        // Skip non user id subdirectories
-        if (user_id->GetName().size() != 0x20) {
-            continue;
-        }
-        for (const auto& title_id : user_id->GetSubdirectories()) {
-            if (!title_id->GetFiles().empty() || !title_id->GetSubdirectories().empty()) {
-                auto user_id_numeric = Common::HexStringToArray<0x10>(user_id->GetName());
-                std::reverse(user_id_numeric.begin(), user_id_numeric.end());
-
-                info.emplace_back(SaveDataInfo{
-                    0,
-                    space,
-                    FileSys::SaveDataType::Temporary,
-                    {},
-                    user_id_numeric,
-                    stoull_be(type->GetName()),
-                    stoull_be(title_id->GetName()),
-                    title_id->GetSize(),
-                    {},
-                    {},
-                });
-            }
-        }
+        SaveDataInfo save_info{};
+        save_info.save_id_unknown = FileSys::GetSaveDataId(entry);
+        save_info.space = entry.space;
+        save_info.type = entry.type;
+        std::memcpy(save_info.user_id.data(), entry.user_id.data(), save_info.user_id.size());
+        save_info.save_id = entry.system_save_data_id;
+        save_info.title_id = entry.title_id;
+        save_info.save_image_size = save_image_size;
+        save_info.index = entry.index;
+        save_info.rank = entry.rank;
+        info.emplace_back(save_info);
     }
 }
 
