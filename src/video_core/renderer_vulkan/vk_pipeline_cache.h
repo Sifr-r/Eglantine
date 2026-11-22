@@ -40,6 +40,7 @@
 #include "shader_recompiler/profile.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/renderer_vulkan/draw_skip_policy.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
@@ -184,7 +185,8 @@ private:
                                                    const GraphicsPipeline& pipeline) noexcept;
     void ClearSkippedGeometryIfDrawn(bool is_indexed) noexcept;
 
-    void DrainReadyDiskPipelines();
+    void DrainReadyDiskPipelines(bool blocking = false);
+    [[nodiscard]] DrawSkipDecision EvaluateCurrentDrawSkip(bool is_mesh) const noexcept;
     [[nodiscard]] bool CanSkipForDiskReplay() const noexcept;
 
     /// Nx2Perf shader_build_budget: whether a new graphics pipeline is left unbuilt this frame.
@@ -381,7 +383,8 @@ private:
 
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::vector<VideoCommon::FileEnvironment>>
         skipped_disk_envs;
-    std::unordered_set<u64> in_flight_disk_replays;
+    ::Common::unordered_map<GraphicsPipelineCacheKey, std::shared_future<void>>
+        in_flight_disk_replays;
     std::mutex ready_disk_pipelines_mutex;
     std::vector<std::pair<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>>>
         ready_disk_pipelines;

@@ -263,6 +263,9 @@ public:
     /// Runs func on the GPU thread after the command lists submitted so far.
     void RunInOrder(std::function<void()>&& func);
 
+    /// Runs func on the GPU thread synchronously after queued command lists finish.
+    void RunInOrderSync(std::function<void()>&& func);
+
     /// RunInOrder for GPU memory maps: also done before the GPU thread reads the command lists
     /// submitted later (with the GPU split, on its front rather than its back).
     /// [gpu_addr, gpu_addr + size) is the range of GPU addresses the map changes.

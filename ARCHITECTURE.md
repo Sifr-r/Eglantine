@@ -45,6 +45,11 @@ fetched through CPM into `.cache/cpm/` at configure time. `dist/` holds packagin
 `tools/nx2/` holds the Switch 2 debugging toolchain; `tools/windows/` holds the Vulkan SDK
 bootstrap.
 
+The standalone Rust Ampere prototype under `rust/crates/ampere_core/` exposes its lowering
+and data-format operations through `rust/include/eglantine_ampere.h`. The emulator still
+uses the C++ shader recompiler. The [polyglot migration guide](POLYGLOT_IMPLEMENTATION_PLAN.md)
+tracks the proposed integration and its parity checks.
+
 ## 3. Core domain contracts
 
 These are the seams that matter when changing behaviour. Each is a real interface, not a
@@ -77,6 +82,9 @@ convention.
   run into locals, so a callback that unschedules the event cannot leave a dangling
   reference. The cheat callbacks resolve the guest process through the kernel on every use
   instead of caching a pointer the kernel released.
+* **NX2 present shutdown.** The emulation stop token wakes the guest fence event used by
+  `INx2Vi2Session`, so the applet service can exit while guest timing is paused. The canceled
+  present exits the handler before queuing a composite or a buffer release.
 * The NUP metadata editor in `src/core/file_sys/nup_writer.cpp` keeps stored file extents at
   their original offsets when metadata must move to the end of the archive.
 * **Save data ownership.** `FileSys::SaveDataFactory` (`src/core/file_sys/savedata_factory.cpp`)
@@ -113,12 +121,24 @@ convention.
   of deferring to the next boot. Both are commented at their handler. The command ids follow
   `ISaveDataInfoReader` and the Atmosphère headers, and a command that is not implemented still
   reports a typed result rather than a silent success.
-* **GPU callback lifetime.** A callback queued on the GPU thread (`GPU().RunInOrder`,
+* **GPU callback and session lifetime.** A callback queued on the GPU thread (`GPU().RunInOrder`,
   `GPU().MapInOrder`, a rasterizer fence) must not capture the session that queued it, and
-  must not capture a raw `Kernel::KEvent*` or a raw `Memory*`. The session keeps a shared
-  callback state with an alive flag, the destructor drains the GPU queue before it closes
-  its events, and the callbacks capture the state, not the session. `INx2SyncptSession`
-  (`m_shared->alive`) and `INx2Vi2Session` (`m_frame_waiter->alive`) follow the same rule.
+  must not capture a raw `Kernel::KEvent*` or a raw `Memory*`. Sessions keep shared callback
+  state with an `alive` flag (`INx2SyncptSession::m_shared`, `INx2Vi2Session::m_frame_waiter`,
+  `INx2GraphicsSystemSession::m_syncpt_state`), destructors unregister listeners/mirrors and
+  drain queued GPU work before closing events or releasing process refs, and callbacks capture
+  the shared state rather than `this`. `INx2GraphicsSystemSession` subscribes via keyed
+  `SyncpointManager::RegisterGuestMirror`/`UnregisterGuestMirror` and skips timer syncpoint
+  scans when neither wait bits nor summary changed. `nvhost_as_gpu::~nvhost_as_gpu()` removes
+  its `Nx2GpuMemoryRegistry` listener before `DrainGpuCallbacks()`, and `Nx2Map` /
+  `Nx2BackSparse` / `Nx2SparseTile` read session state through `Container::WithSession` under
+  `Nx2GpuMemoryRegistry::mutex -> nvhost_as_gpu::mutex -> Container::session_guard ->
+  Nx2GpuMemoryRegistry::device_mutex -> smmu` (never calling registry mutations inside
+  `WithSession`). `TryNvdrvSyncpoints()` guards `INx2Vi2Session` / `INx2VideoSession` against
+  null NVDRV during shutdown (`~INx2Vi2Session()` uses wrap-safe `s32` syncpoint delta),
+  `INx2GpuSession` uses non-recursive `std::mutex`/`std::condition_variable` with eager
+  `AllocateGpuOnlyBacking` outside `m_region_mutex`, and `DrainGpuCallbacks()` /
+  `ReleaseBackstop()` honor `Core::System::GetEmulationStopToken()`.
 * **Guest-controlled sizes.** A count or a range that comes from the guest is bounded and
   range-checked before it is used to allocate, to loop, or to compute an address. The
   checks live next to the service that reads them. `nx2:gpu` command 214 validates page
@@ -128,6 +148,22 @@ convention.
   before allocating a new mapping. GPU and display callers check the pin result before
   using its address or publishing a preallocated buffer.
 
+### `common` — host memory
+
+* **Windows on-demand DRAM commit (`src/common/host_memory.{h,cpp}`).** `Common::HostMemory`
+  reserves backing sections with `CreateFileMapping2(..., SEC_RESERVE)` and fallback buffers with
+  `VirtualAlloc(..., MEM_RESERVE)` instead of committing the full guest DRAM (up to ~14 GiB) up
+  front. First read/write faults into registered `HostMemory` regions commit 64 KiB granules via a
+  vectored exception handler (`HostMemoryFaultHandler`, `SRWLOCK`-synchronized), while unmapped
+  placeholders (`MEM_PRIVATE`) and `PAGE_READONLY`/`PAGE_NOACCESS` faults chain to Dynarmic SEH.
+* **`Protect`, zeroing, external import, and cleanup contracts.** `HostMemory::Impl::Protect`
+  leaves untouched `MEM_RESERVE` pages uncommitted when restoring `PAGE_READWRITE`, and explicitly
+  commits views with target `PAGE_READONLY`/`PAGE_NOACCESS` flags so backing commits never drop
+  view traps. `ClearBackingRegion(..., 0)` skips uncommitted pages, `Common::EnsureHostMemoryCommitted`
+  pre-commits ranges passed to external drivers (`Vulkan::HostImporter`), `Release()` is idempotent
+  on partial `Init()` failure, move operations transfer/clear fallback ownership, and Windows fallback
+  teardown calls `VirtualFree(backing_base, 0, MEM_RELEASE)`.
+
 ### `video_core` — the GPU
 
 * `VideoCommon::Maxwell3D` is the register file. `GetNativeMacroEngine().native_turing`
@@ -136,13 +172,17 @@ convention.
   titles use (`Tegra::Nx2Sparse*`).
 * `VideoCore::TextureCache` owns every host image. `ImageBase` carries the per-image
   bookkeeping; `first_written_frame`, `last_written_frame` and `cleared_frame` are the
-  frame counters the render-target predicates read.
+  frame counters the render-target predicates read (`RedrawnEveryFrame`,
+  `HasRecentPriorFrameOutput`).
 * `VideoCore::PipelineCache` (`src/video_core/renderer_vulkan/vk_pipeline_cache.cpp`) owns
   the graphics pipeline cache, its disk format (`CACHE_VERSION`, currently 34) and the
-  asynchronous shader build. `BuiltPipeline` decides whether a draw waits for its pipeline
-  or is skipped for the frame. Geometry consistency preserves depth-only draws that count
-  occlusion samples or may write shader memory. Non-indexed draws without vertex stream 0
-  are excluded from geometry matching.
+  asynchronous shader build. `src/video_core/renderer_vulkan/draw_skip_policy.h`
+  (`EvaluateDrawSkip`) defines the single skip contract shared by `BuiltPipeline`,
+  `CanSkipDraw` (async translation), `DeferRuntimeBuild` (build budget), and
+  `CanSkipForDiskReplay` / `in_flight_disk_replays` (waiting on in-flight disk replays for
+  unskippable draws). Geometry consistency preserves depth-only draws that count occlusion
+  samples or may write shader memory. Non-indexed draws without vertex stream 0 are excluded
+  from geometry matching.
 * Renderers: `renderer_vulkan/` (the default), `renderer_opengl/`, `renderer_null/`.
 * `src/video_core/gpu_split.h` separates front-thread ring bookkeeping and the back-thread
   engine pointer at 128-byte boundaries. The shared atomics retain their own alignment.
@@ -157,21 +197,32 @@ convention.
   `entries`, `page_table`, `big_entries`, `big_page_table_dev` and
   `big_page_continuous`. The primitives (`GetEntry`, `SetEntry`,
   `IsBigPageContinuous`, `SetBigPageContinuous`) are lock-free and are called with the
-  lock held; they are not public API. The lock is **never** held across a rasterizer,
-  cache or callback call — the GPU thread holds the cache mutexes and then reads the
-  table, so the only safe order is cache mutex → page-table mutex. A walk that has to
-  call into the rasterizer collects its segments under the lock and acts on them after
-  releasing it. The translation serial moves **after** the table changed and while the page
-  table lock is held, so a cache entry that is tagged with a serial always holds the
-  translation that was current when the serial became that value. A walk merges the
-  segments that cover one host-contiguous range after it released the lock, so the list
+  lock held; they are not public API. `FinishPageTableOpLocked` acquires
+  `page_table_mutex -> runs_guard -> guard` to update `UpdateContinuousRunsLocked`,
+  `kind_map`, and a single `map_serial` increment per page-table operation before releasing
+  all locks prior to calling `rasterizer->ModifyGPUMemory`. No `MemoryManager` lock is ever
+  held across a rasterizer, cache or callback call — the GPU thread holds the cache
+  mutexes and then reads the table, so the only safe order is `cache mutexes ->
+  page_table_mutex -> runs_guard -> guard`. A walk that has to call into the rasterizer
+  collects its segments under the lock and acts on them after releasing it. A walk merges
+  the segments that cover one host-contiguous range after it released the lock, so the list
   grows with the number of mappings in the range and not with its size in pages.
 * **Shared state between the GPU and the CPU.** `GpuSplit::active` is an atomic, not a plain
-  `bool`: the front thread, the back thread and the callers that ask whether the split is
-  running read it from three threads. The page-table walk does not share its scratch buffers
-  between calls (`MemoryManager::Unmap` and `MemoryManager::FlushCaching` collect their ranges
-  in local vectors), so two threads that unmap or flush at the same time do not overwrite
-  each other's list.
+  `bool`: the front thread (`GpuSplit::OnGpuThread()`), the back thread
+  (`GpuSplit::OnBackThread()`) and callers asking whether the split is running read it across
+  threads. `MemoryManager::RunRasterizerWork` batches `{DAddr, u64}` regions from
+  `WriteBlockImpl` and `InvalidateRegion` by value onto the split back thread (`DeferFunction`
+  / `Drain` on `OnGpuThread()`, `GPU::RunInOrderSync` on other threads), and
+  `ThreadManager::FlushAndInvalidateRegion` delegates invalidation to `InvalidateRegion`.
+  `DeviceMemoryManager::CanTrapCpuReads()` (updated in `RegisterProcess`/`UnregisterProcess`
+  via `MaxwellDeviceMethods::HasFastmemArena` and `Memory::HasFastmemArena`) gates
+  `BufferCache::AsyncBufferDownloads()` so NCE, non-fastmem, and reactive-flushing paths
+  fall back to buffer downloads. `Tegra::g_nx2_sparse_backing_mutex` (with in-flight handler
+  drain in `Nx2SetSparseBacking`) and `QueryCacheLegacy::mutex` use non-recursive
+  `std::mutex`. The page-table walk does not share its scratch buffers between calls
+  (`MemoryManager::Unmap` and `MemoryManager::FlushCaching` collect their ranges in local
+  vectors), so two threads that unmap or flush at the same time do not overwrite each other's
+  list.
 * **ETC2 and EAC decoding lives in `src/video_core/textures/etc2.cpp`.** `Tegra::Texture::ETC2`
   decodes the Switch's ETC2 and EAC block formats on the host when the GPU cannot do it
   natively. The decoder follows the Khronos data format specification, not a port of another
@@ -352,6 +403,7 @@ Entries under `ignore/` describe one local archive. Their availability depends o
 | Path | Responsibility |
 | --- | --- |
 | `ignore/.lab/` | Local Windows bisect harness, tool binaries, configurations and run artifacts. Run `ignore\.lab\build.cmd tests` from the repository root to reconfigure the existing bisect build for the relocated shader compiler. |
+| `ignore/.lab/nx2_gameplay_baseline.py` | Local Windows runner for bounded gameplay checks with separate portable profiles and cold or warm emulator shader caches. |
 | `ignore/BISECT_RC3_RC4.md` | Results and reproduction steps for the local rc3–rc4 bisect. |
 | `ignore/UPSTREAM_WORKLIST.md` | Local diagnostics and follow-up work for upstream fixes. |
 | `ignore/fixtures/src/tests/video_core/` | Original GPU test sources preserved for local review of title-derived shader and macro fixtures. The normal test target uses only the remaining public sources in `src/tests/`. |
@@ -376,8 +428,13 @@ template applies the same exclusions when a separate CPack configuration uses it
 | `ASSET_PROVENANCE.md` | Record source evidence, attribution and outstanding redistribution questions for audited assets. |
 | `CPackSourceConfig.cmake.in` | Source-package exclusion template used when `CPack` is configured with the repository root on `CMAKE_MODULE_PATH`; preserves CPack’s generated defaults and excludes the repository’s root `ignore/` and `.lab/` from source packages. |
 | `tools/ci/check_release_paths.py` | Reject high-confidence private artifact paths in a Git path list or in ZIP and TAR.GZ members. |
+| `tools/ci/license-header.sh` | Check (exit 1 on failure) and optionally update SPDX headers on branch diffs against `nx2` (excluding `externals/FidelityFX-SDK` and other third-party trees). |
 | `tools/ci/test_check_release_paths.py` | Exercise accepted and rejected scanner inputs with synthetic files. |
-| `.github/workflows/source-checks.yml` | Check the candidate tree and run the emulator’s Linux Catch2 suite on pull requests. |
+| `tools/ci/test_license_header.py` | Verify `license-header.sh` CLI/stanza contracts, repaired SPDX headers, and unmodified FidelityFX-SDK MIT headers. |
+| `tools/ci/test_workflows.py` | Parse `.github/workflows` / `.github/actions` YAML and verify triggers, timeouts, cache wiring, and script hygiene. |
+| `.github/workflows/test-linux.yml` | Reusable workflow running script/Python checks and cached headless Linux Catch2 tests (`ccache` + `.cache/cpm`). |
+| `.github/workflows/source-checks.yml` | Check the candidate tree, run `license-header.sh` on pull requests, and call `test-linux.yml` on `push` (`nx2`, `nx2-experimental`), `pull_request`, and `workflow_dispatch`. |
+| `.github/workflows/obsolete-on-release.yml` | Mark unpinned/unassigned/unmilestoned open issues obsolete after stable releases (called from `ci.yml`, `release`, or `workflow_dispatch`). |
 
 The release workflow uses its trusted checkout to scan the exact build commit and final ZIP and TAR.GZ files. It attaches the project and Apache licenses and the asset record when that record is present in the build commit. Linux AppImage staging is scanned on the build runner. The macOS ZIP and DMG are assembled from the same app bundle. The macOS bundle uses `dist/eglantine.icns` for its app icon.
 
@@ -388,11 +445,15 @@ The release workflow uses its trusted checkout to scan the exact build commit an
   belongs outside `Nx2Perf`, because `Nx2Perf`'s contract is that everything in it is on
   by default and safe mode turns off only the ones that cannot change the output.
 * **A skipped draw must come back.** A draw dropped during compilation can leave a
-  permanent hole. For native draws that reach `BuiltPipeline` with an unbuilt pipeline,
-  the default skip rule requires a color target that was written this frame or the
-  previous frame and has not been cleared this frame. `EDEN_NX2_NATIVE_REDRAW=0` restores
-  the older historical-write rule for comparisons. Runtime build deferral, asynchronous
-  translation and disk replay have independent skip rules.
+  permanent hole. `EvaluateDrawSkip` (`src/video_core/renderer_vulkan/draw_skip_policy.h`)
+  applies one skip contract across `BuiltPipeline`, `CanSkipDraw` (asynchronous translation),
+  `DeferRuntimeBuild` (shader build budget), and `CanSkipForDiskReplay` /
+  `in_flight_disk_replays` (waiting on in-flight disk replays for unskippable draws). For
+  native draws, skipping requires depth testing, an active color target, and a color target
+  redrawn every frame (`RedrawnEveryFrame`); `EDEN_NX2_NATIVE_REDRAW=0` restores the older
+  historical-write rule for comparisons, and `EDEN_NX2_PERF_SAFE=1` (`DefaultOffMask`) turns
+  off all five draw-skipping and replay switches (`ShaderBuildBudget`, `StaleTargetSkip`,
+  `GeometryConsistency`, `BuildOrderPriority`, `ReplayDiskRecordings`).
 * **Cache files are versioned and named per build.** `CACHE_VERSION` guards them, and
   `IsOwnPipelineCache` / `LoadVulkanPipelineCache` delete a file of another version
   rather than read it.
@@ -402,9 +463,11 @@ The release workflow uses its trusted checkout to scan the exact build commit an
 
 ## 7. Known gaps
 
-* [Asset provenance](ASSET_PROVENANCE.md) records two outstanding redistribution questions for
-  the firmware keyboard tables and Eglantine artwork. Earlier revisions still contain the
-  quarantined game-derived fixtures and macOS catalog.
+* [Asset provenance](ASSET_PROVENANCE.md) records the resolved clean-room replacement for
+  the firmware keyboard tables (`src/core/hle/service/set/key_code_map.h`, verified by
+  `src/tests/core/key_code_map.cpp`) and one remaining redistribution confirmation for
+  Eglantine artwork (`dist/Eglantine.png` and `dist/eglantine.icns`). Earlier revisions still
+  contain the quarantined game-derived fixtures and macOS catalog.
 * The public suite omits 31 cases containing or depending on title-derived instructions. Eight
   independently encoded cases now cover priority DMA and Ampere regressions. The Windows
   comparison passed 445 of 450 cases before the fixes and 453 of 458 afterwards, with identical
@@ -444,18 +507,11 @@ These are known and deliberately not fixed by the P0 pass; each one names its ow
   transiently copied. `GetNickname()` still hands out a reference to state the network thread
   writes; its only write happens before the network thread starts, which is why it was left
   alone.
-* **`video_core`**: `MemoryManager::WriteBlockImpl` and `MemoryManager::InvalidateRegion` still
-  call `rasterizer->InvalidateRegion` from the CPU thread while `GpuSplit` is active, and
-  `ThreadManager::FlushAndInvalidateRegion` still does the same next to the path that was
-  fixed (that function has no callers today). The translation serial still moves twice per
-  page-table operation: once after the table changed, so that a translation cache entry is
-  never stale, and once after the kind map changed, so that the mapping snapshot and the native
-  sRGB cache are rebuilt.
-* **`core` HLE**: the Switch 2 syncpoint poll event still captures the session.
-  `CoreTiming::UnscheduleEvent` defaults to `Wait`, which takes `advance_lock` after removing
-  the event and waits for any in-progress callback. The GPU queue drain in the session
-  destructor can block a guest thread for up to five seconds when the GPU thread is wedged.
-  `nx2_gsv.h` still uses `std::recursive_mutex` for the GPU-only region lock.
+* **`core` HLE**: `CoreTiming::UnscheduleEvent` defaults to `Wait`, which takes `advance_lock`
+  after removing the event and waits for any in-progress callback. `DrainGpuCallbacks` in
+  session destructors wakes immediately via `std::condition_variable` +
+  `GetEmulationStopToken()` when emulation stops, though a wedged GPU thread mid-session
+  remains bounded at up to five seconds.
 * **The kernel leaks its own threads.** The threads the kernel creates (the core threads, the
   idle threads, the shutdown threads and the host threads) are registered in the object list
   and never closed, so their slab slots are never released. The list is emptied safely now, so

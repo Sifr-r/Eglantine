@@ -11,7 +11,7 @@
 # EGLANTINE_BIN overrides the binary, WATCH_ARGS the watcher options (default: IPC-trace nx2:).
 set -u
 
-repo=$(cd "$(dirname "$0")/../.." && pwd)
+repo=$(cd "$(dirname "$0")/../.." || exit 1; pwd)
 data=${XDG_DATA_HOME:-$HOME/.local/share}/eglantine
 root=$data/debug-sessions
 session=$root/$(date +%Y%m%d-%H%M%S)

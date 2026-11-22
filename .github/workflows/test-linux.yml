@@ -1,0 +1,174 @@
+name: test-linux
+
+# Reusable: validates CI/NX2 scripts, runs Python unit tests, and runs the headless Linux Catch2
+# suite with cached CPM downloads and ccache objects.
+on:
+  workflow_call:
+    inputs:
+      sha:
+        description: Full commit SHA to test (defaults to the caller ref when omitted)
+        type: string
+        required: false
+        default: ""
+      save_cache:
+        description: Save CPM and ccache archives at the end of the job
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  scripts:
+    name: Script and Python tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - name: Install script check dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck python3-yaml
+
+      - name: Run Python unit tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I tools/ci/test_check_release_paths.py
+          python3 -I tools/ci/test_license_header.py
+          python3 -I tools/ci/test_workflows.py
+          python3 -I tools/nx2/test_debug_mcp.py
+          python3 -I tools/nx2/test_thread_worker_wake.py
+
+      - name: Run ShellCheck on CI and NX2 scripts
+        shell: bash
+        run: >-
+          sh tools/shellcheck.sh --severity=warning
+          tools/shellcheck.sh
+          tools/ci/bump-version.sh
+          tools/ci/changelog-section.sh
+          tools/ci/display-version.sh
+          tools/ci/license-header.sh
+          tools/ci/prepare.sh
+          tools/ci/release-notes.sh
+          tools/ci/slugify.sh
+          tools/nx2/debug-session.sh
+
+  catch2:
+    name: Linux Catch2 tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.sha }}
+          persist-credentials: false
+
+      - name: Configure compiler cache environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "CCACHE_DIR=${{ github.workspace }}/.ccache"
+            echo "CCACHE_MAXSIZE=1000M"
+            echo "CCACHE_COMPILERCHECK=content"
+            echo "CCACHE_BASEDIR=${{ github.workspace }}"
+            echo "CCACHE_NOHASHDIR=true"
+          } >> "$GITHUB_ENV"
+
+      - name: Decide cache saving
+        shell: bash
+        run: |
+          set -euo pipefail
+          save=false
+          if [ '${{ inputs.save_cache }}' = 'true' ] ||
+             [ '${{ github.ref }}' = 'refs/heads/nx2' ] ||
+             { [ '${{ github.event_name }}' = 'push' ] &&
+               [ '${{ github.ref }}' = 'refs/heads/nx2-experimental' ]; }; then
+            save=true
+          fi
+          echo "CACHE_SAVE=$save" >> "$GITHUB_ENV"
+          echo "test cache will be saved: $save"
+
+      - name: Cache CPM downloads (restore and save)
+        if: env.CACHE_SAVE == 'true'
+        uses: actions/cache@v6
+        with:
+          path: .cache/cpm
+          key: cpm-v1-${{ runner.os }}-${{ hashFiles('**/cpmfile.json') }}
+          restore-keys: |
+            cpm-v1-${{ runner.os }}-
+
+      - name: Cache CPM downloads (restore only)
+        if: env.CACHE_SAVE != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: .cache/cpm
+          key: cpm-v1-${{ runner.os }}-${{ hashFiles('**/cpmfile.json') }}
+          restore-keys: |
+            cpm-v1-${{ runner.os }}-
+
+      - name: Cache compiler objects (restore and save)
+        if: env.CACHE_SAVE == 'true'
+        uses: actions/cache@v6
+        with:
+          path: .ccache
+          key: objects-v2-linux-x86_64-tests-${{ hashFiles('.github/workflows/test-linux.yml') }}-${{ inputs.sha || github.sha }}
+          restore-keys: |
+            objects-v2-linux-x86_64-tests-${{ hashFiles('.github/workflows/test-linux.yml') }}-
+
+      - name: Cache compiler objects (restore only)
+        if: env.CACHE_SAVE != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: .ccache
+          key: objects-v2-linux-x86_64-tests-${{ hashFiles('.github/workflows/test-linux.yml') }}-${{ inputs.sha || github.sha }}
+          restore-keys: |
+            objects-v2-linux-x86_64-tests-${{ hashFiles('.github/workflows/test-linux.yml') }}-
+
+      - name: Install headless build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf ccache g++ gcc glslang-tools libglu1-mesa-dev libpulse-dev libtool \
+            libudev-dev libxkbcommon-x11-0 mesa-common-dev nasm ninja-build \
+            libdrm-dev libx11-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
+            spirv-tools spirv-headers libusb-1.0-0-dev libboost-dev \
+            libboost-fiber-dev libboost-context-dev libopus-dev libasound2-dev
+
+      - name: Configure tests
+        shell: bash
+        run: |
+          cmake --version
+          cmake -S . -B build/tests -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=ON \
+            -DYUZU_TESTS=ON \
+            -DDYNARMIC_TESTS=OFF \
+            -DENABLE_QT=OFF \
+            -DENABLE_UPDATE_CHECKER=ON \
+            -DYUZU_CMD=OFF \
+            -DYUZU_ROOM=OFF \
+            -DYUZU_USE_BUNDLED_SDL3=ON \
+            -DYUZU_USE_BUNDLED_OPENSSL=ON \
+            -DYUZU_USE_BUNDLED_FFMPEG=ON \
+            -DVulkanHeaders_FORCE_BUNDLED=ON \
+            -DVulkanUtilityLibraries_FORCE_BUNDLED=ON \
+            -DUSE_CCACHE=ON
+
+      - name: Build test executable
+        shell: bash
+        run: |
+          ccache --zero-stats
+          cmake --build build/tests --target tests --parallel 4
+          ccache --show-stats
+
+      - name: Run tests
+        run: ctest --test-dir build/tests/src/tests --output-on-failure --no-tests=error

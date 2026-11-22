@@ -1,15 +1,23 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <atomic>
 #include <limits>
+#include <memory>
+#include <thread>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "common/scope_exit.h"
 #include "core/core.h"
+#include "core/file_sys/program_metadata.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/heap_mapper.h"
 #include "core/hle/service/nx2_gsv.h"
 #include "tests/core/system_test_context.h"
+#include "video_core/host1x/host1x.h"
 
 TEST_CASE("NX2 GPU map ranges stay inside the GPU address window", "[nx2_guest_ranges]") {
     // A range inside the window is usable.
@@ -105,4 +113,72 @@ TEST_CASE("The kernel keeps its object list container after the shutdown", "[nx2
     // in the guest RAM arena that the system frees before it destroys the kernel.
     CHECK(kernel.ObjectListContainer().GetOwnedCount(nullptr) == 0);
     CHECK(objects_before > 0);
+}
+
+TEST_CASE("Nvidia Container::WithSession safely guards active sessions across close races",
+          "[nx2_guest_ranges]") {
+    const ScopedSystemTestContext context;
+    Core::System system;
+    system.Initialize();
+    auto& kernel = system.Kernel();
+    kernel.Initialize();
+    SCOPE_EXIT {
+        system.ShutdownMainProcess();
+    };
+
+    Kernel::KProcess* const process = Kernel::KProcess::Create(kernel);
+    REQUIRE(process != nullptr);
+    Kernel::KProcess::Register(kernel, process);
+    SCOPE_EXIT {
+        process->Close(kernel);
+    };
+    const auto metadata = FileSys::ProgramMetadata::GetDefault();
+    REQUIRE(process->LoadFromMetadata(kernel, metadata, Kernel::PageSize, {}, 0).IsSuccess());
+
+    auto host1x = std::make_unique<Tegra::Host1x::Host1x>(system);
+    Service::Nvidia::NvCore::Container container{*host1x};
+
+    bool invalid_called = false;
+    CHECK_FALSE(container.WithSession(Service::Nvidia::NvCore::SessionId{42},
+                                      [&](Service::Nvidia::NvCore::Session&) { invalid_called = true; }));
+    CHECK_FALSE(invalid_called);
+
+    const auto session_id = container.OpenSession(process);
+    Kernel::KProcess* observed_process = nullptr;
+    REQUIRE(container.WithSession(session_id, [&](Service::Nvidia::NvCore::Session& session) {
+        observed_process = session.process;
+    }));
+    CHECK(observed_process == process);
+
+    container.CloseSession(session_id);
+    bool closed_called = false;
+    CHECK_FALSE(container.WithSession(session_id,
+                                      [&](Service::Nvidia::NvCore::Session&) { closed_called = true; }));
+    CHECK_FALSE(closed_called);
+
+    std::atomic<bool> stop{false};
+    std::thread churn([&] {
+        for (int i = 0; i < 64; ++i) {
+            const auto id = container.OpenSession(process);
+            std::this_thread::yield();
+            container.CloseSession(id);
+        }
+        stop.store(true, std::memory_order_release);
+    });
+
+    std::atomic<bool> mismatch{false};
+    std::thread reader([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            container.WithSession(Service::Nvidia::NvCore::SessionId{0},
+                                  [&](Service::Nvidia::NvCore::Session& s) {
+                                      if (s.process != process || !s.is_active) {
+                                          mismatch.store(true, std::memory_order_relaxed);
+                                      }
+                                  });
+        }
+    });
+
+    churn.join();
+    reader.join();
+    CHECK_FALSE(mismatch.load(std::memory_order_relaxed));
 }

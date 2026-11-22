@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <type_traits>
@@ -638,6 +639,7 @@ Asid DeviceMemoryManager<Traits>::RegisterProcess(Memory::Memory* memory_device_
         registered_processes.emplace_back(memory_device_inter);
         new_id = registered_processes.size() - 1U;
     }
+    UpdateHasFastmemArenaLocked();
     return Asid{new_id};
 }
 
@@ -649,6 +651,26 @@ void DeviceMemoryManager<Traits>::UnregisterProcess(Asid asid) {
     }
     registered_processes[asid.id] = nullptr;
     id_pool.push_front(asid.id);
+    UpdateHasFastmemArenaLocked();
+}
+
+template <typename Traits>
+void DeviceMemoryManager<Traits>::UpdateHasFastmemArenaLocked() {
+    const bool any = std::any_of(
+        registered_processes.begin(), registered_processes.end(),
+        [](const Memory::Memory* inter) { return DeviceMethods::HasFastmemArena(inter); });
+    has_fastmem_arena.store(any, std::memory_order_release);
+}
+
+template <typename Traits>
+bool DeviceMemoryManager<Traits>::CanTrapCpuReads() const {
+    static const bool disabled = [] {
+        const char* value = std::getenv("EDEN_NX2_READ_TRAPS");
+        return value != nullptr && value[0] == '0';
+    }();
+    return !disabled && has_fastmem_arena.load(std::memory_order_acquire) &&
+           !Settings::values.use_reactive_flushing.GetValue() &&
+           Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
 }
 
 template <typename Traits>
@@ -810,6 +832,9 @@ void DeviceMemoryManager<Traits>::UpdatePagesCachedBatch(std::span<const std::pa
 
 template <typename Traits>
 void DeviceMemoryManager<Traits>::ArmReadTraps(DAddr addr, size_t size) {
+    if (!CanTrapCpuReads()) {
+        return;
+    }
     const auto MarkRegionReadTrap = &DeviceMemoryManager<Traits>::DeviceMethods::MarkRegionReadTrap;
     Memory::Memory* run_inter = nullptr;
     u64 run_begin = 0;

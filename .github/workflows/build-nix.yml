@@ -77,6 +77,7 @@ jobs:
   flake:
     name: flake
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - name: Check out source
         uses: actions/checkout@v7
@@ -91,6 +92,7 @@ jobs:
     name: nix-${{ matrix.system }}${{ matrix.pgo && '-pgo' || '' }}
     needs: flake
     runs-on: ${{ matrix.system == 'aarch64-darwin' && (vars.MACOS_RUNNER || 'macos-26') || (matrix.system == 'aarch64-linux' && 'ubuntu-24.04-arm' || 'ubuntu-24.04') }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:

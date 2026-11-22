@@ -16,6 +16,7 @@ permissions:
 jobs:
   cleanup:
     runs-on: ubuntu-26.04
+    timeout-minutes: 15
     if: >-
       github.event_name != 'delete' || github.event.ref_type == 'branch'
     env:

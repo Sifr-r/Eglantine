@@ -10,6 +10,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -351,16 +352,21 @@ inline void Nx2ClearSemaphoreRegions() {
 // the GPU memory manager calls Nx2BackSparseWrite before each write, with the bytes it writes
 // (blocks nobody wrote that only get zeros need no memory: they read zero already).
 using Nx2SparseBackingHandler = std::function<void(u64 gpu_address, u64 size, const u8* data)>;
-inline std::recursive_mutex g_nx2_sparse_backing_mutex;
+inline std::mutex g_nx2_sparse_backing_mutex;
+inline std::condition_variable g_nx2_sparse_backing_cv;
 inline Nx2SparseBackingHandler g_nx2_sparse_backing;
+inline u32 g_nx2_sparse_backing_inflight{0};
 inline std::atomic<u64> g_nx2_sparse_low{~u64{0}};
 inline std::atomic<u64> g_nx2_sparse_high{0};
 
 inline void Nx2SetSparseBacking(Nx2SparseBackingHandler handler) {
-    std::scoped_lock lk{g_nx2_sparse_backing_mutex};
+    std::unique_lock lk{g_nx2_sparse_backing_mutex};
+    g_nx2_sparse_backing = {};
+    g_nx2_sparse_low.store(~u64{0}, std::memory_order_relaxed);
+    g_nx2_sparse_high.store(0, std::memory_order_relaxed);
+    // Drain any callback already invoked outside the mutex before installing/tearing down.
+    g_nx2_sparse_backing_cv.wait(lk, [] { return g_nx2_sparse_backing_inflight == 0; });
     g_nx2_sparse_backing = std::move(handler);
-    g_nx2_sparse_low.store(~u64{0});
-    g_nx2_sparse_high.store(0);
 }
 
 /// Widens the span that writes are checked against (a new lazily backed region).
@@ -376,13 +382,27 @@ inline void Nx2AddSparseSpan(u64 gpu_address, u64 size) {
 
 inline void Nx2BackSparseWrite(u64 gpu_address, u64 size, const void* data) {
     if (gpu_address + size <= g_nx2_sparse_low.load(std::memory_order_relaxed) ||
-        gpu_address >= g_nx2_sparse_high.load(std::memory_order_relaxed)) [[likely]] {
+        gpu_address >= g_nx2_sparse_high.load(std::memory_order_relaxed)) {
         return;
     }
-    std::scoped_lock lk{g_nx2_sparse_backing_mutex};
-    if (g_nx2_sparse_backing) {
-        g_nx2_sparse_backing(gpu_address, size, static_cast<const u8*>(data));
+    Nx2SparseBackingHandler handler;
+    {
+        std::scoped_lock lk{g_nx2_sparse_backing_mutex};
+        if (!g_nx2_sparse_backing) {
+            return;
+        }
+        handler = g_nx2_sparse_backing;
+        ++g_nx2_sparse_backing_inflight;
     }
+    struct InflightGuard {
+        ~InflightGuard() {
+            std::scoped_lock lk{g_nx2_sparse_backing_mutex};
+            if (--g_nx2_sparse_backing_inflight == 0) {
+                g_nx2_sparse_backing_cv.notify_all();
+            }
+        }
+    } guard;
+    handler(gpu_address, size, static_cast<const u8*>(data));
 }
 
 // Which blocks of each sparse region have been written (got memory), for the texture cache: an

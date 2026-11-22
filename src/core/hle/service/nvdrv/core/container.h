@@ -73,6 +73,9 @@ public:
         return mapper != nullptr ? mapper->GetId() : 0;
     }
 
+    /// Runs func on the session while holding session_guard; returns false if the session is gone.
+    bool WithSession(SessionId id, const std::function<void(Session&)>& func);
+
     /// Runs func on the session's heap mapper while the session cannot close, so the mapper stays
     /// alive for the call. Does nothing when the session has no mapper, or when its mapper is not
     /// the one the id names: the session was closed (and maybe opened again) since the id was

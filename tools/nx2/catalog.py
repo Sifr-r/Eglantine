@@ -2,7 +2,6 @@
 
 # SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
-# SPDX-License-Identifier: GPL-2.0-or-later
 """Shader catalogue: which native program draws what, per game, shared through the repo.
 
 Each game has one file, tools/nx2/catalog/<program id>.json, listing the programs people have

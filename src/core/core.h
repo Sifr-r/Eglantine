@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -185,6 +186,9 @@ public:
 
     /// Shutdown the main emulated process.
     void ShutdownMainProcess();
+
+    /// Returns the stop token for the current emulation session.
+    [[nodiscard]] std::stop_token GetEmulationStopToken() const;
 
     /// Check if the core is shutting down.
     [[nodiscard]] bool IsShuttingDown() const;

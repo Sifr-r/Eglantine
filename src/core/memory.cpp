@@ -617,12 +617,16 @@ struct Memory::Impl {
     /// pages the GPU writes are protected, and each one only until its first read
     /// (EDEN_NX2_READ_TRAPS=0 turns them off). Under NCE every fault is taken as a write, so they
     /// are not used there.
+    bool HasFastmemArena() const {
+        return current_page_table != nullptr && current_page_table->fastmem_arena != nullptr;
+    }
+
     bool ReadTrapsEnabled() const {
         static const bool disabled = [] {
             const char* value = std::getenv("EDEN_NX2_READ_TRAPS");
             return value != nullptr && value[0] == '0';
         }();
-        return !disabled && current_page_table->fastmem_arena &&
+        return !disabled && current_page_table != nullptr && current_page_table->fastmem_arena &&
                !Settings::values.use_reactive_flushing.GetValue() &&
                Settings::values.cpu_backend.GetValue() != Settings::CpuBackend::Nce;
     }
@@ -1222,6 +1226,10 @@ void Memory::RasterizerMarkRegionCached(Common::ProcessAddress vaddr, u64 size, 
 
 void Memory::RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size) {
     impl->RasterizerArmReadTraps(GetInteger(vaddr), size);
+}
+
+bool Memory::HasFastmemArena() const {
+    return impl->HasFastmemArena();
 }
 
 void Memory::MarkRegionDebug(Common::ProcessAddress vaddr, u64 size, bool debug) {

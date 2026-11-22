@@ -69,18 +69,29 @@ TEST_CASE("compute_preload_variants: on by default", "[nx2_perf]") {
             Bit(Opt::ComputePreloadVariants));
 }
 
-TEST_CASE("stale_target_skip: on by default", "[nx2_perf]") {
-    REQUIRE(opt_names[Index(Opt::StaleTargetSkip)] == "stale_target_skip");
-    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::StaleTargetSkip)));
-    REQUIRE(!IsOff(ParseOffMask(false, "", ""), Index(Opt::StaleTargetSkip)));
-    REQUIRE(ParseOffMask(false, "", "stale_target_skip") == Bit(Opt::StaleTargetSkip));
-}
+TEST_CASE("draw-skipping and replay opts are on by default and off under SAFE", "[nx2_perf]") {
+    const u64 default_mask = ParseOffMask(false, "", "");
+    const u64 safe_mask = ParseOffMask(true, "", "");
+    REQUIRE(safe_mask == DefaultOffMask());
 
-TEST_CASE("geometry_consistency and build_order_priority: on by default", "[nx2_perf]") {
-    REQUIRE(opt_names[Index(Opt::GeometryConsistency)] == "geometry_consistency");
-    REQUIRE(opt_names[Index(Opt::BuildOrderPriority)] == "build_order_priority");
-    REQUIRE(opt_names[Index(Opt::ReplayDiskRecordings)] == "replay_disk_recordings");
-    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::GeometryConsistency)));
-    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::BuildOrderPriority)));
-    REQUIRE(!IsOff(DefaultOffMask(), Index(Opt::ReplayDiskRecordings)));
+    struct NamedOpt {
+        Opt opt;
+        const char* name;
+    };
+    constexpr std::array<NamedOpt, 5> draw_skip_opts{{
+        {Opt::ShaderBuildBudget, "shader_build_budget"},
+        {Opt::StaleTargetSkip, "stale_target_skip"},
+        {Opt::GeometryConsistency, "geometry_consistency"},
+        {Opt::BuildOrderPriority, "build_order_priority"},
+        {Opt::ReplayDiskRecordings, "replay_disk_recordings"},
+    }};
+
+    for (const auto& [opt, name] : draw_skip_opts) {
+        REQUIRE(opt_names[Index(opt)] == name);
+        REQUIRE_FALSE(IsOff(default_mask, Index(opt)));
+        REQUIRE(IsOff(DefaultOffMask(), Index(opt)));
+        REQUIRE(IsOff(safe_mask, Index(opt)));
+        REQUIRE_FALSE(IsOff(ParseOffMask(true, name, ""), Index(opt)));
+        REQUIRE(ParseOffMask(false, "", name) == Bit(opt));
+    }
 }

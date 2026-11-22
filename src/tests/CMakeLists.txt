@@ -47,6 +47,7 @@ add_executable(tests
     common/unique_function.cpp
     common/zstd_compression.cpp
     core/core_timing.cpp
+    core/key_code_map.cpp
     core/launch_params.cpp
     core/ldn.cpp
     core/memory_range.cpp
@@ -72,6 +73,7 @@ add_executable(tests
     video_core/nx2_perf_switches.cpp
     video_core/memory_manager_runs.cpp
     video_core/memory_manager_page_table.cpp
+    video_core/nx2_concurrency.cpp
     video_core/nx2_sparse_residency.cpp
     video_core/spirv_storage_alignment.cpp
     video_core/pipeline_cache_dir.cpp
@@ -85,6 +87,7 @@ add_executable(tests
     video_core/h264_packet.cpp
     video_core/vertex_repack.cpp
     video_core/color_target_redraw.cpp
+    video_core/draw_skip_policy.cpp
     video_core/virtual_range_cache.cpp
     video_core/query_copy.cpp
     video_core/ampere_lowering.cpp

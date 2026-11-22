@@ -49,6 +49,15 @@ if [[ "$mode" == workflow_dispatch && "${INPUT_KIND:-branch}" == daily ]]; then
   force=true
 fi
 
+release_branch="${RELEASE_BRANCH:-nx2}"
+if [[ "$mode" == workflow_dispatch && "${INPUT_KIND:-branch}" == release ]]; then
+  [[ "${GITHUB_REF_NAME:-}" == "$release_branch" ]] || {
+    echo "A manual release build can only run from $release_branch" >&2
+    exit 1
+  }
+  mode=push
+fi
+
 skip=false
 prerelease=true
 nightly=true

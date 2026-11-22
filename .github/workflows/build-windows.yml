@@ -49,6 +49,7 @@ jobs:
     name: windows-x86_64
     if: inputs.pgo != 'only'
     runs-on: windows-2025
+    timeout-minutes: 90
     env:
       PLATFORM: windows-x86_64
       SCCACHE_DIR: ${{ github.workspace }}/.sccache
@@ -74,7 +75,7 @@ jobs:
 
       - name: Setup build from compatibility pin
         if: hashFiles('.github/actions/setup-build/action.yml') == ''
-        uses: Djihads80/Eglantine/.github/actions/setup-build@583b125d5a2a330bc3e04fed213b908db5f6a8f2
+        uses: Eglantine-Community/Eglantine/.github/actions/setup-build@583b125d5a2a330bc3e04fed213b908db5f6a8f2
         with:
           platform: ${{ env.PLATFORM }}
           sha: ${{ inputs.sha }}
@@ -172,6 +173,7 @@ jobs:
     name: windows-x86_64-pgo
     if: inputs.pgo == 'both' || inputs.pgo == 'only'
     runs-on: windows-2025
+    timeout-minutes: 120
     env:
       PLATFORM: windows-x86_64-pgo
     steps:
@@ -191,10 +193,11 @@ jobs:
           tag: ${{ inputs.tag }}
           release: ${{ inputs.release }}
           save-cache: ${{ inputs.save_cache }}
+          display: ${{ inputs.display_pgo }}
 
       - name: Setup build from compatibility pin
         if: hashFiles('.github/actions/setup-build/action.yml') == ''
-        uses: Djihads80/Eglantine/.github/actions/setup-build@583b125d5a2a330bc3e04fed213b908db5f6a8f2
+        uses: Eglantine-Community/Eglantine/.github/actions/setup-build@583b125d5a2a330bc3e04fed213b908db5f6a8f2
         with:
           platform: ${{ env.PLATFORM }}
           sha: ${{ inputs.sha }}

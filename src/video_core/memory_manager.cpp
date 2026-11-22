@@ -19,6 +19,8 @@
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "memory_manager.h"
+#include "video_core/gpu.h"
+#include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
@@ -220,23 +222,12 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
             remaining_size -= page_size;
         }
         flush_modified();
-        // The serial moves after the table changed and while the page table lock is held, so
-        // that a reader that sees the new serial also sees the new table.
-        map_serial.fetch_add(1, std::memory_order_release);
+        FinishPageTableOpLocked(gpu_addr, size, kind);
     }
     // The caches are told about the change without the page table lock: the rasterizer takes the
     // cache mutexes, which the GPU thread holds while it reads the page table.
     for (const auto& [modified_start, modified_size] : modified_ranges) {
         rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
-    }
-    {
-        std::unique_lock<std::mutex> lock(guard);
-        kind_map.Map(gpu_addr, gpu_addr + size, kind);
-    }
-    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Bounds)) {
-        UpdateContinuousRuns(gpu_addr, size);
-    } else {
-        map_serial.fetch_add(1, std::memory_order_release);
     }
     return gpu_addr;
 }
@@ -298,21 +289,10 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
             remaining_size -= big_page_size;
         }
         flush_modified();
-        // As in PageTableOp: the serial moves after the table changed and while the page
-        // table lock is held.
-        map_serial.fetch_add(1, std::memory_order_release);
+        FinishPageTableOpLocked(gpu_addr, size, kind);
     }
     for (const auto& [modified_start, modified_size] : modified_ranges) {
         rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
-    }
-    {
-        std::unique_lock<std::mutex> lock(guard);
-        kind_map.Map(gpu_addr, gpu_addr + size, kind);
-    }
-    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Bounds)) {
-        UpdateContinuousRuns(gpu_addr, size);
-    } else {
-        map_serial.fetch_add(1, std::memory_order_release);
     }
     return gpu_addr;
 }
@@ -704,6 +684,35 @@ void MemoryManager::ReadWordsUnsafe(GPUVAddr gpu_src_addr, u32* dest, std::size_
     ReadBlockUnsafe(gpu_src_addr, dest, size);
 }
 
+void MemoryManager::RunRasterizerWork(std::vector<std::pair<DAddr, u64>> regions, bool prepare,
+                                      bool sync, VideoCommon::CacheType which) const {
+    if (regions.empty()) {
+        return;
+    }
+    auto run = [rasterizer_ptr = rasterizer, regions = std::move(regions), prepare, which] {
+        for (const auto& [addr, sz] : regions) {
+            if (prepare) {
+                rasterizer_ptr->PrepareRegionWrite(addr, sz, which);
+            } else {
+                rasterizer_ptr->InvalidateRegion(addr, sz, which);
+            }
+        }
+    };
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.BackRunning() || VideoCommon::GpuSplit::OnBackThread()) {
+        run();
+        return;
+    }
+    if (VideoCommon::GpuSplit::OnGpuThread()) {
+        split.DeferFunction(std::move(run));
+        if (sync) {
+            split.Drain(VideoCommon::DrainSite::Other);
+        }
+        return;
+    }
+    system.GPU().RunInOrderSync(std::move(run));
+}
+
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) {
     // Give Switch 2 sparse pages the write lands on their memory first (otherwise it is dropped).
     Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
@@ -735,12 +744,19 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
     // The merge runs without the page table lock: it asks the device memory whether the host
     // memory behind two segments is contiguous.
     MergeSegments(memory, segments);
+    std::vector<std::pair<DAddr, u64>> regions;
+    if (!unsafe) {
+        regions.reserve(segments.size());
+        for (const auto& segment : segments) {
+            if (segment.kind != MappedSegment::Kind::Zero) {
+                regions.emplace_back(segment.device_addr, segment.size);
+            }
+        }
+        RunRasterizerWork(regions, /*prepare=*/true, /*sync=*/true, which);
+    }
     const auto* src = static_cast<const u8*>(src_buffer);
     for (const auto& segment : segments) {
         if (segment.kind != MappedSegment::Kind::Zero) {
-            if (!unsafe) {
-                rasterizer->PrepareRegionWrite(segment.device_addr, segment.size, which);
-            }
             if (segment.kind == MappedSegment::Kind::Small) {
                 if (u8* physical = memory.GetPointer<u8>(segment.device_addr)) {
                     std::memcpy(physical, src, segment.size);
@@ -754,12 +770,12 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
                     memory.WriteBlockUnsafe(segment.device_addr, src, segment.size);
                 }
             }
-            // After the copy: the buffer cache may upload the written bytes from guest memory.
-            if (!unsafe) {
-                rasterizer->InvalidateRegion(segment.device_addr, segment.size, which);
-            }
         }
         src += segment.size;
+    }
+    if (!unsafe) {
+        // After the copy: the buffer cache may upload the written bytes from guest memory.
+        RunRasterizerWork(std::move(regions), /*prepare=*/false, /*sync=*/false, which);
     }
 }
 
@@ -937,16 +953,28 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
     return result;
 }
 
-void MemoryManager::UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size) {
+void MemoryManager::FinishPageTableOpLocked(GPUVAddr gpu_addr, size_t size, PTEKind kind) {
+    std::scoped_lock runs_lock{runs_guard};
+    if (VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Bounds)) {
+        UpdateContinuousRunsLocked(gpu_addr, size);
+    }
+    {
+        std::unique_lock<std::mutex> lock(guard);
+        kind_map.Map(gpu_addr, gpu_addr + size, kind);
+    }
+    // The serial moves after the table, runs, and kind map all changed while page_table_mutex
+    // and runs_guard are held, so readers observing the new serial see a consistent state.
+    map_serial.fetch_add(1, std::memory_order_release);
+}
+
+void MemoryManager::UpdateContinuousRunsLocked(GPUVAddr gpu_addr, size_t size) {
     // Every entry the operation set lies in these big pages; the walk reads nothing else there.
-    // The walk reads the page table, so it holds its lock; the runs themselves are guarded by
-    // runs_guard, which no path takes before the page table lock.
-    std::scoped_lock page_lock{page_table_mutex};
+    // Caller holds page_table_mutex and runs_guard so table reads and run updates share one
+    // critical section before map_serial advances.
     const GPUVAddr begin = gpu_addr & ~big_page_mask;
     const GPUVAddr end =
         (std::min)(Common::AlignUp(gpu_addr + size, big_page_size), address_space_size);
     if (size == 0 || begin >= end) {
-        map_serial.fetch_add(1, std::memory_order_release);
         return;
     }
     std::vector<std::pair<GPUVAddr, ContinuousRun>> rebuilt;
@@ -960,7 +988,6 @@ void MemoryManager::UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size) {
         }
         rebuilt.push_back({address, {address + length, device_addr}});
     };
-    std::scoped_lock lock{runs_guard};
     // Runs that overlap or touch [begin, end) are cut at its edges and merged again.
     auto it = continuous_runs.lower_bound(begin);
     if (it != continuous_runs.begin() && std::prev(it)->second.end >= begin) {
@@ -996,7 +1023,6 @@ void MemoryManager::UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size) {
     for (const auto& run : rebuilt) {
         continuous_runs.insert(continuous_runs.end(), run);
     }
-    map_serial.fetch_add(1, std::memory_order_release);
 }
 
 const MemoryManager::MappingSnapshot& MemoryManager::CurrentSnapshot() const {
@@ -1154,9 +1180,12 @@ void MemoryManager::InvalidateRegion(GPUVAddr gpu_addr, size_t size,
         };
         MemoryOperation(gpu_addr, size, true, mapped_big, do_nothing, invalidate_short_pages);
     }
+    std::vector<std::pair<DAddr, u64>> regions;
+    regions.reserve(segments.size());
     for (const auto& segment : segments) {
-        rasterizer->InvalidateRegion(segment.device_addr, segment.size, which);
+        regions.emplace_back(segment.device_addr, segment.size);
     }
+    RunRasterizerWork(std::move(regions), /*prepare=*/false, /*sync=*/false, which);
 }
 
 void MemoryManager::CopyBlock(GPUVAddr gpu_dest_addr, GPUVAddr gpu_src_addr, std::size_t size,

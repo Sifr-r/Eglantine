@@ -12,8 +12,8 @@ The macOS app bundle uses [`eglantine.icns`](dist/eglantine.icns). Commit `514cc
 
 The old precompiled `dist/Assets.car` originated in the earlier Eden macOS icon work (`bf23921f07`). The Eglantine bundle now loads the `.icns` through `CFBundleIconFile`. The legacy catalog was removed from the source tree and archived locally in `ignore/provenance/Assets.car`.
 
-## Firmware keyboard maps
+## Keyboard layout maps
 
-The [`KeyCodeMap` tables](src/core/hle/service/set/key_code_map.h) are described in the source as extracted from the version 16.2.0 settings sysmodule. They supply the keyboard-layout response for `GetKeyCodeMap`, `GetKeyCodeMap2`, and `GetKeyCodeMapByPort`. The checked-in source and its introduction (`098788d96a`) provide no redistribution grant for the underlying tables.
+The [`KeyCodeMap` tables](src/core/hle/service/set/key_code_map.h) previously contained binary tables extracted from the version 16.2.0 settings sysmodule (`098788d96a`) with no redistribution grant. Those firmware-extracted byte arrays have been replaced with clean-room `constexpr` keyboard-layout tables (`KeyCodeMapBuilder`) constructed from standard USB HID Usage Page `0x07` scancodes and standard national keyboard layouts for all 14 layouts (`EnglishUsInternational`, `EnglishUk`, `French`, `FrenchCa`, `Spanish`, `SpanishLatin`, `German`, `Italian`, `Portuguese`, `Russian`, `Korean`, `ChineseSimplified`, `ChineseTraditional`, and `Japanese`).
 
-This remains open for public distribution. Obtain documented permission for the data, or replace it with independently generated layouts and verify the response size, locale selection, modifier behavior, and fallback for missing layouts. The firmware version and table descriptions record the inputs that need review.
+The tables supply the `0x1000`-byte `nn::kpr::KeyCodeMap` response for `GetKeyCodeMap`, `GetKeyCodeMap2`, and `GetKeyCodeMapByPort`. Response size (`0x1000`), wire-header and flag invariants, modifier and dead-key behavior, locale/layout selection, and fallback to `KeyCodeMapEnglishUsInternational` for unmapped layouts are verified by [`key_code_map.cpp`](src/tests/core/key_code_map.cpp).

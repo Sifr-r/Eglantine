@@ -13,6 +13,7 @@
 #include <list>
 #include <optional>
 #include <mutex>
+#include <vector>
 
 #include "common/common_types.h"
 
@@ -62,7 +63,11 @@ public:
     /// published and the actions it meets run (empty to stop). Switch 2 clients read syncpoint values from a page the
     /// gsv service fills, and an action may wake a client that reads it right away.
     using GuestMirror = std::function<void(u32 syncpoint_id, u32 value)>;
-    void SetGuestMirror(GuestMirror mirror);
+    using GuestMirrorHandle = u64;
+    static constexpr GuestMirrorHandle InvalidGuestMirrorHandle = 0;
+
+    [[nodiscard]] GuestMirrorHandle RegisterGuestMirror(GuestMirror mirror);
+    void UnregisterGuestMirror(GuestMirrorHandle handle);
 
     /// Runs func with guest increments held off, so a copy of the guest values it makes can't
     /// overwrite a newer value the mirror wrote.
@@ -105,8 +110,14 @@ private:
     std::array<std::list<RegisteredAction>, NUM_MAX_SYNCPOINTS> guest_action_storage;
     std::array<std::list<RegisteredAction>, NUM_MAX_SYNCPOINTS> host_action_storage;
 
+    struct GuestMirrorEntry {
+        GuestMirrorHandle handle{};
+        GuestMirror callback;
+    };
+
     std::mutex guard;
-    GuestMirror guest_mirror; ///< Guarded by `guard`.
+    GuestMirrorHandle next_mirror_handle{1};   ///< Guarded by `guard`.
+    std::vector<GuestMirrorEntry> guest_mirrors; ///< Guarded by `guard`.
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;
 };

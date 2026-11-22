@@ -45,6 +45,7 @@ jobs:
   build:
     name: macos-arm64
     runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
     env:
       PLATFORM: macos-arm64
       SHA: ${{ inputs.sha }}
@@ -69,7 +70,7 @@ jobs:
 
       - name: Setup build from compatibility pin
         if: hashFiles('.github/actions/setup-build/action.yml') == ''
-        uses: Djihads80/Eglantine/.github/actions/setup-build@583b125d5a2a330bc3e04fed213b908db5f6a8f2
+        uses: Eglantine-Community/Eglantine/.github/actions/setup-build@583b125d5a2a330bc3e04fed213b908db5f6a8f2
         with:
           platform: ${{ env.PLATFORM }}
           sha: ${{ inputs.sha }}

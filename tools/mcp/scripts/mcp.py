@@ -1,7 +1,8 @@
-"""Tiny MCP client for the emulator: python mcp.py <tool> [json-args] [--save-image path]
-
 # SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
+
+"""Tiny MCP client for the emulator: python mcp.py <tool> [json-args] [--save-image path]
+
 Keeps the session id in a temp file and re-initializes on 404.
 
 Environment:

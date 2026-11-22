@@ -23,6 +23,7 @@ permissions:
 jobs:
   bump:
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - name: Check out nx2
         uses: actions/checkout@v7

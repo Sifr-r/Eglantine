@@ -65,9 +65,22 @@ void SyncpointManager::IncrementGuest(u32 syncpoint_id) {
               syncpoint_id);
 }
 
-void SyncpointManager::SetGuestMirror(GuestMirror mirror) {
+SyncpointManager::GuestMirrorHandle SyncpointManager::RegisterGuestMirror(GuestMirror mirror) {
+    if (!mirror) {
+        return InvalidGuestMirrorHandle;
+    }
     std::scoped_lock lk(guard);
-    guest_mirror = std::move(mirror);
+    const GuestMirrorHandle handle{next_mirror_handle++};
+    guest_mirrors.push_back({handle, std::move(mirror)});
+    return handle;
+}
+
+void SyncpointManager::UnregisterGuestMirror(GuestMirrorHandle handle) {
+    if (handle == InvalidGuestMirrorHandle) {
+        return;
+    }
+    std::scoped_lock lk(guard);
+    std::erase_if(guest_mirrors, [handle](const auto& entry) { return entry.handle == handle; });
 }
 
 void SyncpointManager::IncrementHost(u32 syncpoint_id) {
@@ -86,10 +99,13 @@ void SyncpointManager::Increment(std::atomic<u32>& syncpoint, std::condition_var
                                  std::list<RegisteredAction>& action_storage,
                                  std::optional<u32> mirrored_id) {
     std::scoped_lock lk(guard);
-    if (mirrored_id && guest_mirror) {
+    if (mirrored_id && !guest_mirrors.empty()) {
         // Before the value is published: the lock-free ready checks in RegisterAction and Wait
         // must not see it ahead of the page.
-        guest_mirror(*mirrored_id, syncpoint.load(std::memory_order_relaxed) + 1);
+        const u32 next_value{syncpoint.load(std::memory_order_relaxed) + 1};
+        for (const auto& entry : guest_mirrors) {
+            entry.callback(*mirrored_id, next_value);
+        }
     }
     const u32 new_value{syncpoint.fetch_add(1, std::memory_order_acq_rel) + 1};
     auto it = action_storage.begin();

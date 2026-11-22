@@ -249,6 +249,10 @@ struct GPU::Impl {
         gpu_thread.Run(std::move(func), true);
     }
 
+    void RunInOrderSync(std::function<void()>&& func) {
+        gpu_thread.Run(std::move(func), false);
+    }
+
     void MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {
         u64 id;
         {
@@ -638,6 +642,10 @@ void GPU::FlushRegion(DAddr addr, u64 size) {
 
 void GPU::RunInOrder(std::function<void()>&& func) {
     impl->RunInOrder(std::move(func));
+}
+
+void GPU::RunInOrderSync(std::function<void()>&& func) {
+    impl->RunInOrderSync(std::move(func));
 }
 
 void GPU::MapInOrder(GPUVAddr gpu_addr, u64 size, std::function<void()>&& func) {

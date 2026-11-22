@@ -896,7 +896,8 @@ private:
         if (forced >= 0) {
             return forced == 1;
         }
-        return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling();
+        return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling() ||
+               !device_memory.CanTrapCpuReads();
     }
 
     /// EDEN_NX2_DOWNLOAD_SMALL=<bytes>: GPU writes up to this size are also copied back at the

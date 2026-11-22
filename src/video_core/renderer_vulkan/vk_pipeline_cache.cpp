@@ -1841,22 +1841,13 @@ bool PipelineCache::DeferRuntimeBuild() {
         }
         return false;
     }
-    // Small draws without depth wait for their pipeline (BuiltPipeline), so they are built now
-    // unless stale_target_skip sees their target already holds an earlier frame's output.
-    // Mesh draws are deferred too: their high-detail LODs then appear a few frames late.
-    if (regs.IsMeshEnabled()) {
-        ++over_budget_mesh;
-    } else if (!regs.zeta_enable) {
-        const auto& draw_state = maxwell3d->draw_manager.draw_state;
-        const bool stale_skip =
-            VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::StaleTargetSkip);
-        const bool is_small_draw =
-            stale_skip ? (draw_state.draw_element_count > 0 && draw_state.draw_element_count <= 6)
-                       : (draw_state.draw_element_count <= 6);
-        if (is_small_draw && (!stale_skip || !texture_cache.ColorTargetHasPriorFrameOutput())) {
+    if (EvaluateCurrentDrawSkip(regs.IsMeshEnabled()) == DrawSkipDecision::Wait) {
+        if (regs.IsMeshEnabled()) {
+            ++over_budget_mesh;
+        } else {
             ++over_budget_small;
-            return false;
         }
+        return false;
     }
     if (use_priority) {
         bool recorded = false;
@@ -1901,16 +1892,18 @@ void PipelineCache::ChargeRuntimeBuild(std::chrono::steady_clock::time_point beg
     build_budget_spent += std::chrono::steady_clock::now() - begin;
 }
 
-void PipelineCache::DrainReadyDiskPipelines() {
-    if (!ready_disk_pipelines_pending.load(std::memory_order_acquire)) {
+void PipelineCache::DrainReadyDiskPipelines(bool blocking) {
+    if (!blocking && !ready_disk_pipelines_pending.load(std::memory_order_acquire)) {
         return;
     }
-    std::unique_lock lock{ready_disk_pipelines_mutex, std::try_to_lock};
-    if (!lock.owns_lock()) {
+    std::unique_lock lock{ready_disk_pipelines_mutex, std::defer_lock};
+    if (blocking) {
+        lock.lock();
+    } else if (!lock.try_lock()) {
         return;
     }
     for (auto& [key, built] : ready_disk_pipelines) {
-        in_flight_disk_replays.erase(key.Hash());
+        in_flight_disk_replays.erase(key);
         if (built) {
             auto [it, inserted] = graphics_cache.try_emplace(key, std::move(built));
             if (inserted) {
@@ -1924,21 +1917,8 @@ void PipelineCache::DrainReadyDiskPipelines() {
 }
 
 bool PipelineCache::CanSkipForDiskReplay() const noexcept {
-    if (!use_asynchronous_shaders || !maxwell3d || maxwell3d->regs.IsMeshEnabled()) {
-        return false;
-    }
-    if (maxwell3d->regs.zeta_enable) {
-        return true;
-    }
-    const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    const bool stale_skip = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::StaleTargetSkip);
-    const bool is_small_draw =
-        stale_skip ? (draw_state.draw_element_count > 0 && draw_state.draw_element_count <= 6)
-                   : (draw_state.draw_element_count <= 6);
-    if (is_small_draw) {
-        return stale_skip && texture_cache.ColorTargetHasPriorFrameOutput();
-    }
-    return true;
+    return EvaluateCurrentDrawSkip(maxwell3d != nullptr && maxwell3d->regs.IsMeshEnabled()) !=
+           DrawSkipDecision::Wait;
 }
 
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed) {
@@ -1946,11 +1926,16 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed
         AdoptTranslatedGraphicsPipelines();
     }
     DrainReadyDiskPipelines();
-    const u64 key_hash = graphics_key.Hash();
-    if (in_flight_disk_replays.contains(key_hash)) {
-        RecordSkippedGeometry(is_indexed, nullptr);
-        graphics_miss = "disk-replay-async";
-        return nullptr;
+    if (const auto replay_it = in_flight_disk_replays.find(graphics_key);
+        replay_it != in_flight_disk_replays.end()) {
+        if (CanSkipForDiskReplay()) {
+            RecordSkippedGeometry(is_indexed, nullptr);
+            graphics_miss = "disk-replay-async";
+            return nullptr;
+        }
+        const auto done = replay_it->second;
+        done.wait();
+        DrainReadyDiskPipelines(true);
     }
     auto it{graphics_cache.find(graphics_key)};
     if (it == graphics_cache.end()) {
@@ -1960,21 +1945,34 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineSlowPath(bool is_indexed
                 !translating_graphics.contains(graphics_key)) {
                 auto envs = std::move(disk_it->second);
                 skipped_disk_envs.erase(disk_it);
-                in_flight_disk_replays.insert(key_hash);
+                const auto done = std::make_shared<std::promise<void>>();
+                in_flight_disk_replays.emplace(graphics_key, done->get_future().share());
                 const bool native_turing =
                     maxwell3d != nullptr && maxwell3d->GetNativeMacroEngine().native_turing;
                 disk_replay_workers.QueueWork(
-                    [this, key = graphics_key, envs_ = std::move(envs), native_turing]() mutable {
+                    [this, key = graphics_key, envs_ = std::move(envs), native_turing,
+                     done]() mutable {
+                        std::unique_ptr<GraphicsPipeline> built;
+                        SCOPE_EXIT {
+                            {
+                                std::scoped_lock lock{ready_disk_pipelines_mutex};
+                                ready_disk_pipelines.emplace_back(key, std::move(built));
+                                ready_disk_pipelines_pending.store(true, std::memory_order_release);
+                            }
+                            done->set_value();
+                        };
                         ShaderPools pools;
                         boost::container::static_vector<Shader::Environment*, 5> env_ptrs;
                         for (auto& env : envs_) {
                             env_ptrs.push_back(&env);
                         }
-                        auto built = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr,
-                                                            false, native_turing);
-                        std::scoped_lock lock{ready_disk_pipelines_mutex};
-                        ready_disk_pipelines.emplace_back(key, std::move(built));
-                        ready_disk_pipelines_pending.store(true, std::memory_order_release);
+                        try {
+                            built = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr,
+                                                           false, native_turing);
+                        } catch (const std::exception& exception) {
+                            LOG_ERROR(Render_Vulkan, "Disk replay pipeline creation failed: {}",
+                                      exception.what());
+                        }
                     });
                 RecordSkippedGeometry(is_indexed, nullptr);
                 graphics_miss = "disk-replay-async";
@@ -2040,8 +2038,8 @@ void PipelineCache::TickFrame() {
         if (deferred_builds != 0 || over_budget_small != 0 || over_budget_mesh != 0) {
             LOG_INFO(Render_Vulkan,
                      "Shader build budget ({} ms/frame): {} draws skipped and their pipelines "
-                     "built in a later frame in the last {} frames; built over budget: {} small "
-                     "draws without depth; {} of the skipped draws were mesh draws",
+                     "built in a later frame in the last {} frames; built over budget: {} "
+                     "unskippable non-mesh draws, {} mesh draws",
                      std::chrono::duration_cast<std::chrono::milliseconds>(build_budget).count(),
                      deferred_builds, EvictCheckFrames, over_budget_small, over_budget_mesh);
             deferred_builds = 0;
@@ -2328,6 +2326,52 @@ void PipelineCache::StopShaderPrecache() {
     precache_workers.reset();
 }
 
+DrawSkipDecision PipelineCache::EvaluateCurrentDrawSkip(bool is_mesh) const noexcept {
+    if (!use_asynchronous_shaders || is_mesh || !maxwell3d) {
+        return DrawSkipDecision::Wait;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    DrawSkipInputs inputs{
+        .use_asynchronous_shaders = true,
+        .is_mesh = false,
+        .native_turing = maxwell3d->GetNativeMacroEngine().native_turing,
+        .is_switch2 = Settings::CurrentProgramIsSwitch2(),
+        .zeta_enable = regs.zeta_enable != 0,
+        .depth_test_enable = regs.depth_test_enable != 0,
+        .draw_element_count = draw_state.draw_element_count,
+        .stale_target_skip =
+            VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::StaleTargetSkip),
+    };
+    if (inputs.native_turing) {
+        static const bool native_async = [] {
+            const char* value = std::getenv("EDEN_NX2_NATIVE_ASYNC");
+            return value == nullptr || value[0] != '0';
+        }();
+        // EDEN_NX2_NATIVE_REDRAW=0 restores the historical-write check for A/B testing.
+        static const bool native_redraw = Common::EnvGate("EDEN_NX2_NATIVE_REDRAW");
+        inputs.native_async = native_async;
+        inputs.native_redraw = native_redraw;
+        if (inputs.native_async && inputs.zeta_enable && inputs.depth_test_enable) {
+            inputs.active_color_target_count = ActiveColorTargetCount(regs);
+            if (inputs.active_color_target_count > 0) {
+                if (inputs.native_redraw) {
+                    inputs.color_target_redrawn_every_frame =
+                        texture_cache.ColorTargetRedrawnEveryFrame();
+                } else {
+                    inputs.color_target_written_before_this_frame =
+                        texture_cache.ColorTargetWrittenBeforeThisFrame();
+                }
+            }
+        }
+    } else if (!inputs.zeta_enable && inputs.stale_target_skip &&
+               inputs.draw_element_count > 0 && inputs.draw_element_count <= 6) {
+        inputs.color_target_has_prior_frame_output =
+            texture_cache.ColorTargetHasPriorFrameOutput();
+    }
+    return Vulkan::EvaluateDrawSkip(inputs);
+}
+
 GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline,
                                                bool is_indexed) noexcept {
     if (pipeline->IsBuilt()) {
@@ -2338,84 +2382,25 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline,
         ClearSkippedGeometryIfDrawn(is_indexed);
         return pipeline;
     }
-    if (!use_asynchronous_shaders || pipeline->IsMeshPipeline()) {
+    const DrawSkipDecision decision = EvaluateCurrentDrawSkip(pipeline->IsMeshPipeline());
+    if (decision == DrawSkipDecision::Wait) {
         ClearSkippedGeometryIfDrawn(is_indexed);
         return pipeline;
     }
-    // Native draws can produce terrain data used only once. Submit them after compilation
-    // instead of leaving permanent holes when their first use misses the shader cache.
-    // Waiting for depth-tested draws held Mario Kart World's frames 50-330 ms per new pipeline.
-    // Permit skipping when the color target was written this frame or the previous frame and
-    // has not been cleared this frame.
-    // EDEN_NX2_NATIVE_ASYNC=0 disables skipping while the native pipeline compiles.
-    if (maxwell3d->GetNativeMacroEngine().native_turing) {
-        static const bool native_async = [] {
-            const char* value = std::getenv("EDEN_NX2_NATIVE_ASYNC");
-            return value == nullptr || value[0] != '0';
-        }();
-        // EDEN_NX2_NATIVE_REDRAW=0 restores the historical-write check for A/B testing.
-        static const bool native_redraw = Common::EnvGate("EDEN_NX2_NATIVE_REDRAW");
-        const auto& regs = maxwell3d->regs;
-        // Depth test on (a bound depth buffer alone doesn't test) and a color target written:
-        // draws with every color write masked are depth-only and keep waiting.
-        if (!native_async || !regs.zeta_enable || !regs.depth_test_enable ||
-            ActiveColorTargetCount(regs) == 0 ||
-            !(native_redraw ? texture_cache.ColorTargetRedrawnEveryFrame()
-                            : texture_cache.ColorTargetWrittenBeforeThisFrame())) {
-            return pipeline;
-        }
-    }
-    // If something is using depth, we can assume that games are not rendering anything which
-    // will be used one time.
-    if (maxwell3d->regs.zeta_enable) {
-        RecordSkippedGeometry(is_indexed, pipeline);
-        graphics_miss = "async-build";
+    if (decision == DrawSkipDecision::SkipStaleTarget) {
+        graphics_miss = "async-build-stale";
         return nullptr;
     }
-    // If games are using a small index count, we can assume these are full screen quads.
-    // Usually these shaders are only used once for building textures so we can assume they
-    // can't be built async unless the target already holds an earlier frame's output.
-    const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    const bool stale_skip = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::StaleTargetSkip);
-    const bool is_small_draw =
-        stale_skip ? (draw_state.draw_element_count > 0 && draw_state.draw_element_count <= 6)
-                   : (draw_state.draw_element_count <= 6);
-    if (is_small_draw) {
-        if (stale_skip && texture_cache.ColorTargetHasPriorFrameOutput()) {
-            graphics_miss = "async-build-stale";
-            return nullptr;
-        }
-        return pipeline;
-    }
-    // Switch 2 titles also draw things they keep with more vertices and no depth buffer, such as
-    // the glyphs of a font atlas, each drawn once: skipping one lost it for the session (Star
-    // Fox's menus lost their most common letters). Their cached pipelines are all built at boot,
-    // so only new ones reach this: wait for those unless the draw is depth-tested.
-    if (Settings::CurrentProgramIsSwitch2()) {
-        return pipeline;
+    if (maxwell3d && maxwell3d->regs.zeta_enable) {
+        RecordSkippedGeometry(is_indexed, pipeline);
     }
     graphics_miss = "async-build";
     return nullptr;
 }
 
 bool PipelineCache::CanSkipDraw() noexcept {
-    // The rules BuiltPipeline and DeferRuntimeBuild apply, for a pipeline still translating.
-    const auto& regs = maxwell3d->regs;
-    if (regs.IsMeshEnabled() || regs.zeta_enable) {
-        return true;
-    }
-    // Small draws are full screen quads, often used once to build a texture: wait for them
-    // unless their target already holds an earlier frame's output.
-    const auto& draw_state = maxwell3d->draw_manager.draw_state;
-    const bool stale_skip = VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::StaleTargetSkip);
-    const bool is_small_draw =
-        stale_skip ? (draw_state.draw_element_count > 0 && draw_state.draw_element_count <= 6)
-                   : (draw_state.draw_element_count <= 6);
-    if (is_small_draw) {
-        return stale_skip && texture_cache.ColorTargetHasPriorFrameOutput();
-    }
-    // Switch 2 titles draw things they keep without depth, such as font glyphs (BuiltPipeline).
-    return !Settings::CurrentProgramIsSwitch2();
+    return EvaluateCurrentDrawSkip(maxwell3d != nullptr && maxwell3d->regs.IsMeshEnabled()) !=
+           DrawSkipDecision::Wait;
 }
 
 bool PipelineCache::BuildNewGraphicsPipeline(bool is_indexed) {

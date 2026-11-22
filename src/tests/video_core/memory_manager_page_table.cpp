@@ -8,13 +8,16 @@
 #include <exception>
 #include <limits>
 #include <thread>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/device_memory.h"
 #include "tests/core/system_test_context.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_perf.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace {
@@ -253,4 +256,118 @@ TEST_CASE("A mapping change is never seen half applied", "[memory_manager][page_
     // The table is still usable after the concurrent changes.
     REQUIRE(memory.IsFullyMappedRange(Window, SmallPage));
     REQUIRE(memory.GpuToCpuAddress(Window) == Device);
+}
+
+TEST_CASE("PageTableOp and BigPageTableOp advance map_serial once per operation",
+          "[memory_manager][page_table]") {
+    PageTableFixture fixture;
+    auto& memory = fixture.memory;
+
+    // Ensure initialization before overriding Opt::Bounds in live_off_mask.
+    (void)VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Bounds);
+    const u64 saved_mask = VideoCommon::Nx2Perf::detail::live_off_mask.load(
+        std::memory_order_relaxed);
+    SCOPE_EXIT {
+        VideoCommon::Nx2Perf::detail::live_off_mask.store(saved_mask, std::memory_order_relaxed);
+    };
+
+    constexpr GPUVAddr SmallWindow = 0x40'0000;
+    constexpr GPUVAddr BigWindow = 0x100'0000;
+    constexpr DAddr TestDevice = 0x20'0000;
+
+    for (const bool bounds_on : {true, false}) {
+        CAPTURE(bounds_on);
+        u64 mask = saved_mask;
+        if (bounds_on) {
+            mask &= ~VideoCommon::Nx2Perf::Bit(VideoCommon::Nx2Perf::Opt::Bounds);
+        } else {
+            mask |= VideoCommon::Nx2Perf::Bit(VideoCommon::Nx2Perf::Opt::Bounds);
+        }
+        VideoCommon::Nx2Perf::detail::live_off_mask.store(mask, std::memory_order_relaxed);
+
+        const u64 s0 = memory.GetMapSerial();
+        memory.Map(SmallWindow, TestDevice, SmallPage, Tegra::PTEKind::PITCH, false);
+        const u64 s1 = memory.GetMapSerial();
+        CHECK(s1 == s0 + 1);
+
+        // Unmap issues BigPageTableOp + PageTableOp (one serial bump per op).
+        memory.Unmap(SmallWindow, SmallPage);
+        const u64 s2 = memory.GetMapSerial();
+        CHECK(s2 == s1 + 2);
+
+        memory.Map(BigWindow, TestDevice, BigPage, Tegra::PTEKind::PITCH, true);
+        const u64 s3 = memory.GetMapSerial();
+        CHECK(s3 == s2 + 1);
+
+        memory.Unmap(BigWindow, BigPage);
+        const u64 s4 = memory.GetMapSerial();
+        CHECK(s4 == s3 + 2);
+    }
+}
+
+TEST_CASE("Concurrent Map/Unmap and range/kind queries remain consistent",
+          "[memory_manager][page_table]") {
+    PageTableFixture fixture;
+    auto& memory = fixture.memory;
+
+    (void)VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Bounds);
+    const u64 saved_mask = VideoCommon::Nx2Perf::detail::live_off_mask.load(
+        std::memory_order_relaxed);
+    VideoCommon::Nx2Perf::detail::live_off_mask.store(
+        saved_mask & ~VideoCommon::Nx2Perf::Bit(VideoCommon::Nx2Perf::Opt::Bounds),
+        std::memory_order_relaxed);
+    SCOPE_EXIT {
+        VideoCommon::Nx2Perf::detail::live_off_mask.store(saved_mask, std::memory_order_relaxed);
+    };
+
+    constexpr GPUVAddr Base = 0x200'0000;
+    constexpr DAddr TestDevice = 0x40'0000;
+    constexpr u64 Span = 2 * BigPage;
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> invalid{false};
+
+    std::thread writer([&] {
+        for (int i = 0; i < 200; ++i) {
+            const GPUVAddr addr = Base + ((i & 1) != 0 ? SmallPage : 0);
+            memory.Map(addr, TestDevice, BigPage, Tegra::PTEKind::PITCH, false);
+            memory.Unmap(addr, BigPage);
+        }
+        memory.Map(Base, TestDevice, Span, Tegra::PTEKind::PITCH, true);
+        stop.store(true, std::memory_order_release);
+    });
+
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 2; ++r) {
+        readers.emplace_back([&] {
+            while (!stop.load(std::memory_order_acquire)) {
+                const u64 serial_before = memory.GetMapSerial();
+                const size_t continuous = memory.MaxContinuousRange(Base, Span);
+                const size_t layout = memory.GetMemoryLayoutSize(Base, Span);
+                const auto kind = memory.GetPageKind(Base);
+                const auto translated = memory.GpuToCpuAddress(Base);
+                const u64 serial_after = memory.GetMapSerial();
+                if (continuous > Span ||
+                    (kind != Tegra::PTEKind::PITCH && kind != Tegra::PTEKind::INVALID) ||
+                    (translated && (*translated < TestDevice || *translated >= TestDevice + Span))) {
+                    invalid.store(true, std::memory_order_relaxed);
+                }
+                if (serial_before == serial_after &&
+                    ((kind == Tegra::PTEKind::PITCH && layout == 0) ||
+                     (kind == Tegra::PTEKind::INVALID && layout != 0))) {
+                    invalid.store(true, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+
+    writer.join();
+    for (auto& reader : readers) {
+        reader.join();
+    }
+
+    REQUIRE_FALSE(invalid.load(std::memory_order_relaxed));
+    CHECK(memory.MaxContinuousRange(Base, Span) == Span);
+    CHECK(memory.GetMemoryLayoutSize(Base, Span) >= Span);
+    CHECK(memory.GetPageKind(Base) == Tegra::PTEKind::PITCH);
 }

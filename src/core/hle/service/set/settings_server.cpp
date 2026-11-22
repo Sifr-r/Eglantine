@@ -25,65 +25,21 @@ constexpr std::size_t POST_4_0_0_MAX_ENTRIES = 0x40;
 constexpr Result ResultInvalidLanguage{ErrorModule::Settings, 625};
 constexpr Result ResultNullPointer{ErrorModule::Settings, 1261};
 
-Result GetKeyCodeMapImpl(KeyCodeMap& out_key_code_map, KeyboardLayout keyboard_layout,
-                         LanguageCode language_code) {
-    switch (keyboard_layout) {
-    case KeyboardLayout::Japanese:
-        out_key_code_map = KeyCodeMapJapanese;
-        R_SUCCEED();
-    case KeyboardLayout::EnglishUs:
-        out_key_code_map = KeyCodeMapEnglishUsInternational;
-        if (language_code == LanguageCode::KO) {
-            out_key_code_map = KeyCodeMapKorean;
-        }
-        if (language_code == LanguageCode::ZH_HANS) {
-            out_key_code_map = KeyCodeMapChineseSimplified;
-        }
-        if (language_code == LanguageCode::ZH_HANT) {
-            out_key_code_map = KeyCodeMapChineseTraditional;
-        }
-        R_SUCCEED();
-    case KeyboardLayout::EnglishUk:
-        out_key_code_map = KeyCodeMapEnglishUk;
-        R_SUCCEED();
-    case KeyboardLayout::French:
-        out_key_code_map = KeyCodeMapFrench;
-        R_SUCCEED();
-    case KeyboardLayout::FrenchCa:
-        out_key_code_map = KeyCodeMapFrenchCa;
-        R_SUCCEED();
-    case KeyboardLayout::Spanish:
-        out_key_code_map = KeyCodeMapSpanish;
-        R_SUCCEED();
-    case KeyboardLayout::SpanishLatin:
-        out_key_code_map = KeyCodeMapSpanishLatin;
-        R_SUCCEED();
-    case KeyboardLayout::German:
-        out_key_code_map = KeyCodeMapGerman;
-        R_SUCCEED();
-    case KeyboardLayout::Italian:
-        out_key_code_map = KeyCodeMapItalian;
-        R_SUCCEED();
-    case KeyboardLayout::Portuguese:
-        out_key_code_map = KeyCodeMapPortuguese;
-        R_SUCCEED();
-    case KeyboardLayout::Russian:
-        out_key_code_map = KeyCodeMapRussian;
-        R_SUCCEED();
-    case KeyboardLayout::Korean:
-        out_key_code_map = KeyCodeMapKorean;
-        R_SUCCEED();
-    case KeyboardLayout::ChineseSimplified:
-        out_key_code_map = KeyCodeMapChineseSimplified;
-        R_SUCCEED();
-    case KeyboardLayout::ChineseTraditional:
-        out_key_code_map = KeyCodeMapChineseTraditional;
-        R_SUCCEED();
-    default:
-    case KeyboardLayout::EnglishUsInternational:
-        out_key_code_map = KeyCodeMapEnglishUsInternational;
-        R_SUCCEED();
+Result FillKeyCodeMapFromSettings(OutLargeData<KeyCodeMap, BufferAttr_HipcMapAlias>& out_key_code_map) {
+    R_UNLESS(out_key_code_map != nullptr, ResultNullPointer);
+
+    const auto language_index =
+        static_cast<std::size_t>(Settings::values.language_index.GetValue());
+    bool found = false;
+    const auto& key_code_map = GetKeyCodeMapForLanguageIndex(language_index, &found);
+    if (!found) {
+        LOG_ERROR(Service_SET,
+                  "Could not find keyboard layout for language index {}, defaulting to English us",
+                  Settings::values.language_index.GetValue());
     }
+
+    *out_key_code_map = key_code_map;
+    R_SUCCEED();
 }
 
 } // Anonymous namespace
@@ -189,24 +145,7 @@ Result ISettingsServer::GetAvailableLanguageCodeCount2(Out<s32> out_count) {
 Result ISettingsServer::GetKeyCodeMap(
     OutLargeData<KeyCodeMap, BufferAttr_HipcMapAlias> out_key_code_map) {
     LOG_DEBUG(Service_SET, "called");
-
-    R_UNLESS(out_key_code_map != nullptr, ResultNullPointer);
-
-    const auto language_code =
-        available_language_codes[static_cast<s32>(Settings::values.language_index.GetValue())];
-    const auto key_code =
-        std::find_if(language_to_layout.cbegin(), language_to_layout.cend(),
-                     [=](const auto& element) { return element.first == language_code; });
-
-    if (key_code == language_to_layout.cend()) {
-        LOG_ERROR(Service_SET,
-                  "Could not find keyboard layout for language index {}, defaulting to English us",
-                  Settings::values.language_index.GetValue());
-        *out_key_code_map = KeyCodeMapEnglishUsInternational;
-        R_SUCCEED();
-    }
-
-    R_RETURN(GetKeyCodeMapImpl(*out_key_code_map, key_code->second, key_code->first));
+    R_RETURN(FillKeyCodeMapFromSettings(out_key_code_map));
 }
 
 Result ISettingsServer::GetQuestFlag(Out<bool> out_quest_flag) {
@@ -219,24 +158,7 @@ Result ISettingsServer::GetQuestFlag(Out<bool> out_quest_flag) {
 Result ISettingsServer::GetKeyCodeMap2(
     OutLargeData<KeyCodeMap, BufferAttr_HipcMapAlias> out_key_code_map) {
     LOG_DEBUG(Service_SET, "called");
-
-    R_UNLESS(out_key_code_map != nullptr, ResultNullPointer);
-
-    const auto language_code =
-        available_language_codes[static_cast<s32>(Settings::values.language_index.GetValue())];
-    const auto key_code =
-        std::find_if(language_to_layout.cbegin(), language_to_layout.cend(),
-                     [=](const auto& element) { return element.first == language_code; });
-
-    if (key_code == language_to_layout.cend()) {
-        LOG_ERROR(Service_SET,
-                  "Could not find keyboard layout for language index {}, defaulting to English us",
-                  Settings::values.language_index.GetValue());
-        *out_key_code_map = KeyCodeMapEnglishUsInternational;
-        R_SUCCEED();
-    }
-
-    R_RETURN(GetKeyCodeMapImpl(*out_key_code_map, key_code->second, key_code->first));
+    R_RETURN(FillKeyCodeMapFromSettings(out_key_code_map));
 }
 
 Result ISettingsServer::GetDeviceNickName(
@@ -251,27 +173,10 @@ Result ISettingsServer::GetDeviceNickName(
     R_SUCCEED();
 }
 
-Result ISettingsServer::GetKeyCodeMapByPort(OutLargeData<KeyCodeMap, BufferAttr_HipcMapAlias> out_key_code_map, u32 port) {
+Result ISettingsServer::GetKeyCodeMapByPort(
+    OutLargeData<KeyCodeMap, BufferAttr_HipcMapAlias> out_key_code_map, u32 port) {
     LOG_DEBUG(Service_SET, "called, port={}", port);
-
-    // Similar to other key code map functions, just pass through to the main implementation
-    R_UNLESS(out_key_code_map != nullptr, ResultNullPointer);
-
-    const auto language_code =
-        available_language_codes[static_cast<s32>(Settings::values.language_index.GetValue())];
-    const auto key_code =
-        std::find_if(language_to_layout.cbegin(), language_to_layout.cend(),
-                     [=](const auto& element) { return element.first == language_code; });
-
-    if (key_code == language_to_layout.cend()) {
-        LOG_ERROR(Service_SET,
-                  "Could not find keyboard layout for language index {}, defaulting to English us",
-                  Settings::values.language_index.GetValue());
-        *out_key_code_map = KeyCodeMapEnglishUsInternational;
-        R_SUCCEED();
-    }
-
-    R_RETURN(GetKeyCodeMapImpl(*out_key_code_map, key_code->second, key_code->first));
+    R_RETURN(FillKeyCodeMapFromSettings(out_key_code_map));
 }
 
 } // namespace Service::Set

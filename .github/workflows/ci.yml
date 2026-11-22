@@ -8,6 +8,7 @@ run-name: >-
 #
 #   push to nx2 touching VERSION   stable or rc release, aborted when that tag already exists
 #   workflow_dispatch, kind=daily  daily build of the daily branch, started by daily.yml on nx2
+#   workflow_dispatch, kind=release manual stable/rc release of nx2
 #   workflow_dispatch              branch build of the chosen ref (or a daily, from the daily branch)
 #   pull_request + ci:build label  branch build of a same-repo PR, rebuilt on each push
 on:
@@ -20,9 +21,9 @@ on:
   workflow_dispatch:
     inputs:
       kind:
-        description: What to build (daily is only allowed on the daily branch)
+        description: What to build (daily only on the daily branch; release only on nx2)
         type: choice
-        options: [branch, daily]
+        options: [branch, daily, release]
         default: branch
       build_linux:
         description: Build Linux binaries
@@ -50,7 +51,7 @@ on:
         type: boolean
         default: true
   pull_request:
-    types: [labeled, synchronize, reopened]
+    types: [opened, labeled, synchronize, reopened]
 
 permissions:
   contents: read
@@ -60,8 +61,8 @@ permissions:
 concurrency:
   # Manual and scheduled daily builds share a group; PR and manual branch builds share a group
   # for the source branch so they cannot race while replacing the same rolling release.
-  group: ci-${{ (github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || (github.event.action == 'labeled' && github.event.label.name != 'ci:build'))) && format('ignored-{0}', github.run_id) || (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.kind == 'daily')) && 'daily' || (github.event_name == 'pull_request' && format('branch-{0}', github.event.pull_request.head.ref)) || (github.event_name == 'workflow_dispatch' && format('branch-{0}', github.ref_name)) || format('release-{0}', github.ref) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.kind != 'daily') }}
+  group: ci-${{ (github.event_name == 'pull_request' && (github.event.pull_request.head.repo.full_name != github.repository || !contains(github.event.pull_request.labels.*.name, 'ci:build') || (github.event.action == 'labeled' && github.event.label.name != 'ci:build'))) && format('ignored-{0}', github.run_id) || (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.kind == 'daily')) && 'daily' || (github.event_name == 'workflow_dispatch' && inputs.kind == 'release') && format('release-{0}', github.ref) || (github.event_name == 'pull_request' && format('branch-{0}', github.event.pull_request.head.ref)) || (github.event_name == 'workflow_dispatch' && format('branch-{0}', github.ref_name)) || format('release-{0}', github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.kind == 'branch') }}
 
 jobs:
   prepare:
@@ -73,6 +74,7 @@ jobs:
         (github.event.action != 'labeled' || github.event.label.name == 'ci:build')
       )
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     permissions:
       contents: read
       pull-requests: read
@@ -108,6 +110,7 @@ jobs:
         env:
           TARGET_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           DAILY_BRANCH: ${{ vars.DAILY_BRANCH || 'nx2-experimental' }}
+          INPUT_KIND: ${{ inputs.kind }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_EVENT_NAME" = schedule ]; then
@@ -118,8 +121,8 @@ jobs:
             sha="$TARGET_SHA"
           fi
           git cat-file -e "$sha^{commit}"
-          # The VERSION file belongs to the source commit for a version-triggered push.
-          if [ "$GITHUB_EVENT_NAME" = push ]; then
+          # The VERSION file belongs to the source commit for a version-triggered push or release dispatch.
+          if [ "$GITHUB_EVENT_NAME" = push ] || { [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$INPUT_KIND" = release ]; }; then
             git show "$sha:VERSION" > VERSION
             git show "$sha:CHANGELOG.md" > CHANGELOG.md
           fi
@@ -197,52 +200,13 @@ jobs:
   # cannot ship a regression the test suite would have caught. The release job below refuses
   # to publish while this job failed.
   tests:
-    name: Linux Catch2 tests
+    name: Linux tests
     needs: prepare
     if: needs.prepare.outputs.skip != 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.prepare.outputs.sha }}
-          persist-credentials: false
-
-      - name: Install headless build dependencies
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            autoconf g++ gcc glslang-tools libglu1-mesa-dev libpulse-dev libtool \
-            libudev-dev libxkbcommon-x11-0 mesa-common-dev nasm ninja-build \
-            libdrm-dev libx11-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
-            spirv-tools spirv-headers libusb-1.0-0-dev libboost-dev \
-            libboost-fiber-dev libboost-context-dev libopus-dev libasound2-dev
-
-      - name: Configure tests
-        shell: bash
-        run: |
-          cmake --version
-          cmake -S . -B build/tests -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTING=ON \
-            -DYUZU_TESTS=ON \
-            -DDYNARMIC_TESTS=OFF \
-            -DENABLE_QT=OFF \
-            -DENABLE_UPDATE_CHECKER=ON \
-            -DYUZU_CMD=OFF \
-            -DYUZU_ROOM=OFF \
-            -DYUZU_USE_BUNDLED_SDL3=ON \
-            -DYUZU_USE_BUNDLED_OPENSSL=ON \
-            -DYUZU_USE_BUNDLED_FFMPEG=ON \
-            -DVulkanHeaders_FORCE_BUNDLED=ON \
-            -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
-
-      - name: Build test executable
-        run: cmake --build build/tests --target tests --parallel 4
-
-      - name: Run tests
-        run: ctest --test-dir build/tests/src/tests --output-on-failure --no-tests=error
+    uses: ./.github/workflows/test-linux.yml
+    with:
+      sha: ${{ needs.prepare.outputs.sha }}
+      save_cache: ${{ inputs.save_cache || (needs.prepare.outputs.kind == 'daily') }}
 
   # Nix will not gate a release and notifies
   # about a failure when non-Nix Nix-supported targets succeed
@@ -292,6 +256,7 @@ jobs:
       needs.macos.result != 'failure' &&
       (needs.linux.result == 'success' || needs.macos.result == 'success')
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Announce the failure
         shell: bash
@@ -338,3 +303,15 @@ jobs:
       prev_tag: ${{ needs.prepare.outputs.prev_tag }}
       branch: ${{ needs.prepare.outputs.branch }}
       macos_runner: ${{ vars.MACOS_RUNNER || 'macos-26' }}
+
+  mark-obsolete:
+    name: Mark issues obsolete
+    needs: [prepare, release]
+    if: >-
+      needs.release.result == 'success' &&
+      needs.prepare.outputs.kind == 'stable'
+    permissions:
+      issues: write
+    uses: ./.github/workflows/obsolete-on-release.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}

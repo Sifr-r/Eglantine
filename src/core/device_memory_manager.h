@@ -136,6 +136,8 @@ public:
 
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     void ArmReadTraps(DAddr addr, size_t size);
+    /// True when host fastmem read traps can observe CPU reads from GPU-written memory.
+    [[nodiscard]] bool CanTrapCpuReads() const;
 
 private:
     struct TranslationEntry {
@@ -269,6 +271,9 @@ private:
         (1ULL << (device_virtual_bits - page_bits)) / subentries;
     using CachedPages = std::array<CounterEntry, num_counter_entries>;
     std::unique_ptr<CachedPages> cached_pages;
+    void UpdateHasFastmemArenaLocked();
+
+    std::atomic<bool> has_fastmem_arena{false};
     Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
 

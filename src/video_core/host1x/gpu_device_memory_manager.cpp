@@ -20,6 +20,10 @@ struct MaxwellDeviceMethods {
                                           size_t size) {
         interface->RasterizerArmReadTraps(address, size);
     }
+
+    static inline bool HasFastmemArena(const Core::Memory::Memory* interface) {
+        return interface != nullptr && interface->HasFastmemArena();
+    }
 };
 
 } // namespace Tegra

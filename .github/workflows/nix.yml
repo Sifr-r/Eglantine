@@ -33,6 +33,7 @@ jobs:
   prepare:
     name: prepare
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     outputs:
       display: ${{ steps.display.outputs.display }}
       display_pgo: ${{ steps.display.outputs.display_pgo }}
@@ -85,6 +86,7 @@ jobs:
     needs: [nix]
     if: always() && needs.nix.result == 'failure'
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - name: Announce the failure
         shell: bash

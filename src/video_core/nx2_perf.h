@@ -147,7 +147,9 @@ inline constexpr u64 DefaultOffMask() {
                           Opt::DownloadBatch, Opt::PipelineFastCache, Opt::DrawPreamble,
                           Opt::BindMemo, Opt::SubmitWhileWaited, Opt::DmaForward,
                           Opt::BankOncePerFrame, Opt::DrawBeginCoalesce, Opt::PendingWake,
-                          Opt::DiagDrawLite}) {
+                          Opt::DiagDrawLite, Opt::ShaderBuildBudget, Opt::StaleTargetSkip,
+                          Opt::GeometryConsistency, Opt::BuildOrderPriority,
+                          Opt::ReplayDiskRecordings}) {
         mask |= Bit(opt);
     }
     return mask;

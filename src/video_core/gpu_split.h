@@ -97,6 +97,11 @@ public:
     static void MarkGpuThread() {
         on_gpu_thread = true;
     }
+
+    /// True on the GPU thread (front when split is active, GPU thread otherwise).
+    [[nodiscard]] static bool OnGpuThread() {
+        return on_gpu_thread;
+    }
     /// Whether the calling thread owns the Vulkan scheduler: the back while it runs, else the
     /// GPU thread. Other threads (CPU cores, services) must not record or submit work.
     [[nodiscard]] static bool OwnsScheduler() {

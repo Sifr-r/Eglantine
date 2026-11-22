@@ -2,7 +2,6 @@
 
 # SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
-# SPDX-License-Identifier: GPL-2.0-or-later
 """Command line control of the shader lab's diagnostics folder, for scripted bisection.
 
 Works on the same files as shader_lab.py (ablate.txt, inspect.txt, draw-list, diag-state.json,

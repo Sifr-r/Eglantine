@@ -315,8 +315,9 @@ public:
     /// UpdateRenderTargets should be called before this
     Framebuffer* GetFramebuffer();
 
-    /// True when the current draw's color target 0 already holds an earlier frame's output and
-    /// was not fully cleared this frame (P2.1 stale_target_skip).
+    /// True when the current draw's color target 0 already holds an earlier frame's output, is
+    /// still redrawn every frame (written this frame or the previous frame), and was not fully
+    /// cleared this frame (P2.1 stale_target_skip).
     [[nodiscard]] bool ColorTargetHasPriorFrameOutput() noexcept;
     /// Whether render target 0 was first written in an earlier frame (cleared this frame or not):
     /// a target the title draws every frame rather than one it fills once.
@@ -327,7 +328,13 @@ public:
     [[nodiscard]] bool ColorTargetRedrawnEveryFrame() noexcept;
 
 private:
-    [[nodiscard]] bool ColorTargetWrittenBefore(bool require_uncleared) noexcept;
+    enum class ColorTargetFrameCheck : u8 {
+        RecentPriorFrameOutput,
+        WrittenBeforeThisFrame,
+        RedrawnEveryFrame,
+    };
+
+    [[nodiscard]] bool CheckColorTargetFrame(ColorTargetFrameCheck check) noexcept;
     /// The image behind render target 0, or ImageId{} when there is none. The caller holds mutex.
     [[nodiscard]] ImageId FindColorTargetImage() noexcept;
 

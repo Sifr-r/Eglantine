@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <stop_token>
 
 #include "common/scope_exit.h"
 #include "core/core.h"
@@ -57,7 +58,18 @@ TEST_CASE("ShutdownMainProcess keeps the timing thread paused", "[core][shutdown
     core_timing.SyncPause(false);
     REQUIRE(core_timing.IsRunning());
 
+    const auto session_stop = system.GetEmulationStopToken();
+    bool timing_running_at_stop = false;
+    const std::stop_callback on_stop(session_stop,
+                                     [&] { timing_running_at_stop = core_timing.IsRunning(); });
+
     system.ShutdownMainProcess();
+
+    CHECK(session_stop.stop_requested());
+    CHECK(timing_running_at_stop);
+    const auto next_session_stop = system.GetEmulationStopToken();
+    CHECK(next_session_stop.stop_possible());
+    CHECK_FALSE(next_session_stop.stop_requested());
 
     // The teardown destroys the services, the guest processes and the cheat engine. A timing
     // callback running at that point uses freed objects, so the timing thread has to stay

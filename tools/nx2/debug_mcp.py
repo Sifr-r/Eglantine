@@ -2,7 +2,6 @@
 
 # SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
-# SPDX-License-Identifier: GPL-3.0-or-later
 """MCP server (stdio) for Eglantine's in-process debug server (docs/nx2/debug-mcp.md).
 
 Run eglantine.exe or eden-cli.exe with EDEN_NX2_DEBUG_SERVER=127.0.0.1:6545, then register this

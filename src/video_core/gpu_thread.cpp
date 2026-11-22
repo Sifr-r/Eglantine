@@ -383,7 +383,7 @@ void ThreadManager::FlushAndInvalidateRegion(DAddr addr, u64 size, bool is_async
             gpu.WaitForSyncOperation(fence);
         }
     }
-    rasterizer->OnCacheInvalidation(addr, size);
+    InvalidateRegion(addr, size);
 }
 
 u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_async) {

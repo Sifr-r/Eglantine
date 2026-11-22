@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <utility>
 #include <vector>
 #include <boost/container/small_vector.hpp>
 
@@ -228,10 +229,14 @@ private:
         std::vector<std::pair<s64, PTEKind>> kinds;
     };
 
-    /// Rebuilds the runs through the big pages a page table operation touched.
-    void UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size);
+    /// Rebuilds the runs through the big pages a page table operation touched; caller holds
+    /// page_table_mutex and runs_guard.
+    void UpdateContinuousRunsLocked(GPUVAddr gpu_addr, size_t size);
+    void FinishPageTableOpLocked(GPUVAddr gpu_addr, size_t size, PTEKind kind);
     const MappingSnapshot& CurrentSnapshot() const;
 
+    void RunRasterizerWork(std::vector<std::pair<DAddr, u64>> regions, bool prepare, bool sync,
+                           VideoCommon::CacheType which) const;
     void ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe) const;
     void WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, VideoCommon::CacheType which, bool unsafe);
 

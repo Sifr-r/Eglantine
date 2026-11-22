@@ -38,6 +38,11 @@ DECLARE_ENUM_FLAG_OPERATORS(MemoryPermission)
 /// Overrides the setting until the process ends.
 void OverrideColdHintMode(Settings::ColdHintMode mode);
 
+/// Ensures backing pages covering [address, address + size) are committed in the host OS
+/// before passing a raw host pointer to kernel/driver APIs (e.g., VK_EXT_external_memory_host).
+/// No-op on platforms whose kernel commits backing pages on demand.
+bool EnsureHostMemoryCommitted(const void* address, size_t size) noexcept;
+
 /// Whether the system is short of memory: memory pressure stalls over 5% of the last 10 s (Linux
 /// PSI, this process's cgroup or the whole system), or less than a tenth of RAM (at least 1 GiB)
 /// available. Re-read at most once a second.
@@ -119,6 +124,8 @@ public:
     }
 
 private:
+    void ReleaseFallback() noexcept;
+
     size_t backing_size{};
     size_t virtual_size{};
 

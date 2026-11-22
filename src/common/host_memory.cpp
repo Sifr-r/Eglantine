@@ -9,7 +9,11 @@
 
 #ifdef _WIN32
 
+#include <algorithm>
+#include <cstdint>
 #include <iterator>
+#include <limits>
+#include <vector>
 #include "common/container/unordered_map.h"
 #include <boost/icl/separate_interval_set.hpp>
 #include <windows.h>
@@ -132,6 +136,197 @@ static void GetFuncAddress(Common::DynamicLibrary& dll, const char* name, T& pfn
     }
 }
 
+namespace {
+
+struct RegisteredHostMemoryRange {
+    uintptr_t begin;
+    uintptr_t end;
+    bool is_fallback;
+};
+
+SRWLOCK g_host_memory_ranges_lock = SRWLOCK_INIT;
+std::vector<RegisteredHostMemoryRange> g_host_memory_ranges;
+
+struct SharedSRWLockGuard {
+    explicit SharedSRWLockGuard(SRWLOCK& lock_) : lock{lock_} {
+        AcquireSRWLockShared(&lock);
+    }
+    ~SharedSRWLockGuard() {
+        ReleaseSRWLockShared(&lock);
+    }
+    SharedSRWLockGuard(const SharedSRWLockGuard&) = delete;
+    SharedSRWLockGuard& operator=(const SharedSRWLockGuard&) = delete;
+    SRWLOCK& lock;
+};
+
+template <typename Fn>
+bool WalkMemoryRegions(uintptr_t start, uintptr_t end, Fn&& fn) noexcept {
+    uintptr_t cursor = start;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi)) == 0 ||
+            mbi.RegionSize == 0) {
+            return false;
+        }
+        const uintptr_t mbi_begin = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        const uintptr_t mbi_end = mbi_begin + mbi.RegionSize;
+        if (mbi_end <= cursor) {
+            return false;
+        }
+        const uintptr_t step_end = (std::min)(end, mbi_end);
+        if (!fn(cursor, step_end - cursor, mbi)) {
+            return false;
+        }
+        cursor = step_end;
+    }
+    return true;
+}
+
+LONG WINAPI HostMemoryFaultHandler(PEXCEPTION_POINTERS info) {
+    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        info->ExceptionRecord->NumberParameters < 2) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    const ULONG_PTR access_type = info->ExceptionRecord->ExceptionInformation[0];
+    const uintptr_t fault_addr =
+        static_cast<uintptr_t>(info->ExceptionRecord->ExceptionInformation[1]);
+
+    SharedSRWLockGuard guard{g_host_memory_ranges_lock};
+
+    bool found = false;
+    bool is_fallback = false;
+    for (const auto& entry : g_host_memory_ranges) {
+        if (entry.begin <= fault_addr && fault_addr < entry.end) {
+            found = true;
+            is_fallback = entry.is_fallback;
+            break;
+        }
+    }
+    if (!found) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    const uintptr_t page_addr = fault_addr & ~uintptr_t{PageAlignment - 1};
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(page_addr), &mbi, sizeof(mbi)) == 0) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    const DWORD expected_type = is_fallback ? MEM_PRIVATE : MEM_MAPPED;
+    if (mbi.Type != expected_type) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // Another thread may have committed this page right before our handler inspected it.
+    if (mbi.State == MEM_COMMIT) {
+        const DWORD prot = mbi.Protect;
+        if (access_type == 0 && (prot == PAGE_READONLY || prot == PAGE_READWRITE ||
+                                 prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE)) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (access_type == 1 && (prot == PAGE_READWRITE || prot == PAGE_EXECUTE_READWRITE)) {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    if (mbi.State != MEM_RESERVE) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // Commit in 64 KiB granules clamped to the current view/allocation region to avoid crossing
+    // mapped view boundaries while keeping allocation fault overhead low.
+    constexpr uintptr_t CommitGranule = size_t{1} << 16;
+    const uintptr_t mbi_begin = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    const uintptr_t mbi_end = mbi_begin + mbi.RegionSize;
+    const uintptr_t aligned_begin = page_addr & ~(CommitGranule - 1);
+    const uintptr_t commit_begin = (std::max)(mbi_begin, aligned_begin);
+    const uintptr_t commit_end = (std::min)(mbi_end, aligned_begin + CommitGranule);
+    const DWORD commit_prot = (mbi.AllocationProtect != 0) ? mbi.AllocationProtect : PAGE_READWRITE;
+
+    if (VirtualAlloc(reinterpret_cast<LPVOID>(commit_begin), commit_end - commit_begin, MEM_COMMIT,
+                     commit_prot) == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void InstallHostMemoryFaultHandler() {
+    static std::once_flag installed;
+    std::call_once(installed, [] {
+        if (AddVectoredExceptionHandler(1, HostMemoryFaultHandler) == nullptr) {
+            LOG_CRITICAL(HW_Memory, "Failed to install HostMemory vectored exception handler ({})",
+                         GetLastError());
+        }
+    });
+}
+
+void RegisterHostMemoryRange(uintptr_t begin, size_t size, bool is_fallback) {
+    if (begin == 0 || size == 0) {
+        return;
+    }
+    AcquireSRWLockExclusive(&g_host_memory_ranges_lock);
+    g_host_memory_ranges.push_back(RegisteredHostMemoryRange{
+        .begin = begin,
+        .end = begin + size,
+        .is_fallback = is_fallback,
+    });
+    ReleaseSRWLockExclusive(&g_host_memory_ranges_lock);
+}
+
+void UnregisterHostMemoryRange(uintptr_t begin) {
+    if (begin == 0) {
+        return;
+    }
+    AcquireSRWLockExclusive(&g_host_memory_ranges_lock);
+    std::erase_if(g_host_memory_ranges,
+                  [begin](const RegisteredHostMemoryRange& entry) { return entry.begin == begin; });
+    ReleaseSRWLockExclusive(&g_host_memory_ranges_lock);
+}
+
+void ZeroCommittedBackingRange(u8* addr, size_t length) {
+    if (addr == nullptr || length == 0) {
+        return;
+    }
+    const uintptr_t start = reinterpret_cast<uintptr_t>(addr);
+    const uintptr_t end = start + length;
+    // Uncommitted MEM_RESERVE pages are already zero-initialized by the OS; zeroing only committed
+    // subranges prevents ClearBackingRegion(0) from forcing physical commit.
+    WalkMemoryRegions(start, end, [](uintptr_t sub_start, size_t sub_len,
+                                     const MEMORY_BASIC_INFORMATION& mbi) {
+        if (mbi.State == MEM_COMMIT) {
+            std::memset(reinterpret_cast<void*>(sub_start), 0, sub_len);
+        }
+        return true;
+    });
+}
+
+} // Anonymous namespace
+
+bool EnsureHostMemoryCommitted(const void* address, size_t size) noexcept {
+    if (address == nullptr || size == 0) {
+        return true;
+    }
+    const uintptr_t addr_val = reinterpret_cast<uintptr_t>(address);
+    if (addr_val > (std::numeric_limits<uintptr_t>::max)() - size) {
+        return false;
+    }
+    const uintptr_t start = addr_val & ~uintptr_t{PageAlignment - 1};
+    const uintptr_t end = AlignUp(addr_val + size, PageAlignment);
+    return WalkMemoryRegions(
+        start, end, [](uintptr_t sub_start, size_t sub_len, const MEMORY_BASIC_INFORMATION& mbi) {
+            if (mbi.State == MEM_RESERVE && (mbi.Type == MEM_MAPPED || mbi.Type == MEM_PRIVATE)) {
+                const DWORD prot =
+                    (mbi.AllocationProtect != 0) ? mbi.AllocationProtect : PAGE_READWRITE;
+                return VirtualAlloc(reinterpret_cast<LPVOID>(sub_start), sub_len, MEM_COMMIT,
+                                    prot) != nullptr;
+            }
+            return true;
+        });
+}
+
 class HostMemory::Impl {
 public:
     explicit Impl(size_t backing_size_, size_t virtual_size_)
@@ -156,10 +351,14 @@ public:
             return false;
         }
 
-        // Allocate backing file map
-        backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE, SEC_COMMIT, backing_size, nullptr, nullptr, 0);
+        // Reserve backing file map on the page file without upfront commit; pages are committed
+        // on demand via HostMemoryFaultHandler or EnsureHostMemoryCommitted.
+        backing_handle = pfn_CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr,
+                                                FILE_MAP_WRITE | FILE_MAP_READ, PAGE_READWRITE,
+                                                SEC_RESERVE, backing_size, nullptr, nullptr, 0);
         if (!backing_handle) {
-            LOG_CRITICAL(HW_Memory, "Failed to allocate {} MiB of backing memory", backing_size >> 20);
+            LOG_CRITICAL(HW_Memory, "Failed to reserve {} MiB of backing memory ({})",
+                         backing_size >> 20, GetLastError());
             return false;
         }
         // Allocate a virtual memory for the backing file map as placeholder
@@ -176,6 +375,7 @@ public:
             LOG_CRITICAL(HW_Memory, "Failed to map {} MiB of virtual memory", backing_size >> 20);
             return false;
         }
+        backing_mapped = true;
         // Allocate virtual address placeholder
         virtual_base = static_cast<u8*>(pfn_VirtualAlloc2(process, nullptr, virtual_size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
         if (!virtual_base) {
@@ -183,6 +383,11 @@ public:
             LOG_CRITICAL(HW_Memory, "Failed to reserve {} GiB of virtual memory", virtual_size >> 30);
             return false;
         }
+
+        InstallHostMemoryFaultHandler();
+        RegisterHostMemoryRange(reinterpret_cast<uintptr_t>(backing_base), backing_size, false);
+        RegisterHostMemoryRange(reinterpret_cast<uintptr_t>(virtual_base), virtual_size, false);
+        ranges_registered = true;
         return true;
     }
 
@@ -191,9 +396,10 @@ public:
     }
 
     void* Allocate(size_t size) {
-        auto* ptr = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        auto* ptr = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE);
         if (ptr == nullptr) {
-            LOG_CRITICAL(HW_Memory, "Failed to allocate fallback buffer with size {:#x}, error {}", size, GetLastError());
+            LOG_CRITICAL(HW_Memory, "Failed to reserve fallback buffer with size {:#x}, error {}",
+                         size, GetLastError());
         }
         return ptr;
     }
@@ -235,10 +441,7 @@ public:
         while (it != end) {
             const size_t offset = (std::max)(it->lower(), virtual_offset);
             const size_t protect_length = (std::min)(it->upper(), virtual_end) - offset;
-            DWORD old_flags{};
-            if (!VirtualProtect(virtual_base + offset, protect_length, new_flags, &old_flags)) {
-                LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules");
-            }
+            ProtectViewRange(virtual_base + offset, protect_length, new_flags);
             ++it;
         }
     }
@@ -255,8 +458,59 @@ public:
     u8* virtual_base{};
 
 private:
+    static void ProtectViewRange(u8* addr, size_t protect_length, DWORD new_flags) {
+        if (protect_length == 0) {
+            return;
+        }
+        DWORD old_flags{};
+        if (VirtualProtect(addr, protect_length, new_flags, &old_flags)) {
+            return;
+        }
+        const DWORD err = GetLastError();
+        if (err != ERROR_INVALID_ADDRESS) {
+            LOG_CRITICAL(HW_Memory, "Failed to change virtual memory protect rules ({})", err);
+            return;
+        }
+        // The mapped view spans uncommitted SEC_RESERVE pages.
+        if (new_flags == PAGE_READWRITE) {
+            // Uncommitted pages already inherit PAGE_READWRITE on commit; only re-protect committed
+            // subranges so untouched pages stay uncommitted.
+            const uintptr_t start = reinterpret_cast<uintptr_t>(addr);
+            const uintptr_t end = start + protect_length;
+            WalkMemoryRegions(start, end, [](uintptr_t sub_start, size_t sub_len,
+                                             const MEMORY_BASIC_INFORMATION& mbi) {
+                if (mbi.State == MEM_COMMIT) {
+                    DWORD sub_old{};
+                    if (!VirtualProtect(reinterpret_cast<LPVOID>(sub_start), sub_len,
+                                        PAGE_READWRITE, &sub_old)) {
+                        LOG_CRITICAL(HW_Memory,
+                                     "Failed to restore PAGE_READWRITE on view ({})",
+                                     GetLastError());
+                    }
+                }
+                return true;
+            });
+            return;
+        }
+        // Restrictive protections (PAGE_READONLY / PAGE_NOACCESS) must commit reserved view PTEs
+        // explicitly so a later backing_base commit cannot leave them readable/writable.
+        if (VirtualAlloc(addr, protect_length, MEM_COMMIT, new_flags) == nullptr) {
+            LOG_CRITICAL(HW_Memory, "Failed to commit protected virtual view range ({})",
+                         GetLastError());
+        }
+    }
+
     /// Release all resources in the object
     void Release() {
+        if (ranges_registered) {
+            if (backing_base) {
+                UnregisterHostMemoryRange(reinterpret_cast<uintptr_t>(backing_base));
+            }
+            if (virtual_base) {
+                UnregisterHostMemoryRange(reinterpret_cast<uintptr_t>(virtual_base));
+            }
+            ranges_registered = false;
+        }
         if (!placeholders.empty()) {
             for (const auto& placeholder : placeholders) {
                 if (!pfn_UnmapViewOfFile2(process, virtual_base + placeholder.lower(),
@@ -264,23 +518,33 @@ private:
                     LOG_CRITICAL(HW_Memory, "Failed to unmap virtual memory placeholder");
                 }
             }
+            placeholders.clear();
+            placeholder_host_pointers.clear();
             Coalesce(0, virtual_size);
         }
         if (virtual_base) {
             if (!VirtualFree(virtual_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(HW_Memory, "Failed to free virtual memory");
             }
+            virtual_base = nullptr;
         }
         if (backing_base) {
-            if (!pfn_UnmapViewOfFile2(process, backing_base, MEM_PRESERVE_PLACEHOLDER)) {
-                LOG_CRITICAL(HW_Memory, "Failed to unmap backing memory placeholder");
+            if (backing_mapped) {
+                if (!pfn_UnmapViewOfFile2(process, backing_base, MEM_PRESERVE_PLACEHOLDER)) {
+                    LOG_CRITICAL(HW_Memory, "Failed to unmap backing memory placeholder");
+                }
+                backing_mapped = false;
             }
             if (!VirtualFreeEx(process, backing_base, 0, MEM_RELEASE)) {
                 LOG_CRITICAL(HW_Memory, "Failed to free backing memory");
             }
+            backing_base = nullptr;
         }
-        if (!CloseHandle(backing_handle)) {
-            LOG_CRITICAL(HW_Memory, "Failed to free backing memory file handle");
+        if (backing_handle) {
+            if (!CloseHandle(backing_handle)) {
+                LOG_CRITICAL(HW_Memory, "Failed to free backing memory file handle");
+            }
+            backing_handle = nullptr;
         }
     }
 
@@ -401,6 +665,8 @@ private:
 
     HANDLE process{};        ///< Current process handle
     HANDLE backing_handle{}; ///< File based backing memory
+    bool backing_mapped{false};
+    bool ranges_registered{false};
 
     DynamicLibrary kernelbase_dll;
     PFN_CreateFileMapping2 pfn_CreateFileMapping2{};
@@ -573,9 +839,9 @@ public:
         if (use_anon) {
             LOG_WARNING(Common_Memory, "Using private mappings instead of shared ones");
             backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE | MAP_NOCORE, -1, 0));
-            if (fd > 0) {
-                fd = -1;
+            if (fd >= 0) {
                 close(fd);
+                fd = -1;
             }
         } else {
             backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_NOCORE, fd, 0));
@@ -724,6 +990,12 @@ private:
 
 #endif // ^^^ POSIX ^^^
 
+#ifndef _WIN32
+bool EnsureHostMemoryCommitted(const void* /*address*/, size_t /*size*/) noexcept {
+    return true;
+}
+#endif
+
 HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
     : backing_size(backing_size_)
     , virtual_size(virtual_size_)
@@ -735,8 +1007,9 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
     backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     virtual_base = nullptr;
 #else
+    const size_t aligned_backing_size = AlignUp(backing_size, PageAlignment);
     // Try to allocate a fastmem arena.
-    impl = std::make_unique<HostMemory::Impl>(AlignUp(backing_size, PageAlignment), AlignUp(virtual_size, PageAlignment) + HugePageSize);
+    impl = std::make_unique<HostMemory::Impl>(aligned_backing_size, AlignUp(virtual_size, PageAlignment) + HugePageSize);
     if (impl->Init()) {
         backing_base = impl->backing_base;
         virtual_base = impl->virtual_base;
@@ -748,28 +1021,93 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
     } else {
         LOG_WARNING(HW_Memory, "Platform can support fastmem, but can't create it");
         fallback_buffer = true;
-        backing_base = static_cast<u8*>(impl->Allocate(backing_size));
+        backing_base = static_cast<u8*>(impl->Allocate(aligned_backing_size));
         virtual_base = nullptr;
         impl.reset();
+#ifdef _WIN32
+        if (backing_base != nullptr) {
+            InstallHostMemoryFaultHandler();
+            RegisterHostMemoryRange(reinterpret_cast<uintptr_t>(backing_base), aligned_backing_size,
+                                    true);
+        }
+#endif
     }
 #endif
+}
+
+void HostMemory::ReleaseFallback() noexcept {
+    if (!fallback_buffer) {
+        return;
+    }
+    fallback_buffer = false;
+    if (backing_base == nullptr) {
+        return;
+    }
+#ifdef _WIN32
+    UnregisterHostMemoryRange(reinterpret_cast<uintptr_t>(backing_base));
+    if (!VirtualFree(backing_base, 0, MEM_RELEASE)) {
+        LOG_CRITICAL(HW_Memory, "Failed to free fallback buffer ({})", GetLastError());
+    }
+#else
+    if (backing_base != MAP_FAILED) {
+        munmap(backing_base, AlignUp(backing_size, PageAlignment));
+    }
+#endif
+    backing_base = nullptr;
 }
 
 HostMemory::~HostMemory() {
-#ifdef _WIN32
-    if (fallback_buffer) {
-        VirtualFree(backing_base, backing_size, MEM_RELEASE);
-    }
-#else
-    if (fallback_buffer) {
-        munmap(backing_base, backing_size);
-    }
-#endif
+    ReleaseFallback();
 }
 
-HostMemory::HostMemory(HostMemory&&) noexcept = default;
+HostMemory::HostMemory(HostMemory&& other) noexcept
+    : backing_size{other.backing_size}
+    , virtual_size{other.virtual_size}
+#if !(defined(__OPENORBIS__) || defined(__managarm__))
+    , impl{std::move(other.impl)}
+#endif
+    , backing_base{other.backing_base}
+    , virtual_base{other.virtual_base}
+    , virtual_base_offset{other.virtual_base_offset}
+    , granules{std::move(other.granules)}
+    , num_granules{other.num_granules}
+    , fallback_buffer{other.fallback_buffer} {
+    other.backing_size = 0;
+    other.virtual_size = 0;
+    other.backing_base = nullptr;
+    other.virtual_base = nullptr;
+    other.virtual_base_offset = 0;
+    other.num_granules = 0;
+    other.fallback_buffer = false;
+}
 
-HostMemory& HostMemory::operator=(HostMemory&&) noexcept = default;
+HostMemory& HostMemory::operator=(HostMemory&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    ReleaseFallback();
+#if !(defined(__OPENORBIS__) || defined(__managarm__))
+    impl.reset();
+    impl = std::move(other.impl);
+#endif
+    backing_size = other.backing_size;
+    virtual_size = other.virtual_size;
+    backing_base = other.backing_base;
+    virtual_base = other.virtual_base;
+    virtual_base_offset = other.virtual_base_offset;
+    granules = std::move(other.granules);
+    num_granules = other.num_granules;
+    fallback_buffer = other.fallback_buffer;
+
+    other.backing_size = 0;
+    other.virtual_size = 0;
+    other.backing_base = nullptr;
+    other.virtual_base = nullptr;
+    other.virtual_base_offset = 0;
+    other.num_granules = 0;
+    other.fallback_buffer = false;
+    return *this;
+}
 
 void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perms, bool separate_heap) {
 #if !(defined(__OPENORBIS__) || defined(__managarm__))
@@ -976,11 +1314,12 @@ ColdHintAction HostMemory::HintCold(size_t physical_offset, size_t length,
 }
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
-    if (length == 0) {
+    if (length == 0 || backing_base == nullptr) {
         return;
     }
     MarkUsed(physical_offset, length);
     if (fill_value != 0) {
+        EnsureHostMemoryCommitted(backing_base + physical_offset, length);
         std::memset(backing_base + physical_offset, fill_value, length);
         MarkDirty(physical_offset, length);
         return;
@@ -1008,7 +1347,11 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
             cleared = whole && punch && impl && impl->PunchHole(granule_begin, granule_end - granule_begin);
 #endif
             if (!cleared) {
+#ifdef _WIN32
+                ZeroCommittedBackingRange(backing_base + offset, clear_end - offset);
+#else
                 std::memset(backing_base + offset, 0, clear_end - offset);
+#endif
             }
             if (whole) {
                 granules[index].fetch_and(static_cast<u8>(~GranuleDirty), std::memory_order_release);
@@ -1019,7 +1362,7 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
 }
 
 void HostMemory::MarkUsed(size_t physical_offset, size_t length) {
-    if (length == 0) {
+    if (length == 0 || !granules || num_granules == 0) {
         return;
     }
     const size_t last = (physical_offset + length - 1) >> GranuleShift;
@@ -1031,7 +1374,7 @@ void HostMemory::MarkUsed(size_t physical_offset, size_t length) {
 }
 
 void HostMemory::MarkDirty(size_t physical_offset, size_t length) {
-    if (length == 0) {
+    if (length == 0 || !granules || num_granules == 0) {
         return;
     }
     const size_t last = (physical_offset + length - 1) >> GranuleShift;

@@ -109,6 +109,13 @@ struct ImageBase {
                cleared_frame != current_frame;
     }
 
+    /// Whether this image already holds an earlier frame's output, is still redrawn every frame
+    /// (written this frame or the previous frame), and has not been cleared this frame.
+    [[nodiscard]] bool HasRecentPriorFrameOutput(u64 current_frame) const noexcept {
+        return first_written_frame != 0 && first_written_frame < current_frame &&
+               RedrawnEveryFrame(current_frame);
+    }
+
     void CheckBadOverlapState();
     void CheckAliasState();
 

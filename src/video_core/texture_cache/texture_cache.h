@@ -1198,7 +1198,7 @@ ImageId TextureCache<P>::FindColorTargetImage() noexcept {
 }
 
 template <class P>
-bool TextureCache<P>::ColorTargetWrittenBefore(bool require_uncleared) noexcept {
+bool TextureCache<P>::CheckColorTargetFrame(ColorTargetFrameCheck check) noexcept {
     std::scoped_lock lock{mutex};
     const ImageId image_id = FindColorTargetImage();
     if (!image_id) {
@@ -1206,29 +1206,30 @@ bool TextureCache<P>::ColorTargetWrittenBefore(bool require_uncleared) noexcept 
     }
     const ImageBase& image = slot_images[image_id];
     const u64 current_frame = frame_tick + 1;
-    return image.first_written_frame != 0 && image.first_written_frame < current_frame &&
-           (!require_uncleared || image.cleared_frame != current_frame);
+    switch (check) {
+    case ColorTargetFrameCheck::RecentPriorFrameOutput:
+        return image.HasRecentPriorFrameOutput(current_frame);
+    case ColorTargetFrameCheck::WrittenBeforeThisFrame:
+        return image.first_written_frame != 0 && image.first_written_frame < current_frame;
+    case ColorTargetFrameCheck::RedrawnEveryFrame:
+        return image.RedrawnEveryFrame(current_frame);
+    }
+    return false;
 }
 
 template <class P>
 bool TextureCache<P>::ColorTargetHasPriorFrameOutput() noexcept {
-    return ColorTargetWrittenBefore(true);
+    return CheckColorTargetFrame(ColorTargetFrameCheck::RecentPriorFrameOutput);
 }
 
 template <class P>
 bool TextureCache<P>::ColorTargetWrittenBeforeThisFrame() noexcept {
-    return ColorTargetWrittenBefore(false);
+    return CheckColorTargetFrame(ColorTargetFrameCheck::WrittenBeforeThisFrame);
 }
 
 template <class P>
 bool TextureCache<P>::ColorTargetRedrawnEveryFrame() noexcept {
-    std::scoped_lock lock{mutex};
-    const ImageId image_id = FindColorTargetImage();
-    if (!image_id) {
-        return false;
-    }
-    const ImageBase& image = slot_images[image_id];
-    return image.RedrawnEveryFrame(frame_tick + 1);
+    return CheckColorTargetFrame(ColorTargetFrameCheck::RedrawnEveryFrame);
 }
 
 

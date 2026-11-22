@@ -11,6 +11,7 @@
 #include <unordered_map>
 
 #include "common/common_types.h"
+#include "common/host_memory.h"
 #include "common/logging.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -90,6 +91,9 @@ private:
         VkDeviceAddress address{};
     };
     Window Import(const void* start, size_t size) {
+        if (!Common::EnsureHostMemoryCommitted(start, size)) {
+            return Fail("host memory commit");
+        }
         const VkDevice logical = *device.GetLogical();
         const auto& dld = device.GetDispatchLoader();
         VkMemoryHostPointerPropertiesEXT host_props{

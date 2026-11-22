@@ -752,6 +752,10 @@ void System::ShutdownMainProcess() {
     impl->ShutdownMainProcess();
 }
 
+std::stop_token System::GetEmulationStopToken() const {
+    return impl->stop_event.get_token();
+}
+
 bool System::IsShuttingDown() const {
     return impl->IsShuttingDown();
 }

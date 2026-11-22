@@ -491,6 +491,7 @@ public:
      * (fastmem only), so that the read reaches the GPU's reactive flush once.
      */
     void RasterizerArmReadTraps(Common::ProcessAddress vaddr, u64 size);
+    [[nodiscard]] bool HasFastmemArena() const;
 
     /**
      * Marks each page within the specified address range as debug or non-debug.

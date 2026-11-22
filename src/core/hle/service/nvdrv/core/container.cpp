@@ -153,6 +153,15 @@ Session* Container::GetSession(SessionId session_id) {
     return &impl->sessions[session_id.id];
 }
 
+bool Container::WithSession(SessionId session_id, const std::function<void(Session&)>& func) {
+    std::scoped_lock lk(impl->session_guard);
+    if (session_id.id >= impl->sessions.size() || !impl->sessions[session_id.id].is_active) {
+        return false;
+    }
+    func(impl->sessions[session_id.id]);
+    return true;
+}
+
 void Container::WithSessionMapper(SessionId session_id, HeapMapperId mapper,
                                   const std::function<void(HeapMapper&)>& func) {
     // The session cannot close while this is held, so the mapper stays alive for the call.
