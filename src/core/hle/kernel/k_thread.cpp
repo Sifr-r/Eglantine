@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -123,7 +126,7 @@ namespace Kernel {
 
         // Convert the virtual core to a physical core.
         const s32 phys_core = Core::Hardware::VirtualToPhysicalCoreMap[virt_core];
-        ASSERT(0 <= phys_core && phys_core < static_cast<s32>(Core::Hardware::NUM_CPU_CORES));
+        ASSERT(0 <= phys_core && phys_core < static_cast<s32>(kernel.ActiveCoreCount()));
 
         // First, clear the TLS address.
         m_tls_address = {};
@@ -133,12 +136,18 @@ namespace Kernel {
         case ThreadType::Main:
             ASSERT(arg == 0);
             [[fallthrough]];
-        case ThreadType::User:
-            ASSERT(((owner == nullptr) ||
-                    (owner->GetCoreMask() | (1ULL << virt_core)) == owner->GetCoreMask()));
+        case ThreadType::User: {
+            const u64 owner_mask = owner != nullptr ? owner->GetCoreMask() : 0;
+            const s32 active_cores = static_cast<s32>(kernel.ActiveCoreCount());
+            const bool core_allowed =
+                owner == nullptr || (owner_mask & (1ULL << virt_core)) != 0 ||
+                (kernel.System().Platform().IsSwitch2() && virt_core + active_cores < 8 &&
+                 (owner_mask & (1ULL << (virt_core + active_cores))) != 0);
+            ASSERT(core_allowed);
             ASSERT(((owner == nullptr) || (prio > Svc::LowestThreadPriority) ||
                     (owner->GetPriorityMask() | (1ULL << prio)) == owner->GetPriorityMask()));
             break;
+        }
         case ThreadType::HighPriority:
         case ThreadType::Dummy:
             break;
@@ -428,7 +437,8 @@ namespace Kernel {
     void KThread::FinishTermination(KernelCore& kernel) {
         // Ensure that the thread is not executing on any core.
         if (m_parent != nullptr) {
-            for (std::size_t i = 0; i < std::size_t(Core::Hardware::NUM_CPU_CORES); ++i) {
+            const std::size_t active_cores = kernel.ActiveCoreCount();
+            for (std::size_t i = 0; i < active_cores; ++i) {
                 KThread* core_thread{};
                 do {
                     core_thread = kernel.Scheduler(i).GetSchedulerCurrentThread();
@@ -620,6 +630,12 @@ namespace Kernel {
     Result KThread::SetCoreMask(KernelCore& kernel, s32 core_id, u64 v_affinity_mask) {
         ASSERT(m_parent != nullptr);
         ASSERT(v_affinity_mask != 0);
+        const u32 active_core_count = kernel.ActiveCoreCount();
+        const u64 active_core_mask = (1ULL << active_core_count) - 1;
+        R_UNLESS((v_affinity_mask & active_core_mask) == v_affinity_mask, ResultInvalidCoreId);
+        R_UNLESS(core_id == Svc::IdealCoreNoUpdate || core_id == Svc::IdealCoreDontCare ||
+                     (0 <= core_id && core_id < static_cast<s32>(active_core_count)),
+                 ResultInvalidCoreId);
         KScopedLightLock lk(m_activity_pause_lock);
 
         // Set the core mask.
@@ -634,7 +650,9 @@ namespace Kernel {
             } else {
                 // Preserve our ideal core id.
                 core_id = m_virtual_ideal_core_id;
-                R_UNLESS(((1ULL << core_id) & v_affinity_mask) != 0, ResultInvalidCombination);
+                if (core_id >= 0) {
+                    R_UNLESS(((1ULL << core_id) & v_affinity_mask) != 0, ResultInvalidCombination);
+                }
             }
 
             // Set our affinity mask.
@@ -642,7 +660,9 @@ namespace Kernel {
 
             // Translate the virtual core to a physical core.
             if (core_id >= 0) {
+                ASSERT(core_id < static_cast<s32>(active_core_count));
                 core_id = Core::Hardware::VirtualToPhysicalCoreMap[core_id];
+                ASSERT(0 <= core_id && core_id < static_cast<s32>(active_core_count));
             }
 
             // Translate the virtual affinity mask to a physical one.
@@ -651,6 +671,8 @@ namespace Kernel {
                 v_affinity_mask &= ~(1ULL << next);
                 p_affinity_mask |= (1ULL << Core::Hardware::VirtualToPhysicalCoreMap[next]);
             }
+            ASSERT(p_affinity_mask != 0);
+            ASSERT((p_affinity_mask & active_core_mask) == p_affinity_mask);
 
             // If we haven't disabled migration, perform an affinity change.
             if (m_num_core_migration_disables == 0) {
@@ -697,13 +719,13 @@ namespace Kernel {
                 // Check if the thread is currently running.
                 bool thread_is_current{};
                 s32 thread_core;
-                for (thread_core = 0; thread_core < static_cast<s32>(Core::Hardware::NUM_CPU_CORES);
-                     ++thread_core) {
+                const s32 active_cores = static_cast<s32>(kernel.ActiveCoreCount());
+                for (thread_core = 0; thread_core < active_cores; ++thread_core) {
                     if (kernel.Scheduler(thread_core).GetSchedulerCurrentThread() == this) {
                         thread_is_current = true;
                         break;
                     }
-                     }
+                }
 
                 // If the thread is currently running, check whether it's no longer allowed under the
                 // new mask.
@@ -902,7 +924,8 @@ namespace Kernel {
                 } else {
                     // Check if the thread is currently running.
                     // If it is, we'll need to retry.
-                    for (auto i = 0; i < static_cast<s32>(Core::Hardware::NUM_CPU_CORES); ++i) {
+                    const s32 active_cores = static_cast<s32>(kernel.ActiveCoreCount());
+                    for (s32 i = 0; i < active_cores; ++i) {
                         if (kernel.Scheduler(i).GetSchedulerCurrentThread() == this) {
                             thread_is_current = true;
                             break;

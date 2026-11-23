@@ -22,6 +22,8 @@
 #include "common/logging.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -171,6 +173,10 @@ struct QueryCacheBase<Traits>::QueryCacheBaseImpl {
         return streamer->GetQuery(location.query_id.Value());
     }
 
+    [[nodiscard]] std::shared_ptr<Core::Nx2SessionState> Nx2Session() const {
+        return gpu.System().Nx2Session();
+    }
+
     QueryCacheBase<Traits>* owner;
     VideoCore::RasterizerInterface& rasterizer;
     Tegra::MaxwellDeviceMemoryManager& device_memory;
@@ -267,18 +273,25 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
-    u8* const pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
     if (!is_fence && !Settings::IsGPULevelHigh() && counter_type == QueryType::Payload) {
-        if (has_timestamp) {
-            const u64 timestamp = impl->gpu.GetTicks();
-            const u64 value = static_cast<u64>(payload);
-            u8* const pointer_timestamp = impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
-            std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
-            std::memcpy(pointer, &value, sizeof(value));
-        } else {
-            std::memcpy(pointer, &payload, sizeof(payload));
+        u8* const pointer = impl->device_memory.template GetPointer<u8>(cpu_addr);
+        if (pointer != nullptr) {
+            if (has_timestamp) {
+                const u64 timestamp = impl->gpu.GetTicks();
+                const u64 value = static_cast<u64>(payload);
+                u8* const pointer_timestamp =
+                    impl->device_memory.template GetPointer<u8>(cpu_addr + 8);
+                if (pointer_timestamp != nullptr) {
+                    std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
+                }
+                std::memcpy(pointer, &value, sizeof(value));
+            } else {
+                std::memcpy(pointer, &payload, sizeof(payload));
+            }
         }
-        Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);
+        if (const auto nx2_session = impl->Nx2Session()) {
+            nx2_session->SemaphoreWaiters().OnWrite(cpu_addr, payload);
+        }
         return;
     }
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
@@ -298,56 +311,77 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
              ? !Settings::IsGPULevelHigh()
              : !Settings::IsGPUFenceBehaviorBalanced() && !Settings::IsGPUFenceBehaviorAccurate()) &&
         is_fence;
-    // Fits beside query_location and is_synced: the capture stays within the SBO limit below.
-    const u16 settle_slot = static_cast<u16>(Tegra::Nx2AsyncReportSlot(cpu_addr));
-    auto operation_fn = [this, query_base = query, pointer, query_location, is_synced,
-                         settle_slot] {
+    const auto nx2_session = impl->Nx2Session();
+    const Core::Nx2SessionState::Handle nx2_handle =
+        nx2_session ? nx2_session->GetHandle() : 0;
+    const u16 settle_slot =
+        nx2_handle != 0 ? static_cast<u16>(Tegra::Nx2AsyncReports::Slot(cpu_addr)) : 0;
+    struct OpMeta {
+        Core::Nx2SessionState::Handle nx2_handle;
+        QueryLocation location;
+        u16 settle_slot;
+        bool is_synced;
+    };
+    // Pack metadata and compact session handle so the capture stays within the SBO limit below.
+    const OpMeta op_meta{nx2_handle, query_location, settle_slot, is_synced};
+    auto operation_fn = [this, query_base = query, op_meta] {
         // Whatever path this takes, the slot's result write is done when it returns.
         struct Settle {
+            std::shared_ptr<Core::Nx2SessionState> session;
             u16 slot;
             ~Settle() {
-                Tegra::g_nx2_async_reports_completed[slot].fetch_add(1,
-                                                                     std::memory_order_release);
+                if (session) {
+                    session->CompleteAsyncReport(slot);
+                }
             }
-        } const settle{settle_slot};
+        } const settle{Core::Nx2SessionState::Lock(op_meta.nx2_handle), op_meta.settle_slot};
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
-            if (!is_synced) [[likely]] {
-                impl->pending_unregister.push_back(query_location);
+            if (!op_meta.is_synced) {
+                impl->pending_unregister.push_back(op_meta.location);
             }
             return;
         }
-        if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) [[unlikely]] {
+        if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) {
             LOG_ERROR(HW_GPU,
                       "Query report value not synchronized. Consider increasing GPU accuracy.");
-            if (!is_synced) [[likely]] {
-                impl->pending_unregister.push_back(query_location);
+            if (!op_meta.is_synced) {
+                impl->pending_unregister.push_back(op_meta.location);
             }
             return;
         }
-        auto* const op_streamer = impl->streamers[query_location.stream_id.Value()];
+        auto* const op_streamer = impl->streamers[op_meta.location.stream_id.Value()];
         query_base->value += op_streamer->GetAmendValue();
         op_streamer->SetAccumulationValue(query_base->value);
         const DAddr query_cpu_addr = query_base->guest_address;
-        if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
-            const u64 timestamp = impl->gpu.GetTicks();
-            u8* const pointer_timestamp =
-                impl->device_memory.template GetPointer<u8>(query_cpu_addr + 8);
-            std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
-            std::memcpy(pointer, &query_base->value, sizeof(query_base->value));
-        } else {
-            const u32 value = static_cast<u32>(query_base->value);
-            std::memcpy(pointer, &value, sizeof(value));
+        u8* const op_pointer = impl->device_memory.template GetPointer<u8>(query_cpu_addr);
+        if (op_pointer != nullptr) {
+            if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
+                const u64 timestamp = impl->gpu.GetTicks();
+                u8* const pointer_timestamp =
+                    impl->device_memory.template GetPointer<u8>(query_cpu_addr + 8);
+                if (pointer_timestamp != nullptr) {
+                    std::memcpy(pointer_timestamp, &timestamp, sizeof(timestamp));
+                }
+                std::memcpy(op_pointer, &query_base->value, sizeof(query_base->value));
+            } else {
+                const u32 value = static_cast<u32>(query_base->value);
+                std::memcpy(op_pointer, &value, sizeof(value));
+            }
         }
-        Tegra::Nx2SemaphoreWaiters::Get().OnWrite(query_cpu_addr,
-                                                  static_cast<u32>(query_base->value));
-        if (!is_synced) [[likely]] {
-            impl->pending_unregister.push_back(query_location);
+        if (settle.session) {
+            settle.session->SemaphoreWaiters().OnWrite(query_cpu_addr,
+                                                       static_cast<u32>(query_base->value));
+        }
+        if (!op_meta.is_synced) {
+            impl->pending_unregister.push_back(op_meta.location);
         }
     };
     static_assert(sizeof(operation_fn) <= 32,
                   "CounterReport operation lambda should fit in std::function SBO");
     std::function<void()> operation(std::move(operation_fn));
-    Tegra::g_nx2_async_reports_issued[settle_slot].fetch_add(1, std::memory_order_release);
+    if (nx2_session && nx2_handle != 0) {
+        nx2_session->IssueAsyncReport(settle_slot);
+    }
     if (is_fence) {
         impl->rasterizer.SignalFence(std::move(operation));
     } else {

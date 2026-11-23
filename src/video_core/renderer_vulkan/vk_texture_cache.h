@@ -35,6 +35,11 @@
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
+namespace Core {
+class Nx2SessionState;
+class System;
+} // namespace Core
+
 namespace Settings {
 struct ResolutionScalingInfo;
 }
@@ -66,6 +71,12 @@ public:
                                  RenderPassCache& render_pass_cache_,
                                  DescriptorPool& descriptor_pool,
                                  ComputePassDescriptorQueue& compute_pass_descriptor_queue);
+
+    void SetSystem(Core::System* system_) noexcept {
+        system = system_;
+    }
+
+    [[nodiscard]] std::shared_ptr<Core::Nx2SessionState> Nx2Session() const;
 
     void Finish();
 
@@ -360,6 +371,7 @@ public:
     u32 allocation_pool_pressure_frames{};
     ::Common::unordered_map<VkImage, ResolveShadow> resolve_shadows;
     std::vector<std::pair<u64, ResolveShadow>> pending_resolve_shadows;
+    Core::System* system = nullptr;
 };
 
 class Framebuffer {

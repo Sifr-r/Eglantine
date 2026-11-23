@@ -698,4 +698,12 @@ void GPU::FlushAndInvalidateRegion(DAddr addr, u64 size) {
     impl->FlushAndInvalidateRegion(addr, size);
 }
 
+Core::System& GPU::System() {
+    return impl->system;
+}
+
+const Core::System& GPU::System() const {
+    return impl->system;
+}
+
 } // namespace Tegra

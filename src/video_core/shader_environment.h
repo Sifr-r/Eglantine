@@ -10,10 +10,13 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <exception>
 #include <filesystem>
 #include <iosfwd>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -38,6 +41,12 @@ namespace VideoCommon {
 /// The shader hash of lowered native code (frame dump "shaders", pipeline cache keys).
 u64 NativeShaderHash(std::span<const u64> code);
 
+/// Resets the counter of Shader::Ampere::LowerToMaxwell invocations (for tests).
+void ResetLowerToMaxwellInvocationCount() noexcept;
+
+/// Returns the number of Shader::Ampere::LowerToMaxwell invocations since startup or reset.
+[[nodiscard]] u64 LowerToMaxwellInvocationCount() noexcept;
+
 /// The code an environment holds for a lowered native program: `header` (the shader header,
 /// zero for compute), the instructions with a Maxwell scheduling word before every fourth word,
 /// a zero word and the native address map. Applies the per-program workarounds to `lowered`
@@ -46,14 +55,25 @@ std::vector<u64> LayOutLoweredNativeCode(std::span<const u64> header,
                                          std::span<const Shader::Ampere::Instruction> native,
                                          Shader::Ampere::LoweredProgram& lowered);
 
-/// A native (Switch 2) program after capture and lowering to Maxwell code. The shader cache keeps
-/// it so the environments built for the program's pipelines don't capture and lower it again.
+/// A native (Switch 2) program captured during shader discovery and lowered lazily to Maxwell
+/// code on demand. The shader cache keeps it so environments built for pipelines reuse both
+/// the captured SM86 program and at most one lazy LowerToMaxwell translation.
 struct LoweredNativeCode {
+    struct LazyLoweringState {
+        std::mutex mutex;
+        std::atomic<bool> attempted{false};
+        bool succeeded{false};
+        std::vector<u64> code;
+        size_t source_size{};
+        u32 texture_bound = ~0U;
+        std::exception_ptr error;
+    };
+
     u64 diagnostic_key{};
     /// Shader::Ampere::NativeProgramKey of the captured program (shader dump file names).
     u64 native_program_key{};
     /// Shader header, lowered instructions with Maxwell scheduling words, then the native
-    /// address map (what the environment's `code` used to be filled with).
+    /// address map (populated when eagerly lowered, e.g. in tests).
     std::vector<u64> code;
     /// Original captured SM86 instructions kept for direct SPIR-V compilation / snapshots.
     std::vector<Shader::Ampere::Instruction> native_code;
@@ -62,7 +82,60 @@ struct LoweredNativeCode {
     /// Constant buffer holding the texture handles if the program requires one, otherwise ~0U
     /// (the engine's register value is used).
     u32 texture_bound = ~0U;
+    /// Deterministic hash computed from captured SM86 code and lowering options before lowering.
+    u64 native_hash{};
+    /// Capture context used if Shader::Ampere::LowerToMaxwell must run lazily on fallback.
+    std::array<u64, sizeof(Shader::ProgramHeader) / sizeof(u64)> header{};
+    GPUVAddr program_base{};
+    u32 source_header_size{};
+    bool geometry{};
+    bool native_tensor{};
+    bool native_compact_tensor{};
+    bool has_native_context{};
+    std::shared_ptr<LazyLoweringState> lazy;
+
+    [[nodiscard]] bool HasLoweredCode() const noexcept {
+        if (!code.empty()) {
+            return true;
+        }
+        return lazy && lazy->attempted.load(std::memory_order_acquire) && lazy->succeeded;
+    }
+
+    [[nodiscard]] bool HasFailedLowering() const noexcept {
+        if (!code.empty()) {
+            return false;
+        }
+        return lazy && lazy->attempted.load(std::memory_order_acquire) && !lazy->succeeded;
+    }
+
+    [[nodiscard]] std::span<const u64> LoweredWords() const noexcept {
+        if (!code.empty()) {
+            return code;
+        }
+        if (lazy && lazy->attempted.load(std::memory_order_acquire) && lazy->succeeded) {
+            return lazy->code;
+        }
+        return {};
+    }
+
+    [[nodiscard]] u32 EffectiveTextureBound() const noexcept {
+        if (lazy && lazy->attempted.load(std::memory_order_acquire) && lazy->succeeded) {
+            return lazy->texture_bound;
+        }
+        return texture_bound;
+    }
 };
+
+/// Computes the deterministic discovery hash of a captured native SM86 program and its options.
+[[nodiscard]] u64 ComputeNativeDiscoveryHash(const LoweredNativeCode& native_info);
+
+/// Serializes a captured native SM86 program into the packed on-disk cache blob format.
+[[nodiscard]] std::vector<u64> PackNativeSm86Blob(const LoweredNativeCode& native_info,
+                                                  bool has_hle_engine_state);
+
+/// Unpacks a serialized native SM86 blob into `out`; returns false for non-blob Maxwell words.
+[[nodiscard]] bool TryUnpackNativeSm86Blob(std::span<const u64> words, LoweredNativeCode& out,
+                                           bool& out_has_hle_engine_state);
 
 /// Immutable, self-contained snapshot of a captured Switch 2 (SM86) program and its
 /// pre-probed environment lookups, safe to compile on worker threads without touching live
@@ -142,6 +215,16 @@ public:
         return lowered_native;
     }
 
+    [[nodiscard]] u64 NativeProgramKey() const noexcept {
+        return lowered_native ? lowered_native->native_program_key : 0;
+    }
+
+    [[nodiscard]] bool HasLoweredNativeCode() const noexcept;
+
+    /// Ensures native SM86 instructions have been lowered to Maxwell code (no-op if already lowered
+    /// or non-native). Thread-safe across environments sharing the same LoweredNativeCode.
+    void EnsureLoweredNative();
+
     [[nodiscard]] bool CanBeSerialized() const noexcept;
 
     [[nodiscard]] u64 CalculateHash() const;
@@ -172,9 +255,12 @@ protected:
     void TryPreprobeTextureFromPool(GPUVAddr tic_addr, u32 tic_limit, bool via_header_index,
                                     u32 cbuf_index, u32 cbuf_offset);
 
-    /// Adopts an already lowered native program, or captures and lowers it when there is none.
+    /// Adopts an already captured native program, or captures it lazily without running
+    /// Shader::Ampere::LowerToMaxwell.
     void InitializeNativeCode(std::shared_ptr<const LoweredNativeCode> lowered,
                               u32 source_header_size = 128, bool geometry = false);
+    [[nodiscard]] std::shared_ptr<const LoweredNativeCode> CaptureNativeCode(
+        u32 source_header_size, bool geometry = false);
     std::shared_ptr<const LoweredNativeCode> LowerNativeCode(u32 source_header_size,
                                                               bool geometry = false);
     size_t native_source_size{};
@@ -367,6 +453,18 @@ public:
 
     void Deserialize(std::ifstream& file, bool with_mesh_state = false);
 
+    [[nodiscard]] bool HasNativeInstructions() const noexcept;
+
+    [[nodiscard]] u64 NativeProgramKey() const noexcept {
+        return lowered_native ? lowered_native->native_program_key : 0;
+    }
+
+    /// Lazily lowers captured SM86 instructions serialized on disk when Maxwell fallback is needed.
+    void EnsureLoweredNative();
+
+    /// Builds an immutable native shader snapshot from serialized SM86 code and recorded metadata.
+    [[nodiscard]] NativeShaderSnapshot BuildNativeSnapshot() const;
+
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
 
     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
@@ -404,7 +502,7 @@ public:
                                                                                u32 offset) override;
 
     [[nodiscard]] bool HasHLEMacroState() const override {
-        return cbuf_replacements.size() != 0;
+        return cbuf_replacements.size() != 0 || native_has_hle_engine_state;
     }
 
     void Dump(u64 pipeline_hash, u64 shader_hash) override;
@@ -425,6 +523,8 @@ private:
     u32 initial_offset{};
     u32 viewport_transform_state = 1;
     const GuessMissing* guess{};
+    std::shared_ptr<const LoweredNativeCode> lowered_native;
+    bool native_has_hle_engine_state{};
 };
 
 void SerializePipeline(std::span<const char> key, std::span<const GenericEnvironment* const> envs,

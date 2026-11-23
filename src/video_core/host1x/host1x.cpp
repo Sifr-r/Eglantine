@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -14,7 +17,7 @@ namespace Tegra::Host1x {
 Host1x::Host1x(Core::System& system_)
     : system{system_}
     , syncpoint_manager{}
-    , memory_manager(system.DeviceMemory())
+    , memory_manager(system.DeviceMemory(), system_.Platform().device_address_bits)
     , gmmu_manager{system, memory_manager, 32, 0, 12}
     , allocator{1 << 12}
 {}

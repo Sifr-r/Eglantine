@@ -593,15 +593,6 @@ TEST_CASE("nvhost_ctrl_gpu GetCharacteristics3 enforces PlatformProfile on 0xD0 
           "[core][platform-profile]") {
     IsolatedProfileTestEnv env{"nvhost"};
 
-    Core::System system;
-    system.Initialize();
-    system.Kernel().Initialize();
-    SCOPE_EXIT {
-        system.ShutdownMainProcess();
-    };
-
-    auto host1x = std::make_unique<Tegra::Host1x::Host1x>(system);
-    Service::Nvidia::Module nvdrv{system, *host1x};
     Service::Nvidia::Ioctl ioctl{};
     ioctl.cmd.Assign(0x5);
     ioctl.group.Assign(static_cast<u32>('G'));
@@ -613,7 +604,16 @@ TEST_CASE("nvhost_ctrl_gpu GetCharacteristics3 enforces PlatformProfile on 0xD0 
                          std::size_t inline_size) {
         Tegra::g_nx2_ampere.store(false, std::memory_order_relaxed);
         Service::Nvidia::Devices::g_nx2_driver.store(false, std::memory_order_relaxed);
+        Core::System system;
         system.SetPlatformProfile(Core::MakePlatformProfile(resolution));
+        system.Initialize();
+        system.Kernel().Initialize();
+        SCOPE_EXIT {
+            system.ShutdownMainProcess();
+        };
+
+        auto host1x = std::make_unique<Tegra::Host1x::Host1x>(system);
+        Service::Nvidia::Module nvdrv{system, *host1x};
 
         const auto fd = nvdrv.Open("/dev/nvhost-ctrl-gpu", Service::Nvidia::NvCore::SessionId{1});
         REQUIRE(fd != Service::Nvidia::INVALID_NVDRV_FD);

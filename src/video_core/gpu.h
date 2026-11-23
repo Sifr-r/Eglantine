@@ -288,6 +288,10 @@ public:
     /// Notify rasterizer that any caches of the specified region should be flushed and invalidated
     void FlushAndInvalidateRegion(DAddr addr, u64 size);
 
+    /// Returns the owning System instance for this GPU session.
+    [[nodiscard]] Core::System& System();
+    [[nodiscard]] const Core::System& System() const;
+
 private:
     struct Impl;
     mutable std::unique_ptr<Impl> impl;

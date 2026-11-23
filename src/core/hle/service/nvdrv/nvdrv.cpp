@@ -12,6 +12,7 @@
 
 #include <fmt/ranges.h>
 #include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/nvdrv/core/container.h"
@@ -133,18 +134,19 @@ Module::Module(Core::System& system) : Module{system, system.Host1x()} {}
 
 Module::Module(Core::System& system, Tegra::Host1x::Host1x& host1x)
     : container{host1x}, service_context{system, "nvdrv"}, events_interface{*this} {
-    // Switch 2 state kept in globals belongs to one emulation session. A game started after another
-    // in the same window inherited the previous game's GPU mappings and queue semaphore regions
-    // (their table filled up, so the new game's GPU waits never completed) and the Switch 2 flags.
-    Devices::Nx2GpuMemoryRegistry::Get().Reset();
-    Tegra::Nx2ClearSemaphoreRegions();
-    Tegra::Nx2ClearSparseRegions();
-    Tegra::Nx2ClearGpuWrittenPages();
-    Tegra::Nx2ClearAsyncReports();
-    Devices::g_nx2_driver = false;
-    Tegra::g_nx2_ampere = false;
-    Core::g_nx2_present_count = 0;
-    VideoCommon::Nx2GpuLatency::Reset();
+    // Legacy Switch 2 process globals are reset on Core::System session retirement; only reset
+    // them here when no other active Nx2SessionState exists in the process.
+    if (!Core::Nx2SessionState::HasActiveSessions()) {
+        Devices::Nx2GpuMemoryRegistry::Get().Reset();
+        Tegra::Nx2ClearSemaphoreRegions();
+        Tegra::Nx2ClearSparseRegions();
+        Tegra::Nx2ClearGpuWrittenPages();
+        Tegra::Nx2ClearAsyncReports();
+        Devices::g_nx2_driver = false;
+        Tegra::g_nx2_ampere = false;
+        Core::g_nx2_present_count = 0;
+        VideoCommon::Nx2GpuLatency::Reset();
+    }
     nx2_stub_builder = [this, &system](DeviceFD fd, const std::string& name) {
         auto device = std::make_shared<Devices::nx2_stub_device>(system, name);
         open_files.emplace(fd, device);

@@ -24,6 +24,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/heap_mapper.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
@@ -46,7 +47,10 @@ nvhost_as_gpu::nvhost_as_gpu(Core::System& system_, Module& module_, NvCore::Con
 
 nvhost_as_gpu::~nvhost_as_gpu() {
     // Unregister before draining so no new listener callbacks arrive on `this` mid-teardown.
-    Nx2GpuMemoryRegistry::Get().RemoveListener(this);
+    const auto session = nx2_session_state.lock();
+    if (session) {
+        session->GpuMemoryRegistry().RemoveListener(this);
+    }
     // The callbacks queued for the GPU thread below use this device's address space and the
     // session's heap mapper: let them run before those are gone. The drain is only skipped once
     // the core shutdown began: the GPU thread is stopped then, before the services are closed,
@@ -57,9 +61,11 @@ nvhost_as_gpu::~nvhost_as_gpu() {
     }
     // Leave shared ranges to the process's other address spaces; like this address space's own
     // ranges, one nobody else maps stays allocated.
-    for (const auto& [key, range] : nx2_device_ranges) {
-        if (range.shared) {
-            Nx2GpuMemoryRegistry::Get().ReleaseDeviceRange(range.asid, key.first, key.second);
+    if (session) {
+        for (const auto& [key, range] : nx2_device_ranges) {
+            if (range.shared) {
+                session->GpuMemoryRegistry().ReleaseDeviceRange(range.asid, key.first, key.second);
+            }
         }
     }
 }
@@ -119,28 +125,31 @@ NvResult nvhost_as_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> i
             return WrapFixed(this, &nvhost_as_gpu::GetVARegions1, input, output);
         case 0x9: {
             const auto result = WrapFixed(this, &nvhost_as_gpu::AllocAsEx, input, output);
-            if (result == NvResult::Success && g_nx2_driver) {
-                Nx2GpuMemoryRegistry::Get().AddListener(
-                    this,
-                    [this](u64 gpu_address, u64 cpu_address, u64 size) {
-                        Nx2Map(gpu_address, cpu_address, size);
-                    },
-                    [this](u64 gpu_address, u64 size) { Nx2Unmap(gpu_address, size); },
-                    [this](u64 cpu_address, u64 size) { Nx2Release(cpu_address, size); },
-                    [this](u64 gpu_address, u64 size, bool create) {
-                        Nx2Sparse(gpu_address, size, create);
-                    },
-                    [this](u64 gpu_address, u64 cpu_address, u64 size) {
-                        Nx2BackSparse(gpu_address, cpu_address, size);
-                    },
-                    [this](u64 gpu_address, u64 cpu_address, u64 size) {
-                        Nx2SparseTile(gpu_address, cpu_address, size);
-                    });
+            if (result == NvResult::Success) {
+                if (const auto session = system.Nx2Session()) {
+                    nx2_session_state = session;
+                    session->GpuMemoryRegistry().AddListener(
+                        this,
+                        [this](u64 gpu_address, u64 cpu_address, u64 size) {
+                            Nx2Map(gpu_address, cpu_address, size);
+                        },
+                        [this](u64 gpu_address, u64 size) { Nx2Unmap(gpu_address, size); },
+                        [this](u64 cpu_address, u64 size) { Nx2Release(cpu_address, size); },
+                        [this](u64 gpu_address, u64 size, bool create) {
+                            Nx2Sparse(gpu_address, size, create);
+                        },
+                        [this](u64 gpu_address, u64 cpu_address, u64 size) {
+                            Nx2BackSparse(gpu_address, cpu_address, size);
+                        },
+                        [this](u64 gpu_address, u64 cpu_address, u64 size) {
+                            Nx2SparseTile(gpu_address, cpu_address, size);
+                        });
+                }
             }
             return result;
         }
         case 0xb:
-            if (g_nx2_driver) {
+            if (const auto session = system.Nx2Session(); session && session->IsDriverActive()) {
                 return WrapFixed(this, &nvhost_as_gpu::GetSyncRoMap, input, output);
             }
             break;
@@ -232,12 +241,19 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
             }
             return address;
         };
+        auto session = nx2_session_state.lock();
+        if (!session) {
+            session = system.Nx2Session();
+        }
+        if (!session) {
+            return;
+        }
         // EDEN_NX2_PRIVATE_DEVICE_RANGES=1 (A/B aid): a range per address space.
         static const bool private_ranges = std::getenv("EDEN_NX2_PRIVATE_DEVICE_RANGES") != nullptr;
         if (private_ranges) {
             range = {allocate(), false};
         } else {
-            range = {Nx2GpuMemoryRegistry::Get().AcquireDeviceRange(session_asid->id, cpu_address,
+            range = {session->GpuMemoryRegistry().AcquireDeviceRange(session_asid->id, cpu_address,
                                                                     size, allocate),
                      false, true, session_asid->id};
         }
@@ -249,7 +265,11 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     }
     const DAddr device_address = range.address;
     nx2_device_ranges[{cpu_address, size}] = range;
-    Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
+    if (auto session = nx2_session_state.lock()) {
+        session->GpuMemoryRegistry().RecordDeviceRange(cpu_address, size, device_address);
+    } else if (const auto active_session = system.Nx2Session()) {
+        active_session->GpuMemoryRegistry().RecordDeviceRange(cpu_address, size, device_address);
+    }
     // On the GPU thread, like unmaps: a GMMU map takes the texture cache lock, and the callers hold
     // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
     // The callback holds a copy of the address space, so it stays alive until it ran.
@@ -295,8 +315,9 @@ void nvhost_as_gpu::Nx2Release(u64 cpu_address, u64 size) {
         }
         const Nx2DeviceRange range = it->second;
         it = nx2_device_ranges.erase(it);
-        if (range.shared &&
-            !Nx2GpuMemoryRegistry::Get().ReleaseDeviceRange(range.asid, entry_cpu, entry_size)) {
+        const auto session = nx2_session_state.lock();
+        if (range.shared && session &&
+            !session->GpuMemoryRegistry().ReleaseDeviceRange(range.asid, entry_cpu, entry_size)) {
             continue; // another address space of the process still maps it
         }
         released.push_back({entry_cpu, entry_size, range});
@@ -416,9 +437,19 @@ void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
     // In GPU-thread order: command lists submitted before the request still see the old tile.
     // Publish cached writes before changing either translation or its device backing.
     const DAddr device = device_address + (gpu_address - start);
-    const auto canonical = cpu_address != 0
-                               ? Nx2GpuMemoryRegistry::Get().DeviceAddressOf(cpu_address, size)
-                               : std::nullopt;
+    const auto canonical = [this, cpu_address, size]() -> std::optional<DAddr> {
+        if (cpu_address == 0) {
+            return std::nullopt;
+        }
+        auto session = nx2_session_state.lock();
+        if (!session) {
+            session = system.Nx2Session();
+        }
+        if (!session) {
+            return std::nullopt;
+        }
+        return session->GpuMemoryRegistry().DeviceAddressOf(cpu_address, size);
+    }();
     auto* const smmu = &system.Host1x().MemoryManager();
     auto gmmu_owner = gmmu;
     system.GPU().MapInOrder(

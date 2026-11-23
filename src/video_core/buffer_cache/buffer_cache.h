@@ -2991,8 +2991,8 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
         device_addr = begin - CACHING_PAGESIZE;
     };
     auto expand_end = [&](DAddr add_value) {
-        static constexpr DAddr max_page = 1ULL << Tegra::MaxwellDeviceMemoryManager::AS_BITS;
-        if (add_value > max_page - end) {
+        const DAddr max_page = device_memory.MaxDeviceArea();
+        if (end >= max_page || add_value > max_page - end) {
             end = max_page;
             return;
         }
@@ -3615,7 +3615,10 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     // (Ocarina of Time draws from several channels: descriptors ended up ~100 MiB past 128 KiB
     // buffers and the GPU faulted).
     for (const size_t other_id : active_channel_ids) {
-        BufferCacheChannelInfo& other = channel_storage[other_id];
+        if (!channel_storage[other_id].has_value()) {
+            continue;
+        }
+        BufferCacheChannelInfo& other = *channel_storage[other_id];
         if (&other == channel_state) {
             continue;
         }

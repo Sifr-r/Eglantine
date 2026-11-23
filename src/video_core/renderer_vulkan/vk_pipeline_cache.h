@@ -32,12 +32,15 @@
 
 #include "common/common_types.h"
 #include "common/thread_worker.h"
+#include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/value.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/object_pool.h"
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/runtime_info.h"
+#include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/draw_skip_policy.h"
@@ -118,6 +121,55 @@ struct ShaderPools {
     Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_block{32};
 };
 
+struct DirectSm86CompileResult {
+    bool compiled_direct{};
+    std::vector<u32> spirv;
+    Shader::Info info;
+    Shader::Backend::Bindings bindings;
+};
+
+/// Test hook overriding EDEN_NX2_DIRECT_SM86 (`std::nullopt` restores env-var behavior).
+void SetDirectSm86EnabledOverride(std::optional<bool> enabled) noexcept;
+
+/// Returns whether direct SM86-to-SPIR-V compilation is currently enabled.
+[[nodiscard]] bool IsDirectSm86Enabled() noexcept;
+
+/// Returns whether direct SM86-to-SPIR-V compilation currently supports `stage`.
+[[nodiscard]] bool DirectSm86SupportsStage(Shader::Stage stage) noexcept;
+
+/// Returns true if a graphics pipeline stage is eligible for direct SM86 compilation
+/// (non-paired VertexB or Fragment, without geometry/mesh emulation requirements).
+[[nodiscard]] bool IsDirectSm86GraphicsStageEligible(
+    const Shader::Environment& env, size_t stage_program_index, bool uses_vertex_a,
+    bool mesh_unsupported, bool has_geometry,
+    bool supports_viewport_index_layer = true) noexcept;
+
+/// Attempts direct SM86 SPIR-V compilation on a live ComputeEnvironment/GenericEnvironment before
+/// falling back lazily to LowerToMaxwell + Maxwell CFG/SPIR-V translation.
+[[nodiscard]] DirectSm86CompileResult CompileComputeStageWithLazyFallback(
+    ShaderPools& pools, VideoCommon::GenericEnvironment& env, const Shader::Profile& profile,
+    const Shader::HostTranslateInfo& host_info, u32 max_shared_memory = 0, u64 unique_hash = 0);
+
+/// Same as above for a serialized warm-cache FileEnvironment.
+[[nodiscard]] DirectSm86CompileResult CompileComputeStageWithLazyFallback(
+    ShaderPools& pools, VideoCommon::FileEnvironment& env, const Shader::Profile& profile,
+    const Shader::HostTranslateInfo& host_info, u32 max_shared_memory = 0, u64 unique_hash = 0);
+
+/// Attempts direct SM86 compilation when eligible for a live graphics stage environment before
+/// lazily invoking LowerToMaxwell + Maxwell translation fallback.
+[[nodiscard]] DirectSm86CompileResult CompileGraphicsStageWithLazyFallback(
+    ShaderPools& pools, VideoCommon::GenericEnvironment& env, const Shader::Profile& profile,
+    const Shader::HostTranslateInfo& host_info, const Shader::RuntimeInfo& runtime_info,
+    Shader::Backend::Bindings bindings = {}, size_t stage_program_index = 1,
+    bool uses_vertex_a = false, bool mesh_unsupported = false, bool has_geometry = false);
+
+/// Same as above for a serialized warm-cache FileEnvironment graphics stage.
+[[nodiscard]] DirectSm86CompileResult CompileGraphicsStageWithLazyFallback(
+    ShaderPools& pools, VideoCommon::FileEnvironment& env, const Shader::Profile& profile,
+    const Shader::HostTranslateInfo& host_info, const Shader::RuntimeInfo& runtime_info,
+    Shader::Backend::Bindings bindings = {}, size_t stage_program_index = 1,
+    bool uses_vertex_a = false, bool mesh_unsupported = false, bool has_geometry = false);
+
 struct ComputePipelineVariant {
     std::unique_ptr<ComputePipeline> pipeline;
     std::vector<std::pair<u32, u32>> null_pointer_slots;
@@ -173,6 +225,10 @@ public:
 
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
+
+protected:
+    void OnDebugRejectionsRefreshed(bool unrejected,
+                                    std::span<const u64> dropped_hashes) override;
 
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath(bool is_indexed);

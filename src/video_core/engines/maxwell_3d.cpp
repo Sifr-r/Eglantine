@@ -20,6 +20,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "core/core_timing.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -2296,8 +2297,8 @@ bool Maxwell3D::FrontDmaReadEarly(VideoCommon::GpuSplit& split, FrontState& fs, 
                                   u32 method, GPUVAddr source, u32 ram, u32 words) {
     namespace Profile = VideoCommon::Nx2Profile;
     const u64 bytes = u64{words} * sizeof(u32);
-    const bool sparse = source < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed) &&
-                        Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) < source + bytes;
+    const auto nx2_session = memory_manager.System().Nx2Session();
+    const bool sparse = nx2_session && nx2_session->SparseState().OverlapsSpan(source, bytes);
     if (words == 0 || sparse) {
         return false;
     }
@@ -2384,8 +2385,10 @@ bool Maxwell3D::FrontDmaReadEarly(VideoCommon::GpuSplit& split, FrontState& fs, 
         // it and its result landed. The words in memory are then what a drained read sees.
         const auto [range_begin, range_size] = read_ranges[i];
         if (const u64 async_position = split.HasAsyncWrite(range_begin, range_size);
-            async_position != 0 && (async_position > consumed_now ||
-                                    !Tegra::Nx2AsyncReportsSettled(range_begin, range_size))) {
+            async_position != 0 &&
+            (async_position > consumed_now ||
+             (nx2_session &&
+              !nx2_session->AreAsyncReportsSettled(range_begin, range_size)))) {
             return false;
         }
     }

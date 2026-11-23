@@ -25,6 +25,8 @@
 #include "common/literals.h"
 #include "common/settings.h"
 
+#include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -180,23 +182,25 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 // A large image over Switch 2 sparse blocks nobody has written (title 1's terrain layer pools, 2.9
 // GB of R8/RG16/R16 that stay empty in the attract demo) is all zeros: it gets no device memory
 // until a write makes the texture cache replace it.
-[[nodiscard]] bool IsUnwrittenSparse(const Device& device, const ImageInfo& info, GPUVAddr gpu_addr) {
-    if (!device.CanUseUnbackedSparseImages()) {
+[[nodiscard]] bool IsUnwrittenSparse(const Device& device, const Core::Nx2SessionState* session,
+                                     const ImageInfo& info, GPUVAddr gpu_addr) {
+    if (session == nullptr || !device.CanUseUnbackedSparseImages()) {
         return false;
     }
     constexpr u32 MinSize = 32U << 20;
     const u64 size = VideoCommon::CalculateGuestSizeInBytes(info);
     return size >= MinSize && info.type != ImageType::e1D && info.type != ImageType::Buffer &&
-           info.type != ImageType::Linear && Tegra::Nx2SparseUnwritten(gpu_addr, size);
+           info.type != ImageType::Linear && session->SparseState().Unwritten(gpu_addr, size);
 }
 
 // A large color array in a Switch 2 sparse region (title 1's terrain arrays: 13-26% of their
 // blocks written) gets memory by layer, as its layers are written: unbacked at first, then
 // Image::BindLayers. Only formats uploaded layer by layer: huge ASTC arrays (GPU decode) and
 // formats the host samples as they are.
-[[nodiscard]] bool UsesSparseLayers(const Device& device, const ImageInfo& info, GPUVAddr gpu_addr) {
-    if (!device.CanUseUnbackedSparseImages() || !device.IsSparseResidencyImage2DSupported() ||
-        info.type != ImageType::e2D ||
+[[nodiscard]] bool UsesSparseLayers(const Device& device, const Core::Nx2SessionState* session,
+                                    const ImageInfo& info, GPUVAddr gpu_addr) {
+    if (session == nullptr || !device.CanUseUnbackedSparseImages() ||
+        !device.IsSparseResidencyImage2DSupported() || info.type != ImageType::e2D ||
         info.resources.layers <= 1 || info.num_samples != 1 ||
         VideoCore::Surface::GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture) {
         return false;
@@ -207,7 +211,7 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
          (!IsPixelFormatBCn(info.format) || device.IsOptimalBcnSupported()) &&
          (!IsPixelFormatETC2(info.format) || device.IsOptimalEtc2Supported()));
     const u64 size = VideoCommon::CalculateGuestSizeInBytes(info);
-    return layer_uploads && size >= (32U << 20) && Tegra::Nx2InSparseRegion(gpu_addr, size);
+    return layer_uploads && size >= (32U << 20) && session->SparseState().InRegion(gpu_addr, size);
 }
 
 // How SparseTiles images leave the blocks without data: unbound (reads give zero), or all bound to
@@ -239,10 +243,11 @@ enum class SparseTilesMode {
 
 // Large NX2 masks and BC6H lightmap arrays get memory by sparse block where guest memory
 // is mapped. A whole BC6H layer can cost 85 MiB even if only a few guest tiles are present.
-[[nodiscard]] bool UsesSparseTiles(const Device& device, const ImageInfo& info, GPUVAddr gpu_addr) {
+[[nodiscard]] bool UsesSparseTiles(const Device& device, const Core::Nx2SessionState* session,
+                                   const ImageInfo& info, GPUVAddr gpu_addr) {
     const auto mode = SparseTilesModeOf(device);
-    if (mode == SparseTilesMode::None || info.type != ImageType::e2D || info.num_samples != 1 ||
-        info.size.depth != 1 || info.block.width != 0 ||
+    if (session == nullptr || mode == SparseTilesMode::None || info.type != ImageType::e2D ||
+        info.num_samples != 1 || info.size.depth != 1 || info.block.width != 0 ||
         VideoCore::Surface::GetFormatType(info.format) !=
             VideoCore::Surface::SurfaceType::ColorTexture) {
         return false;
@@ -256,7 +261,7 @@ enum class SparseTilesMode {
                            mode == SparseTilesMode::Unbound && device.IsOptimalBcnSupported();
     const u64 size = VideoCommon::CalculateGuestSizeInBytes(info);
     return (plain_image || hdr_array) && size >= (32U << 20) &&
-           Tegra::Nx2InSparseRegion(gpu_addr, size);
+           session->SparseState().InRegion(gpu_addr, size);
 }
 
 // Vulkan's standard sparse block shape for single-sampled 2D images (64 KiB blocks), in texel
@@ -3015,6 +3020,10 @@ void TextureCacheRuntime::RecycleImage(Image& image, u64 completed_tick) {
     }
 }
 
+std::shared_ptr<Core::Nx2SessionState> TextureCacheRuntime::Nx2Session() const {
+    return system != nullptr ? system->Nx2Session() : nullptr;
+}
+
 void TextureCacheRuntime::TickFrame() {
     if (PlainGpuUnswizzleEnabled()) {
         static const bool log_plain = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
@@ -3095,9 +3104,13 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
       runtime{&runtime_}, aspect_mask(ImageAspectMask(info.format)) {
     const auto host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
-    const bool unbacked = UsesSparseLayers(runtime_.device, info, gpu_addr_) ||
-                          UsesSparseTiles(runtime_.device, info, gpu_addr_) ||
-                          IsUnwrittenSparse(runtime_.device, info, gpu_addr_);
+    const auto nx2_session = runtime_.Nx2Session();
+    const bool uses_sparse_layers =
+        UsesSparseLayers(runtime_.device, nx2_session.get(), info, gpu_addr_);
+    const bool uses_sparse_tiles =
+        UsesSparseTiles(runtime_.device, nx2_session.get(), info, gpu_addr_);
+    const bool unbacked = uses_sparse_layers || uses_sparse_tiles ||
+                          IsUnwrittenSparse(runtime_.device, nx2_session.get(), info, gpu_addr_);
     if (!unbacked) {
         original_image = runtime_.AcquireImageAllocation(host_info);
     }
@@ -3110,16 +3123,16 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    : runtime->ViewFormats(info.format),
                                AstcHostFormat(runtime_.device, info),
                                unbacked,
-                               UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
+                               uses_sparse_tiles &&
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased);
     }
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
         const u64 texels = u64{host_info.size.width} * host_info.size.height *
                            host_info.size.depth * static_cast<u64>(host_info.resources.layers);
-        if (UsesSparseTiles(runtime_.device, info, gpu_addr_) && InitSparseTiles()) {
+        if (uses_sparse_tiles && InitSparseTiles()) {
             flags |= VideoCommon::ImageFlagBits::SparseTiles;
-        } else if (UsesSparseLayers(runtime_.device, info, gpu_addr_) && InitSparseLayers()) {
+        } else if (uses_sparse_layers && InitSparseLayers()) {
             flags |= VideoCommon::ImageFlagBits::SparseLayers;
         } else if (texels <= (u64{1} << 28)) {
             // Not too big to back (see MemoryAllocator::CreateImage): unbacked because nothing

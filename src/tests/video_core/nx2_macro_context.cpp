@@ -256,15 +256,15 @@ TEST_CASE("NativeMacroContext is shared across channels and isolated per session
 
     DummyEmuWindow window;
     Core::System system;
-    system.Initialize();
-    system.Kernel().Initialize();
     SCOPE_EXIT {
         system.ShutdownMainProcess();
     };
 
     SECTION("Two channels in one Switch 2 session share NativeMacroContext") {
+        system.Initialize();
         REQUIRE(ResolveAndApplyProfile(system, sw2_main_1, Sw2Tid1).resolution ==
                 Core::PlatformResolution::ConfirmedSwitch2);
+        system.Kernel().Initialize();
 
         auto host1x = std::make_unique<Tegra::Host1x::Host1x>(system);
         std::optional<Tegra::GPU> gpu;
@@ -318,8 +318,10 @@ TEST_CASE("NativeMacroContext is shared across channels and isolated per session
         constexpr u32 StartSlot = 3;
 
         {
+            system.Initialize();
             REQUIRE(ResolveAndApplyProfile(system, sw2_main_1, Sw2Tid1).resolution ==
                     Core::PlatformResolution::ConfirmedSwitch2);
+            system.Kernel().Initialize();
 
             auto host1x = std::make_unique<Tegra::Host1x::Host1x>(system);
             std::optional<Tegra::GPU> gpu;
@@ -352,11 +354,11 @@ TEST_CASE("NativeMacroContext is shared across channels and isolated per session
         CHECK_FALSE(Settings::CurrentProgramIsSwitch2());
 
         system.Initialize();
-        system.Kernel().Initialize();
 
         {
             REQUIRE(ResolveAndApplyProfile(system, sw2_main_2, Sw2Tid2).resolution ==
                     Core::PlatformResolution::ConfirmedSwitch2);
+            system.Kernel().Initialize();
 
             auto host1x = std::make_unique<Tegra::Host1x::Host1x>(system);
             std::optional<Tegra::GPU> gpu;
@@ -378,8 +380,10 @@ TEST_CASE("NativeMacroContext is shared across channels and isolated per session
     }
 
     SECTION("Switch 1 session does not allocate NativeMacroContext") {
+        system.Initialize();
         REQUIRE(ResolveAndApplyProfile(system, sw1_main, Sw1Tid).resolution ==
                 Core::PlatformResolution::ConfirmedSwitch1);
+        system.Kernel().Initialize();
 
         auto host1x = std::make_unique<Tegra::Host1x::Host1x>(system);
         std::optional<Tegra::GPU> gpu;

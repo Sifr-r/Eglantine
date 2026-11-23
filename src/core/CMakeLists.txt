@@ -28,6 +28,8 @@ add_library(core STATIC
     cpu_manager.h
     launch_params.cpp
     launch_params.h
+    nx2_session_state.cpp
+    nx2_session_state.h
     platform_profile.cpp
     platform_profile.h
     crypto/aes_util.cpp

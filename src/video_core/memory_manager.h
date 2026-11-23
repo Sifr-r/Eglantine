@@ -34,6 +34,7 @@ class RasterizerInterface;
 
 namespace Core {
 class System;
+struct PlatformProfile;
 } // namespace Core
 
 namespace Tegra {
@@ -60,6 +61,10 @@ public:
         return native_tiling;
     }
     bool IsShuttingDown() const;
+    [[nodiscard]] const Core::PlatformProfile& Platform() const;
+    [[nodiscard]] Core::System& System() const noexcept {
+        return system;
+    }
 
     static constexpr bool HAS_FLUSH_INVALIDATION = true;
 

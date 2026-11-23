@@ -16,6 +16,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/control/channel_state.h"
@@ -180,9 +181,11 @@ bool AcquireEarly(DmaPusher& dma_pusher, GPUVAddr address, const auto& matches) 
         ++stats.declined_gpu_written;
         return false;
     }
+    const auto nx2_session = dma_pusher.system.Nx2Session();
     if (const u64 async_position = split.HasAsyncWrite(slot_begin, slot_end - slot_begin);
         async_position != 0 && (async_position > consumed_now ||
-                                !Tegra::Nx2AsyncReportsSettled(slot_begin, slot_end - slot_begin))) {
+                                (nx2_session && !nx2_session->AreAsyncReportsSettled(
+                                                    slot_begin, slot_end - slot_begin)))) {
         ++stats.declined_async;
         return false;
     }
@@ -236,14 +239,17 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     }
     namespace Profile = VideoCommon::Nx2Profile;
     Profile::Add(Profile::Counter::AcquirePolls, 1);
+    const auto nx2_session = dma_pusher.system.Nx2Session();
+    const bool latched = nx2_session && nx2_session->SemaphoreWaiters().Latched(this);
     const bool met = PollAcquire(dma_pusher);
     if (met) {
         Profile::Add(Profile::Counter::AcquirePollsMet, 1);
-        if (Nx2PendingWake::verify_resume) [[unlikely]] {
+        if (Nx2PendingWake::verify_resume) {
             // pending_wake (Verify): a resume after a wake must still be met or latched.
             DrainBack(VideoCommon::DrainSite::AcquirePoll);
             const u32 word = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
-            if (!pending_acquire->Matches(word) && !Nx2SemaphoreWaiters::Get().Latched(this)) {
+            if (!pending_acquire->Matches(word) && !latched &&
+                !(nx2_session && nx2_session->SemaphoreWaiters().Latched(this))) {
                 const u64 count = Nx2PendingWake::verify_unmet.fetch_add(1) + 1;
                 if (count <= 64) {
                     LOG_ERROR(HW_GPU,
@@ -262,14 +268,18 @@ bool Puller::PollAcquire(DmaPusher& dma_pusher) {
     // A latched release resumes the channel whatever the word holds now: only the log below
     // reads it, so drain for it only while that log is still printing.
     static std::atomic<u32> rescued{};
-    if (Nx2SemaphoreWaiters::Get().Latched(this) && rescued.load(std::memory_order_relaxed) >= 64) {
+    const auto nx2_session = dma_pusher.system.Nx2Session();
+    const auto is_latched = [this, &nx2_session] {
+        return nx2_session && nx2_session->SemaphoreWaiters().Latched(this);
+    };
+    if (is_latched() && rescued.load(std::memory_order_relaxed) >= 64) {
         return true;
     }
     // The release may still be queued for the split GPU thread's back half (and the caches
     // ReadSemaphoreWord asks are its state).
     DrainBack(VideoCommon::DrainSite::AcquirePoll);
     const u32 current = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
-    if (Nx2SemaphoreWaiters::Get().Latched(this)) {
+    if (is_latched()) {
         if (!pending_acquire->Matches(current) && rescued.fetch_add(1) < 64) {
             LOG_INFO(HW_GPU, "Channel {} met semaphore {:#x} value {:#x} at its release (now {:#x})",
                      dma_pusher.channel_state.bind_id, pending_acquire->address,
@@ -291,7 +301,7 @@ bool Puller::PollAcquire(DmaPusher& dma_pusher) {
         delayed && now - pending_acquire->last_fences >= std::chrono::milliseconds{1}) {
         pending_acquire->last_fences = now;
         ReleaseFences(dma_pusher);
-        if (Nx2SemaphoreWaiters::Get().Latched(this) ||
+        if (is_latched() ||
             pending_acquire->Matches(ReadSemaphoreWord(dma_pusher, pending_acquire->address))) {
             return true;
         }
@@ -323,7 +333,9 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     if (pending_acquire) {
         pending_acquire.reset();
         dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
-        Nx2SemaphoreWaiters::Get().Remove(this);
+    if (const auto nx2_session = dma_pusher.system.Nx2Session()) {
+        nx2_session->SemaphoreWaiters().Remove(this);
+    }
     }
     return true;
 }
@@ -347,7 +359,8 @@ void Puller::ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_c
         engine = static_cast<u32>(EngineID::MAXWELL_DMA_COPY_A);
         break;
     case 0x0:
-        if (g_nx2_ampere) {
+        if (const auto nx2_session = dma_pusher.system.Nx2Session();
+            nx2_session && nx2_session->IsAmpere()) {
             LOG_DEBUG(HW_GPU, "Switch 2 unbinds subchannel {}", method_call.subchannel);
             return;
         }
@@ -422,15 +435,18 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                  regs.semaphore_address.SemaphoreAddress(), regs.semaphore_sequence,
                  dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress()));
     }
+    const auto nx2_session = dma_pusher.system.Nx2Session();
+    const bool is_ampere = nx2_session && nx2_session->IsAmpere();
     if (op == GpuSemaphoreOperation::WriteLong) {
         const GPUVAddr sequence_address{regs.semaphore_address.SemaphoreAddress()};
         const u32 payload = regs.semaphore_sequence;
         // RELEASE_SIZE (bit 24) set means a 4-byte release without the timestamp; writing 16
         // bytes there clobbers the words next to it (Switch 2 packs semaphores tightly).
-        const auto properties = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0
+        const auto properties = is_ampere && (regs.semaphore_trigger & (1U << 24)) != 0
                                     ? VideoCommon::QueryPropertiesFlags::IsAFence
                                     : VideoCommon::QueryPropertiesFlags::HasTimeout;
-        const GPUVAddr mirror = g_nx2_ampere ? Nx2SemaphoreMirror(sequence_address) : 0;
+        const GPUVAddr mirror =
+            is_ampere ? nx2_session->SemaphoreRegions().Mirror(sequence_address) : 0;
         if (mirror != 0) {
             LOG_DEBUG(HW_GPU, "Switch 2 semaphore {:#x}={:#x} mirrored to {:#x}", sequence_address, payload, mirror);
             VideoCommon::GpuSplit::Get().NoteWrite(dma_pusher.memory_manager, mirror, 16);
@@ -453,7 +469,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 split.NoteAsyncWrite(*device, 16);
             }
         }
-    } else if (g_nx2_ampere) {
+    } else if (is_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
         // written the commands this channel runs next: suspend the channel until the value is
         // met instead of reading ahead (approach from changes.patch).
@@ -530,7 +546,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         }
         // Registered before the fences run, so a release among them that meets the value counts
         // even if a later one overwrites it.
-        auto& waiters = Nx2SemaphoreWaiters::Get();
+        auto& waiters = nx2_session->SemaphoreWaiters();
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
             waiters.Add(this, *device, acquire.value, acquire.operation);
         }
@@ -697,13 +713,15 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     }
     case BufferMethods::SemaphoreAcquire: {
         // On Ampere host classes 0x17..0x1A are SEM_ADDR_LO/HI and SEM_PAYLOAD_LO/HI.
-        if (!g_nx2_ampere) {
+        if (const auto nx2_session = dma_pusher.system.Nx2Session();
+            !nx2_session || !nx2_session->IsAmpere()) {
             ProcessSemaphoreAcquire(dma_pusher);
         }
         break;
     }
     case BufferMethods::SemaphoreRelease: {
-        if (g_nx2_ampere) {
+        if (const auto nx2_session = dma_pusher.system.Nx2Session();
+            nx2_session && nx2_session->IsAmpere()) {
             ProcessSemaphoreExecute(dma_pusher, method_call.argument);
         } else {
             ProcessSemaphoreRelease(dma_pusher);
@@ -717,9 +735,12 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
     }
     default:
         LOG_ERROR(HW_GPU, "Special puller engine method {:X} not implemented", method);
-        if (static bool dumped = false; g_nx2_ampere && !dumped) {
-            dumped = true;
-            dma_pusher.DumpCurrentEntry("unknown host method");
+        if (static bool dumped = false; !dumped) {
+            if (const auto nx2_session = dma_pusher.system.Nx2Session();
+                nx2_session && nx2_session->IsAmpere()) {
+                dumped = true;
+                dma_pusher.DumpCurrentEntry("unknown host method");
+            }
         }
         break;
     }

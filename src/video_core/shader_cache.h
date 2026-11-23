@@ -42,8 +42,16 @@ class GenericEnvironment;
 struct ShaderInfo {
     u64 unique_hash{};
     size_t size_bytes{};
-    /// Lowered code of a native program, reused when its pipelines are built.
+    /// Captured native program and shared lazy-lowering state, reused across pipelines.
     std::shared_ptr<const LoweredNativeCode> lowered_native;
+
+    [[nodiscard]] u64 NativeProgramKey() const noexcept {
+        return lowered_native ? lowered_native->native_program_key : 0;
+    }
+
+    [[nodiscard]] bool HasNativeCode() const noexcept {
+        return lowered_native && !lowered_native->native_code.empty();
+    }
 };
 
 class ShaderCache : public VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
@@ -123,6 +131,16 @@ protected:
     void GetGraphicsEnvironments(GraphicsEnvironments& result,
                                  const std::array<u64, NUM_PROGRAMS>& unique_hashes);
 
+    /// Called after debug rejections are updated so pipeline caches can evict affected/failed pipelines.
+    virtual void OnDebugRejectionsRefreshed([[maybe_unused]] bool unrejected,
+                                            [[maybe_unused]] std::span<const u64> dropped_hashes) {}
+
+    /// Evicts a cached ShaderInfo entry whose lazy SM86 lowering failed so it does not wedge.
+    bool EvictFailedLazyShader(const ShaderInfo* target);
+
+    /// Evicts all cached ShaderInfo entries whose lazy SM86 lowering failed.
+    size_t EvictFailedLazyShaders();
+
     std::array<const ShaderInfo*, NUM_PROGRAMS> shader_infos{};
     bool last_shaders_valid = false;
     /// Nx2Perf MacroReadWriterSet: Tegra::g_nx2_code_epoch read before shader_infos were last
@@ -133,6 +151,7 @@ protected:
 
 private:
     friend struct ShaderCacheTestAccess;
+    friend struct AmpereLazyLoweringTestAccess;
 
     /// @brief Tries to obtain a cached shader starting in a given address
     /// @note Doesn't check for ranges, the given address has to be the start of the shader

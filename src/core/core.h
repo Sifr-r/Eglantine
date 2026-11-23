@@ -129,6 +129,7 @@ class Debugger;
 class DeviceMemory;
 class ExclusiveMonitor;
 class GPUDirtyMemoryManager;
+class Nx2SessionState;
 class PerfStats;
 class Reporter;
 class SpeedLimiter;
@@ -415,6 +416,16 @@ public:
 
     /// Overrides the active platform profile (used by unit tests).
     void SetPlatformProfile(PlatformProfile profile);
+
+    /// Initializes Host1x and GPU without starting HLE services or guest CPU threads (used by unit tests).
+    void InitializeGpuForTesting(Frontend::EmuWindow& emu_window);
+
+    /// Returns the Switch 2 session state when running a Switch 2 session, or creates and
+    /// attaches one on demand when permitted by the active platform policy.
+    [[nodiscard]] std::shared_ptr<Nx2SessionState> EnsureNx2Session();
+
+    /// Returns the Switch 2 session state when running a Switch 2 session, or nullptr on Switch 1.
+    [[nodiscard]] std::shared_ptr<Nx2SessionState> Nx2Session() const;
 
     /// Tells if the system debugger is enabled.
     [[nodiscard]] bool DebuggerEnabled() const;

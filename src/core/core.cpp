@@ -35,6 +35,8 @@
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_concat.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
+#include "core/nx2_session_state.h"
 #include "core/platform_profile.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hle/kernel/k_memory_manager.h"
@@ -72,7 +74,9 @@
 #include "hid_core/hid_core.h"
 #include "network/network.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_diag.h"
+#include "video_core/nx2_gpu_latency.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
@@ -134,7 +138,8 @@ bool ReadGuestThreadTicks(void* user, std::vector<VideoCommon::Nx2Spikes::GuestT
     }
     clock = system.CoreTiming().GetClockTicks();
     std::array<std::pair<const Kernel::KThread*, s64>, Hardware::NUM_CPU_CORES> running{};
-    for (size_t core = 0; core < running.size(); ++core) {
+    const size_t active_cores = kernel.ActiveCoreCount();
+    for (size_t core = 0; core < active_cores; ++core) {
         const Kernel::KScheduler& scheduler = kernel.Scheduler(core);
         running[core] = {scheduler.GetSchedulerCurrentThread(), scheduler.GetLastContextSwitchTime()};
     }
@@ -174,6 +179,8 @@ struct System::Impl {
           reporter{system}, applet_manager{system}, frontend_applets{system}, profile_manager{} {}
 
     ~Impl() {
+        TeardownSubsystems();
+        EndNx2Session();
         // The kernel's slab objects live in the guest RAM arena. The member destructors below
         // free that arena before the kernel is destroyed, so the kernel's object list has to
         // be emptied while the arena is still alive.
@@ -183,6 +190,7 @@ struct System::Impl {
     u64 program_id;
 
     void Initialize(System& system) {
+        SetShuttingDown(false);
         device_memory.emplace();
 
         is_multicore = Settings::values.use_multi_core.GetValue();
@@ -204,7 +212,9 @@ struct System::Impl {
 
         auto const is_async_gpu = Settings::values.use_asynchronous_gpu_emulation.GetValue();
 
+        kernel.SetActiveCoreCount(platform_profile.cpu_cores);
         kernel.SetMulticore(is_multicore);
+        cpu_manager.SetActiveCoreCount(platform_profile.cpu_cores);
         cpu_manager.SetMulticore(is_multicore);
         cpu_manager.SetAsyncGpu(is_async_gpu);
     }
@@ -378,11 +388,16 @@ struct System::Impl {
             file != nullptr ? Loader::GetLoader(system, file, params.program_id, params.program_index)
                             : nullptr;
 
+        SetShuttingDown(false);
         platform_profile = ResolvePlatformProfile(
             system, loader.get(), ParsePlatformOverride(std::getenv("EDEN_NX2_PLATFORM")));
-        LOG_INFO(Core, "Platform profile: {} (cntfrq={} Hz)",
-                 PlatformResolutionName(platform_profile.resolution), platform_profile.guest_cntfrq);
+        LOG_INFO(Core, "Platform profile: {} (cntfrq={} Hz, cores={}, daddr={} bits)",
+                 PlatformResolutionName(platform_profile.resolution), platform_profile.guest_cntfrq,
+                 platform_profile.cpu_cores, platform_profile.device_address_bits);
 
+        kernel.SetActiveCoreCount(platform_profile.cpu_cores);
+        cpu_manager.SetActiveCoreCount(platform_profile.cpu_cores);
+        SyncNx2SessionToPlatformProfile();
         Settings::SetCurrentProgramIsSwitch2(platform_profile.IsSwitch2());
         Settings::SetAstcRecompressionOverride(std::nullopt);
 
@@ -510,11 +525,10 @@ struct System::Impl {
         return SystemResultStatus::Success;
     }
 
-    void ShutdownMainProcess() {
+    void TeardownSubsystems() {
         VideoCommon::Nx2Spikes::SetGuestThreadSource({});
         debug_service.reset();
         SetShuttingDown(true);
-        Common::ADPF::Shutdown();
 
         // Reset per-game flags
         Settings::values.use_squashed_iterated_blend = false;
@@ -522,21 +536,26 @@ struct System::Impl {
         is_powered_on = false;
         exit_locked = false;
         exit_requested = false;
-        if (gpu_core)
+        if (gpu_core) {
             gpu_core->NotifyShutdown();
+        }
 
         stop_event.request_stop();
         // Keep the timer thread paused for the whole teardown: it is the thread that runs the
         // timing event callbacks, and those callbacks reach into the services, the guest
         // processes and the cheat engine that are destroyed below.
         core_timing.SyncPause(true);
-        Network::CancelPendingSocketOperations();
-        kernel.SuspendEmulation(true);
+        const bool kernel_initialized = kernel.IsInitialized();
+        if (kernel_initialized) {
+            kernel.SuspendEmulation(true);
+        }
         // The cheat engine's event callback dereferences the guest process, so it has to go
         // before the kernel releases the processes.
         cheat_engine.reset();
-        kernel.CloseServices();
-        kernel.ShutdownCores();
+        if (kernel_initialized) {
+            kernel.CloseServices();
+            kernel.ShutdownCores();
+        }
         services.reset();
         service_manager.reset();
         fs_controller.Reset();
@@ -548,17 +567,25 @@ struct System::Impl {
         perf_stats.reset();
         cpu_manager.Shutdown();
         debugger.reset();
-        kernel.Shutdown();
+        if (kernel_initialized) {
+            kernel.Shutdown();
+        }
         stop_event = {};
+
+        // Reset all glue registrations
+        arp_manager.ResetAll();
+    }
+
+    void ShutdownMainProcess() {
+        Common::ADPF::Shutdown();
+        Network::CancelPendingSocketOperations();
+        TeardownSubsystems();
         Network::RestartSocketOperations();
 
         if (auto room_member = Network::GetRoomMember().lock()) {
             Network::GameInfo game_info{};
             room_member->SendGameInfo(game_info);
         }
-
-        // Reset all glue registrations
-        arp_manager.ResetAll();
 
         // The guest RAM section keeps every page the game touched until it is destroyed (up to
         // 12 GiB), and the next Load reuses it. Switch 2 only: Switch 1 keeps its behaviour.
@@ -567,7 +594,12 @@ struct System::Impl {
             device_memory.reset();
         }
         platform_profile = MakePlatformProfile(PlatformResolution::DefaultSwitch1);
-        Settings::SetCurrentProgramIsSwitch2(false);
+        kernel.SetActiveCoreCount(platform_profile.cpu_cores);
+        cpu_manager.SetActiveCoreCount(platform_profile.cpu_cores);
+        EndNx2Session();
+        if (!Nx2SessionState::HasActiveSessions()) {
+            Settings::SetCurrentProgramIsSwitch2(false);
+        }
 
         LOG_DEBUG(Core, "Shutdown OK");
     }
@@ -642,6 +674,10 @@ struct System::Impl {
     std::unique_ptr<FileSys::ContentProviderUnion> content_provider;
     /// Platform profile resolved for the current session
     PlatformProfile platform_profile{MakePlatformProfile(PlatformResolution::DefaultSwitch1)};
+    /// Switch 2 per-session state (nullptr on Switch 1 sessions)
+    mutable std::mutex nx2_session_mutex;
+    std::shared_ptr<Nx2SessionState> nx2_session;
+    std::atomic<bool> has_nx2_session{false};
     /// AppLoader used to load the current executing application
     std::unique_ptr<Loader::AppLoader> app_loader;
     std::stop_source stop_event;
@@ -664,6 +700,45 @@ struct System::Impl {
             general_channel_context.emplace(system, "GeneralChannel");
             general_channel_event.emplace(*general_channel_context);
         }
+    }
+
+    void SyncNx2SessionToPlatformProfile() {
+        EndNx2Session();
+        if (!platform_profile.IsSwitch2()) {
+            return;
+        }
+        auto next = Nx2SessionState::Create();
+        next->SetAmpere(true);
+        std::scoped_lock lock{nx2_session_mutex};
+        nx2_session = std::move(next);
+        has_nx2_session.store(true, std::memory_order_release);
+    }
+
+    void EndNx2Session() {
+        std::shared_ptr<Nx2SessionState> previous;
+        {
+            std::scoped_lock lock{nx2_session_mutex};
+            has_nx2_session.store(false, std::memory_order_release);
+            previous = std::exchange(nx2_session, nullptr);
+        }
+        if (previous) {
+            previous->Retire();
+        }
+        if (!Nx2SessionState::HasActiveSessions()) {
+            ResetLegacyNx2ProcessGlobals();
+        }
+    }
+
+    static void ResetLegacyNx2ProcessGlobals() {
+        Service::Nvidia::Devices::g_nx2_driver.store(false, std::memory_order_release);
+        Tegra::g_nx2_ampere.store(false, std::memory_order_release);
+        g_nx2_present_count.store(0, std::memory_order_release);
+        Tegra::Nx2ClearSemaphoreRegions();
+        Tegra::Nx2ClearSparseRegions();
+        Tegra::Nx2ClearGpuWrittenPages();
+        Tegra::Nx2ClearAsyncReports();
+        Service::Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Reset();
+        VideoCommon::Nx2GpuLatency::Reset();
     }
 };
 
@@ -1057,7 +1132,62 @@ const PlatformProfile& System::Platform() const {
 }
 
 void System::SetPlatformProfile(PlatformProfile profile) {
+    if (impl->kernel.IsInitialized()) {
+        LOG_ERROR(Core, "Ignoring SetPlatformProfile after KernelCore initialization");
+        return;
+    }
     impl->platform_profile = profile;
+    impl->kernel.SetActiveCoreCount(profile.cpu_cores);
+    impl->cpu_manager.SetActiveCoreCount(profile.cpu_cores);
+    if (impl->host1x_core.has_value()) {
+        impl->host1x_core->MemoryManager().SetDeviceAddressBits(profile.device_address_bits);
+    }
+    impl->SyncNx2SessionToPlatformProfile();
+}
+
+void System::InitializeGpuForTesting(Frontend::EmuWindow& emu_window) {
+    if (!impl->device_memory.has_value()) {
+        impl->device_memory.emplace();
+    }
+    if (!impl->host1x_core.has_value()) {
+        impl->host1x_core.emplace(*this);
+    }
+    if (!impl->gpu_core.has_value()) {
+        VideoCore::CreateGPU(impl->gpu_core, emu_window, *this);
+    }
+    impl->is_powered_on.store(true, std::memory_order_relaxed);
+}
+
+std::shared_ptr<Nx2SessionState> System::EnsureNx2Session() {
+    if (impl->has_nx2_session.load(std::memory_order_acquire)) {
+        std::scoped_lock lock{impl->nx2_session_mutex};
+        if (impl->nx2_session) {
+            return impl->nx2_session;
+        }
+    }
+    std::scoped_lock lock{impl->nx2_session_mutex};
+    if (impl->nx2_session) {
+        return impl->nx2_session;
+    }
+    if (!impl->platform_profile.IsSwitch2() &&
+        !impl->platform_profile.allow_contradictory_nx2_gpu_query) {
+        return {};
+    }
+    auto session = Nx2SessionState::Create();
+    if (impl->platform_profile.IsSwitch2()) {
+        session->SetAmpere(true);
+    }
+    impl->nx2_session = session;
+    impl->has_nx2_session.store(true, std::memory_order_release);
+    return session;
+}
+
+std::shared_ptr<Nx2SessionState> System::Nx2Session() const {
+    if (!impl->has_nx2_session.load(std::memory_order_acquire)) {
+        return {};
+    }
+    std::scoped_lock lock{impl->nx2_session_mutex};
+    return impl->nx2_session;
 }
 
 bool System::DebuggerEnabled() const {

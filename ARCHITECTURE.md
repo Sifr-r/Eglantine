@@ -95,6 +95,43 @@ convention.
   `nvhost_ctrl_gpu::GetCharacteristics3` fails closed (`NvResult::NotSupported`) on contradictory
   `0xD0` Switch 2 queries under `ConfirmedSwitch1`/`OverrideSwitch1`, and warns-and-allows under
   `DefaultSwitch1` (missing `main.npdm`); covered by `src/tests/core/platform_profile.cpp`.
+* **Session-owned Switch 2 state (`Core::Nx2SessionState` — Milestone 1B).**
+  `src/core/nx2_session_state.{h,cpp}` owns per-session Switch 2 state (`Nx2SemaphoreWaiters`,
+  async report counters, `Nx2GpuMemoryRegistry`, semaphore regions, and sparse state) backed by
+  an immortal heap-allocated `HandleRegistry` (`new HandleRegistry()`, 64-slot fast table plus
+  overflow map, avoiding static destruction order fiasco on exit). `Core::System::EnsureNx2Session()`
+  attaches on demand where permitted by `PlatformProfile::allow_contradictory_nx2_gpu_query`,
+  `Core::System::Nx2Session()` uses an atomic `has_nx2_session` fast-path (returning `nullptr` on
+  Switch 1), `Nx2SessionState::Retire()` clears all session registries/state and detaches handles,
+  and `System::Impl::TeardownSubsystems()` unifies shutdown across `ShutdownMainProcess()` and
+  `~Impl()` (paired with `EndNx2Session()` and legacy global reset when
+  `!Nx2SessionState::HasActiveSessions()`). Migrated callers include `Tegra::MemoryManager::System()`
+  (`src/video_core/memory_manager.{h,cpp}`), GPU engines (`puller.cpp`, `maxwell_3d.cpp`, and
+  `kepler_compute.cpp` with `std::weak_ptr<Core::Nx2SessionState>` on async `SignalFence`
+  callbacks), `nvdrv` (`nvdrv.cpp`, `core/container.cpp`, `devices/nvhost_ctrl_gpu.cpp`,
+  `devices/nvhost_as_gpu.{h,cpp}`), `src/core/hle/service/nx2_gsv.h`, `VideoCommon::TextureCache`
+  (`src/video_core/texture_cache/texture_cache.h`), `Vulkan::TextureCacheRuntime`
+  (`SetSystem()`/`Nx2Session()` in `vk_texture_cache.{h,cpp}` and `vk_rasterizer.cpp`),
+  `VideoCommon::QueryCache` (`query_cache.h`, null-safe with `<= 32`-byte SBO on `CounterReport`),
+  `gpu_split.cpp`, and `null_rasterizer.cpp`; covered by `src/tests/core/nx2_session_state.cpp`.
+* **Dynamic platform sizing (`cpu_cores` & `device_address_bits` — Milestone 1C).**
+  `Core::PlatformProfile` selects `4` active CPU cores and `34`-bit device virtual addressing on
+  Switch 1 versus `6` cores and `36`-bit addressing on Switch 2. `KernelCore::IsInitialized()`
+  gates `System::SetPlatformProfile()` (which propagates `SetDeviceAddressBits` to `host1x_core`
+  pre-init), while `KernelCore` and `CpuManager` default `active_core_count = 4` and ignore
+  post-initialization `SetActiveCoreCount()` mutations. `KProcess`, `KServerSession`, `KThread`,
+  `svc_info.cpp`, `arm_dynarmic_{32,64}.cpp`, and `svc_thread.cpp` (`CreateThread` and
+  `SetThreadCoreMask` validate against the process core mask pre-fold, fold Switch 2 virtual cores
+  `6..7` onto active cores `0..5`, and reject masks that collapse to `0`) honor
+  `ActiveCoreCount()`. `Core::DeviceMemoryManager` (`src/core/device_memory_manager.{h,inc}`)
+  enforces `IsInBounds`, page-crossing `Read<T>`/`Write<T>`, `size == 0`/null `device_inter`
+  guards in `ReadBlock*`/`WriteBlock*`, lock-ordered `SetDeviceAddressBits()` (`counter_guard`
+  across full VA before `mapping_guard`, resetting `DeviceMemoryManagerAllocator` and clearing/resizing
+  `tracked_entries`, `compressed_device_addr`, and `cached_pages`), and bounds/ASID validation in
+  `ApplyOpOnPAddr`/`ApplyOpOnPointer`/`ArmReadTraps`/`UpdatePagesCachedCountNoLock`; paired with
+  `Common::FlatAllocator` (`src/common/address_space.inc`) and `Common::SparseLargeVector`
+  (`src/common/sparse_large_vector.h`) `>=` bounds and `ResizeAndClear` fixes; covered by
+  `src/tests/core/platform_sizing.cpp`.
 * `Core::g_nx2_present_count` is the frame counter the NX2 diagnostics and key scripts use.
 * Guest address arbitration and condition-variable operations serialize wait and wakeup under the
   kernel scheduler lock. A condition-variable signal can move a waiter directly to the mutex
@@ -208,6 +245,20 @@ convention.
   `GetOrCreateNativeMacroContext()` / `GetNativeMacroContext()`, so channels in a Switch 2
   session share one macro RAM without leaking state across sessions or allocating on Switch 1;
   covered by `src/tests/video_core/nx2_macro_context.cpp`.
+* **Channel state bridge (`Tegra::Control::ChannelStateBridge` — Phase 3).**
+  `src/video_core/control/channel_state_bridge.h` defines a trivially copyable non-owning bridge
+  abstracting channel engines (`Maxwell3D`/`KeplerCompute`), memory manager, DMA pusher, and
+  Maxwell3D dirty tables/flags, including native Ampere `GraphicsProgramAddress` (`reserved[0..1]`)
+  and `const` accessor overloads. `VideoCommon::ChannelSetupCaches<P>`
+  (`src/video_core/control/channel_state_cache.{h,inc,cpp}`) stores channels in
+  `std::deque<std::optional<P>>` (resetting slots to `std::nullopt` in `EraseChannel`) and
+  exposes `virtual CreateChannelFromBridge` (enforcing `HasChannelBindings()`, `bind_id >= 0`, and
+  duplicate-channel checks) across `BufferCacheChannelInfo` and `TextureCacheChannelInfo`
+  (`TextureCache::CreateChannelFromBridge`). `Vulkan::StateTracker`
+  (`src/video_core/renderer_vulkan/vk_state_tracker.{h,cpp}`) and `OpenGL::StateTracker`
+  (`src/video_core/renderer_opengl/gl_state_tracker.{h,cpp}`) keep a fast non-null `DirtyFlags*`
+  pointing to `default_flags` when unbound or after `ClearChannel()`; verified by
+  `src/tests/video_core/channel_bridge_parity.cpp`.
 * `VideoCore::MemoryManager` maps guest memory, including the sparse regions Switch 2
   titles use (`Tegra::Nx2Sparse*`).
 * `VideoCore::TextureCache` owns every host image. `ImageBase` carries the per-image
@@ -215,8 +266,10 @@ convention.
   frame counters the render-target predicates read (`RedrawnEveryFrame`,
   `HasRecentPriorFrameOutput`).
 * `VideoCore::PipelineCache` (`src/video_core/renderer_vulkan/vk_pipeline_cache.cpp`) owns
-  the graphics pipeline cache, its disk format (`CACHE_VERSION`, currently 34) and the
-  asynchronous shader build. `src/video_core/renderer_vulkan/draw_skip_policy.h`
+  the graphics pipeline cache, its disk format (`CACHE_VERSION`, currently `35`, matching
+  `WarmCacheVersion = 35`, with `MIN_COMPATIBLE_CACHE_VERSION = 20` on Switch 1 and
+  `MIN_COMPATIBLE_NX2_CACHE_VERSION = 35` on Switch 2; OpenGL shader cache `CACHE_VERSION = 29`)
+  and asynchronous shader build. `src/video_core/renderer_vulkan/draw_skip_policy.h`
   (`EvaluateDrawSkip`) defines the single skip contract shared by `BuiltPipeline`,
   `CanSkipDraw` (async translation), `DeferRuntimeBuild` (build budget), and
   `CanSkipForDiskReplay` / `in_flight_disk_replays` (waiting on in-flight disk replays for
@@ -255,9 +308,19 @@ convention.
   / `Drain` on `OnGpuThread()`, `GPU::RunInOrderSync` on other threads), and
   `ThreadManager::FlushAndInvalidateRegion` delegates invalidation to `InvalidateRegion`.
   `DeviceMemoryManager::CanTrapCpuReads()` (updated in `RegisterProcess`/`UnregisterProcess`
-  via `MaxwellDeviceMethods::HasFastmemArena` and `Memory::HasFastmemArena`) gates
-  `BufferCache::AsyncBufferDownloads()` so NCE, non-fastmem, and reactive-flushing paths
-  fall back to buffer downloads. `Tegra::g_nx2_sparse_backing_mutex` (with in-flight handler
+  via `MaxwellDeviceMethods::HasFastmemArena` and `Memory::HasFastmemArena`) and
+  `Core::PlatformProfile::prefer_async_buffer_downloads` (`true` on Switch 1, `false` on Switch 2)
+  gate `EvaluateAsyncBufferDownloads()` / `EvaluateFlushesOnCpuRead()` / `BufferCache::FlushesOnCpuRead()`
+  (`src/video_core/buffer_cache/buffer_cache_base.h`) while preserving native tiling,
+  `EDEN_NX2_BUFFER_DOWNLOADS=0|1` (logging warnings on unrecognized values via
+  `ParseBufferDownloadsOverride`), NCE/non-fastmem/reactive-flushing fallbacks, and `Preflushable`
+  range rules. `BufferCache` enforces `size == 0` guards (`SynchronizeBuffer`,
+  `DispatchGpuWriteDownloadPolicy`, `EvaluateHasGpuWritesNotDownloadedAtFence`), sorted fence
+  interval union in `EvaluateHasGpuWritesNotDownloadedAtFence`, `device_memory.MaxDeviceArea()`
+  overlap clamping in `ResolveOverlaps` (`src/video_core/buffer_cache/buffer_cache.h`), and
+  `buffer_cache.mutex`-guarded `FlushesOnCpuRead()` checks in `RasterizerVulkan::GetFlushArea`
+  (`vk_rasterizer.cpp`) and `RasterizerOpenGL::GetFlushArea` (`gl_rasterizer.cpp`) (Phase 4,
+  covered by `src/tests/video_core/buffer_download_policy.cpp`). `Tegra::g_nx2_sparse_backing_mutex` (with in-flight handler
   drain in `Nx2SetSparseBacking`) and `QueryCacheLegacy::mutex` use non-recursive
   `std::mutex`. The page-table walk does not share its scratch buffers between calls
   (`MemoryManager::Unmap` and `MemoryManager::FlushCaching` collect their ranges in local
@@ -298,8 +361,30 @@ a change to the wire format has to land in both.
   relayed payload is capped before it is copied, and only members ever receive it.
 
 
-* `Shader::Ampere::LowerToMaxwell` turns a native Switch 2 program into a Maxwell one.
-* `Shader::Ampere::ProgramCaptureState` captures the guest's shader instructions.
+* **Lazy SM86 lowering & direct compute bypass (Phase 2, Option A).** `Shader::Ampere::LowerToMaxwell`
+  turns a native Switch 2 program into a Maxwell one, and `Shader::Ampere::ProgramCaptureState`
+  captures the guest's shader instructions. `GenericEnvironment` / `ShaderCache`
+  (`src/video_core/shader_environment.{h,cpp}`, `src/video_core/shader_cache.{h,cpp}`) capture
+  native SM86 instructions and `NativeProgramKey` before calling `LowerToMaxwell`, making
+  `LowerToMaxwell` thread-safe and lazy with an observable invocation counter
+  (`ResetLowerToMaxwellInvocationCount` / `LowerToMaxwellInvocationCount`). `ComputeNativeDiscoveryHash`
+  and `PackNativeSm86Blob` / `TryUnpackNativeSm86Blob` align warm compute precache entries
+  (`WarmCacheVersion = 35`, `WarmBuilderVersion = 4` in `src/video_core/shader_warm/warm_records.{h,cpp}`
+  and `shader_warm_builder.cpp`) with runtime discovery keys, while `Vulkan::PipelineCache`
+  (`src/video_core/renderer_vulkan/vk_pipeline_cache.{h,cpp}`, `CACHE_VERSION = 35`, OpenGL
+  `CACHE_VERSION = 29`) gates direct compilation via `DirectSm86SupportsStage` (`Compute` only),
+  invokes `TryCompileDirectSm86` before Maxwell CFG/lowering on cold and warm SM86 compute shaders
+  (`0` `LowerToMaxwell` calls), tracks compute `native_key` (`ComputePipeline::NativeKey()` /
+  `BuildsUnoptimized` in `vk_compute_pipeline.{h,cpp}` and `pipeline_optimization.h`), and defers
+  per-stage graphics lowering lazily pending graphics stage support. `ShaderCache` and
+  `Vulkan::PipelineCache::OnDebugRejectionsRefreshed` evict rejected/invalid cached pipelines,
+  `EvictFailedLazyShader` / `EvictFailedLazyShaders` / `TryGetResolved` (null-guarding
+  `gpu_memory`) evict failed lazy `ShaderInfo` entries, `ShaderCache::ComputeNativeKey()` reports
+  bound compute program keys, and `rust/crates/ampere_spirv/src/ffi.rs` populates `out.error` /
+  `out.error_len` on hard error paths (`rc == -1` / unexpected empty SPIR-V) while keeping
+  `out.error == nullptr` / `out.error_len == 0` on graceful `FallbackToMaxwell`; covered by
+  `src/tests/video_core/ampere_lazy_lowering.cpp`, `ampere_direct_spirv.cpp`, `shader_precache.cpp`,
+  and `shader_precache_identity.cpp`.
 
 ### `input_common` — controllers
 
@@ -569,6 +654,13 @@ These are known and deliberately not fixed by the P0 pass; each one names its ow
 * The Windows MSVC build produced `tests.exe`, `eden-cli.exe` and `eglantine.exe`.
   That run passed 587 Catch2 test cases (75,251,757 assertions) and all seven tests in
   `tools/ci/test_check_release_paths.py`.
+* Post-Milestones 1B–4 verification rebuilt `eglantine.exe`, `eden-cli.exe`, and `tests.exe` cleanly
+  and passed Catch2 `--rng-seed 1488805709` (`671` test cases, `75,395,401` assertions), fresh
+  seed `1091285838` (`671` cases, `75,395,401` assertions), `[ampere]` (`79` cases, `67,380`
+  assertions), targeted Milestones 1B–4 tags (`35` cases, `12,194` assertions), `cargo test`
+  (`28` Rust tests across `parity_tests`, `ampere_spirv`, `spirv_tests`, `nup_tests`,
+  `protocol_tests`), `tools/ci` unittest (`21` tests, `1` skipped), `check_release_paths.py`,
+  and `license-header.sh --check` / `git diff --check`.
 
 ### Recorded Test Coverage Expansion Verification
 

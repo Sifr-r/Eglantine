@@ -14,6 +14,7 @@
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_resource_limit.h"
+#include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
 #include "core/hle/kernel/svc_version.h"
@@ -204,7 +205,7 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
         }
     }
     case InfoType::ThreadTickCount: {
-        constexpr u64 num_cpus = 4;
+        const u64 num_cpus = system.Kernel().ActiveCoreCount();
         if (info_sub_id != 0xFFFFFFFFFFFFFFFF && info_sub_id >= num_cpus) {
             LOG_ERROR(Kernel_SVC, "Core count is out of range, expected {} but got {}", num_cpus, info_sub_id);
             R_THROW(ResultInvalidCombination);

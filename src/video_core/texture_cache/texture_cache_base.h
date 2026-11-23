@@ -89,6 +89,7 @@ class TextureCacheChannelInfo : public ChannelInfo {
 public:
     TextureCacheChannelInfo() = delete;
     TextureCacheChannelInfo(Tegra::Control::ChannelState& state) noexcept;
+    explicit TextureCacheChannelInfo(const Tegra::Control::ChannelStateBridge& bridge);
     TextureCacheChannelInfo(const TextureCacheChannelInfo& state) = delete;
     TextureCacheChannelInfo& operator=(const TextureCacheChannelInfo&) = delete;
 
@@ -425,6 +426,9 @@ public:
 
     /// Create channel state.
     void CreateChannel(Tegra::Control::ChannelState& channel) final override;
+
+    /// Create channel state from a ChannelStateBridge.
+    void CreateChannelFromBridge(const Tegra::Control::ChannelStateBridge& bridge) final override;
 
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);

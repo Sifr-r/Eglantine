@@ -33,6 +33,7 @@ add_library(video_core STATIC
     compatible_formats.h
     control/channel_state.cpp
     control/channel_state.h
+    control/channel_state_bridge.h
     control/channel_state_cache.cpp
     control/channel_state_cache.h
     control/scheduler.cpp

@@ -12,6 +12,7 @@
 // dispatch won't ask for, so the dispatch still compiles. EGLANTINE_WARM_IDENTITY_OUT=<file>
 // writes one line per pair.
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,8 @@
 
 #include "common/cityhash.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/frontend/ampere/program_capture.h"
+#include "shader_recompiler/frontend/ampere/program_override.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
@@ -34,6 +37,7 @@
 #include "shader_recompiler/profile.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/shader_environment.h"
+#include "video_core/shader_warm/warm_records.h"
 #include "video_core/stage_cache.h"
 
 namespace {
@@ -134,7 +138,13 @@ ComputeEntries ReadCompute(const std::filesystem::path& path) {
     }
     file.exceptions(std::ifstream::failbit);
     const auto end{file.tellg()};
-    file.seekg(8 + sizeof(u32));
+    file.seekg(8);
+    u32 version{};
+    file.read(reinterpret_cast<char*>(&version), sizeof(version));
+    if (version != VideoCommon::ShaderWarm::WarmCacheVersion) {
+        std::printf("warm identity: %s has cache version %u, expected %u\n", path.string().c_str(),
+                    version, VideoCommon::ShaderWarm::WarmCacheVersion);
+    }
     try {
         while (file.tellg() != end) {
             u32 num_envs{};
@@ -187,6 +197,15 @@ TEST_CASE("Shader precache builds the game's SPIR-V", "[.warm_identity]") {
         }
         ++pairs;
         auto& warm_env = it->second;
+        try {
+            if (game_env.HasNativeInstructions()) {
+                game_env.EnsureLoweredNative();
+            }
+            if (warm_env.HasNativeInstructions()) {
+                warm_env.EnsureLoweredNative();
+            }
+        } catch (const std::exception&) {
+        }
         std::string fields;
         const auto note = [&](const char* name, auto a, auto b) {
             if (a != b) {
@@ -238,4 +257,36 @@ TEST_CASE("Shader precache builds the game's SPIR-V", "[.warm_identity]") {
     for (const auto& [cause, count] : causes) {
         std::printf("  different SPIR-V, first wrong guess %s: %zu\n", cause.c_str(), count);
     }
+}
+
+TEST_CASE("ShaderPrecacheIdentity: warm SM86 blobs align with PackNativeSm86Blob and "
+          "ComputeNativeDiscoveryHash",
+          "[video_core]") {
+    constexpr Shader::Ampere::Instruction exit_insn{{0x0000794dU, 0U, 0x03800000U, 0U}};
+    const std::array<u8, sizeof(exit_insn)> raw = [&exit_insn] {
+        std::array<u8, sizeof(exit_insn)> bytes{};
+        std::memcpy(bytes.data(), &exit_insn, sizeof(exit_insn));
+        return bytes;
+    }();
+
+    VideoCommon::ShaderWarm::LoweredCode warm_lowered;
+    REQUIRE_FALSE(VideoCommon::ShaderWarm::LowerProgram(raw, warm_lowered).has_value());
+
+    VideoCommon::LoweredNativeCode runtime_info;
+    runtime_info.native_code = {exit_insn};
+    runtime_info.native_program_key = Shader::Ampere::NativeProgramKey(runtime_info.native_code);
+    runtime_info.diagnostic_key = runtime_info.native_program_key;
+    runtime_info.source_size = sizeof(exit_insn);
+    runtime_info.has_native_context = true;
+    runtime_info.native_hash = VideoCommon::ComputeNativeDiscoveryHash(runtime_info);
+
+    const auto packed = VideoCommon::PackNativeSm86Blob(runtime_info, false);
+    VideoCommon::LoweredNativeCode unpacked;
+    bool has_hle = true;
+    REQUIRE(VideoCommon::TryUnpackNativeSm86Blob(packed, unpacked, has_hle));
+    CHECK_FALSE(has_hle);
+    CHECK(unpacked.native_hash == runtime_info.native_hash);
+    CHECK(unpacked.native_program_key == runtime_info.native_program_key);
+    CHECK(warm_lowered.native_hash == runtime_info.native_hash);
+    CHECK(VideoCommon::ShaderWarm::StageHash(warm_lowered.code) == runtime_info.native_hash);
 }

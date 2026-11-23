@@ -1257,7 +1257,7 @@ void HoldHleReply(KernelCore& kernel, KThread* client_thread) {
         return;
     }
     const s32 core = client_thread->GetActiveCore();
-    if (core < 0 || core >= static_cast<s32>(Core::Hardware::NUM_CPU_CORES)) {
+    if (core < 0 || core >= static_cast<s32>(kernel.ActiveCoreCount())) {
         return;
     }
     const auto& scheduler = kernel.Scheduler(core);

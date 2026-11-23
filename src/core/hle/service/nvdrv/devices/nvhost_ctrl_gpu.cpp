@@ -15,6 +15,7 @@
 #include "common/logging.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/nx2_session_state.h"
 #include "core/platform_profile.h"
 #include "core/hle/service/nvdrv/devices/ioctl_serialization.h"
 #include "core/hle/service/nvdrv/devices/nvhost_ctrl_gpu.h"
@@ -370,6 +371,10 @@ NvResult nvhost_ctrl_gpu::GetCharacteristics3(
             LOG_WARNING(Service_NVDRV, "Switch 2 caller, reporting Ampere chip 0x17E");
         }
         nx2_caller = true;
+        if (const auto nx2_session = system.EnsureNx2Session()) {
+            nx2_session->SetDriverActive(true);
+            nx2_session->SetAmpere(true);
+        }
         g_nx2_driver = true;
         Tegra::g_nx2_ampere = true;
         ApplyNx2Characteristics(params.gc);

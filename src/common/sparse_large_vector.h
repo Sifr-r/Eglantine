@@ -10,8 +10,12 @@
 
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
+#include <cstring>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -47,9 +51,12 @@ class SparseLargeVector final {
 public:
     constexpr SparseLargeVector() = default;
 
-    explicit SparseLargeVector(std::size_t count) noexcept
-        : alloc_size{count * sizeof(T)}
-    {
+    explicit SparseLargeVector(std::size_t count) noexcept {
+        if (count == 0) {
+            return;
+        }
+        ASSERT(count <= (std::numeric_limits<std::size_t>::max)() / sizeof(T));
+        alloc_size = count * sizeof(T);
         base_ptr = static_cast<T*>(AllocateMemoryPages(alloc_size));
 
         // each item in vector holds information for 64 pages
@@ -67,19 +74,30 @@ public:
     SparseLargeVector& operator=(SparseLargeVector&& other) = delete;
 
     void ResizeAndClear(std::size_t count) noexcept {
-        if (auto const new_size = count * sizeof(T); new_size != alloc_size) {
+        ASSERT(count <= (std::numeric_limits<std::size_t>::max)() / sizeof(T));
+        const std::size_t new_size = count * sizeof(T);
+        if (new_size == 0) {
+            FreeMemoryPages(base_ptr, alloc_size);
+            base_ptr = nullptr;
+            alloc_size = 0;
+            committed_pages.clear();
+            return;
+        }
+        if (new_size != alloc_size) {
             FreeMemoryPages(base_ptr, alloc_size);
             alloc_size = new_size;
             base_ptr = static_cast<T*>(AllocateMemoryPages(alloc_size));
 
             auto denom = HostPageSize * 64;
             committed_pages = std::vector<std::atomic<u64>>((alloc_size + denom - 1) / denom);
+        } else {
+            ZeroRegion(0, count);
         }
     }
 
     /// Returns a reference to the value of the requested index and allocates memory if needed.
     T& GetAndFault(std::size_t index) noexcept {
-        if (index > alloc_size / sizeof(T)) {
+        if (index >= alloc_size / sizeof(T)) {
             UNREACHABLE_MSG("Out of bounds RW access on SparseLargeVector @ {}", index);
         }
 
@@ -95,13 +113,19 @@ public:
         if (!IsCommittedPage(index)) {
             return *reinterpret_cast<const T*>(&default_val);
         }
+#else
+        if (index >= alloc_size / sizeof(T)) {
+            LOG_CRITICAL(Common_Memory, "Out of bounds access on large vector @ {}", index);
+            static const std::array<u8, sizeof(T)> default_val{};
+            return *reinterpret_cast<const T*>(&default_val);
+        }
 #endif
         // On non-Windows, OS page table should optimize this by pointing to a zero page if unallocated.
         return base_ptr[index];
     }
 
     void Set(std::size_t index, const T& value) noexcept {
-        if (index > alloc_size / sizeof(T)) {
+        if (index >= alloc_size / sizeof(T)) {
             LOG_CRITICAL(Common_Memory, "Out of bounds write on SparseLargeVector @ {}", index);
             return;
         }
@@ -110,13 +134,22 @@ public:
     }
 
     void ZeroRegion(std::size_t start, std::size_t end_) noexcept {
+        const std::size_t count = size();
+        if (base_ptr == nullptr || start >= count) {
+            return;
+        }
+        end_ = (std::min)(end_, count);
+        if (start >= end_) {
+            return;
+        }
+
         u64 base = reinterpret_cast<u64>(&base_ptr[start]);
         const u64 end = reinterpret_cast<u64>(&base_ptr[end_]);
 
         const u64 end_page = AlignUp(base, HostPageSize);
         const u64 first_size = (std::min)(end_page, end) - base;
 
-        if (IsCommittedPage(start)) {
+        if (first_size > 0 && IsCommittedPage(start)) {
             std::memset(reinterpret_cast<void*>(base), 0, first_size);
         }
 
@@ -126,7 +159,10 @@ public:
         base = end_page;
 
         for (u64 page = base; page < end; page += HostPageSize) {
-            if (!IsCommittedPage((page - reinterpret_cast<u64>(base_ptr)) / sizeof(T))) {
+            const std::size_t elem_index =
+                static_cast<std::size_t>((page - reinterpret_cast<u64>(base_ptr) + sizeof(T) - 1) /
+                                         sizeof(T));
+            if (elem_index >= count || !IsCommittedPage(elem_index)) {
                 continue;
             }
 
@@ -135,12 +171,23 @@ public:
     }
 
     constexpr void CommitRegion(size_t index, size_t end_) {
+        const std::size_t count = size();
+        if (index >= count) {
+            return;
+        }
+        end_ = (std::min)(end_, count);
+        if (index >= end_) {
+            return;
+        }
+
         const u64 base = static_cast<u64>(index) * sizeof(T);
         const u64 end = static_cast<u64>(end_) * sizeof(T);
 
         for (u64 page = AlignDown(base, HostPageSize); page < end; page += HostPageSize) {
-            if (!IsCommittedPage(page / sizeof(T))) {
-                CommitPage(page / sizeof(T));
+            const std::size_t elem_index =
+                static_cast<std::size_t>((page + sizeof(T) - 1) / sizeof(T));
+            if (elem_index < count && !IsCommittedPage(elem_index)) {
+                CommitPage(elem_index);
             }
         }
     }
@@ -163,7 +210,7 @@ public:
 
 private:
     [[nodiscard]] constexpr bool IsCommittedPage(std::size_t index) const noexcept {
-        if (index > alloc_size / sizeof(T)) {
+        if (index >= alloc_size / sizeof(T)) {
             LOG_CRITICAL(Common_Memory, "Out of bounds access on large vector @ {}", index);
             return false;
         }
@@ -174,6 +221,9 @@ private:
     }
 
     constexpr bool CommitPage(std::size_t index) noexcept {
+        if (index >= alloc_size / sizeof(T)) {
+            return false;
+        }
         auto page_index = (index * sizeof(T)) >> HostPageBits;
         auto page = reinterpret_cast<uintptr_t>(base_ptr + index) & HostPageMask;
 #if defined(_WIN32)

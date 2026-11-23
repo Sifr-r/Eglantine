@@ -1314,23 +1314,23 @@ void KProcess::LoadModule(KernelCore& kernel, CodeSet code_set, KProcessAddress 
 }
 
 void KProcess::InitializeInterfaces(KernelCore& kernel) {
-    m_exclusive_monitor =
-        Core::MakeExclusiveMonitor(this->GetMemory(), Core::Hardware::NUM_CPU_CORES);
+    const size_t active_cores = kernel.ActiveCoreCount();
+    m_exclusive_monitor = Core::MakeExclusiveMonitor(this->GetMemory(), active_cores);
 
 #ifdef HAS_NCE
     if (this->IsApplication() && Settings::IsNceEnabled()) {
-        for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++)
+        for (size_t i = 0; i < active_cores; i++)
             m_arm_interfaces[i] = std::make_unique<Core::ArmNce>(kernel.System(), true, i);
     } else
 #endif
         if (this->Is64Bit()) {
-        for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
+        for (size_t i = 0; i < active_cores; i++) {
             m_arm_interfaces[i] = std::make_unique<Core::ArmDynarmic64>(
                 kernel.System(), kernel.IsMulticore(), this,
                 static_cast<Core::DynarmicExclusiveMonitor&>(*m_exclusive_monitor), i);
         }
     } else {
-        for (size_t i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
+        for (size_t i = 0; i < active_cores; i++) {
             m_arm_interfaces[i] = std::make_unique<Core::ArmDynarmic32>(
                 kernel.System(), kernel.IsMulticore(), this,
                 static_cast<Core::DynarmicExclusiveMonitor&>(*m_exclusive_monitor), i);

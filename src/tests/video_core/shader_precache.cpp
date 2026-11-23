@@ -15,6 +15,8 @@
 #include <fmt/format.h>
 
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ampere/program_capture.h"
+#include "shader_recompiler/frontend/ampere/program_override.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/shader_environment.h"
 #include "video_core/shader_warm/shader_archives.h"
@@ -224,4 +226,57 @@ TEST_CASE("ShaderPrecache: programs that cannot be lowered are refused", "[video
     const std::array<u8, 16> no_exit{};
     REQUIRE(ShaderWarm::LowerProgram(no_exit, lowered).has_value());
     REQUIRE(lowered.code.empty());
+}
+
+TEST_CASE("ShaderPrecache: SM86 warm entries store blobs keyed by ComputeNativeDiscoveryHash",
+          "[video_core]") {
+    REQUIRE(ShaderWarm::WarmCacheVersion == 35);
+    REQUIRE(ShaderWarm::WarmBuilderVersion == 4);
+
+    constexpr Shader::Ampere::Instruction exit_insn{{0x0000794dU, 0U, 0x03800000U, 0U}};
+    const std::array<u8, sizeof(exit_insn)> raw_bytes = [&exit_insn] {
+        std::array<u8, sizeof(exit_insn)> out{};
+        std::memcpy(out.data(), &exit_insn, sizeof(exit_insn));
+        return out;
+    }();
+
+    ShaderWarm::LoweredCode warm_code;
+    const auto error = ShaderWarm::LowerProgram(raw_bytes, warm_code);
+    REQUIRE_FALSE(error.has_value());
+    REQUIRE(warm_code.native_hash != 0);
+    REQUIRE(ShaderWarm::StageHash(warm_code.code) == warm_code.native_hash);
+
+    VideoCommon::LoweredNativeCode expected_info;
+    expected_info.native_code = {exit_insn};
+    expected_info.native_program_key = Shader::Ampere::NativeProgramKey(expected_info.native_code);
+    expected_info.source_size = sizeof(exit_insn);
+    expected_info.source_header_size = 0;
+    expected_info.has_native_context = true;
+    const u64 expected_discovery = VideoCommon::ComputeNativeDiscoveryHash(expected_info);
+    REQUIRE(warm_code.native_hash == expected_discovery);
+
+    const ShaderWarm::ComputeControl control{{8, 4, 1}, 512, 64};
+    ShaderWarm::ComputeKey key_bytes{};
+    const auto entry = ShaderWarm::ComputeEntry(warm_code, control, key_bytes);
+
+    TempDir dir;
+    const auto file = dir.path / "sm86_entry.bin";
+    WriteBytes(file, std::string_view{reinterpret_cast<const char*>(entry.data()), entry.size()});
+
+    std::ifstream in(file, std::ios::binary);
+    in.exceptions(std::ifstream::failbit);
+    u32 num_envs{};
+    in.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+    REQUIRE(num_envs == 1);
+    VideoCommon::FileEnvironment env;
+    env.Deserialize(in);
+    Vulkan::ComputePipelineCacheKey key{};
+    in.read(reinterpret_cast<char*>(&key), sizeof(key));
+
+    REQUIRE(env.IsNativeProgram());
+    REQUIRE(env.HasNativeInstructions());
+    REQUIRE(env.NativeProgramKey() == expected_info.native_program_key);
+    REQUIRE(key.unique_hash == expected_discovery);
+    REQUIRE(key.shared_memory_size == control.shared_memory);
+    REQUIRE(key.workgroup_size == control.workgroup);
 }

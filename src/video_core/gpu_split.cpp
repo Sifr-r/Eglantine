@@ -29,6 +29,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "video_core/engines/engine_interface.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_split.h"
@@ -124,7 +125,8 @@ void GpuSplit::MaybeStart(Core::System& system_) {
     }();
     VideoCommon::Nx2Sampler::Sampler::MaybeStart();
     const bool wanted = mode == '1' || mode == '2';
-    if (!wanted || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+    const auto nx2_session = system_.Nx2Session();
+    if (!wanted || !nx2_session || !nx2_session->IsAmpere()) {
         return;
     }
     // The front reads command lists straight from guest memory; a read that flushes the caches
@@ -375,8 +377,8 @@ bool GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u
     }
     // While a queued function may still change the GPU mappings, the back may translate the
     // address differently. Sparse pages are written through their own backing.
-    const bool sparse = address < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed) &&
-                        Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) < address + size;
+    const auto nx2_session = memory.System().Nx2Session();
+    const bool sparse = nx2_session && nx2_session->SparseState().OverlapsSpan(address, size);
     if (last_function_position > consumed_cache || sparse) {
         writes.Entry(Effect::Unknown, write_position);
         return false;

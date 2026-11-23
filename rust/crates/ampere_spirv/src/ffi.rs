@@ -555,34 +555,45 @@ fn convert_bindings(b: &EglSpirvBindings) -> Bindings {
     }
 }
 
-unsafe fn parse_owned_input(input: &EglSpirvCompileInput) -> Option<OwnedCompileInput> {
-    let stage = Stage::from_u32(input.stage)?;
-    let code_raw = unsafe { checked_slice(input.code, input.code_count)? };
+unsafe fn parse_owned_input(input: &EglSpirvCompileInput) -> Result<OwnedCompileInput, &'static str> {
+    let stage = Stage::from_u32(input.stage).ok_or("invalid shader stage")?;
+    let code_raw =
+        unsafe { checked_slice(input.code, input.code_count) }.ok_or("invalid shader code slice")?;
     let code = code_raw
         .iter()
         .map(|insn| Instruction { words: insn.words })
         .collect();
 
     let mut snapshot = SnapshotEnv::default();
-    for entry in unsafe { checked_slice(input.cbufs, input.cbuf_count)? } {
+    for entry in
+        unsafe { checked_slice(input.cbufs, input.cbuf_count) }.ok_or("invalid cbuf slice")?
+    {
         snapshot.cbufs.insert((entry.index, entry.offset), entry.value);
     }
-    for entry in unsafe { checked_slice(input.texture_types, input.texture_type_count)? } {
+    for entry in unsafe { checked_slice(input.texture_types, input.texture_type_count) }
+        .ok_or("invalid texture_types slice")?
+    {
         snapshot.texture_types.insert(entry.handle, entry.texture_type);
     }
-    for entry in unsafe { checked_slice(input.texture_formats, input.texture_format_count)? } {
+    for entry in unsafe { checked_slice(input.texture_formats, input.texture_format_count) }
+        .ok_or("invalid texture_formats slice")?
+    {
         snapshot.texture_formats.insert(entry.handle, entry.pixel_format);
     }
-    for entry in unsafe { checked_slice(input.storage_ptrs, input.storage_ptr_count)? } {
+    for entry in unsafe { checked_slice(input.storage_ptrs, input.storage_ptr_count) }
+        .ok_or("invalid storage_ptrs slice")?
+    {
         snapshot.storage_ptrs.insert(entry.key, entry.is_mapped != 0);
     }
-    for entry in unsafe { checked_slice(input.replacements, input.replacement_count)? } {
+    for entry in unsafe { checked_slice(input.replacements, input.replacement_count) }
+        .ok_or("invalid replacements slice")?
+    {
         snapshot
             .replacements
             .insert((entry.bank, entry.offset), entry.replace_constant);
     }
 
-    Some(OwnedCompileInput {
+    Ok(OwnedCompileInput {
         stage,
         program_key: input.program_key,
         code,
@@ -602,6 +613,24 @@ fn box_slice_into_raw<T>(vec: Vec<T>) -> (*mut T, usize) {
     let len = vec.len();
     let boxed: Box<[T]> = vec.into_boxed_slice();
     (Box::into_raw(boxed) as *mut T, len)
+}
+
+fn box_error_into_raw(msg: &str) -> (*mut c_char, usize) {
+    let bytes = if msg.is_empty() {
+        b"ampere_spirv FFI error".to_vec()
+    } else {
+        msg.as_bytes().to_vec()
+    };
+    let (ptr, len) = box_slice_into_raw(bytes);
+    (ptr as *mut c_char, len)
+}
+
+fn make_error_output(msg: &str) -> EglSpirvCompileOutput {
+    let mut out = EglSpirvCompileOutput::default();
+    let (err_ptr, err_len) = box_error_into_raw(msg);
+    out.error = err_ptr;
+    out.error_len = err_len;
+    out
 }
 
 unsafe fn free_raw_slice<T>(ptr_val: *mut T, len: usize) {
@@ -627,6 +656,14 @@ fn write_outcome_to_c(outcome: CompileOutcome, out: &mut EglSpirvCompileOutput) 
         out.fallback_to_maxwell = 1;
         out.fallback_offset = fb.offset;
         out.fallback_opcode = fb.opcode;
+        return;
+    }
+
+    if outcome.spirv_words.is_empty() {
+        out.fallback_to_maxwell = 1;
+        let (err_ptr, err_len) = box_error_into_raw("ampere_spirv produced empty SPIR-V output");
+        out.error = err_ptr;
+        out.error_len = err_len;
         return;
     }
 
@@ -844,15 +881,24 @@ pub unsafe extern "C" fn egl_ampere_spirv_compile(
     input: *const EglSpirvCompileInput,
     out_output: *mut EglSpirvCompileOutput,
 ) -> i32 {
+    let out_valid = !out_output.is_null() && is_valid_mut_ptr(out_output, 1);
     let res = catch_unwind(AssertUnwindSafe(|| unsafe {
-        if !is_valid_mut_ptr(out_output, 1) || out_output.is_null() {
+        if !out_valid {
             return -1;
         }
         let Some(c_in) = read_aligned(input) else {
+            ptr::write(
+                out_output,
+                make_error_output("null or unaligned compile input pointer"),
+            );
             return -1;
         };
-        let Some(owned) = parse_owned_input(&c_in) else {
-            return -1;
+        let owned = match parse_owned_input(&c_in) {
+            Ok(owned) => owned,
+            Err(reason) => {
+                ptr::write(out_output, make_error_output(reason));
+                return -1;
+            }
         };
         let outcome = compile_shader(&owned.as_lower_input());
         let mut c_out = EglSpirvCompileOutput::default();
@@ -860,7 +906,20 @@ pub unsafe extern "C" fn egl_ampere_spirv_compile(
         ptr::write(out_output, c_out);
         0
     }));
-    res.unwrap_or(-1)
+    match res {
+        Ok(code) => code,
+        Err(_) => {
+            if out_valid {
+                unsafe {
+                    ptr::write(
+                        out_output,
+                        make_error_output("panic during SM86 SPIR-V compilation"),
+                    );
+                }
+            }
+            -1
+        }
+    }
 }
 
 #[no_mangle]
@@ -869,22 +928,33 @@ pub unsafe extern "C" fn egl_ampere_spirv_compile_batch(
     count: usize,
     outputs: *mut EglSpirvCompileOutput,
 ) -> i32 {
+    let outputs_valid = count > 0 && !outputs.is_null() && is_valid_mut_ptr(outputs, count);
     let res = catch_unwind(AssertUnwindSafe(|| unsafe {
         if count == 0 {
             return 0;
         }
-        let Some(c_inputs) = checked_slice(inputs, count) else {
-            return -1;
-        };
-        if !is_valid_mut_ptr(outputs, count) || outputs.is_null() {
+        if !outputs_valid {
             return -1;
         }
+        for i in 0..count {
+            ptr::write(outputs.add(i), EglSpirvCompileOutput::default());
+        }
+        let Some(c_inputs) = checked_slice(inputs, count) else {
+            ptr::write(
+                outputs,
+                make_error_output("null or unaligned batch inputs pointer"),
+            );
+            return -1;
+        };
         let mut owned_inputs = Vec::with_capacity(count);
-        for c_in in c_inputs {
-            let Some(owned) = parse_owned_input(c_in) else {
-                return -1;
-            };
-            owned_inputs.push(owned);
+        for (idx, c_in) in c_inputs.iter().enumerate() {
+            match parse_owned_input(c_in) {
+                Ok(owned) => owned_inputs.push(owned),
+                Err(reason) => {
+                    ptr::write(outputs.add(idx), make_error_output(reason));
+                    return -1;
+                }
+            }
         }
         let outcomes = compile_batch(&owned_inputs);
         let c_outs = std::slice::from_raw_parts_mut(outputs, count);
@@ -895,7 +965,24 @@ pub unsafe extern "C" fn egl_ampere_spirv_compile_batch(
         }
         0
     }));
-    res.unwrap_or(-1)
+    match res {
+        Ok(code) => code,
+        Err(_) => {
+            if outputs_valid {
+                for i in 0..count {
+                    let val = if i == 0 {
+                        make_error_output("panic during SM86 SPIR-V batch compilation")
+                    } else {
+                        EglSpirvCompileOutput::default()
+                    };
+                    unsafe {
+                        ptr::write(outputs.add(i), val);
+                    }
+                }
+            }
+            -1
+        }
+    }
 }
 
 #[no_mangle]
@@ -928,4 +1015,95 @@ pub unsafe extern "C" fn egl_ampere_spirv_free(output: *mut EglSpirvCompileOutpu
         );
         *out = EglSpirvCompileOutput::default();
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_compile_input() -> EglSpirvCompileInput {
+        EglSpirvCompileInput {
+            stage: 0,
+            texture_bound: u32::MAX,
+            program_key: 0,
+            program_header: [0; 10],
+            code: ptr::null(),
+            code_count: 0,
+            workgroup_size: [1, 1, 1],
+            local_memory_size: 0,
+            shared_memory_size: 0,
+            is_task_shader: 0,
+            is_mesh_shader: 0,
+            native_tensor: 0,
+            native_compact_tensor: 0,
+            has_hle_engine_state: 0,
+            mesh_as_compute: 0,
+            _pad0: [0; 2],
+            viewport_transform_state: 0,
+            mesh_max_vertices: 0,
+            mesh_max_primitives: 0,
+            mesh_topology: 0,
+            mesh_payload_words: 0,
+            _pad1: 0,
+            cbufs: ptr::null(),
+            cbuf_count: 0,
+            texture_types: ptr::null(),
+            texture_type_count: 0,
+            texture_formats: ptr::null(),
+            texture_format_count: 0,
+            storage_ptrs: ptr::null(),
+            storage_ptr_count: 0,
+            replacements: ptr::null(),
+            replacement_count: 0,
+            profile: EglSpirvProfile::default(),
+            bindings: EglSpirvBindings::default(),
+            _pad2: 0,
+        }
+    }
+
+    #[test]
+    fn ffi_error_and_fallback_paths_populate_error_message() {
+        let mut out = EglSpirvCompileOutput::default();
+        unsafe {
+            assert_eq!(egl_ampere_spirv_compile(ptr::null(), &mut out), -1);
+            assert!(!out.error.is_null());
+            assert!(out.error_len > 0);
+            egl_ampere_spirv_free(&mut out);
+            assert!(out.error.is_null() && out.error_len == 0);
+
+            let mut invalid_slice_in = empty_compile_input();
+            invalid_slice_in.stage = 5;
+            invalid_slice_in.code = ptr::null();
+            invalid_slice_in.code_count = 1;
+            assert_eq!(egl_ampere_spirv_compile(&invalid_slice_in, &mut out), -1);
+            assert!(!out.error.is_null());
+            assert!(out.error_len > 0);
+            egl_ampere_spirv_free(&mut out);
+
+            let exit_insn = [EglAmpereInstruction {
+                words: [0x0000_794d, 0, 0x0380_0000, 0],
+            }];
+            let mut non_compute = empty_compile_input();
+            non_compute.stage = Stage::VertexB as u32;
+            non_compute.code = exit_insn.as_ptr();
+            non_compute.code_count = exit_insn.len();
+            non_compute.profile.supported_spirv = 0x0001_0600;
+            assert_eq!(egl_ampere_spirv_compile(&non_compute, &mut out), 0);
+            assert_eq!(out.fallback_to_maxwell, 1);
+            assert!(out.error.is_null());
+            assert_eq!(out.error_len, 0);
+            egl_ampere_spirv_free(&mut out);
+
+            let mut outs = [EglSpirvCompileOutput::default(); 2];
+            assert_eq!(
+                egl_ampere_spirv_compile_batch(ptr::null(), outs.len(), outs.as_mut_ptr()),
+                -1
+            );
+            assert!(!outs[0].error.is_null());
+            assert!(outs[0].error_len > 0);
+            for slot in &mut outs {
+                egl_ampere_spirv_free(slot);
+            }
+        }
+    }
 }

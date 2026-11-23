@@ -19,6 +19,7 @@
 #include <numeric>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -30,12 +31,14 @@
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "common/literals.h"
+#include "common/logging.h"
 #include "common/lru_cache.h"
 #include "common/range_sets.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
 #include "common/spin_recursive_mutex.h"
+#include "core/platform_profile.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/buffer_cache/buffer_base.h"
 #include "video_core/buffer_cache/buffer_dependency_trace.h"
@@ -145,6 +148,8 @@ class BufferCacheChannelInfo : public ChannelInfo {
 public:
     BufferCacheChannelInfo() = delete;
     BufferCacheChannelInfo(Tegra::Control::ChannelState& state) noexcept : ChannelInfo(state) {}
+    explicit BufferCacheChannelInfo(const Tegra::Control::ChannelStateBridge& bridge_)
+        : ChannelInfo(bridge_) {}
     BufferCacheChannelInfo(const BufferCacheChannelInfo& state) = delete;
     BufferCacheChannelInfo& operator=(const BufferCacheChannelInfo&) = delete;
 
@@ -197,6 +202,179 @@ public:
     std::array<std::array<u32, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_buffer_binding_sizes{};
 };
+
+/// Parses EDEN_NX2_BUFFER_DOWNLOADS ("0" -> false, "1" -> true, unset/other -> nullopt).
+/// Logs a warning for unrecognized non-empty values.
+[[nodiscard]] inline std::optional<bool> ParseBufferDownloadsOverride(const char* value) {
+    if (value == nullptr || value[0] == '\0') {
+        return std::nullopt;
+    }
+    const std::string_view text{value};
+    if (text == "0") {
+        return false;
+    }
+    if (text == "1") {
+        return true;
+    }
+    LOG_WARNING(HW_GPU, "Invalid EDEN_NX2_BUFFER_DOWNLOADS value '{}'; expected '0' or '1'", text);
+    return std::nullopt;
+}
+
+/// Platform default for fence-time buffer downloads supplied by Core::PlatformProfile.
+template <typename Profile>
+[[nodiscard]] constexpr bool ProfilePrefersAsyncBufferDownloads(const Profile& profile) noexcept {
+    if constexpr (requires { static_cast<bool>(profile.prefer_async_buffer_downloads); }) {
+        return static_cast<bool>(profile.prefer_async_buffer_downloads);
+    } else {
+        return !profile.IsSwitch2();
+    }
+}
+
+/// Resolves the active Core::PlatformProfile from runtime/gpu_memory if exposed, otherwise falls
+/// back to Settings::CurrentProgramIsSwitch2().
+template <typename RuntimeT, typename MemoryManagerT>
+[[nodiscard]] Core::PlatformProfile ResolveBufferCachePlatformProfile(
+    const RuntimeT& runtime, const MemoryManagerT* gpu_memory) {
+    if constexpr (requires { gpu_memory->Platform(); }) {
+        if (gpu_memory != nullptr) {
+            return gpu_memory->Platform();
+        }
+    }
+    if constexpr (requires { runtime.Platform(); }) {
+        return runtime.Platform();
+    } else {
+        return Core::MakePlatformProfile(Settings::CurrentProgramIsSwitch2()
+                                               ? Core::PlatformResolution::ConfirmedSwitch2
+                                               : Core::PlatformResolution::DefaultSwitch1);
+    }
+}
+
+/// Inputs governing whether GPU-written buffer ranges are downloaded at every fence.
+struct BufferDownloadPolicyInputs {
+    Core::PlatformProfile profile{};
+    bool has_gpu_memory{};
+    bool uses_native_tiling{};
+    bool can_trap_cpu_reads{};
+    std::optional<bool> env_override{};
+};
+
+/// Returns true when GPU-written buffer ranges are copied back to guest memory at every fence.
+/// Explicit EDEN_NX2_BUFFER_DOWNLOADS overrides take precedence; otherwise async downloads remain
+/// enabled when gpu_memory is absent, native tiling is disabled, host CPU read traps are
+/// unavailable, or the platform profile defaults them on.
+[[nodiscard]] constexpr bool EvaluateAsyncBufferDownloads(
+    const BufferDownloadPolicyInputs& inputs) noexcept {
+    if (inputs.env_override.has_value()) {
+        return *inputs.env_override;
+    }
+    if (!inputs.has_gpu_memory || !inputs.uses_native_tiling || !inputs.can_trap_cpu_reads) {
+        return true;
+    }
+    return ProfilePrefersAsyncBufferDownloads(inputs.profile);
+}
+
+/// Without downloads at every fence, guest CPU reads must query the buffer cache (GetFlushArea).
+[[nodiscard]] constexpr bool EvaluateFlushesOnCpuRead(
+    const BufferDownloadPolicyInputs& inputs) noexcept {
+    return !EvaluateAsyncBufferDownloads(inputs);
+}
+
+/// Whether a GPU write to [device_addr, device_addr + size) is copied back at the next fence:
+/// true when fence-time downloads are active or the range is marked Preflushable.
+template <typename MemoryTracker>
+[[nodiscard]] bool EvaluateDownloadsAtFence(const BufferDownloadPolicyInputs& inputs,
+                                            MemoryTracker& memory_tracker, DAddr device_addr,
+                                            u64 size) noexcept {
+    return EvaluateAsyncBufferDownloads(inputs) ||
+           memory_tracker.IsRegionPreflushable(device_addr, size);
+}
+
+/// Whether [device_addr, device_addr + size) holds GPU-written data that no fence downloads
+/// (neither global async fence downloads nor per-range Preflushable marks).
+template <typename MemoryTracker>
+[[nodiscard]] bool EvaluateHasGpuWritesNotDownloadedAtFence(
+    const BufferDownloadPolicyInputs& inputs, MemoryTracker& memory_tracker, DAddr device_addr,
+    u64 size) {
+    if (size == 0 || EvaluateAsyncBufferDownloads(inputs)) {
+        return false;
+    }
+    bool found = false;
+    memory_tracker.ForEachDownloadRange(
+        device_addr, size, false, [&](u64 start, u64 range_size) {
+            if (found || range_size == 0) {
+                return;
+            }
+            const u64 range_end = start + range_size;
+            boost::container::small_vector<std::pair<u64, u64>, 8> intervals;
+            memory_tracker.ForEachPreflushableRange(
+                start, range_size, [&](u64 lower, u64 length) {
+                    if (length == 0 || lower >= range_end) {
+                        return;
+                    }
+                    const u64 clamped_end =
+                        length > range_end - lower ? range_end : lower + length;
+                    if (clamped_end <= start) {
+                        return;
+                    }
+                    intervals.emplace_back((std::max)(lower, start), clamped_end);
+                });
+            std::ranges::sort(intervals);
+            u64 covered_until = start;
+            for (const auto& [begin, end] : intervals) {
+                if (begin > covered_until) {
+                    found = true;
+                    return;
+                }
+                covered_until = (std::max)(covered_until, end);
+                if (covered_until >= range_end) {
+                    return;
+                }
+            }
+            found = covered_until < range_end;
+        });
+    return found;
+}
+
+/// Dispatches a GPU write to [device_addr, device_addr + size) into fence-download intervals
+/// (`on_download`) and host read-trap intervals (`on_trap`).
+template <typename MemoryTracker, typename DownloadFn, typename TrapFn>
+void DispatchGpuWriteDownloadPolicy(const BufferDownloadPolicyInputs& inputs,
+                                    u64 small_download_limit, bool preflush_aging,
+                                    MemoryTracker& memory_tracker, DAddr device_addr, u64 size,
+                                    DownloadFn&& on_download, TrapFn&& on_trap) {
+    if (size == 0) {
+        return;
+    }
+    if (EvaluateAsyncBufferDownloads(inputs) || size <= small_download_limit) {
+        on_download(device_addr, size);
+        return;
+    }
+    const DAddr end = device_addr + size;
+    DAddr cursor = device_addr;
+    memory_tracker.ForEachPreflushableRange(device_addr, size, [&](DAddr start, u64 range_size) {
+        if (range_size == 0 || start >= end) {
+            return;
+        }
+        const DAddr upper = range_size > end - start ? end : start + range_size;
+        const DAddr lower = (std::max)(start, cursor);
+        if (lower >= upper) {
+            return;
+        }
+        if (lower > cursor) {
+            on_trap(cursor, lower - cursor);
+        }
+        // PreflushAging observes reads of marked ranges: GetFlushArea finds them marked and
+        // lets the read go on without a flush, but stamps the blocks read.
+        if (preflush_aging) {
+            on_trap(lower, upper - lower);
+        }
+        on_download(lower, upper - lower);
+        cursor = upper;
+    });
+    if (cursor < end) {
+        on_trap(cursor, end - cursor);
+    }
+}
 
 template <class P>
 class BufferCache : public VideoCommon::ChannelSetupCaches<BufferCacheChannelInfo> {
@@ -289,7 +467,7 @@ public:
     /// Without downloads at every fence, a guest CPU read is the only way GPU-written buffer
     /// data reaches guest memory, so reads must ask the buffer cache (GetFlushArea).
     bool FlushesOnCpuRead() const {
-        return !AsyncBufferDownloads();
+        return EvaluateFlushesOnCpuRead(CurrentDownloadPolicyInputs());
     }
 
     bool InlineMemory(DAddr dest_address, size_t copy_size, std::span<const u8> inlined_buffer);
@@ -881,23 +1059,20 @@ private:
     MemoryTracker memory_tracker;
     Common::RangeSet<DAddr> uncommitted_gpu_modified_ranges;
 
-    /// Whether GPU-written buffer ranges are copied back to guest memory at the next fence;
-    /// otherwise only when something flushes them (as upstream yuzu below High GPU accuracy).
-    /// Not for Switch 2 titles: title 1 had 250-330 MB/s copied back (a fence per compute
-    /// dispatch, the fencing thread holding the buffer cache while it wrote them), while its CPU
-    /// read GPU-written memory at most 64 times in 200 s (counted with reactive flushing) and
-    /// the native MME's DMA reads never touched those pages. Without them a fence costs ~1 us
-    /// instead of ~5 and draw setup ~7% less. EDEN_NX2_BUFFER_DOWNLOADS=0/1 forces it.
-    bool AsyncBufferDownloads() const {
-        static const int forced = [] {
-            const char* value = std::getenv("EDEN_NX2_BUFFER_DOWNLOADS");
-            return value == nullptr ? -1 : (value[0] == '0' ? 0 : 1);
-        }();
-        if (forced >= 0) {
-            return forced == 1;
-        }
-        return gpu_memory == nullptr || !gpu_memory->UsesNativeTiling() ||
-               !device_memory.CanTrapCpuReads();
+    static std::optional<bool> EnvBufferDownloadsOverride() {
+        static const std::optional<bool> forced =
+            ParseBufferDownloadsOverride(std::getenv("EDEN_NX2_BUFFER_DOWNLOADS"));
+        return forced;
+    }
+
+    BufferDownloadPolicyInputs CurrentDownloadPolicyInputs() const {
+        return BufferDownloadPolicyInputs{
+            .profile = ResolveBufferCachePlatformProfile(runtime, gpu_memory),
+            .has_gpu_memory = gpu_memory != nullptr,
+            .uses_native_tiling = gpu_memory != nullptr && gpu_memory->UsesNativeTiling(),
+            .can_trap_cpu_reads = device_memory.CanTrapCpuReads(),
+            .env_override = EnvBufferDownloadsOverride(),
+        };
     }
 
     /// EDEN_NX2_DOWNLOAD_SMALL=<bytes>: GPU writes up to this size are also copied back at the
@@ -911,66 +1086,23 @@ private:
         return limit;
     }
 
-    /// Whether a GPU write to this range is copied back at the next fence. Ranges the guest CPU
-    /// has read (Preflushable, set by the first reactive flush) always are: later reads skip the
-    /// flush and rely on these downloads, e.g. collision meshes skinned by compute shaders.
-    bool DownloadsAtFence(DAddr device_addr, u64 size) noexcept {
-        return AsyncBufferDownloads() || memory_tracker.IsRegionPreflushable(device_addr, size);
-    }
-
     /// Whether the range holds GPU-written data that no fence downloads (not Preflushable).
     bool HasGpuWritesNotDownloadedAtFence(DAddr device_addr, u64 size) {
-        if (AsyncBufferDownloads()) {
-            return false;
-        }
-        bool found = false;
-        memory_tracker.ForEachDownloadRange(
-            device_addr, size, false, [&](u64 start, u64 range_size) {
-                if (found) {
-                    return;
-                }
-                u64 covered = 0;
-                memory_tracker.ForEachPreflushableRange(
-                    start, range_size, [&](u64 lower, u64 length) {
-                        const u64 begin = (std::max)(lower, start);
-                        const u64 end = (std::min)(lower + length, start + range_size);
-                        covered += end > begin ? end - begin : 0;
-                    });
-                found = covered < range_size;
-            });
-        return found;
+        return EvaluateHasGpuWritesNotDownloadedAtFence(CurrentDownloadPolicyInputs(),
+                                                        memory_tracker, device_addr, size);
     }
 
     /// A GPU write: queues its Preflushable parts for download at the next fence and traps reads
     /// of the rest. Queuing the whole range when any page of it was Preflushable copied whole
     /// written storage buffers (up to 8 MiB) back at every fence: ~5 GB/s in title 1's forest.
     void QueueGpuWrite(DAddr device_addr, u64 size) {
-        if (AsyncBufferDownloads() || size <= SmallDownloadLimit()) {
-            uncommitted_gpu_modified_ranges.Add(device_addr, size);
-            return;
-        }
-        const DAddr end = device_addr + size;
-        DAddr cursor = device_addr;
-        memory_tracker.ForEachPreflushableRange(device_addr, size, [&](DAddr start, u64 range_size) {
-            const DAddr lower = (std::max)(start, cursor);
-            const DAddr upper = (std::min)(start + range_size, end);
-            if (lower >= upper) {
-                return;
-            }
-            if (lower > cursor) {
-                ArmReadTraps(cursor, lower - cursor);
-            }
-            // PreflushAging observes reads of marked ranges: GetFlushArea finds them marked and
-            // lets the read go on without a flush, but stamps the blocks read.
-            if (Nx2Perf::On(Nx2Perf::Opt::PreflushAging)) {
-                ArmReadTraps(lower, upper - lower);
-            }
-            uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
-            cursor = upper;
-        });
-        if (cursor < end) {
-            ArmReadTraps(cursor, end - cursor);
-        }
+        DispatchGpuWriteDownloadPolicy(
+            CurrentDownloadPolicyInputs(), SmallDownloadLimit(),
+            Nx2Perf::On(Nx2Perf::Opt::PreflushAging), memory_tracker, device_addr, size,
+            [this](DAddr addr, u64 range_size) {
+                uncommitted_gpu_modified_ranges.Add(addr, range_size);
+            },
+            [this](DAddr addr, u64 range_size) { ArmReadTraps(addr, range_size); });
     }
 
     /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their

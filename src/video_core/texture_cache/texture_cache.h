@@ -24,10 +24,13 @@
 #include "common/alignment.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
+#include "video_core/memory_manager.h"
 #include "video_core/nx2_draw_stats.h"
 #include "video_core/nx2_hazard.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
@@ -2446,8 +2449,11 @@ void TextureCache<P>::RefreshSparseTiles(Image& image) {
         // data (the tiles the game maps there, or the blocks written).
         std::vector<std::pair<u64, u64>> ranges = std::move(image.dirty_ranges);
         image.dirty_ranges.clear();
-        if (ranges.empty()) {
-            ranges = Tegra::Nx2SparseDataRanges(image.gpu_addr, image.guest_size_bytes);
+        if (ranges.empty() && gpu_memory != nullptr) {
+            if (const auto nx2_session = gpu_memory->System().Nx2Session()) {
+                ranges = nx2_session->SparseState().DataRanges(image.gpu_addr,
+                                                               image.guest_size_bytes);
+            }
         }
         const std::vector<LevelRect> rects =
             SparseTileRects(image.info, ranges, image.SparseTileWidth(), image.SparseTileHeight(),
@@ -2534,11 +2540,15 @@ void TextureCache<P>::RefreshSparseLayers(Image& image) {
         // blocks has been written.
         const u32 num_layers = static_cast<u32>(image.info.resources.layers);
         const u64 stride = image.info.layer_stride;
+        const auto nx2_session =
+            gpu_memory != nullptr ? gpu_memory->System().Nx2Session() : nullptr;
         std::vector<u32> layers;
         for (u32 layer = 0; layer < num_layers; ++layer) {
             const bool written =
                 image.dirty_layers.empty()
-                    ? !Tegra::Nx2SparseUnwritten(image.gpu_addr + layer * stride, stride)
+                    ? (nx2_session == nullptr ||
+                       !nx2_session->SparseState().Unwritten(image.gpu_addr + layer * stride,
+                                                             stride))
                     : ((image.dirty_layers[layer / 64] >> (layer % 64)) & 1) != 0;
             if (written) {
                 layers.push_back(layer);
@@ -2855,7 +2865,10 @@ void TextureCache<P>::InvalidateScale(Image& image) {
     image.image_view_ids.clear();
     image.image_view_infos.clear();
     for (size_t c : active_channel_ids) {
-        auto& channel_info = channel_storage[c];
+        if (!channel_storage[c].has_value()) {
+            continue;
+        }
+        auto& channel_info = *channel_storage[c];
 
 #ifndef NDEBUG
         if constexpr (ENABLE_VALIDATION) {
@@ -3368,10 +3381,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         ++images_created;
     }
 
+    const auto nx2_session = gpu_memory != nullptr ? gpu_memory->System().Nx2Session() : nullptr;
     if (!gpu_memory->IsContinuousRange(new_image.gpu_addr, new_image.guest_size_bytes) &&
         (new_info.is_sparse ||
-         (new_info.native_tiling &&
-          Tegra::Nx2InSparseRegion(new_image.gpu_addr, new_image.guest_size_bytes)))) {
+         (new_info.native_tiling && nx2_session != nullptr &&
+          nx2_session->SparseState().InRegion(new_image.gpu_addr, new_image.guest_size_bytes)))) {
         new_image.flags |= ImageFlagBits::Sparse;
     }
 
@@ -4387,7 +4401,10 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         slot_image_allocs.erase(alloc_id);
     }
     for (size_t c : active_channel_ids) {
-        auto& channel_info = channel_storage[c];
+        if (!channel_storage[c].has_value()) {
+            continue;
+        }
+        auto& channel_info = *channel_storage[c];
 #ifndef NDEBUG
         if constexpr (ENABLE_VALIDATION) {
             std::ranges::fill(channel_info.graphics_image_table.bound_ids, CORRUPT_ID);
@@ -4409,10 +4426,11 @@ void TextureCache<P>::RemoveImageViewReferences(std::span<const ImageViewId> rem
         }
         for (const auto& [channel, descriptor] : refs->second) {
             // The channel may be gone, or its entry point to another view since.
-            if (std::ranges::find(active_channel_ids, channel) == active_channel_ids.end()) {
+            if (std::ranges::find(active_channel_ids, channel) == active_channel_ids.end() ||
+                !channel_storage[channel].has_value()) {
                 continue;
             }
-            auto& image_views = channel_storage[channel].image_views;
+            auto& image_views = channel_storage[channel]->image_views;
             if (const auto it = image_views.find(descriptor);
                 it != image_views.end() && it->second == removed) {
                 image_views.erase(it);
@@ -4566,7 +4584,11 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             // The GPU renders into it: these writes are lost, later uses get a backed image.
             LOG_WARNING(HW_GPU, "GPU write into unwritten sparse image {:#x}; replacing it",
                         image.gpu_addr);
-            Tegra::Nx2SparseMarkWritten(image.gpu_addr, image.guest_size_bytes);
+            if (gpu_memory != nullptr) {
+                if (const auto nx2_session = gpu_memory->System().Nx2Session()) {
+                    nx2_session->SparseState().MarkWritten(image.gpu_addr, image.guest_size_bytes);
+                }
+            }
             image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
         }
         MarkModification(image);
@@ -4768,9 +4790,37 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
 template <class P>
 void TextureCache<P>::CreateChannel(struct Tegra::Control::ChannelState& channel) {
     VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo>::CreateChannel(channel);
+    std::unique_lock<std::mutex> lk(config_mutex);
     const auto it = channel_map.find(channel.bind_id);
-    auto* this_state = &channel_storage[it->second];
+    if (it == channel_map.end() || !channel_storage[it->second].has_value()) {
+        return;
+    }
+    auto* this_state = &*channel_storage[it->second];
     const auto& this_as_ref = address_spaces[channel.memory_manager->GetID()];
+    this_state->gpu_page_table = &gpu_page_table_storage[this_as_ref.storage_id * 2];
+    this_state->sparse_page_table = &gpu_page_table_storage[this_as_ref.storage_id * 2 + 1];
+}
+
+template <class P>
+void TextureCache<P>::CreateChannelFromBridge(const Tegra::Control::ChannelStateBridge& bridge) {
+    VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo>::CreateChannelFromBridge(bridge);
+    if (!bridge.HasChannelBindings() || bridge.BindId() < 0) {
+        return;
+    }
+    std::unique_lock<std::mutex> lk(config_mutex);
+    const auto it = channel_map.find(bridge.BindId());
+    if (it == channel_map.end() || !channel_storage[it->second].has_value()) {
+        return;
+    }
+    auto* this_state = &*channel_storage[it->second];
+    if (this_state->gpu_page_table != nullptr) {
+        return;
+    }
+    auto* const mem = bridge.GpuMemoryPtr();
+    if (mem == nullptr) {
+        return;
+    }
+    const auto& this_as_ref = address_spaces[mem->GetID()];
     this_state->gpu_page_table = &gpu_page_table_storage[this_as_ref.storage_id * 2];
     this_state->sparse_page_table = &gpu_page_table_storage[this_as_ref.storage_id * 2 + 1];
 }

@@ -33,6 +33,9 @@ struct PlatformProfile {
     PlatformKind kind{PlatformKind::Switch1};
     PlatformResolution resolution{PlatformResolution::DefaultSwitch1};
     u64 guest_cntfrq{19'200'000ULL};
+    u32 cpu_cores{4};
+    u32 device_address_bits{34};
+    bool prefer_async_buffer_downloads{true};
     bool force_12gb_memory_layout{false};
     bool reset_dram_on_shutdown{false};
     bool allow_contradictory_nx2_gpu_query{true};

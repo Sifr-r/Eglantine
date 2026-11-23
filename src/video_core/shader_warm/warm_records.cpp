@@ -7,8 +7,8 @@
 #include <algorithm>
 #include <cstring>
 
-#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
 #include "shader_recompiler/frontend/ampere/program_capture.h"
+#include "shader_recompiler/frontend/ampere/program_override.h"
 #include "video_core/shader_environment.h"
 #include "video_core/shader_warm/warm_records.h"
 
@@ -50,9 +50,9 @@ void PutEnvHeader(std::vector<u8>& out, u64 code_size, u64 cbuf_count, u32 local
     Put<u32>(out, local_memory);
     Put<u32>(out, texture_bound);
     Put<u32>(out, start_address);
-    Put<u32>(out, 0);                                  // read lowest
-    Put<u32>(out, static_cast<u32>(code_size - 8));    // read highest
-    Put<u32>(out, 1);                                  // viewport transform state
+    Put<u32>(out, 0);                                                      // read lowest
+    Put<u32>(out, static_cast<u32>(code_size >= 8 ? code_size - 8 : 0));  // read highest
+    Put<u32>(out, 1);                                                      // viewport transform state
     Put<u32>(out, stage);
 }
 
@@ -60,6 +60,9 @@ void PutEnvHeader(std::vector<u8>& out, u64 code_size, u64 cbuf_count, u32 local
 
 std::optional<std::string> LowerProgram(std::span<const u8> program, LoweredCode& out) {
     using Shader::Ampere::Instruction;
+    out.code.clear();
+    out.native_hash = 0;
+    out.texture_buffer = ~0U;
     if (program.empty() || program.size() % sizeof(Instruction) ||
         program.size() / sizeof(Instruction) > 65536) {
         return "Native input must contain 1..65536 complete 16-byte instructions";
@@ -82,22 +85,38 @@ std::optional<std::string> LowerProgram(std::span<const u8> program, LoweredCode
     if (!complete) {
         return "Native allocation lacks a complete runtime capture";
     }
-    // As GenericEnvironment::LowerNativeCode for a compute dispatch, without the tensor forms.
-    auto lowered = Shader::Ampere::LowerToMaxwell(native, {});
-    if (!lowered) {
-        return std::string(lowered.error);
-    }
-    constexpr std::array<u64, ComputeHeaderWords> header{};
-    const std::vector<u64> words = LayOutLoweredNativeCode(header, native, lowered);
-    out.code.resize(words.size() * sizeof(u64));
-    std::memcpy(out.code.data(), words.data(), out.code.size());
-    out.texture_buffer = lowered.required_texture_buffer;
+
+    // Match GenericEnvironment::CaptureNativeCode for a compute dispatch: store the captured
+    // SM86 blob and deterministic discovery hash so warm entries share runtime pipeline keys.
+    LoweredNativeCode native_info;
+    native_info.native_program_key = Shader::Ampere::NativeProgramKey(native);
+    native_info.diagnostic_key = native_info.native_program_key;
+    native_info.source_size = native.size() * sizeof(Instruction);
+    native_info.native_code = std::move(native);
+    native_info.source_header_size = 0;
+    native_info.has_native_context = true;
+    native_info.native_hash = ComputeNativeDiscoveryHash(native_info);
+
+    const std::vector<u64> blob = PackNativeSm86Blob(native_info, false);
+    out.code.resize(blob.size() * sizeof(u64));
+    std::memcpy(out.code.data(), blob.data(), out.code.size());
+    out.native_hash = native_info.native_hash;
+    out.texture_buffer = ~0U;
     return std::nullopt;
 }
 
 u64 StageHash(std::span<const u8> code) {
+    if (code.empty() || code.size() % sizeof(u64) != 0) {
+        return 0;
+    }
     std::vector<u64> words(code.size() / sizeof(u64));
     std::memcpy(words.data(), code.data(), words.size() * sizeof(u64));
+    LoweredNativeCode unpacked;
+    bool has_hle{};
+    if (TryUnpackNativeSm86Blob(words, unpacked, has_hle)) {
+        return unpacked.native_hash != 0 ? unpacked.native_hash
+                                         : ComputeNativeDiscoveryHash(unpacked);
+    }
     return NativeShaderHash(words);
 }
 
@@ -130,7 +149,9 @@ std::vector<u8> ComputeEntry(const LoweredCode& lowered, const ComputeControl& c
     }
     Put<u32>(out, control.shared_memory);
     std::vector<u8> key_bytes;
-    Put<u64>(key_bytes, StageHash(lowered.code));
+    const u64 unique_hash =
+        lowered.native_hash != 0 ? lowered.native_hash : StageHash(lowered.code);
+    Put<u64>(key_bytes, unique_hash);
     Put<u32>(key_bytes, control.shared_memory);
     for (const u32 size : control.workgroup) {
         Put<u32>(key_bytes, size);

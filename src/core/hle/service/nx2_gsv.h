@@ -38,6 +38,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "core/device_memory.h"
 #include "video_core/nx2_diag.h"
 #include "video_core/nx2_spikes.h"
@@ -90,9 +91,6 @@
 #include "core/hle/service/service.h"
 
 namespace Service {
-
-/// LOCAL TEST (Zelda): steady-clock time of the last decoded video frame (PaceToVblank).
-inline std::atomic<s64> g_nx2_video_last_frame_ns{0};
 
 // Creates a session served by `iface` and returns its client end. Unlike PushIpcInterface this
 // works from a domain too, for callers that want a raw session handle.
@@ -439,17 +437,22 @@ public:
             {8003, &INx2GpuSession::StubReplyZeroed, "Unknown8003"},
             {8004, &INx2GpuSession::StubReplyZeroed, "Unknown8004"},
         });
+        m_nx2_session = system.EnsureNx2Session();
         if (LazySparseRegions()) {
-            Tegra::Nx2SetSparseBacking(
-                [this](u64 gpu_address, u64 size, const u8* data) {
-                    BackSparseWrite(gpu_address, size, data);
-                });
+            if (const auto nx2_session = m_nx2_session.lock()) {
+                nx2_session->SparseState().SetBacking(
+                    [this](u64 gpu_address, u64 size, const u8* data) {
+                        BackSparseWrite(gpu_address, size, data);
+                    });
+            }
         }
     }
 
     ~INx2GpuSession() override {
         // Waits for a backing the GPU thread may be doing.
-        Tegra::Nx2SetSparseBacking({});
+        if (const auto nx2_session = m_nx2_session.lock()) {
+            nx2_session->SparseState().SetBacking({});
+        }
         // The callbacks queued for the GPU thread must not run after this returns: let them run
         // now, while the session and its events are still there. The drain is only skipped once
         // the core shutdown began: the GPU thread is stopped then, before the services are
@@ -642,13 +645,15 @@ private:
             return;
         }
         const u64 size = last - start + 1;
-        Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Register(start, size);
-        // Two-page regions hold queue semaphores: GPU releases go to the second page, waits
-        // read the first (see video_core/nx2.h).
-        if (size == 0x2000) {
-            Tegra::Nx2AddSemaphoreRegion(start);
-            LOG_DEBUG(Service, "nx2:gpu semaphore page {:#x} mirrored to {:#x}", start + 0x1000,
-                      start);
+        if (const auto nx2_session = Nx2Session()) {
+            nx2_session->GpuMemoryRegistry().Register(start, size);
+            // Two-page regions hold queue semaphores: GPU releases go to the second page, waits
+            // read the first (see video_core/nx2.h).
+            if (size == 0x2000) {
+                nx2_session->SemaphoreRegions().Add(start);
+                LOG_DEBUG(Service, "nx2:gpu semaphore page {:#x} mirrored to {:#x}",
+                          start + 0x1000, start);
+            }
         }
         // nn::gpu::sdk::CreateGpuAccessibleMemory stores word 3 of the reply as the
         // GpuMemoryHandle that later map jobs (211) name.
@@ -698,7 +703,9 @@ private:
                     // Also at the memory's own address: an earlier 213 may have unmapped the mapping
                     // 101 made there.
                     const u64 cpu = it->second.address + c;
-                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(a, cpu, size);
+                    if (const auto nx2_session = Nx2Session()) {
+                        nx2_session->GpuMemoryRegistry().MapAt(a, cpu, size);
+                    }
                 }
             }
         } else {
@@ -748,7 +755,9 @@ private:
             rb.PushRaw<u32>(validation.raw);
             return;
         }
-        Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
+        if (const auto nx2_session = Nx2Session()) {
+            nx2_session->GpuMemoryRegistry().Unmap(first, last - first + 1);
+        }
         SignalAfterGpu(w[8]);
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
@@ -803,11 +812,13 @@ private:
             const auto [address, size] = it->second;
             LOG_DEBUG(Service, "nx2:gpu 102 destroy handle={} [{:#x}, +{:#x}] slot={}", handle,
                       address, size, w[3]);
-            if (size != 0) {
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(address, size);
-            }
-            if (size == 0x2000) {
-                Tegra::Nx2RemoveSemaphoreRegion(address);
+            if (const auto nx2_session = Nx2Session()) {
+                if (size != 0) {
+                    nx2_session->GpuMemoryRegistry().Unmap(address, size);
+                }
+                if (size == 0x2000) {
+                    nx2_session->SemaphoreRegions().Remove(address);
+                }
             }
             m_memory.erase(it);
         } else {
@@ -860,9 +871,11 @@ private:
                     .size = size,
                     .blocks = std::vector<u8>(Common::DivCeil(size, SparseBlockSize)),
                 };
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().CreateSparse(start, size);
-                Tegra::Nx2SparseRegionCreated(start, size, SparseBlockSize);
-                Tegra::Nx2AddSparseSpan(start, size);
+                if (const auto nx2_session = Nx2Session()) {
+                    nx2_session->GpuMemoryRegistry().CreateSparse(start, size);
+                    nx2_session->SparseState().RegionCreated(start, size, SparseBlockSize);
+                    nx2_session->SparseState().AddSpan(start, size);
+                }
                 LOG_INFO(Service, "nx2:gpu 214 sparse region [{:#x}, {:#x}] backed as the GPU writes it",
                          start, last);
             } else if (use_lazy_gpu_only) {
@@ -875,14 +888,18 @@ private:
                     .size = size,
                     .blocks = std::vector<u8>(Common::DivCeil(size, SparseBlockSize)),
                 };
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().CreateSparse(start, size);
-                Tegra::Nx2AddSparseSpan(start, size);
+                if (const auto nx2_session = Nx2Session()) {
+                    nx2_session->GpuMemoryRegistry().CreateSparse(start, size);
+                    nx2_session->SparseState().AddSpan(start, size);
+                }
                 LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed as it is written",
                          start, last);
             } else if (eager_backing) {
                 const u64 address = eager_backing->address;
                 RegisterGpuOnlyBacking(start, std::move(*eager_backing));
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(start, address, size);
+                if (const auto nx2_session = Nx2Session()) {
+                    nx2_session->GpuMemoryRegistry().MapAt(start, address, size);
+                }
                 LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed at {:#x} "
                                   "({} MiB of GPU-only memory in use, peak {} MiB)",
                          start, last, address, m_gpu_only_bytes >> 20, m_gpu_only_peak >> 20);
@@ -924,10 +941,14 @@ private:
                             static_cast<u64>(std::count(region->second.tile_pages.begin(),
                                                         region->second.tile_pages.end(), true));
             m_sparse_regions.erase(region);
-            Tegra::Nx2SparseRegionDestroyed(first);
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DestroySparse(first, last - first + 1);
+            if (const auto nx2_session = Nx2Session()) {
+                nx2_session->SparseState().RegionDestroyed(first);
+                nx2_session->GpuMemoryRegistry().DestroySparse(first, last - first + 1);
+            }
         } else {
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
+            if (const auto nx2_session = Nx2Session()) {
+                nx2_session->GpuMemoryRegistry().Unmap(first, last - first + 1);
+            }
         }
         // The region's backing: all of it, or the blocks a sparse region got as it was written.
         std::shared_ptr<std::atomic<bool>> done;
@@ -937,8 +958,10 @@ private:
                 ++region;
                 continue;
             }
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(
-                region->second.cpu_address, region->second.size);
+            if (const auto nx2_session = Nx2Session()) {
+                nx2_session->GpuMemoryRegistry().ReleaseBacking(
+                    region->second.cpu_address, region->second.size);
+            }
             if (!done) {
                 done = std::make_shared<std::atomic<bool>>(false);
             }
@@ -1160,9 +1183,11 @@ private:
         // Its bytes stay counted until the region is unmapped (FreeReleasedRegions), like every
         // other region that waits for the GPU thread.
         if (const auto it = m_gpu_only_regions.find(gpu_address); it != m_gpu_only_regions.end()) {
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(gpu_address, it->second.size);
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().ReleaseBacking(it->second.cpu_address,
-                                                                        it->second.size);
+            if (const auto nx2_session = Nx2Session()) {
+                nx2_session->GpuMemoryRegistry().Unmap(gpu_address, it->second.size);
+                nx2_session->GpuMemoryRegistry().ReleaseBacking(it->second.cpu_address,
+                                                                it->second.size);
+            }
             auto done = std::make_shared<std::atomic<bool>>(false);
             QueueBackingRelease(done);
             m_released_regions.push_back({std::move(it->second), done});
@@ -1178,6 +1203,10 @@ private:
     // region's device pages. The GPU mapping stays as it is, so the images over the region keep
     // their storage and only see the write.
     void BackSparseWrite(u64 gpu_address, u64 size, const u8* data) {
+        const auto nx2_session = m_nx2_session.lock();
+        if (!nx2_session) {
+            return;
+        }
         struct Pending {
             u64 region;
             u64 block;
@@ -1209,7 +1238,7 @@ private:
                         // The write lands in the game's own memory (a tile it mapped) or nowhere;
                         // the texture cache only learns that the block has contents now.
                         region.blocks[block] = BlockWritten;
-                        Tegra::Nx2SparseBlockWritten(start, block);
+                        nx2_session->SparseState().BlockWritten(start, block);
                     } else if (region.blocks[block] == BlockEmpty) {
                         // Zeros over a block nobody wrote change nothing: it reads zero without
                         // memory. Title 1 clears ~1 GB of them at boot.
@@ -1219,7 +1248,7 @@ private:
                             {end, block_begin + SparseBlockSize, start + region.size});
                         if (data != nullptr &&
                             IsAllZero(data + (write_begin - gpu_address), write_end - write_begin) &&
-                            !Tegra::Nx2SparseBlockIsWritten(start, block)) {
+                            !nx2_session->SparseState().BlockIsWritten(start, block)) {
                             zero_bytes += write_end - write_begin;
                             continue;
                         }
@@ -1262,7 +1291,7 @@ private:
                     // The game started mapping its tiles there meanwhile (216): no block.
                     stale = true;
                     it->second.blocks[block] = BlockWritten;
-                    Tegra::Nx2SparseBlockWritten(start, block);
+                    nx2_session->SparseState().BlockWritten(start, block);
                 } else if (!backing) {
                     auto& region = it->second;
                     region.blocks[block] = BlockFailed; // out of memory: not again for every write
@@ -1277,9 +1306,9 @@ private:
                     const u64 address = backing->address;
                     it->second.blocks[block] = BlockBacked;
                     RegisterGpuOnlyBacking(block_address, std::move(*backing));
-                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().BackSparse(block_address, address,
-                                                                            block_size);
-                    Tegra::Nx2SparseBlockWritten(start, block);
+                    nx2_session->GpuMemoryRegistry().BackSparse(block_address, address,
+                                                                block_size);
+                    nx2_session->SparseState().BlockWritten(start, block);
                     m_sparse_backed_bytes += block_size;
                     if (++m_sparse_blocks == 1 || (m_sparse_blocks % 64) == 0) {
                         LOG_INFO(Service, "nx2:gpu {} sparse blocks backed ({} MiB); {} MiB of GPU-only "
@@ -1391,7 +1420,11 @@ private:
                         gpu_address, size);
             return;
         }
-        auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
+        const auto nx2_session = Nx2Session();
+        if (!nx2_session) {
+            return;
+        }
+        auto& registry = nx2_session->GpuMemoryRegistry();
         auto it = m_sparse_regions.upper_bound(gpu_address);
         SparseRegion* region = nullptr;
         u64 start = 0;
@@ -1411,7 +1444,7 @@ private:
             ++m_tile_unmaps;
             LOG_DEBUG(Service, "nx2:gpu 216 unmap [{:#x}, +{:#x}]", gpu_address, size);
             if (region != nullptr) {
-                Tegra::Nx2SparseTilesMapped(start, gpu_address - start, size, false);
+                nx2_session->SparseState().TilesMapped(start, gpu_address - start, size, false);
                 registry.MapSparseTile(gpu_address, 0, size);
                 MarkTiles(*region, gpu_address - start, size, false);
             } else {
@@ -1446,9 +1479,9 @@ private:
             if (region->blocks[block] == BlockEmpty) {
                 region->blocks[block] = BlockWritten;
             }
-            Tegra::Nx2SparseBlockWritten(start, block);
+            nx2_session->SparseState().BlockWritten(start, block);
         }
-        Tegra::Nx2SparseTilesMapped(start, gpu_address - start, size, true);
+        nx2_session->SparseState().TilesMapped(start, gpu_address - start, size, true);
         registry.MapSparseTile(gpu_address, cpu_address, size);
         MarkTiles(*region, gpu_address - start, size, true);
     }
@@ -1478,7 +1511,11 @@ private:
     //   a group keep the memory 214 gave them.
     // Lazily backed regions take the sparse-tile path above once explicit backing is supplied.
     void ApplyGpuOnlyRequest(u64 region, const SparseMapRequest& request) {
-        auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
+        const auto nx2_session = Nx2Session();
+        if (!nx2_session) {
+            return;
+        }
+        auto& registry = nx2_session->GpuMemoryRegistry();
         const u64 gpu_address = request.gpu_address;
         const u64 size = request.size;
         if (request.memory_handle == 0) {
@@ -1563,7 +1600,11 @@ private:
     // Forgets the game's tiles in [gpu_address, +size) of GPU-only regions; with `restore` (an
     // unmap) those ranges show the region's own memory again, or nothing where it has none.
     void DropGpuOnlyTiles(u64 gpu_address, u64 size, bool restore) {
-        auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
+        const auto nx2_session = Nx2Session();
+        if (!nx2_session) {
+            return;
+        }
+        auto& registry = nx2_session->GpuMemoryRegistry();
         auto it = m_gpu_only_tiles.upper_bound(gpu_address);
         if (it != m_gpu_only_tiles.begin()) {
             const auto previous = std::prev(it);
@@ -1597,7 +1638,10 @@ private:
     // tile was mapped, which the console would have dropped) go back.
     void StartTiles(u64 start, SparseRegion& region) {
         using Core::Memory::YUZU_PAGESIZE;
-        Tegra::Nx2SparseRegionTiled(start, region.size, SparseBlockSize);
+        const auto nx2_session = Nx2Session();
+        if (nx2_session) {
+            nx2_session->SparseState().RegionTiled(start, region.size, SparseBlockSize);
+        }
         region.tiles = true;
         region.tile_pages.assign(Common::DivCeil(region.size, YUZU_PAGESIZE), false);
         std::shared_ptr<std::atomic<bool>> done;
@@ -1612,8 +1656,10 @@ private:
             if (backing == m_gpu_only_regions.end()) {
                 continue;
             }
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapSparseTile(block_address, 0,
-                                                                        backing->second.size);
+            if (nx2_session) {
+                nx2_session->GpuMemoryRegistry().MapSparseTile(block_address, 0,
+                                                               backing->second.size);
+            }
             if (!done) {
                 done = std::make_shared<std::atomic<bool>>(false);
             }
@@ -1694,6 +1740,16 @@ private:
 
     KernelHelpers::ServiceContext m_context;
     std::array<Kernel::KEvent*, NumIds> m_events{};
+    std::weak_ptr<Core::Nx2SessionState> m_nx2_session;
+
+    [[nodiscard]] std::shared_ptr<Core::Nx2SessionState> Nx2Session() {
+        if (auto session = m_nx2_session.lock()) {
+            return session;
+        }
+        auto ensured = system.EnsureNx2Session();
+        m_nx2_session = ensured;
+        return ensured;
+    }
 
     /// Outlives the session: the callbacks queued for the GPU thread may run after it is gone,
     /// and they signal an event only while `alive` (cleared under `mutex` before the events
@@ -2093,6 +2149,9 @@ private:
         const auto* w = ctx.CommandBuffer();
         ++m_presents;
         VideoCommon::Nx2GpuLatency::NotePresent();
+        if (const auto nx2_session = system.EnsureNx2Session()) {
+            nx2_session->IncrementPresentCount();
+        }
         Core::g_nx2_present_count.fetch_add(1, std::memory_order_relaxed);
         if (m_presents <= 4 || (m_presents % 600) == 0) {
             LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
@@ -2451,7 +2510,8 @@ private:
         }
         // LOCAL TEST (Zelda): not while a video plays. Ocarina's cutscene videos are 60 fps AV1;
         // forced to two vblanks a frame they played at half rate.
-        const s64 video_ns = g_nx2_video_last_frame_ns.load(std::memory_order_relaxed);
+        const auto nx2_session = system.Nx2Session();
+        const s64 video_ns = nx2_session ? nx2_session->VideoLastFrameNs() : 0;
         const bool video_playing =
             video_ns != 0 &&
             std::chrono::steady_clock::now().time_since_epoch().count() - video_ns <
@@ -2742,7 +2802,9 @@ private:
             layout = Nx2CalculateImageLayout(image->second.preference.data());
             image_format = image->second.preference[6];
         }
-        const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address);
+        const auto nx2_session = system.Nx2Session();
+        const auto device =
+            nx2_session ? nx2_session->GpuMemoryRegistry().DeviceAddressOf(address) : std::nullopt;
         if (!device) {
             LOG_WARNING(Service, "nx2:vi2 present: image {} at {:#x} has no device mapping",
                         image_id, address);
@@ -2958,9 +3020,13 @@ private:
             // On the GPU thread: waiting for it here can deadlock with a GPU wait on this present.
             static_cast<void>(system.GPU().RunOnGpuThread([&system = system, address, size, path] {
                 std::vector<u8> bytes(size);
+                const auto nx2_session = system.Nx2Session();
                 for (u64 current = address; current < address + size;) {
                     const u64 chunk = std::min((current | 0xfff) + 1, address + size) - current;
-                    if (const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(current)) {
+                    if (const auto device =
+                            nx2_session
+                                ? nx2_session->GpuMemoryRegistry().DeviceAddressOf(current)
+                                : std::nullopt) {
                         system.GPU().Renderer().ReadRasterizer()->FlushRegion(*device, chunk);
                         system.Host1x().MemoryManager().ReadBlock(*device, bytes.data() + (current - address), chunk);
                     }
@@ -3785,9 +3851,10 @@ private:
                 decoder->Drain(pictures);
             }
             if (!pictures.empty()) {
-                g_nx2_video_last_frame_ns.store(
-                    std::chrono::steady_clock::now().time_since_epoch().count(),
-                    std::memory_order_relaxed);
+                if (const auto nx2_session = system.EnsureNx2Session()) {
+                    nx2_session->SetVideoLastFrameNs(
+                        std::chrono::steady_clock::now().time_since_epoch().count());
+                }
             }
             lk.lock();
             if (m_flush) {
@@ -3864,8 +3931,10 @@ private:
             Tegra::Texture::SwizzleTexture(m_tiled, bytes, 4, static_cast<u32>(layout.pitch / 4),
                                            layout.height, 1, 4, 0, 1, true);
             memory.WriteBlock(address, m_tiled.data(), m_tiled.size());
+            const auto nx2_session = system.Nx2Session();
             if (const auto device =
-                    Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
+                    nx2_session ? nx2_session->GpuMemoryRegistry().DeviceAddressOf(address)
+                                : std::nullopt) {
                 system.GPU().InvalidateRegion(*device, m_tiled.size());
             }
             return {width, height};
@@ -3879,7 +3948,10 @@ private:
                               layout.pitch * ((height + 1) / 2));
         }
         // The game samples the image on the GPU: drop the texture cache's copy of the old frame.
-        if (const auto device = Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address)) {
+        const auto nx2_session = system.Nx2Session();
+        if (const auto device =
+                nx2_session ? nx2_session->GpuMemoryRegistry().DeviceAddressOf(address)
+                            : std::nullopt) {
             system.GPU().InvalidateRegion(*device, layout.size);
         }
         return {width, height};
@@ -4682,13 +4754,16 @@ private:
                     offset <= memory->second.size && size <= memory->second.size - offset &&
                     address <= std::numeric_limits<u64>::max() - (size - 1) &&
                     Nx2GpuMemoryRangeValid(address, address + size - 1, Nx2GpuVaStart, Nx2GpuVaEnd);
-                register_mapping = valid_range && image->second.gpu_maps++ == 0 &&
-                                   !Nvidia::Devices::Nx2GpuMemoryRegistry::Get().DeviceAddressOf(address);
+                const auto nx2_session = system.EnsureNx2Session();
+                register_mapping = valid_range && image->second.gpu_maps++ == 0 && nx2_session &&
+                                   !nx2_session->GpuMemoryRegistry().DeviceAddressOf(address);
                 image->second.mapped_here |= register_mapping;
             }
         }
         if (register_mapping) {
-            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Register(address, size);
+            if (const auto nx2_session = system.EnsureNx2Session()) {
+                nx2_session->GpuMemoryRegistry().Register(address, size);
+            }
         }
         LOG_INFO(Service, "nx2:gsv {} decoder image {} at {:#x}+{:#x}{}", ctx.GetCommand(), handle,
                  address, size, register_mapping ? ", mapped for the GPU" : "");
@@ -4747,11 +4822,13 @@ private:
         return std::pair{memory->second.address + image.offset, image.size};
     }
 
-    static void DropDecoderMapping(const std::optional<std::pair<u64, u64>>& range) {
+    void DropDecoderMapping(const std::optional<std::pair<u64, u64>>& range) const {
         if (range) {
-            auto& registry = Nvidia::Devices::Nx2GpuMemoryRegistry::Get();
-            registry.Unmap(range->first, range->second);
-            registry.ReleaseBacking(range->first, range->second);
+            if (const auto nx2_session = system.Nx2Session()) {
+                auto& registry = nx2_session->GpuMemoryRegistry();
+                registry.Unmap(range->first, range->second);
+                registry.ReleaseBacking(range->first, range->second);
+            }
         }
     }
 
