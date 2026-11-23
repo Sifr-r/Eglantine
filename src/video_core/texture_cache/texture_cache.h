@@ -228,8 +228,7 @@ void TextureCache<P>::RunGarbageCollector() {
             image.DownloadMemory(map, copies);
             runtime.Finish();
             try {
-                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
-                             swizzle_data_buffer);
+                WriteBackImage(image, copies, map.mapped_span);
             } catch (const std::bad_alloc&) {
                 HandleScratchAllocationFailure(image);
                 return false;
@@ -1375,8 +1374,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         runtime.Finish();
         for (Pending& entry : pending) {
             Image& image = slot_images[entry.image_id];
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
-                         entry.map.mapped_span, swizzle_data_buffer);
+            WriteBackImage(image, entry.copies, entry.map.mapped_span);
         }
         pending.clear();
         pending_bytes = 0;
@@ -1943,6 +1941,12 @@ bool TextureCache<P>::HasAsyncFlushWork() const noexcept {
 }
 
 template <class P>
+bool TextureCache<P>::HasUncommittedBufferDownloads() const noexcept {
+    return std::ranges::any_of(uncommitted_downloads,
+                               [](const PendingDownload& download) { return !download.is_swizzle; });
+}
+
+template <class P>
 bool TextureCache<P>::ShouldWaitAsyncFlushes() const noexcept {
     return !committed_downloads.empty() && !committed_downloads.front().empty();
 }
@@ -2035,14 +2039,12 @@ void TextureCache<P>::PopAsyncFlushes() {
                 download_buffer.offset -= Common::AlignUp(image.unswizzled_size_bytes, 64);
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
-                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span,
-                             swizzle_data_buffer);
+                WriteBackImage(image, copies, download_span);
             } else {
                 const BufferDownload& buffer_info = slot_buffer_downloads[download_info.object_id];
                 std::span<u8> download_span =
                     download_buffer.mapped_span.subspan(download_buffer.offset);
-                gpu_memory->WriteBlockUnsafe(buffer_info.address, download_span.data(),
-                                             buffer_info.size);
+                WriteHostRuns(buffer_info.destination, download_span.data());
                 slot_buffer_downloads.erase(download_info.object_id);
             }
         }
@@ -2084,8 +2086,7 @@ void TextureCache<P>::PopAsyncFlushes() {
             }
             const ImageBase& image = download_info.GetImage(slot_images);
             const auto copies = FullDownloadCopies(image.info);
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, download_span,
-                         swizzle_data_buffer);
+            WriteBackImage(image, copies, download_span);
             download_map.offset += image.unswizzled_size_bytes;
             download_span = download_span.subspan(image.unswizzled_size_bytes);
         }
@@ -2198,7 +2199,10 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
                                               std::span<const VideoCommon::BufferImageCopy> copies,
                                               GPUVAddr address, size_t size) {
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
-        const BufferDownload new_buffer_download{address, size};
+        const BufferDownload new_buffer_download{GatherHostRuns(
+            address, size, Core::DEVICE_PAGESIZE, [this](GPUVAddr page) {
+                return gpu_memory != nullptr ? gpu_memory->GetPointer<u8>(page) : nullptr;
+            })};
         auto slot = slot_buffer_downloads.insert(new_buffer_download);
         const PendingDownload new_download{false, uncommitted_async_buffers.size(), slot};
         uncommitted_downloads.emplace_back(new_download);
@@ -2216,6 +2220,45 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
     } else {
         image->DownloadMemory(buffer, buffer_offset, copies);
     }
+}
+
+template <class P>
+std::shared_ptr<Tegra::MemoryManager> TextureCache<P>::WriteBackMemory(const ImageBase& image) {
+    boost::container::small_vector<std::shared_ptr<Tegra::MemoryManager>, 4> others;
+    {
+        std::scoped_lock lock{config_mutex};
+        for (const auto& [id, ref] : address_spaces) {
+            std::shared_ptr<Tegra::MemoryManager> memory = ref.owner.lock();
+            if (!memory) {
+                continue;
+            }
+            if (id == image.address_space) {
+                return memory;
+            }
+            others.push_back(std::move(memory));
+        }
+    }
+    if (True(image.flags & ImageFlagBits::Sparse)) {
+        return nullptr;
+    }
+    for (std::shared_ptr<Tegra::MemoryManager>& memory : others) {
+        if (memory->GpuToCpuAddress(image.gpu_addr) == image.cpu_addr) {
+            return std::move(memory);
+        }
+    }
+    return nullptr;
+}
+
+template <class P>
+bool TextureCache<P>::WriteBackImage(const ImageBase& image,
+                                     std::span<const BufferImageCopy> copies,
+                                     std::span<const u8> data) {
+    const std::shared_ptr<Tegra::MemoryManager> memory = WriteBackMemory(image);
+    if (!memory) {
+        return false;
+    }
+    SwizzleImage(*memory, image.gpu_addr, image.info, copies, data, swizzle_data_buffer);
+    return true;
 }
 
 template <class P>
@@ -4121,8 +4164,10 @@ void TextureCache<P>::ForEachSparseSegment(ImageBase& image, Func&& func) {
     constexpr bool RETURNS_BOOL = std::is_same_v<FuncReturn, bool>;
     const auto segments = gpu_memory->GetSubmappedRange(image.gpu_addr, image.guest_size_bytes);
     for (const auto& [gpu_addr, size] : segments) {
-        std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
-        ASSERT(cpu_addr);
+        const auto cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
+        if (!cpu_addr) {
+            continue;
+        }
         if constexpr (RETURNS_BOOL) {
             if (func(gpu_addr, *cpu_addr, size)) {
                 break;
@@ -4160,6 +4205,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    image.address_space = current_address_space;
     total_used_memory += ImageMemoryBytes(slot_images[image_id]);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
 
@@ -4198,6 +4244,10 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
     image.flags &= ~ImageFlagBits::Registered;
     image.flags &= ~ImageFlagBits::BadOverlap;
     lru_cache.Free(image.lru_index);
+    const std::optional<size_t> storage_id = getStorageID(image.address_space);
+    ASSERT(storage_id);
+    auto& gpu_page_table = gpu_page_table_storage[*storage_id * 2];
+    auto& sparse_page_table = gpu_page_table_storage[*storage_id * 2 + 1];
     const auto& clear_page_table =
         [image_id](u64 page,
                    ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>&
@@ -4219,9 +4269,10 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
                 selected_page_table.erase(page_it);
             }
         };
-    ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, &clear_page_table](u64 page) {
-        clear_page_table(page, (*channel_state->gpu_page_table));
-    });
+    ForEachGPUPage(image.gpu_addr, image.guest_size_bytes,
+                   [&clear_page_table, &gpu_page_table](u64 page) {
+                       clear_page_table(page, gpu_page_table);
+                   });
     if (False(image.flags & ImageFlagBits::Sparse)) {
         const auto map_id = image.map_view_id;
         ForEachCPUPage(image.cpu_addr, image.guest_size_bytes, [this, map_id](u64 page) {
@@ -4245,9 +4296,10 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
         slot_map_views.erase(map_id);
         return;
     }
-    ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, &clear_page_table](u64 page) {
-        clear_page_table(page, (*channel_state->sparse_page_table));
-    });
+    ForEachGPUPage(image.gpu_addr, image.guest_size_bytes,
+                   [&clear_page_table, &sparse_page_table](u64 page) {
+                       clear_page_table(page, sparse_page_table);
+                   });
     auto it = sparse_views.find(image_id);
     ASSERT(it != sparse_views.end());
     auto& sparse_maps = it->second;

@@ -39,7 +39,7 @@ struct PlatformProfile;
 
 namespace Tegra {
 
-class MemoryManager final {
+class MemoryManager final : public std::enable_shared_from_this<MemoryManager> {
 public:
     explicit MemoryManager(Core::System& system_, u64 address_space_bits_ = 40,
                            GPUVAddr split_address = 1ULL << 34, u64 big_page_bits_ = 16,

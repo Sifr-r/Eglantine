@@ -315,29 +315,37 @@ struct Memory::Impl {
         });
     }
 
-    [[nodiscard]] inline const u8* GetSpan(const VAddr addr, const std::size_t size) const noexcept {
-        const auto first = current_page_table->entries[addr >> YUZU_PAGEBITS].Block();
-        const auto last = current_page_table->entries[(addr + size) >> YUZU_PAGEBITS].Block();
-        if (Common::PageTable::PageEntryData::CanFastSpan(first, last)) {
-            return GetPointerSilent(addr);
-        }
-        if (first != Common::PageTable::PageEntryData::INVALID_BLOCK_ID &&
-            last != Common::PageTable::PageEntryData::INVALID_BLOCK_ID) {
+    [[nodiscard]] u8* GetSpanImpl(const VAddr addr, const std::size_t size) const noexcept {
+        if (current_page_table == nullptr ||
+            !AddressSpaceContains(*current_page_table, addr, size) ||
+            addr >= (u64{1} << current_page_table->GetAddressSpaceBits())) {
             return nullptr;
         }
-        return GetContiguousSpan(addr, size);
+        const u64 first_page = addr >> YUZU_PAGEBITS;
+        const u64 last_page = (addr + (size != 0 ? size - 1 : std::size_t{0})) >> YUZU_PAGEBITS;
+        const auto first_raw = current_page_table->entries[first_page].Raw();
+        const uintptr_t offset =
+            Common::PageTable::PageEntryData::ExtractPointer(first_raw, true);
+        if (offset == 0 ||
+            static_cast<Common::PageType>(first_raw.type) == Common::PageType::Unmapped) {
+            return nullptr;
+        }
+        for (u64 page = first_page + 1; page <= last_page; ++page) {
+            const auto page_raw = current_page_table->entries[page].Raw();
+            if (static_cast<Common::PageType>(page_raw.type) == Common::PageType::Unmapped ||
+                Common::PageTable::PageEntryData::ExtractPointer(page_raw, true) != offset) {
+                return nullptr;
+            }
+        }
+        return GetPointerSilent(addr);
     }
-    [[nodiscard]] inline u8* GetSpan(const VAddr addr, const std::size_t size) noexcept {
-        const auto first = current_page_table->entries[addr >> YUZU_PAGEBITS].Block();
-        const auto last = current_page_table->entries[(addr + size) >> YUZU_PAGEBITS].Block();
-        if (Common::PageTable::PageEntryData::CanFastSpan(first, last)) {
-            return GetPointerSilent(addr);
-        }
-        if (first != Common::PageTable::PageEntryData::INVALID_BLOCK_ID &&
-            last != Common::PageTable::PageEntryData::INVALID_BLOCK_ID) {
-            return nullptr;
-        }
-        return GetContiguousSpan(addr, size);
+
+    [[nodiscard]] const u8* GetSpan(const VAddr addr, const std::size_t size) const noexcept {
+        return GetSpanImpl(addr, size);
+    }
+
+    [[nodiscard]] u8* GetSpan(const VAddr addr, const std::size_t size) noexcept {
+        return GetSpanImpl(addr, size);
     }
 
     bool WriteBlockImpl(const Common::ProcessAddress addr, const void* buffer, const std::size_t size, bool unsafe) {
@@ -745,10 +753,6 @@ struct Memory::Impl {
                 }
                 current_block =
                     Common::PageTable::PageEntryData::BlockIdForMapping(mapping_id);
-                if (mapping_id == Common::PageTable::PageEntryData::INVALID_BLOCK_ID) {
-                    LOG_WARNING(HW_Memory,
-                                "Page table block ids are exhausted; validating spans page by page");
-                }
                 last_mapped_table = &page_table;
                 last_mapped_end = end;
                 last_mapped_host_ptr = first_host_ptr;
@@ -818,24 +822,6 @@ struct Memory::Impl {
     [[nodiscard]] u8* GetPointerSilent(const Common::ProcessAddress vaddr) const {
         return GetPointerImpl(
             GetInteger(vaddr), []() {}, []() {});
-    }
-
-    [[nodiscard]] u8* GetContiguousSpan(VAddr addr, std::size_t size) const noexcept {
-        u8* const base = GetPointerSilent(addr);
-        if (base == nullptr) {
-            return nullptr;
-        }
-
-        const VAddr end = addr + size;
-        const VAddr first_page = ((addr >> YUZU_PAGEBITS) + 1) << YUZU_PAGEBITS;
-        const std::uintptr_t base_ptr = reinterpret_cast<std::uintptr_t>(base);
-        for (VAddr page = first_page; page < end; page += YUZU_PAGESIZE) {
-            const std::uintptr_t expected = base_ptr + (page - addr);
-            if (reinterpret_cast<std::uintptr_t>(GetPointerSilent(page)) != expected) {
-                return nullptr;
-            }
-        }
-        return base;
     }
 
     /// @brief Reads a particular data type out of memory at the given virtual address.
@@ -1178,7 +1164,7 @@ bool Memory::ReadBlockUnsafe(const Common::ProcessAddress src_addr, void* dest_b
 }
 
 const u8* Memory::GetSpan(const VAddr src_addr, const std::size_t size) const {
-    return impl->GetSpan(src_addr, size);
+    return std::as_const(*impl).GetSpan(src_addr, size);
 }
 
 u8* Memory::GetSpan(const VAddr src_addr, const std::size_t size) {

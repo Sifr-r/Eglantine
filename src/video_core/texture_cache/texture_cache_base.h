@@ -13,6 +13,7 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -52,6 +53,7 @@
 #include "video_core/textures/texture.h"
 
 namespace Tegra {
+class MemoryManager;
 namespace Control {
 struct ChannelState;
 }
@@ -400,6 +402,9 @@ public:
     /// Whether CommitAsyncFlushes would commit anything (downloads or their buffers).
     [[nodiscard]] bool HasAsyncFlushWork() const noexcept;
 
+    /// Whether an uncommitted download copies an image into guest buffer memory (DMA).
+    [[nodiscard]] bool HasUncommittedBufferDownloads() const noexcept;
+
     /// Return true when the caller should wait for async downloads
     [[nodiscard]] bool ShouldWaitAsyncFlushes() const noexcept;
 
@@ -484,6 +489,10 @@ private:
     [[nodiscard]] bool IsDownloadable(const ImageBase& image) const noexcept;
 
     void HandleScratchAllocationFailure(const ImageBase& image);
+
+    std::shared_ptr<Tegra::MemoryManager> WriteBackMemory(const ImageBase& image);
+    bool WriteBackImage(const ImageBase& image, std::span<const BufferImageCopy> copies,
+                        std::span<const u8> data);
 
     void RefreshContents(Image& image, ImageId image_id);
 
@@ -662,8 +671,7 @@ private:
     u32 swizzle_slices_per_batch = 0;
 
     struct BufferDownload {
-        GPUVAddr address;
-        size_t size;
+        HostRuns destination;
     };
 
     using PendingDownload = PendingImageDownload<Image>;

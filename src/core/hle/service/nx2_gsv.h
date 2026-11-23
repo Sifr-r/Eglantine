@@ -66,6 +66,7 @@
 #include "core/hle/kernel/svc_results.h"
 #include "core/memory.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/host1x/nx2_video_decoder.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_job_stats.h"
@@ -91,6 +92,9 @@
 #include "core/hle/service/service.h"
 
 namespace Service {
+
+inline constexpr u32 HostSyncpoints =
+    static_cast<u32>(Tegra::Host1x::SyncpointManager::NUM_MAX_SYNCPOINTS);
 
 // Creates a session served by `iface` and returns its client end. Unlike PushIpcInterface this
 // works from a domain too, for callers that want a raw session handle.
@@ -385,8 +389,6 @@ private:
         }
         return false;
     }
-
-    static constexpr u32 HostSyncpoints = 192; // Tegra::Host1x::SyncpointManager
 
     KernelHelpers::ServiceContext m_context;
     std::map<u32, Kernel::KEvent*> m_events;
@@ -3399,7 +3401,6 @@ private:
     static constexpr u32 NoSyncpoint = ~0U;
     static constexpr size_t MaxQueuedInputs = 8;
     static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
-    static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
     // Movie pacing (see DropOvertakenFrames): a longer gap between acquires is a pause, a longer
     // lag a jump in the stream; both restart the clock instead of dropping frames.
     static constexpr s64 PauseGap = 1'000'000;   // us
@@ -4024,6 +4025,54 @@ private:
     std::thread m_worker;
 };
 
+struct Nx2SyncptMemoryLayout {
+    static constexpr u32 ValuesOffset = 0x40;   // RO, u64 per syncpoint
+    static constexpr u32 RoSummaryOffset = 0x1040;
+    static constexpr u32 RoBitsOffset = 0x1100; // RO, up to 0x40 u64 words
+    static constexpr u32 RwSummaryOffset = 0x0;
+    static constexpr u32 RwBitsOffset = 0x100;  // RW, up to 0x40 u64 words
+    static constexpr u32 MaxSyncpoints = (0x1000U - ValuesOffset) / 8U;
+};
+
+template <typename ReadRwFn, typename ReadRoFn, typename WriteRoFn>
+inline bool Nx2PollSyncptPages(Tegra::Host1x::SyncpointManager& manager,
+                               Tegra::Host1x::SyncpointManager::GuestMirrorHandle mirror_handle,
+                               u32 count, u64& last_rw_summary, bool& has_last_rw_summary,
+                               ReadRwFn&& read_rw64, ReadRoFn&& read_ro64,
+                               WriteRoFn&& write_ro64) {
+    const u32 clamped_count = (std::min)(count, Nx2SyncptMemoryLayout::MaxSyncpoints);
+    const u32 words = (clamped_count + 63U) / 64U;
+    std::array<u64, Tegra::Host1x::SyncpointManager::NUM_MOVED_WORDS> armed_words{};
+    bool acked = false;
+    for (u32 w = 0; w < words; ++w) {
+        const u64 rw_bits = read_rw64(Nx2SyncptMemoryLayout::RwBitsOffset + u64{w} * 8);
+        if (w < armed_words.size()) {
+            armed_words[w] = rw_bits;
+        }
+        const u64 ro_offset = Nx2SyncptMemoryLayout::RoBitsOffset + u64{w} * 8;
+        if (read_ro64(ro_offset) != rw_bits) {
+            write_ro64(ro_offset, rw_bits);
+            acked = true;
+        }
+    }
+    // Wake already-armed waits when their syncpoint moved: re-arming leaves rw_bits == ro_bits,
+    // and the mirror already updated the value page.
+    const auto moved = manager.TakeMovedGuestForMirror(mirror_handle);
+    for (u32 w = 0; w < (std::min)(words, static_cast<u32>(moved.size())); ++w) {
+        if ((armed_words[w] & moved[w]) != 0) {
+            acked = true;
+            break;
+        }
+    }
+    const u64 rw_summary = read_rw64(Nx2SyncptMemoryLayout::RwSummaryOffset);
+    if (!has_last_rw_summary || rw_summary != last_rw_summary) {
+        write_ro64(Nx2SyncptMemoryLayout::RoSummaryOffset, rw_summary);
+        last_rw_summary = rw_summary;
+        has_last_rw_summary = true;
+    }
+    return acked;
+}
+
 // Placeholder for the Switch 2 graphics-system server that nn::gsv::BootWithRemoteMemory talks
 // to over TIPC. Nothing behind it is emulated: commands succeed and are logged, so boot can show
 // what comes next. Commands 202 and 1402 hand out the syncpt and nvsrv sessions the SDK uses.
@@ -4325,19 +4374,19 @@ private:
     // event (it attaches that handle as writable), and waits on the second until the server makes
     // the bits equal again; it then rereads the value and rearms if the threshold isn't reached.
     // Reply: the two handles (words 3 and 4), then the result.
-    static constexpr u32 SyncptValuesOffset = 0x40;   // RO, u64 per syncpoint
-    static constexpr u32 SyncptRoSummaryOffset = 0x1040;
-    static constexpr u32 SyncptRoBitsOffset = 0x1100; // RO, up to 0x40 u64 words
-    static constexpr u32 SyncptRwSummaryOffset = 0x0;
-    static constexpr u32 SyncptRwBitsOffset = 0x100;  // RW, up to 0x40 u64 words
-    static constexpr u32 HostSyncpoints = 192;        // Tegra::Host1x::SyncpointManager
+    static constexpr u32 SyncptValuesOffset = Nx2SyncptMemoryLayout::ValuesOffset;
+    static constexpr u32 SyncptRoSummaryOffset = Nx2SyncptMemoryLayout::RoSummaryOffset;
+    static constexpr u32 SyncptRoBitsOffset = Nx2SyncptMemoryLayout::RoBitsOffset;
+    static constexpr u32 SyncptRwSummaryOffset = Nx2SyncptMemoryLayout::RwSummaryOffset;
+    static constexpr u32 SyncptRwBitsOffset = Nx2SyncptMemoryLayout::RwBitsOffset;
 
     void AttachSyncptMemory(HLERequestContext& ctx) {
         // RequestParser doesn't skip TIPC handle words, so read the raw data words.
         const auto* cmd_buf = ctx.CommandBuffer();
         const size_t data = TipcDataOffset(cmd_buf);
         const u32 version_requested = cmd_buf[data];
-        const u32 max_syncpoints = std::min<u32>(cmd_buf[data + 1], (0x1000 - 0x40) / 8);
+        const u32 max_syncpoints =
+            (std::min<u32>)(cmd_buf[data + 1], Nx2SyncptMemoryLayout::MaxSyncpoints);
         LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC 204, version={} max_syncpoints={:#x}",
                     version_requested, max_syncpoints);
 
@@ -4375,20 +4424,17 @@ private:
                 memory.Write32(m_syncpt_state->ro + 0x14, SyncptRoSummaryOffset);
                 memory.Write32(m_syncpt_state->ro + 0x18, SyncptRwBitsOffset);
                 memory.Write32(m_syncpt_state->ro + 0x1c, SyncptRoBitsOffset);
-                UpdateSyncptValuesLocked(*m_syncpt_state, system);
-                // Mirror each guest increment as it happens, before the waits it meets are answered:
-                // the client's TryWaitNativeSync reads this page, and a client woken by an answered
-                // wait (nx2:syncpt 201) before the next poll read the old value. Yoshi and the
-                // Mysterious Book's movie player then aborted on purpose (2162-0001) a few minutes in.
-                // The mirror holds a pointer to the owner's memory, which the session keeps alive.
+                // Seed and register under one SyncpointManager lock so no increment lands between
+                // snapshot and registration, and the mirror remains the sole value writer.
                 auto* const memory_ptr = &memory;
                 const auto new_mirror = system.Host1x().GetSyncpointManager().RegisterGuestMirror(
-                    [memory = memory_ptr, values = m_syncpt_state->ro + SyncptValuesOffset,
+                    [memory_ptr, values = m_syncpt_state->ro + SyncptValuesOffset,
                      count = (std::min)(m_syncpt_state->count, HostSyncpoints)](u32 id, u32 value) {
                         if (id < count) {
-                            memory->Write64(values + u64{id} * 8, value);
+                            memory_ptr->Write64(values + u64{id} * 8, value);
                         }
-                    });
+                    },
+                    true);
                 old_mirror = std::exchange(m_syncpt_state->mirror_handle, new_mirror);
                 if (!m_syncpt_poll) {
                     m_syncpt_poll = Core::Timing::CreateEvent(
@@ -4415,31 +4461,8 @@ private:
         rb.PushCopyObjects(ctx, m_syncpt_events[1]->GetReadableEvent());
     }
 
-    // Mirrors Eden's guest syncpoint values into the shared RO page. Caller holds state.mutex.
-    static bool UpdateSyncptValuesLocked(SyncptPollState& state, Core::System& system_ref) {
-        if (state.owner.IsNull()) {
-            return false;
-        }
-        auto& memory = state.owner->GetMemory();
-        auto& manager = system_ref.Host1x().GetSyncpointManager();
-        bool changed = false;
-        const u32 count = (std::min)(state.count, HostSyncpoints);
-        manager.WithGuestValuesStable([&] {
-            for (u32 id = 0; id < count; ++id) {
-                const u64 value = manager.GetGuestSyncpointValue(id);
-                const u64 address = state.ro + SyncptValuesOffset + id * 8;
-                if (memory.Read64(address) != value) {
-                    memory.Write64(address, value);
-                    changed = true;
-                }
-            }
-        });
-        return changed;
-    }
-
     // Answers every armed wait: the value page is current, so the client rechecks its threshold
-    // and rearms if it still has to wait. Acknowledging without a value change costs the client a
-    // wakeup per poll, which keeps waits whose syncpoint we never see from hanging.
+    // and rearms if it still has to wait.
     static void PollSyncpts(const std::shared_ptr<SyncptPollState>& state,
                             Core::System& system_ref) {
         std::scoped_lock lk{state->mutex};
@@ -4447,34 +4470,13 @@ private:
             return;
         }
         auto& memory = state->owner->GetMemory();
-        const u32 words = (state->count + 63) / 64;
-        bool bits_changed = false;
-        for (u32 w = 0; w < words; ++w) {
-            const u64 rw_bits = memory.Read64(state->rw + SyncptRwBitsOffset + w * 8);
-            const u64 ro_address = state->ro + SyncptRoBitsOffset + w * 8;
-            if (memory.Read64(ro_address) != rw_bits) {
-                bits_changed = true;
-                break;
-            }
-        }
-        const u64 rw_summary = memory.Read64(state->rw + SyncptRwSummaryOffset);
-        const bool summary_changed = !state->has_last_rw_summary || rw_summary != state->last_rw_summary;
-        if (!bits_changed && !summary_changed) {
-            return;
-        }
-        UpdateSyncptValuesLocked(*state, system_ref);
-        bool acked = false;
-        for (u32 w = 0; w < words; ++w) {
-            const u64 rw_bits = memory.Read64(state->rw + SyncptRwBitsOffset + w * 8);
-            const u64 ro_address = state->ro + SyncptRoBitsOffset + w * 8;
-            if (memory.Read64(ro_address) != rw_bits) {
-                memory.Write64(ro_address, rw_bits);
-                acked = true;
-            }
-        }
-        memory.Write64(state->ro + SyncptRoSummaryOffset, rw_summary);
-        state->last_rw_summary = rw_summary;
-        state->has_last_rw_summary = true;
+        auto& manager = system_ref.Host1x().GetSyncpointManager();
+        const bool acked = Nx2PollSyncptPages(
+            manager, state->mirror_handle, state->count, state->last_rw_summary,
+            state->has_last_rw_summary,
+            [&](u64 offset) { return memory.Read64(state->rw + offset); },
+            [&](u64 offset) { return memory.Read64(state->ro + offset); },
+            [&](u64 offset, u64 value) { memory.Write64(state->ro + offset, value); });
         if (acked && state->notify_event != nullptr) {
             state->notify_event->Signal(system_ref.Kernel());
         }

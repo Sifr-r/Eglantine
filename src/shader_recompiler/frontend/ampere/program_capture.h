@@ -24,7 +24,17 @@ public:
         if (verify_rust) {
             const Result cpp_res = ObserveCpp(instruction, index);
             const Result rust_res = ObserveRust(instruction, index);
-            const bool state_match = last_call_target == rs_state.last_call_target &&
+            bool exit_setup_match = true;
+            for (size_t i = 0; i < exit_setup.size(); ++i) {
+                if (!std::equal(exit_setup[i].words.begin(), exit_setup[i].words.end(),
+                                rs_state.exit_setup[i].words)) {
+                    exit_setup_match = false;
+                    break;
+                }
+            }
+            const bool state_match = exit_setup_match &&
+                                     exit_handler_end == rs_state.exit_handler_end &&
+                                     last_call_target == rs_state.last_call_target &&
                                      last_forward_target == rs_state.last_forward_target &&
                                      main_exited == (rs_state.main_exited != 0) &&
                                      computed_branch == (rs_state.computed_branch != 0);
@@ -68,6 +78,17 @@ public:
 
     Result ObserveCpp(const Instruction& instruction, u32 index) {
         const u32 opcode = instruction.Bits(0, 12);
+        if (index < exit_setup.size()) {
+            exit_setup[index] = instruction;
+            if (index + 1 == exit_setup.size() && IsGeometryExitSetup()) {
+                const u32 target = exit_setup[1].words[1];
+                if (target < exit_setup.size() * 16 || target % 16 ||
+                    target >= MaximumInstructions * 16)
+                    return Result::InvalidTarget;
+                last_forward_target = std::max(last_forward_target, target / 16);
+                exit_handler_end = target / 16 + 2;
+            }
+        }
         if (opcode == 0x944 || opcode == 0x947 || opcode == 0x945) {
             // BRA keeps its .DIV/.CONV mode in the offset's two low bits.
             const u32 low = instruction.words[1] & (opcode == 0x947 ? ~3U : ~0U);
@@ -90,6 +111,8 @@ public:
                 target == s64{index} * 16)
                 return Result::Complete;
         }
+        if (opcode == 0x94d && instruction.Bits(12, 4) == 7 && index == exit_handler_end)
+            return Result::Complete;
         if (opcode == 0x949 || opcode == 0x958) computed_branch = true;
         if (computed_branch) return Result::Continue;
         if (opcode == 0x94d && instruction.Bits(12, 4) == 7 && index >= last_forward_target) {
@@ -103,6 +126,24 @@ public:
     }
 
 private:
+    bool IsGeometryExitSetup() const {
+        return std::all_of(exit_setup.begin(), exit_setup.end(),
+                           [](const Instruction& setup) {
+                               return (setup.words[3] & 0xc00001ffU) == 0;
+                           }) &&
+               exit_setup[0].words[0] == 0x0000734e && exit_setup[0].words[1] == 0 &&
+               exit_setup[0].words[2] == 0 && exit_setup[1].words[0] == 0x00037802 &&
+               exit_setup[1].words[2] == 0xf00 && exit_setup[2].words[0] == 0x00007210 &&
+               exit_setup[2].words[1] == 3 && exit_setup[2].words[2] == 0x07f1e0ff &&
+               exit_setup[3].words[1] == 0xff &&
+               ((exit_setup[3].words[0] == 0x01017210 && exit_setup[3].words[2] == 0x007fe4ff) ||
+                (exit_setup[3].words[0] == 0xff017224 && exit_setup[3].words[2] == 0x000e0401)) &&
+               exit_setup[4].words[0] == 0x00007357 && exit_setup[4].words[1] == 0 &&
+               exit_setup[4].words[2] == 0;
+    }
+
+    std::array<Instruction, 5> exit_setup{};
+    u32 exit_handler_end{};
     u32 last_call_target{};
     u32 last_forward_target{};
     bool main_exited{};

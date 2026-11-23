@@ -27,6 +27,8 @@ pub enum EglAmpereCaptureResult {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EglAmpereCaptureState {
+    pub exit_setup: [EglAmpereInstruction; 5],
+    pub exit_handler_end: u32,
     pub last_call_target: u32,
     pub last_forward_target: u32,
     pub main_exited: u8,
@@ -179,12 +181,16 @@ pub extern "C" fn egl_ampere_capture_observe(
         let state_ref = unsafe { &mut *state };
         let insn_ref = unsafe { &*insn };
         let mut capture = ProgramCaptureState {
+            exit_setup: state_ref.exit_setup,
+            exit_handler_end: state_ref.exit_handler_end,
             last_call_target: state_ref.last_call_target,
             last_forward_target: state_ref.last_forward_target,
             main_exited: state_ref.main_exited != 0,
             computed_branch: state_ref.computed_branch != 0,
         };
         let observed = capture.observe(insn_ref, index);
+        state_ref.exit_setup = capture.exit_setup;
+        state_ref.exit_handler_end = capture.exit_handler_end;
         state_ref.last_call_target = capture.last_call_target;
         state_ref.last_forward_target = capture.last_forward_target;
         state_ref.main_exited = u8::from(capture.main_exited);
@@ -417,5 +423,53 @@ pub extern "C" fn egl_ampere_free_bytes(bytes: *mut EglAmpereBytes) {
         let b = &mut *bytes;
         free_raw_slice(b.data, b.len);
         *b = EglAmpereBytes::default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem::{align_of, offset_of, size_of};
+
+    #[test]
+    fn capture_state_ffi_layout_and_roundtrip() {
+        assert_eq!(size_of::<EglAmpereCaptureState>(), 96);
+        assert_eq!(align_of::<EglAmpereCaptureState>(), 4);
+        assert_eq!(offset_of!(EglAmpereCaptureState, exit_setup), 0);
+        assert_eq!(offset_of!(EglAmpereCaptureState, exit_handler_end), 80);
+        assert_eq!(offset_of!(EglAmpereCaptureState, last_call_target), 84);
+        assert_eq!(offset_of!(EglAmpereCaptureState, last_forward_target), 88);
+        assert_eq!(offset_of!(EglAmpereCaptureState, main_exited), 92);
+        assert_eq!(offset_of!(EglAmpereCaptureState, computed_branch), 93);
+        assert_eq!(offset_of!(EglAmpereCaptureState, _pad), 94);
+
+        let mut state = EglAmpereCaptureState::default();
+        egl_ampere_capture_init(&mut state);
+        let insns = [
+            Instruction::new([0x0000_734e, 0, 0, 0x000f_e400]),
+            Instruction::new([0x0003_7802, 0x70, 0x0000_0f00, 0x000f_c800]),
+            Instruction::new([0x0000_7210, 3, 0x07f1_e0ff, 0x000f_c800]),
+            Instruction::new([0x0101_7210, 0xff, 0x007f_e4ff, 0x000f_c800]),
+            Instruction::new([0x0000_7357, 0, 0, 0x0001_e400]),
+            Instruction::new([0x0000_894d, 0, 0x0380_0000, 0x021f_ea00]),
+            Instruction::new([0x0000_794d, 0, 0x0380_0000, 0x003f_ea00]),
+            Instruction::new([0x00ff_7324, 0xff, 0, 0x0001_e200]),
+            Instruction::new([0x0000_7957, 0, 0, 0x000f_e200]),
+            Instruction::new([0x0000_794d, 0, 0x0380_0000, 0x001f_ea00]),
+        ];
+        for (index, insn) in insns.iter().enumerate() {
+            let expected = if index + 1 == insns.len() {
+                EglAmpereCaptureResult::Complete
+            } else {
+                EglAmpereCaptureResult::Continue
+            };
+            assert_eq!(
+                egl_ampere_capture_observe(&mut state, insn, index as u32),
+                expected
+            );
+        }
+        assert_eq!(state.exit_handler_end, 9);
+        assert_eq!(state.last_forward_target, 7);
+        assert_eq!(state.exit_setup, insns[..5]);
     }
 }

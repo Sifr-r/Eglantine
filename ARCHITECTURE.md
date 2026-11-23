@@ -68,7 +68,7 @@ and parity switches. Five `std`-only Cargo crates (zero external `crates.io` dep
   * `core` links `PUBLIC eglantine_rs zstd::zstd` (`EGLANTINE_ENABLE_RUST_NUP=1`).
   * `input_common` links `PUBLIC eglantine_rs` (`EGLANTINE_ENABLE_RUST_SWITCH2_IO=1`).
   * `src/CMakeLists.txt` loads `src/simd_kernels` before `core`/`audio_core`/`video_core` via `CMakeModules/AddIspcKernel.cmake`; `video_core` links `PRIVATE simd_kernels` (`EGLANTINE_ENABLE_ISPC=1` when `ispc` is found; empty `INTERFACE` no-op with scalar C++ fallback otherwise) and `PUBLIC xbyak::xbyak` (`x86_64`) / `PUBLIC merry::oaknut` (`arm64` for `TuringMacroJit`).
-  * `tests` links `common`, `core`, `frontend_common`, `input_common`, `video_core`, `eglantine_rs`, and (when `ENABLE_QT`) `qt_common`.
+  * `tests` links `audio_core`, `common`, `core`, `frontend_common`, `input_common`, `video_core`, `eglantine_rs`, and (when `ENABLE_QT`) `qt_common`.
 * **Flat C ABI boundary:** Every Rust <-> C++ crossing uses `#[repr(C)]` POD structs, primitives, and callback tables declared in `rust/include/*.h`. All Rust domain modules enforce `#![deny(warnings)]` and `#![forbid(unsafe_code)]`, isolating pointer/alignment validation, `catch_unwind`, and idempotent `*_free` helpers inside `ffi.rs`.
 * **Slang & ISPC host-shader scaffolding:** `src/video_core/host_shaders/CMakeLists.txt` optionally compiles `hmma_tiled_fallback.slang` and `nv12_to_block_linear.slang` when `slangc` is on `PATH` (skipping cleanly when absent). `src/simd_kernels/*.ispc` (`tex_etc2.ispc`, `tex_astc_scan.ispc`, `tex_swizzle.ispc`, `audio_mix.ispc`) compile multi-ISA (`sse4-i32x4,avx2-i32x8,avx512skx-i32x16` / `neon-i32x4`) behind `EGLANTINE_ENABLE_ISPC`.
 * **Runtime switches:** `EDEN_NX2_RUST_AMPERE`, `EDEN_NX2_DIRECT_SM86`, `EDEN_NX2_RUST_NUP`, `EDEN_NX2_RUST_SWITCH2_IO`, `EDEN_NX2_ISPC` (plus `*_VERIFY=1` differential modes), `EDEN_NX2_VK_VIDEO=1`, and `EDEN_NX2_DRAW_CACHE`. Temporal upscaling shares `Vulkan::ITemporalUpscaler` (`src/video_core/renderer_vulkan/vk_temporal_upscaler.h`) with runtime fallback `DLSS -> XeSS -> FSR 3.1 -> temporal stand-in` (`vk_xess_upscaler.{h,cpp}`).
@@ -200,8 +200,10 @@ convention.
   `INx2GraphicsSystemSession::m_syncpt_state`), destructors unregister listeners/mirrors and
   drain queued GPU work before closing events or releasing process refs, and callbacks capture
   the shared state rather than `this`. `INx2GraphicsSystemSession` subscribes via keyed
-  `SyncpointManager::RegisterGuestMirror`/`UnregisterGuestMirror` and skips timer syncpoint
-  scans when neither wait bits nor summary changed. `nvhost_as_gpu::~nvhost_as_gpu()` removes
+  `SyncpointManager::RegisterGuestMirror(..., seed_initial)` / `UnregisterGuestMirror` and routes
+  timer syncpoint checks through `Nx2PollSyncptPages` (`Nx2SyncptMemoryLayout`) using
+  `TakeMovedGuestForMirror` so already-armed waits wake even when `rw_bits == ro_bits`
+  (`src/core/hle/service/nx2_gsv.h`, `src/tests/video_core/syncpoint_manager.cpp`). `nvhost_as_gpu::~nvhost_as_gpu()` removes
   its `Nx2GpuMemoryRegistry` listener before `DrainGpuCallbacks()`, and `Nx2Map` /
   `Nx2BackSparse` / `Nx2SparseTile` read session state through `Container::WithSession` under
   `Nx2GpuMemoryRegistry::mutex -> nvhost_as_gpu::mutex -> Container::session_guard ->
@@ -225,6 +227,7 @@ convention.
   * `KThread::FinishTermination()` (`src/core/hle/kernel/k_thread.cpp`) drops `KScopedSchedulerLock` after signaling/notifying before calling `this->Close(kernel)`; covered by `src/tests/core/kernel_finish_termination.cpp`.
   * `HLERequestContext::ReadOutputBuffer()` (`src/core/hle/service/hle_ipc.{h,cpp}`) prefills `cmif_serialization.h` `OutBuffer` scratch coherently from the selected B/C descriptor so partial writes preserve guest tail bytes; covered by `src/tests/core/cmif_out_buffer.cpp`.
   * `Core::System::Impl::content_provider` starts initialized with an empty `FileSys::ContentProviderUnion` (`src/core/core.cpp`), `ManualContentProvider::SwapEntries()` (`src/core/file_sys/registered_cache.{h,cpp}`) exchanges `entries` and `multi_version_entries` atomically (`src/tests/core/content_provider_init.cpp`), and `AppLoader_NUP` (`src/core/loader/nup.cpp`, `WithPlatformOf` in `src/core/file_sys/common_funcs.h`) preserves a native Switch 2 base ExeFS when paired with a legacy update (`src/tests/core/nup_writer.cpp`).
+* **Validated guest memory spans.** `Memory::Impl::GetSpan` (`src/core/memory.cpp`) validates `current_page_table`, `AddressSpaceContains` (`addr + size` overflow and upper bound), exclusive-end empty-span bounds, and non-unmapped host pointer contiguity across every spanned page via shared const/non-const `GetSpanImpl`; covered by `src/tests/core/memory_span.cpp`.
 
 ### `common` — host memory
 
@@ -351,6 +354,15 @@ convention.
   (`MemoryManager::Unmap` and `MemoryManager::FlushCaching` collect their ranges in local
   vectors), so two threads that unmap or flush at the same time do not overwrite each other's
   list.
+* **Syncpoints, address-space lifetime, pinned DMA readbacks, and Ampere capture parity.**
+  * `Tegra::Host1x::SyncpointManager` (`src/video_core/host1x/syncpoint_manager.{h,cpp}`) validates `IsValidSyncpoint(id)` bounds, supports seeded multi-listener `RegisterGuestMirror(..., seed_initial)` with per-mirror moved tracking (`TakeMovedGuest` / `TakeMovedGuestForMirror`) and `WithGuestValuesStable`.
+  * `Tegra::MemoryManager` inherits `std::enable_shared_from_this<MemoryManager>` (`src/video_core/memory_manager.h`), `ChannelSetupCaches<P>::AddressSpaceRef::owner` (`channel_state_cache.{h,inc}`) holds `std::weak_ptr<Tegra::MemoryManager>` across both `CreateChannel` and `CreateChannelFromBridge`, and `ImageBase::address_space` (`image_base.h`) keeps `TextureCache<P>::UnregisterImage` and `WriteBackMemory` / `WriteBackImage` (`texture_cache_base.h`, `texture_cache.h`) safe when an owning channel closes while `ForEachSparseSegment` skips unmapped segments.
+  * `PendingDownload` (`pending_download.h`, `texture_cache.h`) pins DMA readback destinations via `HostRuns` (`GatherHostRuns` / `WriteHostRuns`), and `FenceManager` (`fence_manager.h`) tracks `buffer_downloads` / `ordered_fences_in_flight` while preserving `force_completion` and `SkipEmptyFence()`; covered by `src/tests/video_core/pending_download.cpp` and `src/tests/video_core/texture_cache_lifetime.cpp`.
+  * Ampere geometry exit-envelope capture (`exit_setup`, `exit_handler_end`, `IsGeometryExitSetup`, omitting `FallbackEnd`) stays bit-exact between `src/shader_recompiler/frontend/ampere/program_capture.h`, `rust/include/eglantine_ampere.h`, and `rust/crates/ampere_core/src/{capture.rs,ffi.rs}`; covered by `src/tests/video_core/{ampere_geometry,ampere_rust_parity}.cpp` and `eglantine_ampere_core` Cargo tests.
+
+### `audio_core` — audio sinks and silent recovery
+
+* **`SinkStream` silent fallback and backend recovery.** `AudioCore::Sink::SinkStream` (`src/audio_core/sink/sink_stream.{h,cpp}`) provides protected `StartSilentDevice()` / `StopSilentDevice()` with `std::jthread silent_device` declared last so teardown joins before base members are destroyed, driving paced output/zeroed input frames when paused or unbound. `CubebSink` / `CubebSinkStream` (`src/audio_core/sink/cubeb_sink.{h,cpp}`) adds `streams_mutex`, a COM-MTA `watchdog` thread, and stall/error reopen recovery; `SDLSinkStream` (`src/audio_core/sink/sdl3_sink.cpp`) handles device disconnect/hotplug recovery with `StartSilentDevice()` fallback; covered by `src/tests/audio_core/sink_stream_silent.cpp`.
 * **ETC2 and EAC decoding lives in `src/video_core/textures/etc2.cpp`.** `Tegra::Texture::ETC2`
   decodes the Switch's ETC2 and EAC block formats on the host when the GPU cannot do it
   natively. The decoder follows the Khronos data format specification, not a port of another
@@ -713,3 +725,11 @@ These are known and deliberately not fixed by the P0 pass; each one names its ow
   all five targeted Catch2 runs passed: `[launch_params]` (6 cases, 202 assertions), `[nx2_gsv]`
   (12 cases, 114 assertions), `[shutdown-ordering]` (5 cases, 25 assertions), `[switch2]`
   (30 cases, 574 assertions), and `[ampere]` (70 cases, 60,262 assertions).
+* After porting Orchid Tier 2 fixes and registering `audio_core/sink_stream_silent.cpp`,
+  `core/memory_span.cpp`, `video_core/pending_download.cpp`, `video_core/syncpoint_manager.cpp`,
+  and `video_core/texture_cache_lifetime.cpp` in `src/tests/CMakeLists.txt`, Windows MSVC built
+  `eglantine.exe`, `eden-cli.exe`, and `tests.exe`; full `tests.exe` passed (75,167,354 assertions
+  in 737 test cases), `EDEN_NX2_RUST_AMPERE_VERIFY=1` `[ampere]` passed (98,126 assertions in 92
+  test cases), targeted Tier 2 tags passed (`[audio_recovery]` 29/4, `[lifetime]` 27/5,
+  `[channel_bridge]` 10/2, `[syncpoint]` 684/5, `[memory_span]` 54/2, `[pending_download]` 76/3,
+  `[clear_covers]` 20/3), and `cargo test --manifest-path rust/Cargo.toml` passed across all workspace crates.

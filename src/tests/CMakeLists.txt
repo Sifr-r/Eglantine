@@ -127,10 +127,15 @@ add_executable(tests
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
     video_core/ocarina_upscale.cpp
+    video_core/pending_download.cpp
     video_core/shader_ir_edges.cpp
+    video_core/syncpoint_manager.cpp
+    video_core/texture_cache_lifetime.cpp
     video_core/texture_clear_covers.cpp
     video_core/vulkan_device_version.cpp
     video_core/vulkan_static_cache.cpp
+    audio_core/sink_stream_silent.cpp
+    core/memory_span.cpp
     frontend_common/config_persistence.cpp
     frontend_common/play_time.cpp
     input_common/calibration_configuration_job.cpp
@@ -152,7 +157,7 @@ if (ENABLE_UPDATE_CHECKER)
         common/update_installer.cpp)
 endif()
 
-target_link_libraries(tests PRIVATE common core frontend_common input_common video_core)
+target_link_libraries(tests PRIVATE audio_core common core frontend_common input_common video_core)
 if (TARGET eglantine_rs)
     target_link_libraries(tests PRIVATE eglantine_rs)
 endif()

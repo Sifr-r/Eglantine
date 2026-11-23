@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <span>
+#include <thread>
 #include <vector>
 
 #include "audio_core/common/common.h"
@@ -225,6 +226,14 @@ protected:
      */
     void SignalPause();
 
+    /**
+     * Consume buffers in real time and discard them, for a backend that could not open its
+     * device. Without a consumer the ADSP runs unpaced and AppendBuffer blocks once the queue
+     * is full, which freezes games that wait on the renderer.
+     */
+    void StartSilentDevice();
+    void StopSilentDevice();
+
 protected:
     /// Core system
     Core::System& system;
@@ -270,6 +279,8 @@ private:
     /// Signalled when ring buffer entries are consumed
     std::condition_variable_any release_cv;
     std::mutex release_mutex;
+    /// Stand-in consumer from StartSilentDevice, declared last so it is joined first
+    std::jthread silent_device;
 };
 
 using SinkStreamPtr = std::unique_ptr<SinkStream>;

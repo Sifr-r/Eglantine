@@ -11,6 +11,7 @@
 
 #include <deque>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <type_traits>
@@ -144,6 +145,7 @@ protected:
         size_t ref_count;
         size_t storage_id;
         Tegra::MemoryManager* gpu_memory;
+        std::weak_ptr<Tegra::MemoryManager> owner;
     };
     ::Common::unordered_map<size_t, AddressSpaceRef> address_spaces;
     mutable std::mutex config_mutex;
@@ -204,6 +206,7 @@ void ChannelSetupCaches<P>::CreateChannelFromBridge(
             .ref_count = 1,
             .storage_id = address_spaces.size(),
             .gpu_memory = memory_manager,
+            .owner = memory_manager->weak_from_this(),
         };
         address_spaces.emplace(gpu_as_id, new_gpu_mem_ref);
         OnGPUASRegister(gpu_as_id);

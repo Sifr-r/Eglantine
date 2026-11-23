@@ -10,9 +10,11 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <memory>
 #include <span>
+#include <thread>
 #include <vector>
 
 #include "audio_core/audio_core.h"
@@ -269,6 +271,41 @@ void SinkStream::SignalPause() {
         paused = true;
     }
     release_cv.notify_one();
+}
+
+void SinkStream::StopSilentDevice() {
+    if (silent_device.joinable()) {
+        silent_device.request_stop();
+        silent_device.join();
+    }
+}
+
+void SinkStream::StartSilentDevice() {
+    if (silent_device.joinable()) {
+        return;
+    }
+    silent_device = std::jthread([this](std::stop_token stop_token) {
+        Common::SetCurrentThreadName("SilentAudioDevice");
+        std::vector<s16> samples(static_cast<std::size_t>(TargetSampleCount) * device_channels);
+        constexpr auto period = std::chrono::nanoseconds{std::chrono::seconds{1}} *
+                                static_cast<s64>(TargetSampleCount) /
+                                static_cast<s64>(TargetSampleRate);
+        auto next = std::chrono::steady_clock::now();
+        while (!stop_token.stop_requested()) {
+            // No burst to catch up after a stall, a real device would not do that either.
+            next = (std::max)(next + period, std::chrono::steady_clock::now());
+            std::this_thread::sleep_until(next);
+            if (stop_token.stop_requested() || paused) {
+                continue;
+            }
+            if (type == StreamType::In) {
+                std::fill(samples.begin(), samples.end(), s16{0});
+                ProcessAudioIn(samples, TargetSampleCount);
+            } else {
+                ProcessAudioOutAndRender(samples, TargetSampleCount);
+            }
+        }
+    });
 }
 
 } // namespace AudioCore::Sink

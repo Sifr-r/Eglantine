@@ -6,6 +6,7 @@
 #ifdef EGLANTINE_ENABLE_RUST_AMPERE
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <optional>
@@ -61,6 +62,16 @@ using Shader::Ampere::ProgramOverrideSourceSizeRust;
 
 constexpr Instruction kExit{{0x0000794dU, 0U, 0x03800000U, 0U}};
 constexpr Instruction kNop{{0x00007918U, 0U, 0U, 0U}};
+
+static_assert(sizeof(EglAmpereCaptureState) == 96);
+static_assert(alignof(EglAmpereCaptureState) == 4);
+static_assert(offsetof(EglAmpereCaptureState, exit_setup) == 0);
+static_assert(offsetof(EglAmpereCaptureState, exit_handler_end) == 80);
+static_assert(offsetof(EglAmpereCaptureState, last_call_target) == 84);
+static_assert(offsetof(EglAmpereCaptureState, last_forward_target) == 88);
+static_assert(offsetof(EglAmpereCaptureState, main_exited) == 92);
+static_assert(offsetof(EglAmpereCaptureState, computed_branch) == 93);
+static_assert(offsetof(EglAmpereCaptureState, _pad) == 94);
 
 class ScopedEnvVar {
 public:
@@ -244,6 +255,64 @@ TEST_CASE("Ampere ProgramCaptureState C++ and Rust FFI parity", "[video_core][am
         {Instruction{{0x00007947U, static_cast<u32>(-32), 0x0003ffffU, 0U}}},
         // Invalid unaligned JMP target
         {Instruction{{0x00007945U, 4U, 0U, 0U}}},
+        // Static IADD3.X geometry exit-envelope program
+        {
+            Instruction{{0x0000734eU, 0U, 0U, 0x000fe400U}},
+            Instruction{{0x00037802U, 0x70U, 0x00000f00U, 0x000fc800U}},
+            Instruction{{0x00007210U, 3U, 0x07f1e0ffU, 0x000fc800U}},
+            Instruction{{0x01017210U, 0xffU, 0x007fe4ffU, 0x000fc800U}},
+            Instruction{{0x00007357U, 0U, 0U, 0x0001e400U}},
+            Instruction{{0x0000894dU, 0U, 0x03800000U, 0x021fea00U}},
+            Instruction{{0x0000794dU, 0U, 0x03800000U, 0x003fea00U}},
+            Instruction{{0x00ff7324U, 0xffU, 0U, 0x0001e200U}},
+            Instruction{{0x00007957U, 0U, 0U, 0x000fe200U}},
+            Instruction{{0x0000794dU, 0U, 0x03800000U, 0x001fea00U}},
+        },
+        // IMAD geometry exit-envelope program
+        {
+            Instruction{{0x0000734eU, 0U, 0U, 0x000fe400U}},
+            Instruction{{0x00037802U, 0x70U, 0x00000f00U, 0x000fc800U}},
+            Instruction{{0x00007210U, 3U, 0x07f1e0ffU, 0x000fca00U}},
+            Instruction{{0xff017224U, 0xffU, 0x000e0401U, 0x000fc800U}},
+            Instruction{{0x00007357U, 0U, 0U, 0x0001e400U}},
+            kExit,
+            kNop,
+            Instruction{{0x00ff7324U, 0xffU, 0U, 0x0001e200U}},
+            Instruction{{0x00007957U, 0U, 0U, 0x000fe200U}},
+            kExit,
+        },
+        // Geometry exit-envelope with body CALL + BRX + forward target past handler
+        {
+            Instruction{{0x0000734eU, 0U, 0U, 0x000fe400U}},
+            Instruction{{0x00037802U, 0x90U, 0x00000f00U, 0x000fc800U}},
+            Instruction{{0x00007210U, 3U, 0x07f1e0ffU, 0x000fc800U}},
+            Instruction{{0x01017210U, 0xffU, 0x007fe4ffU, 0x000fc800U}},
+            Instruction{{0x00007357U, 0U, 0U, 0x0001e400U}},
+            Instruction{{0x00007944U, 0x10U, 0x03c00000U, 0x000fea00U}},
+            Instruction{{0x00007949U, 0U, 0U, 0U}},
+            Instruction{{0x08007950U, 0xffffff80U, 0x03c3ffffU, 0x000fea00U}},
+            Instruction{{0x00007947U, 0x90U, 0x03800000U, 0U}},
+            Instruction{{0x00ff7324U, 0xffU, 0U, 0x0001e200U}},
+            Instruction{{0x00007957U, 0U, 0U, 0x000fe200U}},
+            kExit,
+        },
+        // Invalid geometry exit handler destination
+        {
+            Instruction{{0x0000734eU, 0U, 0U, 0x000fe400U}},
+            Instruction{{0x00037802U, 0x40U, 0x00000f00U, 0x000fc800U}},
+            Instruction{{0x00007210U, 3U, 0x07f1e0ffU, 0x000fc800U}},
+            Instruction{{0x01017210U, 0xffU, 0x007fe4ffU, 0x000fc800U}},
+            Instruction{{0x00007357U, 0U, 0U, 0x0001e400U}},
+        },
+        // Mismatched geometry exit setup form stops at first main EXIT
+        {
+            Instruction{{0x0000634eU, 0U, 0U, 0x000fe400U}},
+            Instruction{{0x00037802U, 0x70U, 0x00000f00U, 0x000fc800U}},
+            Instruction{{0x00007210U, 3U, 0x07f1e0ffU, 0x000fc800U}},
+            Instruction{{0x01017210U, 0xffU, 0x007fe4ffU, 0x000fc800U}},
+            Instruction{{0x00007357U, 0U, 0U, 0x0001e400U}},
+            kExit,
+        },
     };
 
     for (const auto& seq : sequences) {
