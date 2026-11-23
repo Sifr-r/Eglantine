@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <bit>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <span>
 #include <vector>
@@ -21,9 +22,14 @@
 
 #include "common/alignment.h"
 #include "common/common_types.h"
+#include "common/logging.h"
 #include <ranges>
 #include "video_core/textures/astc.h"
 #include "video_core/textures/workers.h"
+
+#ifdef EGLANTINE_ENABLE_ISPC
+#include "simd_kernels/tex_astc_scan_ispc.h"
+#endif
 
 class InputBitStream {
 public:
@@ -2070,14 +2076,52 @@ static std::array<BlockModeInfo, 2048> MakeBlockModeInfos() {
     return infos;
 }
 
-bool IsOpaque(std::span<const uint8_t> data) {
+#ifdef EGLANTINE_ENABLE_ISPC
+static bool IspcEnvEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_ISPC");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+static bool IspcVerifyEnabled() noexcept {
+    static const bool verify = [] {
+        const char* value = std::getenv("EDEN_NX2_ISPC_VERIFY");
+        return value != nullptr && value[0] == '1';
+    }();
+    return verify;
+}
+
+static std::array<u32, 2048> PackBlockModeInfos(const std::array<BlockModeInfo, 2048>& infos) {
+    std::array<u32, 2048> packed{};
+    for (size_t i = 0; i < infos.size(); ++i) {
+        const BlockModeInfo& info = infos[i];
+        u32 value = static_cast<u32>(info.weight_bits);
+        if (info.error) {
+            value |= 1U << 16;
+        }
+        if (info.void_extent) {
+            value |= 1U << 17;
+        }
+        if (info.void_extent_hdr) {
+            value |= 1U << 18;
+        }
+        if (info.dual_plane) {
+            value |= 1U << 19;
+        }
+        packed[i] = value;
+    }
+    return packed;
+}
+#endif
+
+static bool IsOpaqueScalar(std::span<const uint8_t> data,
+                           const std::array<BlockModeInfo, 2048>& mode_infos) {
     // Endpoint modes with an alpha channel: LDR luminance+alpha (4, 5), RGB scale + two alpha
     // (10), LDR RGBA (12, 13) and HDR RGBA (14, 15).
     constexpr u32 AlphaModes = (1U << 4) | (1U << 5) | (1U << 10) | (1U << 12) | (1U << 13) |
                                (1U << 14) | (1U << 15);
-    // Decoding each block's mode bit by bit took ~12% of title 1's long frames, where every
-    // new ASTC texture is scanned (its title screen streams them in by the thousand).
-    static const std::array<BlockModeInfo, 2048> mode_infos = MakeBlockModeInfos();
     for (size_t offset = 0; offset + 16 <= data.size(); offset += 16) {
         const std::span<const u8> block = data.subspan(offset, 16);
         u32 low;
@@ -2140,6 +2184,40 @@ bool IsOpaque(std::span<const uint8_t> data) {
         }
     }
     return true;
+}
+
+bool IsIspcEnabled() noexcept {
+#ifdef EGLANTINE_ENABLE_ISPC
+    return IspcEnvEnabled();
+#else
+    return false;
+#endif
+}
+
+bool IsOpaque(std::span<const uint8_t> data) {
+    // Decoding each block's mode bit by bit took ~12% of title 1's long frames, where every
+    // new ASTC texture is scanned (its title screen streams them in by the thousand).
+    static const std::array<BlockModeInfo, 2048> mode_infos = MakeBlockModeInfos();
+#ifdef EGLANTINE_ENABLE_ISPC
+    const u64 block_count = static_cast<u64>(data.size() / 16);
+    if (IspcEnvEnabled() && block_count > 0) {
+        static const std::array<u32, 2048> packed_mode_infos = PackBlockModeInfos(mode_infos);
+        const bool ispc_opaque =
+            ispc::astc_is_opaque_blocks(data.data(), packed_mode_infos.data(), block_count);
+        if (IspcVerifyEnabled()) {
+            const bool scalar_opaque = IsOpaqueScalar(data, mode_infos);
+            if (ispc_opaque != scalar_opaque) {
+                LOG_ERROR(HW_GPU,
+                          "EDEN_NX2_ISPC_VERIFY: ASTC IsOpaque mismatch ({} blocks: ispc={} "
+                          "scalar={})",
+                          block_count, ispc_opaque, scalar_opaque);
+                return scalar_opaque;
+            }
+        }
+        return ispc_opaque;
+    }
+#endif
+    return IsOpaqueScalar(data, mode_infos);
 }
 
 } // namespace Tegra::Texture::ASTC

@@ -57,18 +57,22 @@ FileType AppLoader_NCA::IdentifyType(const FileSys::VirtualFile& nca_file) {
     return FileType::Error;
 }
 
-AppLoader_NCA::LoadResult AppLoader_NCA::Load(Kernel::KProcess& process, Core::System& system) {
-    if (is_loaded) {
-        return {ResultStatus::ErrorAlreadyLoaded, {}};
+FileSys::VirtualDir AppLoader_NCA::ResolveExeFS(Core::System& system,
+                                                ResultStatus& out_status) const {
+    if (nca == nullptr) {
+        out_status = ResultStatus::ErrorNullFile;
+        return nullptr;
     }
 
     const auto result = nca->GetStatus();
     if (result != ResultStatus::Success) {
-        return {result, {}};
+        out_status = result;
+        return nullptr;
     }
 
     if (nca->GetType() != FileSys::NCAContentType::Program) {
-        return {ResultStatus::ErrorNCANotProgram, {}};
+        out_status = ResultStatus::ErrorNCANotProgram;
+        return nullptr;
     }
 
     auto exefs = nca->GetExeFS();
@@ -76,16 +80,32 @@ AppLoader_NCA::LoadResult AppLoader_NCA::Load(Kernel::KProcess& process, Core::S
         LOG_INFO(Loader, "No ExeFS found in NCA, looking for ExeFS from update");
 
         const auto& installed = system.GetContentProvider();
-        const auto update_nca = installed.GetEntry(FileSys::GetUpdateTitleID(nca->GetTitleId()),
+        const auto update_nca = installed.GetEntry(FileSys::GetUpdateTitleID(GetProgramId()),
                                                    FileSys::ContentRecordType::Program);
 
-        if (update_nca) {
+        if (update_nca != nullptr) {
             exefs = update_nca->GetExeFS();
         }
 
         if (exefs == nullptr) {
-            return {ResultStatus::ErrorNoExeFS, {}};
+            out_status = ResultStatus::ErrorNoExeFS;
+            return nullptr;
         }
+    }
+
+    out_status = ResultStatus::Success;
+    return exefs;
+}
+
+AppLoader_NCA::LoadResult AppLoader_NCA::Load(Kernel::KProcess& process, Core::System& system) {
+    if (is_loaded) {
+        return {ResultStatus::ErrorAlreadyLoaded, {}};
+    }
+
+    ResultStatus exefs_status = ResultStatus::Success;
+    auto exefs = ResolveExeFS(system, exefs_status);
+    if (exefs == nullptr) {
+        return {exefs_status, {}};
     }
 
     directory_loader = std::make_unique<AppLoader_DeconstructedRomDirectory>(exefs, true);
@@ -296,6 +316,18 @@ ResultStatus AppLoader_NCA::ReadNSOModules(Modules& modules) {
     }
 
     return directory_loader->ReadNSOModules(modules);
+}
+
+ResultStatus AppLoader_NCA::ReadProgramMetadata(Core::System& system,
+                                                FileSys::ProgramMetadata& out_metadata) {
+    ResultStatus exefs_status = ResultStatus::Success;
+    auto exefs = ResolveExeFS(system, exefs_status);
+    if (exefs == nullptr) {
+        return exefs_status;
+    }
+
+    AppLoader_DeconstructedRomDirectory exefs_loader{std::move(exefs), true};
+    return exefs_loader.ReadProgramMetadata(system, out_metadata);
 }
 
 } // namespace Loader

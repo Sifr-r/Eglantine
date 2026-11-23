@@ -30,18 +30,12 @@
 #include "core/debugger/debugger.h"
 #include "core/debugger/nx2_debug_tools.h"
 #include "core/device_memory.h"
-#include "core/file_sys/card_image.h"
-#include "core/file_sys/content_archive.h"
 #include "core/file_sys/fs_filesystem.h"
-#include "core/file_sys/nup_container.h"
 #include "core/file_sys/patch_manager.h"
-#include "core/file_sys/program_metadata.h"
 #include "core/file_sys/registered_cache.h"
-#include "core/file_sys/romfs_factory.h"
-#include "core/file_sys/savedata_factory.h"
-#include "core/file_sys/submission_package.h"
 #include "core/file_sys/vfs/vfs_concat.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "core/platform_profile.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
@@ -127,64 +121,6 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
 }
 
 namespace {
-
-// Detect the platform before initializing the kernel memory layout and guest clock.
-bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::size_t program_index) {
-    FileSys::ProgramMetadata metadata;
-    if (FileSys::NupContainer::IsNupFile(file)) {
-        FileSys::NupContainer nup{file};
-        if (nup.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
-        }
-        const auto base = nup.FindBasePackage();
-        const auto update = nup.FindBestUpdatePackage();
-        std::optional<std::size_t> program;
-        if (update && nup.GetExeFSDir(*update) != nullptr) {
-            program = update;
-        } else if (base && nup.GetExeFSDir(*base) != nullptr) {
-            program = base;
-        }
-        const auto exefs = program ? nup.GetExeFSDir(*program) : nullptr;
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
-    }
-    const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
-    if (type == Loader::FileType::XCI || type == Loader::FileType::XCZ) {
-        const FileSys::XCI xci{file, program_id, program_index};
-        if (xci.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
-        }
-        const auto partition = xci.GetSecurePartitionNSP();
-        const auto program = partition != nullptr
-                                 ? partition->GetNCA(xci.GetProgramTitleID(),
-                                                     FileSys::ContentRecordType::Program)
-                                 : nullptr;
-        const auto exefs = program != nullptr ? program->GetExeFS() : nullptr;
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
-    }
-    if (type == Loader::FileType::NSP || type == Loader::FileType::NSZ) {
-        const FileSys::NSP nsp{file, program_id, program_index};
-        if (nsp.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
-        }
-        auto exefs = nsp.GetExeFS();
-        if (!nsp.IsExtractedType()) {
-            const auto program =
-                nsp.GetNCA(nsp.GetProgramTitleID(), FileSys::ContentRecordType::Program);
-            exefs = program != nullptr ? program->GetExeFS() : nullptr;
-        }
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
-    }
-    const auto dir = file != nullptr ? file->GetContainingDirectory() : nullptr;
-    const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
-    return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-           metadata.IsSwitch2();
-}
 
 /// Frame spike recorder source: every application thread's CPU ticks, counting the running
 /// thread of each core up to now (the kernel only adds a thread's time when it switches out).
@@ -436,16 +372,23 @@ struct System::Impl {
             fs_controller.InitTempStorage();
         }
 
-        const bool switch2_program =
-            virtual_filesystem != nullptr &&
-            IsSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath), params.program_id,
-                             params.program_index);
-        Settings::SetCurrentProgramIsSwitch2(switch2_program);
+        const auto file =
+            virtual_filesystem != nullptr ? GetGameFileFromPath(virtual_filesystem, filepath) : nullptr;
+        auto loader =
+            file != nullptr ? Loader::GetLoader(system, file, params.program_id, params.program_index)
+                            : nullptr;
+
+        platform_profile = ResolvePlatformProfile(
+            system, loader.get(), ParsePlatformOverride(std::getenv("EDEN_NX2_PLATFORM")));
+        LOG_INFO(Core, "Platform profile: {} (cntfrq={} Hz)",
+                 PlatformResolutionName(platform_profile.resolution), platform_profile.guest_cntfrq);
+
+        Settings::SetCurrentProgramIsSwitch2(platform_profile.IsSwitch2());
         Settings::SetAstcRecompressionOverride(std::nullopt);
 
         // Switch 2 titles size their heap from the total memory and need the 12 GiB layout. Set it
         // as a per-game value, so RestoreGlobalState brings back the configured layout afterwards.
-        if (switch2_program &&
+        if (platform_profile.force_12gb_memory_layout &&
             Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_12Gb) {
             LOG_INFO(Core, "Switch 2 program: using the 12 GiB memory layout");
             Settings::values.memory_layout_mode.SetGlobal(false);
@@ -460,9 +403,7 @@ struct System::Impl {
             const char* value = std::getenv("EDEN_NX2_CNTFRQ");
             return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
         }();
-        const u64 cntfrq = forced_cntfrq != 0 ? forced_cntfrq
-                           : switch2_program  ? Common::WallClock::Switch2CNTFRQ
-                                              : Common::WallClock::CNTFRQ;
+        const u64 cntfrq = forced_cntfrq != 0 ? forced_cntfrq : platform_profile.guest_cntfrq;
         Common::g_wall_clock.SetGuestCNTFRQ(cntfrq);
         LOG_INFO(Core, "Guest counter frequency: {} Hz", cntfrq);
 
@@ -472,19 +413,21 @@ struct System::Impl {
             current_application_filepath = filepath;
         }
 
-        const auto file = GetGameFileFromPath(virtual_filesystem, filepath);
-
-        // Create the application process
+        // Create the application process using the same loader that resolved platform_profile.
         Loader::ResultStatus load_result{};
         std::vector<u8> control;
-        auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
+        std::unique_ptr<Service::Process> process;
+        if (loader != nullptr) {
+            process = Service::AM::CreateApplicationProcess(control, *loader, load_result, system);
+            app_loader = std::move(loader);
+        }
         if (load_result != Loader::ResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
             ShutdownMainProcess();
             return SystemResultStatus(u32(SystemResultStatus::ErrorLoader) + u32(load_result));
         }
 
-        if (!app_loader) {
+        if (!app_loader || !process) {
             LOG_CRITICAL(Core, "Failed to obtain loader for {}!", filepath);
             ShutdownMainProcess();
             return SystemResultStatus::ErrorGetLoader;
@@ -620,9 +563,11 @@ struct System::Impl {
         // The guest RAM section keeps every page the game touched until it is destroyed (up to
         // 12 GiB), and the next Load reuses it. Switch 2 only: Switch 1 keeps its behaviour.
         // InitializeKernel creates it again, sized for the next game.
-        if (Settings::CurrentProgramIsSwitch2()) {
+        if (platform_profile.reset_dram_on_shutdown || Settings::CurrentProgramIsSwitch2()) {
             device_memory.reset();
         }
+        platform_profile = MakePlatformProfile(PlatformResolution::DefaultSwitch1);
+        Settings::SetCurrentProgramIsSwitch2(false);
 
         LOG_DEBUG(Core, "Shutdown OK");
     }
@@ -695,6 +640,8 @@ struct System::Impl {
     std::shared_ptr<Service::SM::ServiceManager> service_manager;
     /// ContentProviderUnion instance
     std::unique_ptr<FileSys::ContentProviderUnion> content_provider;
+    /// Platform profile resolved for the current session
+    PlatformProfile platform_profile{MakePlatformProfile(PlatformResolution::DefaultSwitch1)};
     /// AppLoader used to load the current executing application
     std::unique_ptr<Loader::AppLoader> app_loader;
     std::stop_source stop_event;
@@ -1103,6 +1050,14 @@ void System::RegisterHostThread() {
 
 bool System::IsMulticore() const {
     return impl->is_multicore;
+}
+
+const PlatformProfile& System::Platform() const {
+    return impl->platform_profile;
+}
+
+void System::SetPlatformProfile(PlatformProfile profile) {
+    impl->platform_profile = profile;
 }
 
 bool System::DebuggerEnabled() const {

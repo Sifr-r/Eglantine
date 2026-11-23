@@ -59,6 +59,8 @@ public:
     bool IsRomFSUpdatable() const override;
 
     ResultStatus ReadNSOModules(Modules& out_modules) override;
+    ResultStatus ReadProgramMetadata(Core::System& system,
+                                     FileSys::ProgramMetadata& out_metadata) override;
 
 private:
     /// The loose RomFS next to the ExeFS, found (and built) on first use.

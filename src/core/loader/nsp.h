@@ -60,6 +60,8 @@ public:
     ResultStatus ReadLogo(std::vector<u8>& buffer) override;
 
     ResultStatus ReadNSOModules(Modules& modules) override;
+    ResultStatus ReadProgramMetadata(Core::System& system,
+                                     FileSys::ProgramMetadata& out_metadata) override;
 
 private:
     std::unique_ptr<FileSys::NSP> nsp;

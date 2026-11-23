@@ -129,8 +129,10 @@ void LoopProcess(Core::System& system) {
     ServerManager::RunServer(std::move(server_manager));
 }
 
-Module::Module(Core::System& system)
-    : container{system.Host1x()}, service_context{system, "nvdrv"}, events_interface{*this} {
+Module::Module(Core::System& system) : Module{system, system.Host1x()} {}
+
+Module::Module(Core::System& system, Tegra::Host1x::Host1x& host1x)
+    : container{host1x}, service_context{system, "nvdrv"}, events_interface{*this} {
     // Switch 2 state kept in globals belongs to one emulation session. A game started after another
     // in the same window inherited the previous game's GPU mappings and queue semaphore regions
     // (their table filled up, so the new game's GPU waits never completed) and the Switch 2 flags.

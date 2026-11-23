@@ -276,4 +276,34 @@ ResultStatus AppLoader_NSP::ReadNSOModules(Modules& modules) {
     return secondary_loader->ReadNSOModules(modules);
 }
 
+ResultStatus AppLoader_NSP::ReadProgramMetadata(Core::System& system,
+                                                FileSys::ProgramMetadata& out_metadata) {
+    const auto title_id = nsp->GetProgramTitleID();
+    if (!nsp->IsExtractedType() && title_id == 0) {
+        return ResultStatus::ErrorNSPMissingProgramNCA;
+    }
+
+    const auto nsp_status = nsp->GetStatus();
+    if (nsp_status != ResultStatus::Success) {
+        return nsp_status;
+    }
+
+    const auto nsp_program_status = nsp->GetProgramStatus();
+    if (nsp_program_status != ResultStatus::Success) {
+        return nsp_program_status;
+    }
+
+    if (secondary_loader == nullptr) {
+        if (!nsp->IsExtractedType() &&
+            nsp->GetNCA(title_id, FileSys::ContentRecordType::Program) == nullptr) {
+            return Core::Crypto::KeyManager::KeyFileExists(false)
+                       ? ResultStatus::ErrorNSPMissingProgramNCA
+                       : ResultStatus::ErrorMissingProductionKeyFile;
+        }
+        return ResultStatus::ErrorNotInitialized;
+    }
+
+    return secondary_loader->ReadProgramMetadata(system, out_metadata);
+}
+
 } // namespace Loader

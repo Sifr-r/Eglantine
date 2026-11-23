@@ -189,6 +189,10 @@ private:
     };
 
     bool Parse();
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    bool ParseCpp();
+    bool ParseRust();
+#endif
     bool ParseMeta(PackageInfo& package);
     bool ValidateDirTree() const;
     void BuildDirTree(u32 dir_index, VectorVfsDirectory& out);

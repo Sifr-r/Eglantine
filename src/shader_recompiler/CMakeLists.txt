@@ -64,8 +64,9 @@ add_library(shader_recompiler STATIC
     frontend/ir/value.cpp
     frontend/ir/value.h
     frontend/ampere/lower_to_maxwell.h
-    frontend/ampere/program_override.h
     frontend/ampere/program_address_map.h
+    frontend/ampere/program_capture.h
+    frontend/ampere/program_override.h
     frontend/maxwell/control_flow.cpp
     frontend/maxwell/control_flow.h
     frontend/maxwell/decode.cpp
@@ -257,6 +258,20 @@ if (ENABLE_OPENGL)
 endif()
 
 target_link_libraries(shader_recompiler PUBLIC common fmt::fmt sirit::sirit)
+
+if (ENABLE_RUST_AMPERE OR ENABLE_RUST_AMP_SPIRV)
+    if (TARGET eglantine_rs)
+        target_link_libraries(shader_recompiler PUBLIC eglantine_rs)
+        if (ENABLE_RUST_AMPERE)
+            target_compile_definitions(shader_recompiler PUBLIC EGLANTINE_ENABLE_RUST_AMPERE=1)
+        endif()
+        if (ENABLE_RUST_AMP_SPIRV)
+            target_compile_definitions(shader_recompiler PUBLIC EGLANTINE_ENABLE_RUST_AMP_SPIRV=1)
+        endif()
+    else()
+        message(WARNING "ENABLE_RUST_AMPERE or ENABLE_RUST_AMP_SPIRV is ON, but target eglantine_rs is not defined")
+    endif()
+endif()
 
 if (MSVC)
     target_compile_options(shader_recompiler PRIVATE

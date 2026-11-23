@@ -138,6 +138,7 @@ class Host1x;
 } // namespace Host1x
 
 class MemoryManager;
+struct NativeMacroContext;
 
 class GPU final {
 public:
@@ -160,6 +161,9 @@ public:
     std::shared_ptr<Control::ChannelState> AllocateChannel();
 
     void InitChannel(Control::ChannelState& to_init, u64 program_id);
+
+    [[nodiscard]] std::shared_ptr<NativeMacroContext> GetOrCreateNativeMacroContext();
+    [[nodiscard]] std::shared_ptr<NativeMacroContext> GetNativeMacroContext() const;
 
     void BindChannel(s32 channel_id);
 

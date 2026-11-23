@@ -97,9 +97,11 @@ let
           path: _type:
           let
             base = builtins.baseNameOf path;
-            top = lib.head (lib.splitString "/" (lib.removePrefix "${toString src}/" (toString path)));
+            rel = lib.removePrefix "${toString src}/" (toString path);
+            top = lib.head (lib.splitString "/" rel);
           in
-          !(builtins.elem top [
+          !(rel == "rust/target" || lib.hasPrefix "rust/target/" rel)
+          && !(builtins.elem top [
             ".ci"
             ".claude"
             ".forgejo"
@@ -290,6 +292,8 @@ in
 
         # ccache is made to be optional
         preConfigure = ''
+          export CARGO_HOME="''${CARGO_HOME:-$NIX_BUILD_TOP/.cargo}"
+          mkdir -p "$CARGO_HOME"
           if mkdir -p "$CCACHE_DIR" 2>/dev/null && [ -w "$CCACHE_DIR" ]; then
             # Paths inside the preprocessed source have to be stable for a hit
             # to be possible, and the build root differs by platform.

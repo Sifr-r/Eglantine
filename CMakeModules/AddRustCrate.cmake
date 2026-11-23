@@ -57,14 +57,42 @@ function(add_rust_static_library)
         set(_lib_filename "lib${RUST_LIB_NAME}.a")
     endif()
 
+    if(NOT DEFINED EGLANTINE_RUST_TARGET)
+        set(EGLANTINE_RUST_TARGET "" CACHE STRING "Explicit Cargo --target triple override")
+    endif()
+
     set(_cargo_triple "")
-    if(DEFINED EGLANTINE_RUST_TARGET AND NOT "${EGLANTINE_RUST_TARGET}" STREQUAL "")
+    if(NOT "${EGLANTINE_RUST_TARGET}" STREQUAL "")
         set(_cargo_triple "${EGLANTINE_RUST_TARGET}")
     elseif(MINGW)
-        if(ARCHITECTURE_x86_64)
-            set(_cargo_triple "x86_64-pc-windows-gnu")
-        elseif(ARCHITECTURE_arm64)
-            set(_cargo_triple "aarch64-pc-windows-gnullvm")
+        set(_use_default_mingw_triple TRUE)
+        if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+            get_filename_component(_cargo_dir "${CARGO_EXECUTABLE}" DIRECTORY)
+            find_program(RUSTC_EXECUTABLE rustc HINTS "${_cargo_dir}")
+            if(RUSTC_EXECUTABLE)
+                execute_process(
+                    COMMAND "${RUSTC_EXECUTABLE}" -vV
+                    OUTPUT_VARIABLE _rustc_vv
+                    ERROR_QUIET
+                    RESULT_VARIABLE _rustc_rc
+                )
+                if(_rustc_rc EQUAL 0 AND _rustc_vv MATCHES "host: ([^\r\n]+)")
+                    string(STRIP "${CMAKE_MATCH_1}" _rustc_host)
+                    # Native MSYS2 UCRT64/CLANG64 rustc targets MinGW directly without --target.
+                    if(ARCHITECTURE_x86_64 AND _rustc_host MATCHES "^x86_64-pc-windows-(gnu|gnullvm)$")
+                        set(_use_default_mingw_triple FALSE)
+                    elseif(ARCHITECTURE_arm64 AND _rustc_host MATCHES "^aarch64-pc-windows-(gnu|gnullvm)$")
+                        set(_use_default_mingw_triple FALSE)
+                    endif()
+                endif()
+            endif()
+        endif()
+        if(_use_default_mingw_triple)
+            if(ARCHITECTURE_x86_64)
+                set(_cargo_triple "x86_64-pc-windows-gnu")
+            elseif(ARCHITECTURE_arm64)
+                set(_cargo_triple "aarch64-pc-windows-gnullvm")
+            endif()
         endif()
     elseif(APPLE)
         if(ARCHITECTURE_arm64)
@@ -95,7 +123,32 @@ function(add_rust_static_library)
     if(_triple_args)
         list(APPEND _cargo_args ${_triple_args})
     endif()
-    list(APPEND _cargo_args "$<$<NOT:$<CONFIG:Debug>>:--release>")
+
+    get_property(_is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    if(_is_multi_config)
+        list(APPEND _cargo_args "$<$<NOT:$<CONFIG:Debug>>:--release>")
+        set(_stamp_file "${_cargo_target_dir}/${RUST_TARGET}_$<CONFIG>.stamp")
+        set(_byproduct_libs "$<$<CONFIG:Debug>:${_lib_debug}>$<$<NOT:$<CONFIG:Debug>>:${_lib_release}>")
+        set(_comment_config "$<CONFIG>")
+        set(_default_location "${_lib_release}")
+    else()
+        string(TOUPPER "${CMAKE_BUILD_TYPE}" _build_type_upper)
+        if(_build_type_upper STREQUAL "DEBUG")
+            set(_default_location "${_lib_debug}")
+            set(_stamp_config "Debug")
+        else()
+            list(APPEND _cargo_args --release)
+            set(_default_location "${_lib_release}")
+            if(CMAKE_BUILD_TYPE)
+                set(_stamp_config "${CMAKE_BUILD_TYPE}")
+            else()
+                set(_stamp_config "Release")
+            endif()
+        endif()
+        set(_stamp_file "${_cargo_target_dir}/${RUST_TARGET}_${_stamp_config}.stamp")
+        set(_byproduct_libs "${_default_location}")
+        set(_comment_config "${_stamp_config}")
+    endif()
 
     set(_env_args "CARGO_TARGET_DIR=${_cargo_target_dir}")
     if(MSVC)
@@ -119,19 +172,17 @@ function(add_rust_static_library)
         "${_manifest_dir}/Cargo.lock"
         "${_manifest_dir}/src/*.rs"
         "${_manifest_dir}/crates/*/Cargo.toml"
-        "${_manifest_dir}/crates/*/src/*.rs"
+        "${_manifest_dir}/crates/**/*.rs"
     )
-
-    set(_stamp_file "${_cargo_target_dir}/${RUST_TARGET}_$<CONFIG>.stamp")
 
     add_custom_command(
         OUTPUT "${_stamp_file}"
-        BYPRODUCTS "${_lib_debug}" "${_lib_release}"
+        BYPRODUCTS "${_byproduct_libs}"
         COMMAND "${CMAKE_COMMAND}" -E env ${_env_args} "${CARGO_EXECUTABLE}" ${_cargo_args}
         COMMAND "${CMAKE_COMMAND}" -E touch "${_stamp_file}"
         WORKING_DIRECTORY "${_manifest_dir}"
         DEPENDS ${_rust_sources}
-        COMMENT "Building Rust static library ${RUST_TARGET} ($<CONFIG>)"
+        COMMENT "Building Rust static library ${RUST_TARGET} (${_comment_config})"
         COMMAND_EXPAND_LISTS
         VERBATIM
     )
@@ -143,7 +194,7 @@ function(add_rust_static_library)
     add_dependencies("${RUST_TARGET}" "${_build_target}")
 
     set_target_properties("${RUST_TARGET}" PROPERTIES
-        IMPORTED_LOCATION "${_lib_release}"
+        IMPORTED_LOCATION "${_default_location}"
         IMPORTED_LOCATION_RELEASE "${_lib_release}"
         IMPORTED_LOCATION_RELWITHDEBINFO "${_lib_release}"
         IMPORTED_LOCATION_MINSIZEREL "${_lib_release}"

@@ -303,6 +303,19 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     if (!dld.vkCreateRenderPass2) {
         Proc(dld.vkCreateRenderPass2, dld, "vkCreateRenderPass2KHR", device);
     }
+
+    // Optional VK_KHR_video_queue / VK_KHR_video_decode_queue entrypoints
+    X(vkCreateVideoSessionKHR);
+    X(vkDestroyVideoSessionKHR);
+    X(vkGetVideoSessionMemoryRequirementsKHR);
+    X(vkBindVideoSessionMemoryKHR);
+    X(vkCreateVideoSessionParametersKHR);
+    X(vkUpdateVideoSessionParametersKHR);
+    X(vkDestroyVideoSessionParametersKHR);
+    X(vkCmdBeginVideoCodingKHR);
+    X(vkCmdEndVideoCodingKHR);
+    X(vkCmdControlVideoCodingKHR);
+    X(vkCmdDecodeVideoKHR);
 #undef X
 }
 
@@ -348,6 +361,8 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
     X(vkGetPhysicalDeviceSurfacePresentModesKHR);
     X(vkGetPhysicalDeviceSurfaceSupportKHR);
     X(vkGetPhysicalDeviceToolProperties);
+    X(vkGetPhysicalDeviceVideoCapabilitiesKHR);
+    X(vkGetPhysicalDeviceVideoFormatPropertiesKHR);
     X(vkGetSwapchainImagesKHR);
     X(vkQueuePresentKHR);
 
@@ -1046,6 +1061,46 @@ std::vector<VkCooperativeMatrixPropertiesKHR> PhysicalDevice::GetCooperativeMatr
              });
     if (dld->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physical_device, &num,
                                                                properties.data()) != VK_SUCCESS) {
+        return {};
+    }
+    properties.resize(num);
+    return properties;
+}
+
+std::optional<VkVideoCapabilitiesKHR> PhysicalDevice::GetVideoCapabilitiesKHR(
+    const VkVideoProfileInfoKHR& profile, void* next_structures) const {
+    if (!dld->vkGetPhysicalDeviceVideoCapabilitiesKHR) {
+        return std::nullopt;
+    }
+    VkVideoCapabilitiesKHR capabilities{
+        .sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR,
+        .pNext = next_structures,
+    };
+    if (dld->vkGetPhysicalDeviceVideoCapabilitiesKHR(physical_device, &profile, &capabilities) !=
+        VK_SUCCESS) {
+        return std::nullopt;
+    }
+    return capabilities;
+}
+
+std::vector<VkVideoFormatPropertiesKHR> PhysicalDevice::GetVideoFormatPropertiesKHR(
+    const VkPhysicalDeviceVideoFormatInfoKHR& format_info) const {
+    if (!dld->vkGetPhysicalDeviceVideoFormatPropertiesKHR) {
+        return {};
+    }
+    u32 num = 0;
+    if (dld->vkGetPhysicalDeviceVideoFormatPropertiesKHR(physical_device, &format_info, &num,
+                                                         nullptr) != VK_SUCCESS ||
+        num == 0) {
+        return {};
+    }
+    std::vector<VkVideoFormatPropertiesKHR> properties(
+        num, VkVideoFormatPropertiesKHR{
+                 .sType = VK_STRUCTURE_TYPE_VIDEO_FORMAT_PROPERTIES_KHR,
+                 .pNext = nullptr,
+             });
+    if (dld->vkGetPhysicalDeviceVideoFormatPropertiesKHR(physical_device, &format_info, &num,
+                                                         properties.data()) != VK_SUCCESS) {
         return {};
     }
     properties.resize(num);

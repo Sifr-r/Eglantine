@@ -1567,24 +1567,50 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
     });
 }
 
-bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
-    // FSR 3.1 replaces DLSS; the temporal stand-in only runs when FSR cannot (no depth, a device
-    // without the formats, a failed start). EDEN_NX2_DLSS_REPLACEMENT=standin forces
-    // the stand-in for A/B runs.
-    static const bool force_standin = [] {
+namespace {
+
+TemporalUpscalerBackend TemporalReplacementOverride() {
+    static const TemporalUpscalerBackend forced = [] {
         const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "standin";
+        if (value == nullptr) {
+            return TemporalUpscalerBackend::None;
+        }
+        const std::string_view sv{value};
+        if (sv == "standin") {
+            return TemporalUpscalerBackend::StandIn;
+        }
+        if (sv == "fsr") {
+            return TemporalUpscalerBackend::Fsr3;
+        }
+        if (sv == "xess") {
+            return TemporalUpscalerBackend::XeSS;
+        }
+        if (sv == "dlss") {
+            return TemporalUpscalerBackend::Dlss;
+        }
+        return TemporalUpscalerBackend::None;
     }();
-    return !force_standin && !fsr3_unsupported;
+    return forced;
+}
+
+} // Anonymous namespace
+
+bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
+    // Priority order is DLSS -> XeSS -> FSR 3.1; the temporal stand-in only runs when no depth
+    // backend can run or EDEN_NX2_DLSS_REPLACEMENT=standin forces it.
+    if (TemporalReplacementOverride() == TemporalUpscalerBackend::StandIn) {
+        return false;
+    }
+    return UsesNvidiaDlss() || !xess_unsupported || !fsr3_unsupported;
 }
 
 bool TextureCacheRuntime::UsesNvidiaDlss() const {
 #ifdef EGLANTINE_STREAMLINE
-    static const bool force_fsr = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "fsr";
-    }();
-    return !force_fsr && !dlss_unsupported && Streamline::IsDlssAvailable();
+    const auto forced = TemporalReplacementOverride();
+    const bool blocked = forced == TemporalUpscalerBackend::Fsr3 ||
+                         forced == TemporalUpscalerBackend::XeSS ||
+                         forced == TemporalUpscalerBackend::StandIn;
+    return !blocked && !dlss_unsupported && Streamline::IsDlssAvailable();
 #else
     return false;
 #endif
@@ -1600,35 +1626,56 @@ std::optional<VideoCore::GameDlssProbe> TextureCacheRuntime::ProbeGameDlssOutput
                                      output.Handle(Shader::TextureType::Color2D));
 }
 
-bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
-                                          ImageView& motion_vectors, ImageView& depth,
-                                          std::array<u32, 2> render_size,
-                                          std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale) {
-    if (!WantsTemporalUpscaleDepth()) {
-        return false;
+TemporalUpscaleImage TextureCacheRuntime::MakeUpscaleImage(ImageView& view, VkImageView handle,
+                                                             VkImageAspectFlags aspect) const {
+    return TemporalUpscaleImage{
+        .view = handle,
+        .image = view.ImageHandle(),
+        .format =
+            MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, view.format).format,
+        .range{
+            .aspectMask = aspect,
+            .baseMipLevel = static_cast<u32>(view.range.base.level),
+            .levelCount = 1,
+            .baseArrayLayer = static_cast<u32>(view.range.base.layer),
+            .layerCount = 1,
+        },
+        .barrier_aspect = ImageAspectMask(view.format),
+    };
+}
+
+XeSSUpscaler* TextureCacheRuntime::GetXessUpscaler() {
+    if (xess_unsupported) {
+        return nullptr;
     }
-    const VkExtent2D extent = dst_framebuffer->RenderArea();
-    // A gap in the evaluations (a menu, a movie, a load) starts the history again.
-    const auto now = std::chrono::steady_clock::now();
-    const f32 frame_time_ms =
-        fsr3_last_evaluation
-            ? std::chrono::duration<f32, std::milli>(now - *fsr3_last_evaluation).count()
-            : 1000.0f / 30.0f;
-    const bool reset = !fsr3_last_evaluation || frame_time_ms > 250.0f;
-    fsr3_last_evaluation = now;
-#ifdef EGLANTINE_STREAMLINE
-    if (UpscaleWithDlss(dst_framebuffer, input_color, motion_vectors, depth, render_size, jitter,
-                        motion_scale, reset)) {
-        return true;
+    if (!xess_upscaler) {
+        if (!XeSSUpscaler::IsSupported(device)) {
+            xess_unsupported = true;
+            return nullptr;
+        }
+        try {
+            xess_upscaler =
+                std::make_unique<XeSSUpscaler>(device, scheduler, memory_allocator);
+        } catch (const vk::Exception& exception) {
+            LOG_WARNING(Render_Vulkan, "Intel XeSS unavailable ({}); falling back to FSR 3.1",
+                        exception.what());
+            xess_unsupported = true;
+            return nullptr;
+        }
     }
-#endif
+    return xess_upscaler.get();
+}
+
+Fsr3Upscaler* TextureCacheRuntime::GetFsr3Upscaler() {
+    if (fsr3_unsupported) {
+        return nullptr;
+    }
     if (!fsr3_upscaler) {
         if (!Fsr3Upscaler::IsSupported(device)) {
             LOG_WARNING(Render_Vulkan, "FSR 3.1 needs formats or features this device lacks; "
                                        "using the temporal stand-in");
             fsr3_unsupported = true;
-            return false;
+            return nullptr;
         }
         try {
             fsr3_upscaler = std::make_unique<Fsr3Upscaler>(device, scheduler, memory_allocator,
@@ -1638,9 +1685,49 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
             LOG_ERROR(Render_Vulkan, "FSR 3.1 failed to start ({}); using the temporal stand-in",
                       exception.what());
             fsr3_unsupported = true;
-            return false;
+            return nullptr;
         }
     }
+    return fsr3_upscaler.get();
+}
+
+bool TextureCacheRuntime::TryUpscaleBackend(ITemporalUpscaler& upscaler,
+                                            Framebuffer* dst_framebuffer,
+                                            const TemporalUpscaleInputs& inputs,
+                                            const char* backend_name, bool& logged) {
+    if (!upscaler.Upscale(inputs)) {
+        return false;
+    }
+    DrawUpscaledOutput(dst_framebuffer, upscaler.OutputView(), upscaler.OutputImage(),
+                       upscaler.PointSampler());
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Render_Vulkan, "DLSS replaced by {}: {}x{} -> {}x{}", backend_name,
+                 inputs.render_size.width, inputs.render_size.height, inputs.upscale_size.width,
+                 inputs.upscale_size.height);
+    }
+    return true;
+}
+
+bool TextureCacheRuntime::UpscaleWithTemporalBackends(Framebuffer* dst_framebuffer,
+                                                       ImageView& input_color,
+                                                       ImageView& motion_vectors, ImageView& depth,
+                                                       std::array<u32, 2> render_size,
+                                                       std::array<f32, 2> jitter,
+                                                       std::array<f32, 2> motion_scale) {
+    if (!WantsTemporalUpscaleDepth()) {
+        return false;
+    }
+    const VkExtent2D extent = dst_framebuffer->RenderArea();
+    // A gap in the evaluations (a menu, a movie, a load) starts the history again.
+    const auto now = std::chrono::steady_clock::now();
+    const f32 frame_time_ms =
+        temporal_last_evaluation
+            ? std::chrono::duration<f32, std::milli>(now - *temporal_last_evaluation).count()
+            : 1000.0f / 30.0f;
+    const bool reset = !temporal_last_evaluation || frame_time_ms > 250.0f;
+    temporal_last_evaluation = now;
+
     // FSR's own RCAS, set by the sharpness slider: FSR takes 0-1 for 2 to 0 stops, and the slider
     // stores stops x 100, so this is the percentage the slider shows; 0% (stored 200) is off.
     // EDEN_NX2_TEMPORAL_SHARPEN=<stops>|off overrides the slider.
@@ -1652,10 +1739,14 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
         sharpen = std::string_view{sharpen_override} != "off";
         stops = static_cast<f32>(std::strtod(sharpen_override, nullptr));
     }
-    fsr3_upscaler->Upscale({
-        .color = input_color.Handle(Shader::TextureType::Color2D),
-        .depth = depth.DepthView(),
-        .motion_vectors = motion_vectors.Handle(Shader::TextureType::Color2D),
+
+    const TemporalUpscaleInputs inputs{
+        .color = MakeUpscaleImage(input_color, input_color.Handle(Shader::TextureType::Color2D),
+                                  VK_IMAGE_ASPECT_COLOR_BIT),
+        .depth = MakeUpscaleImage(depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
+        .motion_vectors =
+            MakeUpscaleImage(motion_vectors, motion_vectors.Handle(Shader::TextureType::Color2D),
+                             VK_IMAGE_ASPECT_COLOR_BIT),
         .render_size = {render_size[0], render_size[1]},
         .upscale_size = extent,
         .jitter = jitter,
@@ -1663,18 +1754,41 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
                                 motion_scale[1] * static_cast<f32>(render_size[1])},
         .frame_time_ms = frame_time_ms,
         .reset = reset,
+        .depth_inverted = true,
+        .hdr = true,
         .sharpen = sharpen,
         .sharpness = 1.0f - stops / 2.0f,
-    });
-    DrawUpscaledOutput(dst_framebuffer, fsr3_upscaler->OutputView(), fsr3_upscaler->OutputImage(),
-                       fsr3_upscaler->PointSampler());
-    static bool logged{};
-    if (!logged) {
-        logged = true;
-        LOG_INFO(Render_Vulkan, "DLSS replaced by FSR 3.1: {}x{} -> {}x{}", render_size[0],
-                 render_size[1], extent.width, extent.height);
+    };
+
+    const auto forced = TemporalReplacementOverride();
+#ifdef EGLANTINE_STREAMLINE
+    if (forced != TemporalUpscalerBackend::Fsr3 && forced != TemporalUpscalerBackend::XeSS) {
+        if (auto* dlss = DlssUpscaler()) {
+            static bool dlss_logged{};
+            if (TryUpscaleBackend(*dlss, dst_framebuffer, inputs, "NVIDIA DLSS", dlss_logged)) {
+                return true;
+            }
+            dlss_unsupported = true;
+        }
     }
-    return true;
+#endif
+    if (forced != TemporalUpscalerBackend::Fsr3) {
+        if (auto* xess = GetXessUpscaler()) {
+            static bool xess_logged{};
+            if (TryUpscaleBackend(*xess, dst_framebuffer, inputs, "Intel XeSS", xess_logged)) {
+                return true;
+            }
+            xess_unsupported = true;
+        }
+    }
+    if (auto* fsr3 = GetFsr3Upscaler()) {
+        static bool fsr3_logged{};
+        if (TryUpscaleBackend(*fsr3, dst_framebuffer, inputs, "FSR 3.1", fsr3_logged)) {
+            return true;
+        }
+        fsr3_unsupported = true;
+    }
+    return false;
 }
 
 void TextureCacheRuntime::DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view,
@@ -1716,12 +1830,9 @@ void TextureCacheRuntime::DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkIma
 
 #ifdef EGLANTINE_STREAMLINE
 StreamlineDlssUpscaler* TextureCacheRuntime::DlssUpscaler() {
-    // EDEN_NX2_DLSS_REPLACEMENT=fsr keeps FSR 3.1 for A/B runs.
-    static const bool force_fsr = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "fsr";
-    }();
-    if (force_fsr || dlss_unsupported) {
+    const auto forced = TemporalReplacementOverride();
+    if (forced == TemporalUpscalerBackend::Fsr3 || forced == TemporalUpscalerBackend::XeSS ||
+        dlss_unsupported) {
         return nullptr;
     }
     if (!dlss_upscaler) {
@@ -1740,67 +1851,6 @@ StreamlineDlssUpscaler* TextureCacheRuntime::DlssUpscaler() {
         }
     }
     return dlss_upscaler.get();
-}
-
-namespace {
-StreamlineDlssUpscaler::Image DlssImage(const Device& device, ImageView& view, VkImageView handle,
-                                        VkImageAspectFlags aspect) {
-    return StreamlineDlssUpscaler::Image{
-        .view = handle,
-        .image = view.ImageHandle(),
-        .format =
-            MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, view.format).format,
-        .range{
-            .aspectMask = aspect,
-            .baseMipLevel = static_cast<u32>(view.range.base.level),
-            .levelCount = 1,
-            .baseArrayLayer = static_cast<u32>(view.range.base.layer),
-            .layerCount = 1,
-        },
-        .barrier_aspect = ImageAspectMask(view.format),
-    };
-}
-} // Anonymous namespace
-
-bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageView& input_color,
-                                          ImageView& motion_vectors, ImageView& depth,
-                                          std::array<u32, 2> render_size,
-                                          std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale, bool reset) {
-    if (!DlssUpscaler()) {
-        return false;
-    }
-    const auto image = [&](ImageView& view, VkImageView handle, VkImageAspectFlags aspect) {
-        return DlssImage(device, view, handle, aspect);
-    };
-    const VkExtent2D extent = dst_framebuffer->RenderArea();
-    const bool upscaled = dlss_upscaler->Upscale({
-        .color = image(input_color, input_color.Handle(Shader::TextureType::Color2D),
-                       VK_IMAGE_ASPECT_COLOR_BIT),
-        .depth = image(depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
-        .motion_vectors = image(motion_vectors,
-                                motion_vectors.Handle(Shader::TextureType::Color2D),
-                                VK_IMAGE_ASPECT_COLOR_BIT),
-        .render_size = {render_size[0], render_size[1]},
-        .upscale_size = extent,
-        .jitter = jitter,
-        .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
-                                motion_scale[1] * static_cast<f32>(render_size[1])},
-        .reset = reset,
-    });
-    if (!upscaled) {
-        dlss_unsupported = true;
-        return false;
-    }
-    DrawUpscaledOutput(dst_framebuffer, dlss_upscaler->OutputView(), dlss_upscaler->OutputImage(),
-                       dlss_upscaler->PointSampler());
-    static bool logged{};
-    if (!logged) {
-        logged = true;
-        LOG_INFO(Render_Vulkan, "DLSS replaced by NVIDIA DLSS: {}x{} -> {}x{}", render_size[0],
-                 render_size[1], extent.width, extent.height);
-    }
-    return true;
 }
 #endif
 
@@ -1826,7 +1876,7 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
             device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
     }
     camera_motion_pass->Record(depth.DepthView(), render_extent, reprojection);
-    const StreamlineDlssUpscaler::Image motion_vectors{
+    const TemporalUpscaleImage motion_vectors{
         .view = camera_motion_pass->View(),
         .image = camera_motion_pass->Image(),
         .format = CameraMotionPass::FORMAT,
@@ -1841,11 +1891,11 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
     };
     bool upscaled{};
     try {
-        upscaled = dlss_upscaler->Upscale({
-            .color = DlssImage(device, input_color,
-                               input_color.Handle(Shader::TextureType::Color2D),
-                               VK_IMAGE_ASPECT_COLOR_BIT),
-            .depth = DlssImage(device, depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
+        upscaled = dlss_upscaler->Upscale(TemporalUpscaleInputs{
+            .color = MakeUpscaleImage(input_color,
+                                      input_color.Handle(Shader::TextureType::Color2D),
+                                      VK_IMAGE_ASPECT_COLOR_BIT),
+            .depth = MakeUpscaleImage(depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
             .motion_vectors = motion_vectors,
             .render_size = render_extent,
             .upscale_size = upscale_extent,
@@ -1886,8 +1936,8 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
     if (dst.Samples() != VK_SAMPLE_COUNT_1_BIT || ImageAspectMask(dst.format) != VK_IMAGE_ASPECT_COLOR_BIT) {
         return false;
     }
-    if (depth && UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
-                                 jitter, motion_scale)) {
+    if (depth && UpscaleWithTemporalBackends(dst_framebuffer, input_color, motion_vectors, *depth,
+                                             render_size, jitter, motion_scale)) {
         return true;
     }
     const VkFormat format =

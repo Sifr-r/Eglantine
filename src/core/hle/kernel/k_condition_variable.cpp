@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_condition_variable.h"
@@ -116,7 +118,7 @@ KConditionVariable::~KConditionVariable() = default;
 Result KConditionVariable::SignalToAddress(KernelCore& kernel, KProcessAddress addr) {
     KThread* owner_thread = GetCurrentThreadPointer(kernel);
 
-    // Signal the address.
+    // Condition-variable signals can add waiters directly to the mutex owner.
     {
         KScopedSchedulerLock sl(kernel);
 

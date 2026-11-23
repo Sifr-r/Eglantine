@@ -9,6 +9,8 @@
 
 #pragma once
 
+#include <array>
+
 #include "common/common_types.h"
 
 namespace Shader {
@@ -111,6 +113,10 @@ struct Profile {
     bool has_broken_spirv_subgroup_shuffle{};
     /// The guest's HMMA.16816.F16 runs on a cooperative matrix, in compute shaders
     bool support_cooperative_hmma{};
+    u32 coop_tile_m{16};
+    u32 coop_tile_n{8};
+    u32 coop_tile_k{16};
+    std::array<u32, 4> coop_a_word_map{0, 2, 1, 3};
     bool has_broken_spirv_fragment_shuffle{};
     u32 max_subgroup_size{};
 

@@ -1853,6 +1853,8 @@ void RasterizerVulkan::DispatchCompute() {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
+    // Compute dispatches may swap descriptor buffer chunks or bind descriptor sets.
+    descriptor_buffer_ring.InvalidateDrawOffsetCache();
     const auto& qmd{kepler_compute->launch_description};
     const auto publish_collision_map = [&] {
         if (native_key != 0x6e0ae200ee9aa220ULL ||
@@ -2508,6 +2510,7 @@ void RasterizerVulkan::FlushCommands() {
         return;
     }
     draw_counter = 0;
+    descriptor_buffer_ring.InvalidateDrawBindCache();
     // Fences with downloads or queries come here right after queueing: ~9,400 a second in
     // Hyrule Warriors: Age of Imprisonment fights. Batched like the fences themselves.
     if (!scheduler.DeferFlush()) {

@@ -420,7 +420,11 @@ void Fsr3Upscaler::CreateResources(VkExtent2D render_size, VkExtent2D upscale_si
     LOG_INFO(Render_Vulkan, "FSR 3.1 upscaler: {}x{} -> {}x{}", rw, rh, uw, uh);
 }
 
-void Fsr3Upscaler::Upscale(const Inputs& in) {
+bool Fsr3Upscaler::Upscale(const Inputs& in) {
+    if (in.render_size.width == 0 || in.render_size.height == 0 ||
+        in.upscale_size.width == 0 || in.upscale_size.height == 0) {
+        return false;
+    }
     if (!output.image || in.render_size.width != render_extent.width ||
         in.render_size.height != render_extent.height ||
         in.upscale_size.width != upscale_extent.width ||
@@ -632,9 +636,9 @@ void Fsr3Upscaler::Upscale(const Inputs& in) {
         return Resource{.view = *spd_mips.levels[(std::min)(level, static_cast<u32>(
                                                                        spd_mips.levels.size() - 1))]};
     };
-    const Resource color{.view = in.color};
-    const Resource depth{.view = in.depth};
-    const Resource motion{.view = in.motion_vectors};
+    const Resource color{.view = in.color.view};
+    const Resource depth{.view = in.depth.view};
+    const Resource motion{.view = in.motion_vectors.view};
     const Resource exposure = tex(frame_info); // FSR's own exposure (auto exposure)
     const Resource current_luma = tex(luma[p]);
     const auto groups = [](s32 size, u32 tile) {
@@ -691,7 +695,8 @@ void Fsr3Upscaler::Upscale(const Inputs& in) {
                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
                                MemoryBarrier(VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT));
     });
-    frame_parity = q;
+    frame_parity = static_cast<u32>(q);
+    return true;
 }
 
 } // namespace Vulkan

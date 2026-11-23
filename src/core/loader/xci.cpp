@@ -212,4 +212,21 @@ ResultStatus AppLoader_XCI::ReadNSOModules(Modules& modules) {
     return nca_loader->ReadNSOModules(modules);
 }
 
+ResultStatus AppLoader_XCI::ReadProgramMetadata(Core::System& system,
+                                                FileSys::ProgramMetadata& out_metadata) {
+    if (xci->GetStatus() != ResultStatus::Success) {
+        return xci->GetStatus();
+    }
+
+    if (xci->GetProgramNCAStatus() != ResultStatus::Success) {
+        return xci->GetProgramNCAStatus();
+    }
+
+    if (nca_loader == nullptr) {
+        return ResultStatus::ErrorNotInitialized;
+    }
+
+    return nca_loader->ReadProgramMetadata(system, out_metadata);
+}
+
 } // namespace Loader

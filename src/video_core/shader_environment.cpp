@@ -529,8 +529,8 @@ void GenericEnvironment::InitializeNativeCode(std::shared_ptr<const LoweredNativ
     lowered_native = std::move(lowered);
 }
 
-std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32 source_header_size,
-                                                                            bool geometry) {
+std::vector<Shader::Ampere::Instruction> GenericEnvironment::CaptureNativeInstructions(
+    u32 source_header_size) const {
     using Shader::Ampere::Instruction;
     const u32 native_header_size = source_header_size;
     constexpr u32 maximum_instructions = Shader::Ampere::ProgramCaptureState::MaximumInstructions;
@@ -568,6 +568,134 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         }
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
+    return native;
+}
+
+void GenericEnvironment::PreprobeNativeCbuf([[maybe_unused]] u32 cbuf_index,
+                                            [[maybe_unused]] u32 cbuf_offset,
+                                            [[maybe_unused]] bool probe_pointer_slot) {}
+
+void GenericEnvironment::PreprobeNativeTexture([[maybe_unused]] u32 cbuf_index,
+                                               [[maybe_unused]] u32 cbuf_offset) {}
+
+void GenericEnvironment::TryPreprobeTextureFromPool(GPUVAddr tic_addr, u32 tic_limit,
+                                                    bool via_header_index, u32 cbuf_index,
+                                                    u32 cbuf_offset) {
+    if (gpu_memory == nullptr) {
+        return;
+    }
+    const auto it = cbuf_values.find(MakeCbufKey(cbuf_index, cbuf_offset));
+    if (it == cbuf_values.end()) {
+        return;
+    }
+    const u32 handle = it->second;
+    const auto pair{Tegra::Texture::TexturePair(handle, via_header_index)};
+    const u32 index{Tegra::Texture::TextureHeaderIndex(pair.first, tic_limit,
+                                                       gpu_memory->UsesNativeTiling())};
+    if (index > tic_limit) {
+        return;
+    }
+    Tegra::Texture::TICEntry entry{};
+    const GPUVAddr desc_addr{tic_addr + index * sizeof(entry)};
+    if (!gpu_memory->IsFullyMappedRange(desc_addr, sizeof(entry))) {
+        return;
+    }
+    gpu_memory->ReadBlockUnsafe(desc_addr, &entry, sizeof(entry));
+    if (static_cast<u32>(entry.texture_type.Value()) >
+        static_cast<u32>(Tegra::Texture::TextureType::TextureCubeArray)) {
+        return;
+    }
+    static_cast<void>(ReadTextureType(handle));
+    static_cast<void>(ReadTexturePixelFormat(handle));
+}
+
+NativeShaderSnapshot GenericEnvironment::BuildNativeSnapshot() {
+    NativeShaderSnapshot snap;
+    std::memcpy(snap.header.data(), &sph, sizeof(sph));
+    if (lowered_native && !lowered_native->native_code.empty()) {
+        snap.native_code = lowered_native->native_code;
+        snap.program_key = lowered_native->native_program_key;
+    } else if (gpu_memory != nullptr) {
+        const u32 header_size = stage == Shader::Stage::Compute ? 0U : 128U;
+        snap.native_code = CaptureNativeInstructions(header_size);
+    }
+    if (snap.program_key == 0 && !snap.native_code.empty()) {
+        snap.program_key = Shader::Ampere::NativeProgramKey(snap.native_code);
+    }
+    snap.stage = stage;
+    snap.local_memory_size = local_memory_size;
+    snap.shared_memory_size = shared_memory_size;
+    snap.workgroup_size = workgroup_size;
+    snap.texture_bound = texture_bound;
+    snap.viewport_transform_state = viewport_transform_state;
+    snap.native_tensor = native_tensor;
+    snap.native_compact_tensor = native_compact_tensor;
+    snap.has_hle_engine_state = has_hle_engine_state;
+    snap.mesh_registers = mesh_registers;
+    snap.mesh_primitive_header = mesh_primitive_header;
+
+    for (const auto& insn : snap.native_code) {
+        if (insn.Bits(12, 4) == 15U) {
+            continue;
+        }
+        const u32 op = insn.Bits(0, 12);
+        const auto normalize_bank = [](u32 raw_bank) -> u32 {
+            return raw_bank == 24U ? 17U : raw_bank;
+        };
+        if ((op == 0xab9U && insn.Bits(24, 8) == 63U) ||
+            (op == 0xb82U && insn.Bits(24, 8) == 255U)) {
+            const u32 bank = normalize_bank(insn.Bits(54, 5));
+            const u32 offset = insn.Bits(38, 16) & ~3U;
+            const u32 width = insn.Bits(73, 3);
+            if (bank < Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers) {
+                PreprobeNativeCbuf(bank, offset, width == 5U && (offset % 8U) == 0U);
+                if (width == 5U) {
+                    PreprobeNativeCbuf(bank, offset + 4U, false);
+                }
+            }
+            continue;
+        }
+        const u32 form = op >> 9;
+        const bool is_tex_or_mem = (op & 0x0f0U) == 0x060U || (op & 0x0f0U) == 0x080U ||
+                                   (op & 0x0f0U) == 0x090U;
+        if (!is_tex_or_mem && (form == 3U || form == 5U) && insn.Bits(91, 1) == 0U) {
+            const u32 bank = normalize_bank(insn.Bits(54, 5));
+            const u32 offset = insn.Bits(38, 16);
+            if (bank < Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers && (offset % 4U) == 0U) {
+                PreprobeNativeCbuf(bank, offset, (offset % 8U) == 0U);
+            }
+            continue;
+        }
+        if (op == 0xb60U || op == 0xb63U || op == 0xb66U || op == 0xb69U || op == 0xb6cU ||
+            op == 0xb6fU) {
+            const u32 bank = normalize_bank(insn.Bits(54, 5));
+            const u32 offset = insn.Bits(40, 14) * 4U;
+            if (bank < Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers) {
+                PreprobeNativeCbuf(bank, offset, false);
+                PreprobeNativeTexture(bank, offset);
+            }
+        } else if (op == 0xb97U || op == 0xb9bU || op == 0x593U || op == 0x59fU) {
+            const u32 bank = normalize_bank(insn.Bits(54, 5));
+            const u32 offset = insn.Bits(40, 14) * 4U;
+            if (bank < Tegra::Engines::Maxwell3D::Regs::MaxConstBuffers) {
+                PreprobeNativeCbuf(bank, offset, false);
+            }
+        }
+    }
+
+    snap.cbuf_values = cbuf_values;
+    snap.texture_types = texture_types;
+    snap.texture_pixel_formats = texture_pixel_formats;
+    snap.storage_pointer_types = storage_pointer_types;
+    snap.cbuf_replacements = cbuf_replacements;
+    return snap;
+}
+
+std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32 source_header_size,
+                                                                            bool geometry) {
+    using Shader::Ampere::Instruction;
+    const u32 native_header_size = source_header_size;
+    std::vector<Instruction> native = CaptureNativeInstructions(source_header_size);
     auto lowered = Shader::Ampere::LowerToMaxwell(
         native, {.geometry = geometry,
                  .tensor = native_tensor,
@@ -675,6 +803,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     std::array<u64, sizeof(sph) / sizeof(u64)> header;
     std::memcpy(header.data(), &sph, sizeof(sph));
     result->code = LayOutLoweredNativeCode(header, native, lowered);
+    result->native_code = std::move(native);
     // What Analyze returns for this program once the environment holds the lowered code.
     const u64 shader_hash = NativeShaderHash(result->code);
     if (VideoCommon::Nx2Diag::Active()) {
@@ -1010,6 +1139,72 @@ GraphicsEnvironment::TexturePoolCheck GraphicsEnvironment::CheckTextureReads(
     return check;
 }
 
+void GraphicsEnvironment::PreprobeNativeCbuf(u32 cbuf_index, u32 cbuf_offset,
+                                             bool probe_pointer_slot) {
+    if (cbuf_index >= Maxwell::MaxConstBuffers) {
+        return;
+    }
+    u32 cbuf_size = 0;
+    bool can_read = false;
+    bool can_read_u64 = false;
+    if (snapshot) {
+        const auto& cbuf{snapshot->const_buffers[cbuf_index]};
+        if (cbuf.enabled) {
+            cbuf_size = cbuf.size;
+            can_read = cbuf_offset + sizeof(u32) <= cbuf_size;
+            can_read_u64 = cbuf_offset + sizeof(u64) <= cbuf_size;
+        }
+    } else if (maxwell3d != nullptr && gpu_memory != nullptr) {
+        const auto& cbuf{maxwell3d->state.shader_stages[stage_index].const_buffers[cbuf_index]};
+        if (cbuf.enabled) {
+            cbuf_size = cbuf.size;
+            can_read = cbuf_offset + sizeof(u32) <= cbuf_size &&
+                       gpu_memory->IsFullyMappedRange(cbuf.address + cbuf_offset, sizeof(u32));
+            can_read_u64 = cbuf_offset + sizeof(u64) <= cbuf_size &&
+                           gpu_memory->IsFullyMappedRange(cbuf.address + cbuf_offset, sizeof(u64));
+        }
+    }
+    if (!can_read) {
+        return;
+    }
+    static_cast<void>(ReadCbufValue(cbuf_index, cbuf_offset));
+    if (has_hle_engine_state) {
+        static_cast<void>(GetReplaceConstBuffer(cbuf_index, cbuf_offset));
+    }
+    if (probe_pointer_slot && can_read_u64) {
+        static_cast<void>(IsCbufStorageBufferPointer(cbuf_index, cbuf_offset));
+    }
+}
+
+void GraphicsEnvironment::PreprobeNativeTexture(u32 cbuf_index, u32 cbuf_offset) {
+    if (snapshot) {
+        const auto it = cbuf_values.find(MakeCbufKey(cbuf_index, cbuf_offset));
+        if (it == cbuf_values.end()) {
+            return;
+        }
+        const u32 handle = it->second;
+        const auto pair{Tegra::Texture::TexturePair(handle, snapshot->via_header_index)};
+        const u32 index{Tegra::Texture::TextureHeaderIndex(
+            pair.first, snapshot->texture_pool_limit, snapshot->native_tiling)};
+        if (index > snapshot->texture_pool_limit) {
+            return;
+        }
+        const Tegra::Texture::TICEntry entry = ReadSnapshotDescriptor(handle);
+        if (static_cast<u32>(entry.texture_type.Value()) >
+            static_cast<u32>(Tegra::Texture::TextureType::TextureCubeArray)) {
+            return;
+        }
+        static_cast<void>(ReadTextureType(handle));
+        static_cast<void>(ReadTexturePixelFormat(handle));
+    } else if (maxwell3d != nullptr) {
+        const auto& regs{maxwell3d->regs};
+        const bool via_header_index{regs.sampler_binding ==
+                                    Maxwell::SamplerBinding::ViaHeaderBinding};
+        TryPreprobeTextureFromPool(regs.tex_header.Address(), regs.tex_header.limit,
+                                   via_header_index, cbuf_index, cbuf_offset);
+    }
+}
+
 ComputeEnvironment::ComputeEnvironment(Tegra::Engines::KeplerCompute& kepler_compute_,
                                        Tegra::MemoryManager& gpu_memory_, GPUVAddr program_base_,
                                        u32 start_address_,
@@ -1070,6 +1265,38 @@ bool ComputeEnvironment::IsTexturePixelFormatInteger(u32 handle) {
 
 u32 ComputeEnvironment::ReadViewportTransformState() {
     return viewport_transform_state;
+}
+
+void ComputeEnvironment::PreprobeNativeCbuf(u32 cbuf_index, u32 cbuf_offset,
+                                            bool probe_pointer_slot) {
+    if (kepler_compute == nullptr || gpu_memory == nullptr) {
+        return;
+    }
+    const auto& qmd{kepler_compute->launch_description};
+    if (cbuf_index >= qmd.const_buffer_config.size() ||
+        ((qmd.const_buffer_enable_mask.Value() >> cbuf_index) & 1U) == 0U) {
+        return;
+    }
+    const auto& cbuf{qmd.const_buffer_config[cbuf_index]};
+    if (cbuf_offset + sizeof(u32) > cbuf.size ||
+        !gpu_memory->IsFullyMappedRange(cbuf.Address() + cbuf_offset, sizeof(u32))) {
+        return;
+    }
+    static_cast<void>(ReadCbufValue(cbuf_index, cbuf_offset));
+    if (probe_pointer_slot && cbuf_offset + sizeof(u64) <= cbuf.size &&
+        gpu_memory->IsFullyMappedRange(cbuf.Address() + cbuf_offset, sizeof(u64))) {
+        static_cast<void>(IsCbufStorageBufferPointer(cbuf_index, cbuf_offset));
+    }
+}
+
+void ComputeEnvironment::PreprobeNativeTexture(u32 cbuf_index, u32 cbuf_offset) {
+    if (kepler_compute == nullptr) {
+        return;
+    }
+    const auto& regs{kepler_compute->regs};
+    const auto& qmd{kepler_compute->launch_description};
+    TryPreprobeTextureFromPool(regs.tic.Address(), regs.tic.limit, qmd.linked_tsc != 0U,
+                               cbuf_index, cbuf_offset);
 }
 
 void FileEnvironment::Deserialize(std::ifstream& file, bool with_mesh_state) {

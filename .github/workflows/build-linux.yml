@@ -110,6 +110,35 @@ jobs:
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
             libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
 
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts (restore and save)
+        if: env.CACHE_SAVE == 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Cache Rust build artifacts (restore only)
+        if: env.CACHE_SAVE != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Run Rust workspace tests
+        shell: bash
+        run: cargo test --manifest-path rust/Cargo.toml --locked --offline
+
       - name: Install Qt on Linux x86_64
         if: runner.arch != 'ARM64'
         uses: jurplel/install-qt-action@v4

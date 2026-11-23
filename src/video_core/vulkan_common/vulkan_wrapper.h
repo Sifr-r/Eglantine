@@ -196,6 +196,8 @@ struct InstanceDispatch {
     PFN_vkGetPhysicalDeviceSurfaceFormatsKHR vkGetPhysicalDeviceSurfaceFormatsKHR{};
     PFN_vkGetPhysicalDeviceSurfacePresentModesKHR vkGetPhysicalDeviceSurfacePresentModesKHR{};
     PFN_vkGetPhysicalDeviceSurfaceSupportKHR vkGetPhysicalDeviceSurfaceSupportKHR{};
+    PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR vkGetPhysicalDeviceVideoCapabilitiesKHR{};
+    PFN_vkGetPhysicalDeviceVideoFormatPropertiesKHR vkGetPhysicalDeviceVideoFormatPropertiesKHR{};
     PFN_vkGetSwapchainImagesKHR vkGetSwapchainImagesKHR{};
     PFN_vkQueuePresentKHR vkQueuePresentKHR{};
 };
@@ -371,6 +373,17 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkUpdateDescriptorSets vkUpdateDescriptorSets{};
     PFN_vkWaitForFences vkWaitForFences{};
     PFN_vkWaitSemaphores vkWaitSemaphores{};
+    PFN_vkCreateVideoSessionKHR vkCreateVideoSessionKHR{};
+    PFN_vkDestroyVideoSessionKHR vkDestroyVideoSessionKHR{};
+    PFN_vkGetVideoSessionMemoryRequirementsKHR vkGetVideoSessionMemoryRequirementsKHR{};
+    PFN_vkBindVideoSessionMemoryKHR vkBindVideoSessionMemoryKHR{};
+    PFN_vkCreateVideoSessionParametersKHR vkCreateVideoSessionParametersKHR{};
+    PFN_vkUpdateVideoSessionParametersKHR vkUpdateVideoSessionParametersKHR{};
+    PFN_vkDestroyVideoSessionParametersKHR vkDestroyVideoSessionParametersKHR{};
+    PFN_vkCmdBeginVideoCodingKHR vkCmdBeginVideoCodingKHR{};
+    PFN_vkCmdEndVideoCodingKHR vkCmdEndVideoCodingKHR{};
+    PFN_vkCmdControlVideoCodingKHR vkCmdControlVideoCodingKHR{};
+    PFN_vkCmdDecodeVideoKHR vkCmdDecodeVideoKHR{};
 };
 
 /// Loads instance agnostic function pointers.
@@ -1227,6 +1240,14 @@ public:
 
     /// Matrix shapes and types of VK_KHR_cooperative_matrix; empty when the driver lacks it.
     std::vector<VkCooperativeMatrixPropertiesKHR> GetCooperativeMatrixPropertiesKHR() const;
+
+    /// Video decode capabilities for VK_KHR_video_queue; std::nullopt when unavailable.
+    std::optional<VkVideoCapabilitiesKHR> GetVideoCapabilitiesKHR(
+        const VkVideoProfileInfoKHR& profile, void* next_structures = nullptr) const;
+
+    /// Supported image formats for VK_KHR_video_queue; empty when unavailable.
+    std::vector<VkVideoFormatPropertiesKHR> GetVideoFormatPropertiesKHR(
+        const VkPhysicalDeviceVideoFormatInfoKHR& format_info) const;
 
     bool GetSurfaceSupportKHR(u32 queue_family_index, VkSurfaceKHR) const;
 

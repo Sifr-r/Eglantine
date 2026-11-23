@@ -92,4 +92,28 @@ ResultStatus AppLoader_NAX::ReadNSOModules(Modules& modules) {
     return nca_loader->ReadNSOModules(modules);
 }
 
+ResultStatus AppLoader_NAX::ReadProgramMetadata(Core::System& system,
+                                                FileSys::ProgramMetadata& out_metadata) {
+    if (nax->GetStatus() != ResultStatus::Success) {
+        return nax->GetStatus();
+    }
+
+    const auto nca = nax->AsNCA();
+    if (nca == nullptr) {
+        return Core::Crypto::KeyManager::KeyFileExists(false)
+                   ? ResultStatus::ErrorNAXInconvertibleToNCA
+                   : ResultStatus::ErrorMissingProductionKeyFile;
+    }
+
+    if (nca->GetStatus() != ResultStatus::Success) {
+        return nca->GetStatus();
+    }
+
+    if (nca_loader == nullptr) {
+        return ResultStatus::ErrorNotInitialized;
+    }
+
+    return nca_loader->ReadProgramMetadata(system, out_metadata);
+}
+
 } // namespace Loader

@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -14,6 +16,127 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 
 namespace Vulkan {
+
+namespace {
+
+[[nodiscard]] u64 HashMix64(u64 x) noexcept {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+} // namespace
+
+bool ParseDrawCacheEnvValue(const char* value) noexcept {
+    return value == nullptr || value[0] != '0';
+}
+
+bool IsDrawCacheEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_DRAW_CACHE");
+        return ParseDrawCacheEnvValue(value);
+    }();
+    return enabled;
+}
+
+u64 HashDescriptorBytes(const void* data, size_t byte_count) noexcept {
+    if (data == nullptr || byte_count == 0) {
+        return 0;
+    }
+    const auto* bytes = static_cast<const u8*>(data);
+    u64 hash = 0xcbf29ce484222325ULL ^ static_cast<u64>(byte_count);
+    size_t offset = 0;
+    while (offset + sizeof(u64) <= byte_count) {
+        u64 word{};
+        std::memcpy(&word, bytes + offset, sizeof(word));
+        hash = HashMix64(hash ^ word);
+        offset += sizeof(u64);
+    }
+    if (offset < byte_count) {
+        u64 tail{};
+        std::memcpy(&tail, bytes + offset, byte_count - offset);
+        hash = HashMix64(hash ^ tail);
+    }
+    return hash;
+}
+
+size_t DescriptorSliceCache::SlotFor(const DescriptorSliceKey& key) noexcept {
+    u64 h = HashMix64(key.layout_hash ^ key.payload_hash);
+    h = HashMix64(h ^ (static_cast<u64>(key.entry_count) << 32) ^ static_cast<u64>(key.size));
+    for (const u64 stage_hash : key.stage_hashes) {
+        h = HashMix64(h ^ stage_hash);
+    }
+    return static_cast<size_t>(h) & SLOT_MASK;
+}
+
+std::optional<DescriptorSliceHit> DescriptorSliceCache::Lookup(const DescriptorSliceKey& key,
+                                                               u64 generation) const noexcept {
+    if (!enabled) {
+        return std::nullopt;
+    }
+    const Entry& entry = slots[SlotFor(key)];
+    if (!entry.valid || entry.generation != generation || entry.key != key) {
+        return std::nullopt;
+    }
+    return DescriptorSliceHit{
+        .offset = entry.offset,
+        .chunk = entry.chunk,
+        .generation = entry.generation,
+    };
+}
+
+void DescriptorSliceCache::Insert(const DescriptorSliceKey& key, VkDeviceSize offset, u32 chunk,
+                                  u64 generation) noexcept {
+    if (!enabled) {
+        return;
+    }
+    Entry& entry = slots[SlotFor(key)];
+    entry.key = key;
+    entry.offset = offset;
+    entry.chunk = chunk;
+    entry.generation = generation;
+    entry.valid = true;
+}
+
+void DescriptorSliceCache::Clear() noexcept {
+    for (Entry& entry : slots) {
+        entry.valid = false;
+    }
+}
+
+DescriptorBindCache::BindDecision DescriptorBindCache::AcquireGraphicsBinding(
+    u32 chunk, VkDeviceSize offset, VkPipelineLayout layout, u64 generation, u64 tick,
+    bool scheduler_chunk_dirty) noexcept {
+    if (!enabled) {
+        buffer_bound = true;
+        offsets_bound = true;
+        bound_chunk = chunk;
+        bound_offset = offset;
+        bound_layout = layout;
+        bound_generation = generation;
+        bound_tick = tick;
+        return BindDecision{.bind_buffer = true, .set_offsets = true};
+    }
+
+    const bool need_bind_buffer = scheduler_chunk_dirty || !buffer_bound || bound_chunk != chunk ||
+                                  bound_generation != generation || bound_tick != tick;
+    const bool need_set_offsets =
+        need_bind_buffer || !offsets_bound || bound_offset != offset || bound_layout != layout;
+
+    buffer_bound = true;
+    offsets_bound = true;
+    bound_chunk = chunk;
+    bound_offset = offset;
+    bound_layout = layout;
+    bound_generation = generation;
+    bound_tick = tick;
+
+    return BindDecision{
+        .bind_buffer = need_bind_buffer,
+        .set_offsets = need_set_offsets,
+    };
+}
 
 DescriptorBufferRing::DescriptorBufferRing(const Device& device_,
                                            MemoryAllocator& memory_allocator)
@@ -89,6 +212,8 @@ void DescriptorBufferRing::TickFrame() {
     cursor = 0;
     ++generation;
     frame_reused = true;
+    slice_cache.Clear();
+    draw_bind_cache.InvalidateAll();
 }
 
 void DescriptorBufferRing::TouchFrame(Scheduler& scheduler) {
@@ -116,6 +241,8 @@ DescriptorBufferRing::Allocation DescriptorBufferRing::Allocate(Scheduler& sched
             scheduler.Finish();
             chunk_cursor = 0;
             ++generation;
+            slice_cache.Clear();
+            draw_bind_cache.InvalidateAll();
         }
         cursor = 0;
     }

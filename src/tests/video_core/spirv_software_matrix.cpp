@@ -305,6 +305,64 @@ TEST_CASE("Cooperative HMMA keeps the driver's order of A's registers",
     REQUIRE(register_of_element == std::array<u32, 8>{0, 0, 2, 2, 1, 1, 3, 3});
 }
 
+TEST_CASE("Cooperative HMMA honors parameterized lane map and tile geometry",
+          "[video_core][tensor][ampere]") {
+    const auto extract_a_map = [](const std::vector<u32>& code) {
+        const auto extracts = Instructions(code, OP_COMPOSITE_EXTRACT);
+        const auto bitcasts = Instructions(code, OP_BITCAST);
+        const auto by_result = [](const auto& instructions, u32 result) {
+            const auto it = std::ranges::find_if(
+                instructions, [=](const auto& words) { return words[1] == result; });
+            REQUIRE(it != instructions.end());
+            return *it;
+        };
+        const auto types = Instructions(code, OP_TYPE_COOPERATIVE_MATRIX);
+        const auto constants = Constants(code);
+        const auto matrix_a = std::ranges::find_if(
+            types, [&](const auto& words) { return constants.at(words[5]) == 0; });
+        REQUIRE(matrix_a != types.end());
+        std::array<u32, 8> register_of_element{};
+        u32 inserts = 0;
+        for (const auto& words : Instructions(code, OP_COMPOSITE_INSERT)) {
+            if (words[0] != (*matrix_a)[0]) {
+                continue;
+            }
+            const auto half = by_result(extracts, words[2]);
+            const auto halves = by_result(bitcasts, half[2]);
+            const auto guest_register = by_result(extracts, halves[2]);
+            register_of_element.at(words[4]) = guest_register[3];
+            ++inserts;
+        }
+        REQUIRE(inserts == 8);
+        return register_of_element;
+    };
+
+    SECTION("identity word map") {
+        TensorProgram fixture{1, 16};
+        fixture.profile.support_cooperative_hmma = true;
+        fixture.profile.coop_a_word_map = {0, 1, 2, 3};
+        const auto code = fixture.Emit("cooperative-k16-identity-map");
+        REQUIRE(extract_a_map(code) == std::array<u32, 8>{0, 0, 1, 1, 2, 2, 3, 3});
+    }
+    SECTION("reversed test shader word map") {
+        constexpr std::array<u32, 4> custom_map{3, 1, 2, 0};
+        const auto code = Backend::SPIRV::EmitCooperativeHmmaTest(0x00010600U, custom_map, 16, 8, 16);
+        REQUIRE(extract_a_map(code) == std::array<u32, 8>{3, 3, 1, 1, 2, 2, 0, 0});
+    }
+    SECTION("incompatible tile geometry falls back to software helper") {
+        TensorProgram fixture{1, 16};
+        fixture.profile.support_cooperative_hmma = true;
+        fixture.profile.coop_tile_m = 16;
+        fixture.profile.coop_tile_n = 16;
+        fixture.profile.coop_tile_k = 16;
+        const auto code = fixture.Emit("cooperative-k16-incompatible-tile");
+        REQUIRE_FALSE(HasCapability(code, CAPABILITY_COOPERATIVE_MATRIX));
+        REQUIRE(Instructions(code, OP_TYPE_COOPERATIVE_MATRIX).empty());
+        REQUIRE(Instructions(code, 57).size() == 1);
+        REQUIRE_FALSE(fixture.program.info.uses_cooperative_matrix);
+    }
+}
+
 TEST_CASE("Cooperative HMMA falls back to the software helper", "[video_core][tensor][ampere]") {
     const auto require_software = [](TensorProgram& fixture) {
         const auto code = fixture.Emit();

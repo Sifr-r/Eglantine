@@ -12,13 +12,19 @@
 #include <cstdlib>
 #include <cstring>
 #include <span>
+#include <vector>
 
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
+#include "common/logging.h"
 #include "video_core/gpu.h"
 #include "video_core/textures/decoders.h"
+
+#ifdef EGLANTINE_ENABLE_ISPC
+#include "simd_kernels/tex_swizzle_ispc.h"
+#endif
 
 namespace Tegra::Texture {
 namespace {
@@ -199,19 +205,35 @@ void SwizzleSubrectImpl(std::span<u8> output, std::span<const u8> input, u32 wid
     }
 }
 
-template <bool TO_LINEAR>
-void Swizzle(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel, u32 width,
-             u32 height, u32 depth, u32 block_height, u32 block_depth, u32 stride_alignment, bool native_tiling) {
-    static const bool native_masks = [] {
-        const char* value = std::getenv("EDEN_NX2_NATIVE_SWIZZLE_MASKS");
+#ifdef EGLANTINE_ENABLE_ISPC
+bool IspcEnvEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_ISPC");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool IspcVerifyEnabled() noexcept {
+    static const bool verify = [] {
+        const char* value = std::getenv("EDEN_NX2_ISPC_VERIFY");
         return value != nullptr && value[0] == '1';
     }();
+    return verify;
+}
+#endif
+
+template <bool TO_LINEAR>
+void SwizzleScalar(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel, u32 width,
+                   u32 height, u32 depth, u32 block_height, u32 block_depth, u32 stride_alignment,
+                   bool native_tiling, bool native_masks) {
     switch (bytes_per_pixel) {
 #define BPP_CASE(x)                                                                                \
     case x:                                                                                        \
-        if (native_tiling && native_masks) {                                                        \
-            return SwizzleImpl<TO_LINEAR, x, true>(output, input, width, height, depth, block_height, \
-                                                    block_depth, stride_alignment, true);           \
+        if (native_tiling && native_masks) {                                                       \
+            return SwizzleImpl<TO_LINEAR, x, true>(output, input, width, height, depth,            \
+                                                   block_height, block_depth, stride_alignment,    \
+                                                   true);                                          \
         }                                                                                          \
         return SwizzleImpl<TO_LINEAR, x>(output, input, width, height, depth, block_height,        \
                                          block_depth, stride_alignment, native_tiling);
@@ -230,7 +252,51 @@ void Swizzle(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixe
     }
 }
 
+template <bool TO_LINEAR>
+void Swizzle(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel, u32 width,
+             u32 height, u32 depth, u32 block_height, u32 block_depth, u32 stride_alignment, bool native_tiling) {
+    static const bool native_masks = [] {
+        const char* value = std::getenv("EDEN_NX2_NATIVE_SWIZZLE_MASKS");
+        return value != nullptr && value[0] == '1';
+    }();
+#ifdef EGLANTINE_ENABLE_ISPC
+    if (IspcEnvEnabled() && width > 0 && height > 0 && depth > 0 && !output.empty() &&
+        !input.empty()) {
+        if (IspcVerifyEnabled()) {
+            std::vector<u8> scalar_out(output.begin(), output.end());
+            SwizzleScalar<TO_LINEAR>(scalar_out, input, bytes_per_pixel, width, height, depth,
+                                     block_height, block_depth, stride_alignment, native_tiling,
+                                     native_masks);
+            ispc::tex_swizzle_copy(output.data(), input.data(), bytes_per_pixel, width, height,
+                                   depth, block_height, block_depth, stride_alignment, TO_LINEAR,
+                                   native_tiling, native_tiling && native_masks);
+            if (std::memcmp(output.data(), scalar_out.data(), output.size()) != 0) {
+                LOG_ERROR(HW_GPU,
+                          "EDEN_NX2_ISPC_VERIFY: swizzle mismatch (to_linear={}, bpp={}, {}x{}x{})",
+                          TO_LINEAR, bytes_per_pixel, width, height, depth);
+                std::memcpy(output.data(), scalar_out.data(), output.size());
+            }
+            return;
+        }
+        ispc::tex_swizzle_copy(output.data(), input.data(), bytes_per_pixel, width, height, depth,
+                               block_height, block_depth, stride_alignment, TO_LINEAR,
+                               native_tiling, native_tiling && native_masks);
+        return;
+    }
+#endif
+    SwizzleScalar<TO_LINEAR>(output, input, bytes_per_pixel, width, height, depth, block_height,
+                             block_depth, stride_alignment, native_tiling, native_masks);
+}
+
 } // Anonymous namespace
+
+bool IsIspcEnabled() noexcept {
+#ifdef EGLANTINE_ENABLE_ISPC
+    return IspcEnvEnabled();
+#else
+    return false;
+#endif
+}
 
 void UnswizzleTexture(std::span<u8> output, std::span<const u8> input, u32 bytes_per_pixel,
                       u32 width, u32 height, u32 depth, u32 block_height, u32 block_depth,

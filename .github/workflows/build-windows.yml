@@ -115,6 +115,37 @@ jobs:
         shell: pwsh
         run: glslangValidator --version
 
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build artifacts (restore and save)
+        if: env.CACHE_SAVE == 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Cache Rust build artifacts (restore only)
+        if: env.CACHE_SAVE != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Run Rust workspace tests
+        shell: pwsh
+        run: cargo test --manifest-path rust/Cargo.toml --locked --offline
+
       - name: Configure
         shell: bash
         run: >-
@@ -229,6 +260,7 @@ jobs:
           cache: true
           install: >-
             git make autoconf libtool automake-wrapper patch jq pactoys ninja
+            mingw-w64-ucrt-x86_64-rust
           pacboy: >-
             toolchain:p clang:p lld:p cmake:p python-pip:p
             qt6-base:p qt6-charts:p qt6-tools:p qt6-translations:p qt6-svg:p
@@ -236,6 +268,32 @@ jobs:
             vulkan-memory-allocator:p vulkan-devel:p glslang:p enet:p opus:p
             libusb:p unordered_dense:p jbigkit:p xz:p libdeflate:p bzip2:p
             lerc:p graphite2:p libwebp:p libtiff:p brotli:p ccache:p
+
+      - name: Cache Rust build artifacts (restore and save)
+        if: env.CACHE_SAVE == 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Cache Rust build artifacts (restore only)
+        if: env.CACHE_SAVE != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Run Rust workspace tests
+        shell: msys2 {0}
+        run: cargo test --manifest-path rust/Cargo.toml --locked --offline
 
       # MinGW build: system Qt and libraries from MSYS2, clang plus the repo's PGO profile. The profile
       # path is converted to its Windows form because clang runs with the MSYS mount underneath.

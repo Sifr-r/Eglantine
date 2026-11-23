@@ -243,6 +243,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_state_tracker.h
     renderer_vulkan/vk_swapchain.cpp
     renderer_vulkan/vk_swapchain.h
+    renderer_vulkan/vk_temporal_upscaler.h
     renderer_vulkan/vk_texture_cache.cpp
     renderer_vulkan/vk_texture_cache.h
     renderer_vulkan/vk_texture_cache_base.cpp
@@ -250,6 +251,8 @@ add_library(video_core STATIC
     renderer_vulkan/vk_turbo_mode.h
     renderer_vulkan/vk_update_descriptor.cpp
     renderer_vulkan/vk_update_descriptor.h
+    renderer_vulkan/vk_xess_upscaler.cpp
+    renderer_vulkan/vk_xess_upscaler.h
     vulkan_common/vulkan_debug_callback.cpp
     vulkan_common/vulkan_debug_callback.h
     vulkan_common/vulkan_device.cpp
@@ -472,6 +475,12 @@ target_link_libraries(video_core PUBLIC common core)
 # Shader precache builder: game archives use zstd (also with dictionaries) and zlib.
 target_link_libraries(video_core PRIVATE zstd::zstd ZLIB::ZLIB)
 target_link_libraries(video_core PUBLIC shader_recompiler stb bc_decoder gpu_logging)
+if (TARGET simd_kernels)
+    target_link_libraries(video_core PRIVATE simd_kernels)
+endif()
+if (ENABLE_INTEL_XESS)
+    target_compile_definitions(video_core PRIVATE EGLANTINE_ENABLE_INTEL_XESS=1)
+endif()
 if (ENABLE_OPENGL)
     target_link_libraries(video_core PUBLIC glad)
 endif()
@@ -537,6 +546,8 @@ endif()
 
 if (ARCHITECTURE_x86_64)
     target_link_libraries(video_core PUBLIC xbyak::xbyak)
+elseif (ARCHITECTURE_arm64)
+    target_link_libraries(video_core PUBLIC merry::oaknut)
 endif()
 
 if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64)

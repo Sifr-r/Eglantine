@@ -10,10 +10,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -1183,6 +1185,184 @@ TEST_CASE("ParseLaunchParams preserves non-ASCII UTF-8 paths across options and 
         const auto lp = Core::ParseLaunchParams(
             system, static_cast<int>(narrow_storage.size()), argv.data(), argv_w.data());
         REQUIRE(lp.filepath == utf8_game);
+    }
+#endif
+}
+
+TEST_CASE("NUP roundtrip and Rust FFI differential parity", "[nup]") {
+    using namespace FileSys::Nup;
+
+    const auto roundtrip_check = [&](const std::string& expected_repro_sha,
+                                     bool check_scratch_preservation = false) {
+        TempDir t;
+        const auto root = t.path / "Game";
+        MakeDump(root);
+        Put(root / "Base/RomFS/large.bin", [] {
+            std::string data(20 * 1024 * 1024, '\0');
+            u32 x = 1;
+            for (auto& c : data) {
+                x = x * 1664525 + 1013904223;
+                c = static_cast<char>('a' + (x >> 28));
+            }
+            return data;
+        }());
+
+        REQUIRE(IsLooseDump(root));
+        const auto resolved_root = DumpRootFromMain(root / "Base/ExeFS/main");
+        REQUIRE(resolved_root.has_value());
+
+        const auto meta = ProbeMetadata(root);
+        REQUIRE(meta.display_version == "1.1.0");
+        REQUIRE(meta.version_source == "update 65536");
+
+        const auto archive = t.path / "Game.nup";
+        const auto legacy_archive = t.path / "Game.nup.rust_verify_tmp";
+        const auto legacy_part = t.path / "Game.nup.rust_verify_tmp.part";
+        const auto legacy_journal = t.path / "Game.nup.rust_verify_tmp.journal";
+        if (check_scratch_preservation) {
+            Put(legacy_archive, "existing archive");
+            Put(legacy_part, "existing partial archive");
+            Put(legacy_journal, "existing journal");
+        }
+        REQUIRE(PackDump(root, archive) == PackResult::Success);
+        if (check_scratch_preservation) {
+            CHECK(ReadAll(legacy_archive) == "existing archive");
+            CHECK(ReadAll(legacy_part) == "existing partial archive");
+            CHECK(ReadAll(legacy_journal) == "existing journal");
+            Put(legacy_archive, "existing archive before edit");
+            Put(legacy_part, "existing partial archive before edit");
+        }
+
+        std::string hex;
+        for (const u8 b : Sha256(ReadAll(archive))) {
+            hex += fmt::format("{:02x}", b);
+        }
+        REQUIRE(hex == expected_repro_sha);
+
+        {
+            FileSys::RealVfsFilesystem vfs;
+            const auto vf =
+                vfs.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read);
+            REQUIRE(vf != nullptr);
+            REQUIRE(NupContainer::IsNupFile(vf));
+            NupContainer container{vf};
+            REQUIRE(container.GetStatus() == Loader::ResultStatus::Success);
+            REQUIRE(container.VerifyIntegrity({}) == Loader::ResultStatus::Success);
+        }
+
+        MetadataEdit edit;
+        edit.title_name = "Rust Parity Title";
+        edit.display_version = "2.5.0";
+        REQUIRE(EditNupMetadata(archive, edit) == EditResult::Success);
+        if (check_scratch_preservation) {
+            CHECK(ReadAll(legacy_archive) == "existing archive before edit");
+            CHECK(ReadAll(legacy_part) == "existing partial archive before edit");
+        }
+
+        const auto updated_meta = ProbeNupMetadata(archive);
+        REQUIRE(updated_meta.title_name == "Rust Parity Title");
+        REQUIRE(updated_meta.display_version == "2.5.0");
+
+        const auto extracted = t.path / "Extracted";
+        const auto legacy_extract_sentinel = t.path / "Extracted.rust_verify_tmp/nested/keep.txt";
+        if (check_scratch_preservation) {
+            Put(legacy_extract_sentinel, "existing extracted data");
+        }
+        REQUIRE(ExtractNup(archive, extracted) == ExtractResult::Success);
+        if (check_scratch_preservation) {
+            CHECK(ReadAll(legacy_extract_sentinel) == "existing extracted data");
+        }
+        REQUIRE(fs::is_regular_file(extracted / "base/exefs/main"));
+        REQUIRE(fs::is_regular_file(extracted / "base/romfs/large.bin"));
+
+        if (check_scratch_preservation) {
+            const auto output_entries = [&] {
+                std::vector<fs::path> names;
+                for (const auto& entry : fs::directory_iterator{t.path}) {
+                    names.push_back(entry.path().filename());
+                }
+                std::sort(names.begin(), names.end());
+                return names;
+            };
+            const auto trailing = t.path / "Trailing";
+            auto expected_entries = output_entries();
+            expected_entries.push_back(trailing.filename());
+            std::sort(expected_entries.begin(), expected_entries.end());
+
+            REQUIRE(ExtractNup(archive, trailing / "") == ExtractResult::Success);
+            CHECK(fs::is_regular_file(trailing / "base/exefs/main"));
+            CHECK(output_entries() == expected_entries);
+        }
+    };
+
+    constexpr auto kExpectedReproSha =
+        "718231e0974ca04c7be7bd6ed4334015b777c6e5f1ed51de23f899f81ee004ab";
+    roundtrip_check(kExpectedReproSha);
+
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    struct ScopedEnvVar {
+        const char* name;
+        std::optional<std::string> prev;
+        explicit ScopedEnvVar(const char* n, const char* value) : name{n} {
+            if (const char* old = std::getenv(n); old != nullptr) {
+                prev = std::string{old};
+            }
+            Set(value);
+        }
+        ~ScopedEnvVar() {
+            Set(prev ? prev->c_str() : nullptr);
+        }
+        void Set(const char* val) const {
+#ifdef _WIN32
+            _putenv_s(name, val != nullptr ? val : "");
+#else
+            if (val != nullptr) {
+                setenv(name, val, 1);
+            } else {
+                unsetenv(name);
+            }
+#endif
+        }
+    };
+
+    {
+        ScopedEnvVar rust_mode{"EDEN_NX2_RUST_NUP", nullptr};
+        ScopedEnvVar verify_mode{"EDEN_NX2_RUST_NUP_VERIFY", "1"};
+        roundtrip_check(kExpectedReproSha, true);
+    }
+
+    {
+        ScopedEnvVar verify_mode{"EDEN_NX2_RUST_NUP_VERIFY", nullptr};
+        ScopedEnvVar rust_mode{"EDEN_NX2_RUST_NUP", "1"};
+        roundtrip_check(kExpectedReproSha);
+
+        // Also test cancel + journal resume with delete_sources under Rust backend.
+        TempDir rt;
+        const auto dump = rt.path / "ResumeGame";
+        MakeDump(dump);
+        const auto archive = rt.path / "ResumeGame.nup";
+        PackOptions opts;
+        opts.delete_sources = true;
+        opts.chunk_bytes = 1;
+        std::atomic_bool cancel{false};
+        const auto cancelled = PackDump(
+            dump, archive, opts,
+            [&](const PackProgress& p) {
+                if (p.files_done >= 3) {
+                    cancel.store(true, std::memory_order_relaxed);
+                }
+            },
+            &cancel);
+        REQUIRE(cancelled == PackResult::Cancelled);
+        REQUIRE(HasResumableJournal(archive));
+        REQUIRE(PackDump(dump, archive, opts) == PackResult::Success);
+        REQUIRE_FALSE(HasResumableJournal(archive));
+        FileSys::RealVfsFilesystem vfs;
+        const auto vf = vfs.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read);
+        REQUIRE(vf != nullptr);
+        NupContainer resumed{vf};
+        REQUIRE(resumed.GetStatus() == Loader::ResultStatus::Success);
+        REQUIRE(resumed.VerifyIntegrity({}) == Loader::ResultStatus::Success);
     }
 #endif
 }

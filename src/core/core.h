@@ -24,6 +24,7 @@
 #include "core/file_sys/vfs/vfs_types.h"
 #include "core/hle/service/os/event.h"
 #include "core/hle/service/kernel_helpers.h"
+#include "core/platform_profile.h"
 
 namespace Core::Frontend {
 class EmuWindow;
@@ -408,6 +409,12 @@ public:
 
     /// Tells if system is running on multicore.
     [[nodiscard]] bool IsMulticore() const;
+
+    /// Returns the immutable platform profile resolved for the current session.
+    [[nodiscard]] const PlatformProfile& Platform() const;
+
+    /// Overrides the active platform profile (used by unit tests).
+    void SetPlatformProfile(PlatformProfile profile);
 
     /// Tells if the system debugger is enabled.
     [[nodiscard]] bool DebuggerEnabled() const;

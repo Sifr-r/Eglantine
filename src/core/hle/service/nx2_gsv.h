@@ -2130,6 +2130,11 @@ private:
         m_host_while_suspended = frames_ahead != 0;
         if (frames_ahead == 1 ||
             (frames_ahead == -1 && !WaitForFrame(~w[22], w[24], stop_token, true))) {
+            if (frames_ahead == 1) {
+                // Flush queued GPU command lists and pending submissions before pacing on the
+                // previous frame fence so scene changes never drop or outrun a syncpoint update.
+                WaitForBackThread(true, stop_token);
+            }
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
                       ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
@@ -2144,7 +2149,7 @@ private:
                                     !system.Host1x().GetSyncpointManager().IsReadyGuest(
                                         m_previous_fence_id, m_previous_fence_value);
             WaitForFrame(m_previous_fence_id, m_previous_fence_value, stop_token);
-            if (gpu_behind) {
+            if (gpu_behind && !system.GPU().HasSuspendedChannels()) {
                 WaitForFrame(~w[22], w[24], stop_token);
             }
         } else if (frames_ahead == 0) {
@@ -2498,15 +2503,29 @@ private:
     /// GPU channel was seen suspended on a semaphore (it may be one this thread releases later).
     /// Returns whether the fence was reached.
     // Returns once the GPU thread, and the back thread behind it, ran everything queued so far.
-    void WaitForBackThread() {
+    void WaitForBackThread(bool flush_commands = false,
+                           const std::stop_token& stop_token = {}) {
+        if (!system.IsPoweredOn() || stop_token.stop_requested()) {
+            return;
+        }
         struct Wake {
             std::mutex mutex;
             std::condition_variable cv;
             bool done{};
         };
         auto wake = std::make_shared<Wake>();
+        const std::stop_callback wake_on_stop{stop_token, [wake] {
+            {
+                std::scoped_lock lk{wake->mutex};
+                wake->done = true;
+            }
+            wake->cv.notify_all();
+        }};
         VideoCommon::Nx2GpuLatency::NoteGuestWait();
-        system.GPU().RunInOrder([wake] {
+        system.GPU().RunInOrder([wake, flush_commands, &gpu = system.GPU()] {
+            if (flush_commands) {
+                gpu.FlushCommands();
+            }
             {
                 std::scoped_lock lk{wake->mutex};
                 wake->done = true;
@@ -2514,8 +2533,9 @@ private:
             wake->cv.notify_all();
         });
         std::unique_lock lk{wake->mutex};
-        wake->cv.wait_for(lk, std::chrono::milliseconds{4000},
-                          [&] { return wake->done || !system.IsPoweredOn(); });
+        wake->cv.wait_for(lk, std::chrono::milliseconds{4000}, [&] {
+            return wake->done || !system.IsPoweredOn() || stop_token.stop_requested();
+        });
     }
 
     ///

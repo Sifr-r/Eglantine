@@ -31,6 +31,10 @@ namespace Kernel {
 class KEvent;
 }
 
+namespace Tegra::Host1x {
+class Host1x;
+}
+
 namespace Service::Nvidia {
 
 namespace NvCore {
@@ -63,6 +67,7 @@ private:
 class Module final {
 public:
     explicit Module(Core::System& system_);
+    Module(Core::System& system_, Tegra::Host1x::Host1x& host1x_);
     ~Module();
 
     /// Returns a pointer to one of the available devices, identified by its name.

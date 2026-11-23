@@ -42,6 +42,7 @@
 #include "video_core/gpu_timestamp.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/host1x/syncpoint_manager.h"
+#include "video_core/macro.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
@@ -83,9 +84,26 @@ struct GPU::Impl {
     }
 
     void InitChannel(Control::ChannelState& to_init, u64 program_id) {
-        to_init.Init(system, program_id);
+        const bool use_ampere =
+            g_nx2_ampere.load(std::memory_order_relaxed) || system.Platform().IsSwitch2();
+        to_init.Init(system, program_id, use_ampere ? GetOrCreateNativeMacroContext() : nullptr);
         to_init.BindRasterizer(renderer->ReadRasterizer());
         renderer->ReadRasterizer()->InitializeChannel(to_init);
+    }
+
+    std::shared_ptr<NativeMacroContext> GetOrCreateNativeMacroContext() {
+        std::scoped_lock lock{native_macro_context_mutex};
+        if (!native_macro_context) {
+            native_macro_context = std::make_shared<NativeMacroContext>();
+            native_macro_context->engine.native_turing = true;
+            native_macro_context->compute_engine.native_turing = true;
+        }
+        return native_macro_context;
+    }
+
+    std::shared_ptr<NativeMacroContext> GetNativeMacroContext() const {
+        std::scoped_lock lock{native_macro_context_mutex};
+        return native_macro_context;
     }
 
     void InitAddressSpace(Tegra::MemoryManager& memory_manager) {
@@ -400,6 +418,10 @@ struct GPU::Impl {
 
     Core::System& system;
 
+    // Owned by the GPU session and destroyed after channels, renderer, and gpu_thread.
+    mutable std::mutex native_macro_context_mutex;
+    std::shared_ptr<NativeMacroContext> native_macro_context;
+
     // Destruction of thread must be done before all (non trivial)
     // previous members has been destroyed
     VideoCommon::GPUThread::ThreadManager gpu_thread;
@@ -469,6 +491,14 @@ std::shared_ptr<Control::ChannelState> GPU::AllocateChannel() {
 
 void GPU::InitChannel(Control::ChannelState& to_init, u64 program_id) {
     impl->InitChannel(to_init, program_id);
+}
+
+std::shared_ptr<NativeMacroContext> GPU::GetOrCreateNativeMacroContext() {
+    return impl->GetOrCreateNativeMacroContext();
+}
+
+std::shared_ptr<NativeMacroContext> GPU::GetNativeMacroContext() const {
+    return impl->GetNativeMacroContext();
 }
 
 void GPU::BindChannel(s32 channel_id) {

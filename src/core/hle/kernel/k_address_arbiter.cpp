@@ -116,6 +116,17 @@ bool UpdateIfEqual(KernelCore& kernel, s32* out, KProcessAddress address, s32 va
     return true;
 }
 
+bool Read64FromUser(KernelCore& kernel, s64* out, KProcessAddress address) {
+    auto& memory = GetCurrentMemory(kernel);
+    const u64 raw_addr = GetInteger(address);
+    if (raw_addr > std::numeric_limits<u64>::max() - sizeof(s64) ||
+        !memory.IsValidVirtualAddressRange(raw_addr, sizeof(s64))) {
+        return false;
+    }
+    *out = static_cast<s64>(memory.Read64(raw_addr));
+    return true;
+}
+
 class ThreadQueueImplForKAddressArbiter final : public KThreadQueue {
 public:
     explicit ThreadQueueImplForKAddressArbiter(KernelCore& kernel, KAddressArbiter::ThreadTree* t)
@@ -327,12 +338,7 @@ Result KAddressArbiter::WaitIfEqual(uint64_t addr, s64 value, s64 timeout, bool 
         s64 user_value{};
         bool succeeded{};
         if (is_64_bit) {
-            auto& memory = GetCurrentMemory(system.Kernel());
-            succeeded = addr <= std::numeric_limits<u64>::max() - sizeof(s64) &&
-                        memory.IsValidVirtualAddressRange(addr, sizeof(s64));
-            if (succeeded) {
-                user_value = static_cast<s64>(memory.Read64(addr));
-            }
+            succeeded = Read64FromUser(system.Kernel(), std::addressof(user_value), addr);
         } else {
             s32 user_value32{};
             succeeded = ReadFromUser(system.Kernel(), std::addressof(user_value32), addr);

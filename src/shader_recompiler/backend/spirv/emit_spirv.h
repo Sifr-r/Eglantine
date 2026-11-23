@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <array>
 #include <vector>
 
 #include "common/common_types.h"
@@ -48,7 +49,9 @@ constexpr u32 COOPERATIVE_HMMA_TEST_LANE_WORDS = 10;
 
 /// A compute shader of one warp running the HMMA.16816.F16 lowering on the registers in its storage
 /// buffer (set 0, binding 0), to check at startup that the driver's matrix layout is the expected.
-[[nodiscard]] std::vector<u32> EmitCooperativeHmmaTest(u32 spirv_version);
+[[nodiscard]] std::vector<u32> EmitCooperativeHmmaTest(
+    u32 spirv_version, std::array<u32, 4> a_word_map = {0, 2, 1, 3}, u32 tile_m = 16,
+    u32 tile_n = 8, u32 tile_k = 16);
 
 /// Mesh emulation without VK_EXT_mesh_shader. The mesh program runs as a compute shader
 /// (RuntimeInfo::mesh_as_compute) that writes one block per workgroup to a u32 storage buffer:

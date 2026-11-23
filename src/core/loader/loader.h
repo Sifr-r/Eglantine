@@ -28,6 +28,7 @@ class System;
 
 namespace FileSys {
 class NACP;
+class ProgramMetadata;
 } // namespace FileSys
 
 namespace Kernel {
@@ -356,6 +357,14 @@ public:
     using Modules = std::map<VAddr, std::string>;
 
     virtual ResultStatus ReadNSOModules(Modules& modules) {
+        return ResultStatus::ErrorNotImplemented;
+    }
+
+    /**
+     * Read the effective program metadata (main.npdm) without loading modules or building RomFS.
+     */
+    virtual ResultStatus ReadProgramMetadata(Core::System& system,
+                                             FileSys::ProgramMetadata& out_metadata) {
         return ResultStatus::ErrorNotImplemented;
     }
 

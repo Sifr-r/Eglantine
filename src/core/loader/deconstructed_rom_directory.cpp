@@ -615,4 +615,47 @@ ResultStatus AppLoader_DeconstructedRomDirectory::ReadNSOModules(Modules& out_mo
     return ResultStatus::Success;
 }
 
+ResultStatus AppLoader_DeconstructedRomDirectory::ReadProgramMetadata(
+    Core::System& system, FileSys::ProgramMetadata& out_metadata) {
+    FileSys::VirtualDir effective_dir = dir;
+    if (effective_dir == nullptr) {
+        if (file == nullptr) {
+            return ResultStatus::ErrorNullFile;
+        }
+        effective_dir = file->GetContainingDirectory();
+    }
+    if (effective_dir == nullptr) {
+        return ResultStatus::ErrorMissingNPDM;
+    }
+
+    FileSys::VirtualFile npdm = effective_dir->GetFile("main.npdm");
+    if (npdm == nullptr) {
+        return ResultStatus::ErrorMissingNPDM;
+    }
+
+    const ResultStatus load_res = out_metadata.Load(npdm);
+    if (load_res != ResultStatus::Success) {
+        return load_res;
+    }
+
+    if (override_update) {
+        const FileSys::PatchManager patch_manager(
+            out_metadata.GetTitleID(), system.GetFileSystemController(), system.GetContentProvider());
+        effective_dir = patch_manager.PatchExeFS(effective_dir);
+        if (effective_dir == nullptr) {
+            return ResultStatus::ErrorMissingNPDM;
+        }
+        npdm = effective_dir->GetFile("main.npdm");
+        if (npdm == nullptr) {
+            return ResultStatus::ErrorMissingNPDM;
+        }
+        const ResultStatus reload_res = out_metadata.Reload(npdm);
+        if (reload_res != ResultStatus::Success) {
+            return reload_res;
+        }
+    }
+
+    return ResultStatus::Success;
+}
+
 } // namespace Loader

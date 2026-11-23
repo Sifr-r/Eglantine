@@ -29,13 +29,15 @@ namespace Tegra {
 
 class GPU;
 class MemoryManager;
+struct NativeMacroContext;
 
 namespace Control {
 
 struct ChannelState {
     explicit ChannelState(s32 bind_id);
 
-    void Init(Core::System& system, u64 program_id);
+    void Init(Core::System& system, u64 program_id,
+              std::shared_ptr<NativeMacroContext> native_macro_context = nullptr);
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 

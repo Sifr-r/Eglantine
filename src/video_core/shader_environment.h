@@ -25,17 +25,13 @@
 #include "common/polyfill_thread.h"
 #include "common/unique_function.h"
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 
 namespace Tegra {
 class Memorymanager;
 }
-
-namespace Shader::Ampere {
-struct Instruction;
-struct LoweredProgram;
-} // namespace Shader::Ampere
 
 namespace VideoCommon {
 
@@ -59,11 +55,38 @@ struct LoweredNativeCode {
     /// Shader header, lowered instructions with Maxwell scheduling words, then the native
     /// address map (what the environment's `code` used to be filled with).
     std::vector<u64> code;
+    /// Original captured SM86 instructions kept for direct SPIR-V compilation / snapshots.
+    std::vector<Shader::Ampere::Instruction> native_code;
     /// Bytes of the native program that were read, header included.
     size_t source_size{};
     /// Constant buffer holding the texture handles if the program requires one, otherwise ~0U
     /// (the engine's register value is used).
     u32 texture_bound = ~0U;
+};
+
+/// Immutable, self-contained snapshot of a captured Switch 2 (SM86) program and its
+/// pre-probed environment lookups, safe to compile on worker threads without touching live
+/// GPU memory or engine state.
+struct NativeShaderSnapshot {
+    std::array<u64, sizeof(Shader::ProgramHeader) / sizeof(u64)> header{};
+    std::vector<Shader::Ampere::Instruction> native_code;
+    u64 program_key{};
+    Shader::Stage stage{};
+    u32 local_memory_size{};
+    u32 shared_memory_size{};
+    std::array<u32, 3> workgroup_size{};
+    u32 texture_bound = ~0U;
+    u32 viewport_transform_state = 1;
+    bool native_tensor{};
+    bool native_compact_tensor{};
+    bool has_hle_engine_state{};
+    std::array<u32, 3> mesh_registers{};
+    Shader::ProgramHeader mesh_primitive_header{};
+    ::Common::unordered_map<u64, u32> cbuf_values;
+    ::Common::unordered_map<u32, Shader::TextureType> texture_types;
+    ::Common::unordered_map<u32, Shader::TexturePixelFormat> texture_pixel_formats;
+    ::Common::unordered_map<u64, u8> storage_pointer_types;
+    ::Common::unordered_map<u64, Shader::ReplaceConstant> cbuf_replacements;
 };
 
 class GenericEnvironment : public Shader::Environment {
@@ -133,8 +156,21 @@ public:
         return has_hle_engine_state;
     }
 
+    /// Captures an immutable snapshot of this native program and pre-probes statically
+    /// referenced constant buffer, storage pointer, and texture metadata on the calling thread.
+    [[nodiscard]] NativeShaderSnapshot BuildNativeSnapshot();
+
 protected:
     std::optional<u64> TryFindSize();
+
+    /// Captures native SM86 instructions starting at `program_base + source_header_size`.
+    [[nodiscard]] std::vector<Shader::Ampere::Instruction> CaptureNativeInstructions(
+        u32 source_header_size) const;
+
+    virtual void PreprobeNativeCbuf(u32 cbuf_index, u32 cbuf_offset, bool probe_pointer_slot);
+    virtual void PreprobeNativeTexture(u32 cbuf_index, u32 cbuf_offset);
+    void TryPreprobeTextureFromPool(GPUVAddr tic_addr, u32 tic_limit, bool via_header_index,
+                                    u32 cbuf_index, u32 cbuf_offset);
 
     /// Adopts an already lowered native program, or captures and lowers it when there is none.
     void InitializeNativeCode(std::shared_ptr<const LoweredNativeCode> lowered,
@@ -260,6 +296,9 @@ private:
     /// Texture descriptor of a texture handle from the snapshot's pool.
     Tegra::Texture::TICEntry ReadSnapshotDescriptor(u32 handle) const;
 
+    void PreprobeNativeCbuf(u32 cbuf_index, u32 cbuf_offset, bool probe_pointer_slot) override;
+    void PreprobeNativeTexture(u32 cbuf_index, u32 cbuf_offset) override;
+
     Tegra::Engines::Maxwell3D* maxwell3d{};
     size_t stage_index{};
     std::optional<EngineSnapshot> snapshot;
@@ -291,6 +330,9 @@ public:
     }
 
 private:
+    void PreprobeNativeCbuf(u32 cbuf_index, u32 cbuf_offset, bool probe_pointer_slot) override;
+    void PreprobeNativeTexture(u32 cbuf_index, u32 cbuf_offset) override;
+
     Tegra::Engines::KeplerCompute* kepler_compute{};
 };
 

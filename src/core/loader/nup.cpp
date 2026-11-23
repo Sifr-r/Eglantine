@@ -298,4 +298,15 @@ ResultStatus AppLoader_NUP::ReadNSOModules(Modules& modules) {
     return secondary_loader->ReadNSOModules(modules);
 }
 
+ResultStatus AppLoader_NUP::ReadProgramMetadata(Core::System& system,
+                                                FileSys::ProgramMetadata& out_metadata) {
+    if (nup->GetStatus() != ResultStatus::Success) {
+        return nup->GetStatus();
+    }
+    if (!has_program || secondary_loader == nullptr) {
+        return ResultStatus::ErrorNUPNoBasePackage;
+    }
+    return secondary_loader->ReadProgramMetadata(system, out_metadata);
+}
+
 } // namespace Loader

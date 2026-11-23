@@ -119,6 +119,9 @@ VK_DEFINE_HANDLE(VmaPool)
     EXTENSION(KHR, MAINTENANCE_3, maintenance3)                                                    \
     EXTENSION(KHR, MAINTENANCE_7, maintenance7)                                                    \
     EXTENSION(KHR, MAINTENANCE_8, maintenance8)                                                    \
+    EXTENSION(KHR, VIDEO_QUEUE, video_queue)                                                       \
+    EXTENSION(KHR, VIDEO_DECODE_QUEUE, video_decode_queue)                                         \
+    EXTENSION(KHR, VIDEO_DECODE_H264, video_decode_h264)                                           \
     EXTENSION(NV, DEVICE_DIAGNOSTICS_CONFIG, device_diagnostics_config)                            \
     EXTENSION(NV, GEOMETRY_SHADER_PASSTHROUGH, geometry_shader_passthrough)                        \
     EXTENSION(NV, VIEWPORT_ARRAY2, viewport_array2)                                                \
@@ -233,6 +236,35 @@ enum class NvidiaArchitecture {
     Arch_AmpereOrNewer,
 };
 
+struct CoopMatrixShape {
+    u32 m{};
+    u32 n{};
+    u32 k{};
+    VkComponentTypeKHR a_type{VK_COMPONENT_TYPE_MAX_ENUM_KHR};
+    VkComponentTypeKHR b_type{VK_COMPONENT_TYPE_MAX_ENUM_KHR};
+    VkComponentTypeKHR c_type{VK_COMPONENT_TYPE_MAX_ENUM_KHR};
+    VkComponentTypeKHR result_type{VK_COMPONENT_TYPE_MAX_ENUM_KHR};
+    bool saturating_accumulation{};
+    VkScopeKHR scope{VK_SCOPE_MAX_ENUM_KHR};
+};
+
+struct CoopMatrixCapabilities {
+    bool extension_supported{};
+    bool feature_enabled{};
+    bool compute_stage_supported{};
+    bool has_fp16_16x8x16{};   ///< NVIDIA Ampere+ / Lovelace / Blackwell
+    bool has_fp16_16x16x16{};  ///< AMD RDNA3 / RDNA4
+    bool has_fp16_8x16x16{};   ///< Intel XMX (Arc / Lunar Lake / Battlemage)
+    u32 preferred_m{};
+    u32 preferred_n{};
+    u32 preferred_k{};
+    u32 subgroup_size{};
+    u32 min_subgroup_size{};
+    u32 max_subgroup_size{};
+    VkShaderStageFlags supported_stages{};
+    std::vector<CoopMatrixShape> shapes;
+};
+
 /// Handles data specific to a physical device.
 class Device {
 public:
@@ -321,6 +353,21 @@ public:
     /// Returns main present queue family index.
     u32 GetPresentFamily() const {
         return present_family;
+    }
+
+    /// Returns true if an optional Vulkan Video decode queue is available.
+    bool HasVideoDecodeQueue() const {
+        return video_decode_family.has_value() && extensions.video_decode_queue;
+    }
+
+    /// Returns optional video decode queue family index.
+    std::optional<u32> GetVideoDecodeFamily() const {
+        return video_decode_family;
+    }
+
+    /// Returns optional Vulkan Video decode queue (null handle when unavailable).
+    vk::Queue GetVideoDecodeQueue() const {
+        return video_decode_queue;
     }
 
     /// Returns the current Vulkan API version provided in Vulkan-formatted version numbers.
@@ -688,6 +735,26 @@ FN_MAX_LIMIT_LIST
     /// (VK_KHR_cooperative_matrix with the same 16x8x16 shape on 16-bit floats, 32-lane subgroups).
     bool IsCooperativeHmmaSupported() const {
         return extensions.cooperative_matrix;
+    }
+
+    /// Returns queried VK_KHR_cooperative_matrix shapes and subgroup sizes.
+    const CoopMatrixCapabilities& GetCoopMatrixCapabilities() const {
+        return coop_matrix_capabilities;
+    }
+
+    /// Returns true if the device supports VK_KHR_video_queue.
+    bool IsKhrVideoQueueSupported() const {
+        return extensions.video_queue;
+    }
+
+    /// Returns true if the device supports VK_KHR_video_decode_queue with an active decode queue.
+    bool IsKhrVideoDecodeQueueSupported() const {
+        return HasVideoDecodeQueue();
+    }
+
+    /// Returns true if the device supports VK_KHR_video_decode_h264 with an active decode queue.
+    bool IsKhrVideoDecodeH264Supported() const {
+        return HasVideoDecodeQueue() && extensions.video_decode_h264;
     }
 
     /// Returns true if the device supports VK_KHR_shader_quad_control.
@@ -1285,12 +1352,15 @@ private:
     vk::Device logical;          ///< Logical device.
     vk::Queue graphics_queue;    ///< Main graphics queue.
     vk::Queue present_queue;     ///< Main present queue.
+    vk::Queue video_decode_queue; ///< Optional Vulkan Video decode queue.
     vk::PipelineCache static_pipeline_cache;
     bool owns_static_pipeline_cache{};
     u32 instance_version{};      ///< Vulkan instance version.
     u32 graphics_family{};       ///< Main graphics queue family index.
     u32 present_family{};        ///< Main present queue family index.
+    std::optional<u32> video_decode_family{}; ///< Optional Vulkan Video decode queue family index.
     bool graphics_family_sparse_binding{};
+    CoopMatrixCapabilities coop_matrix_capabilities{};
 
     struct Extensions {
 #define EXTENSION(prefix, macro_name, var_name) bool var_name{};

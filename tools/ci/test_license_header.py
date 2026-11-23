@@ -35,6 +35,22 @@ REPAIRED_SPDX_FILES = [
     "src/tests/core/key_code_map.cpp",
 ]
 
+POLYGLOT_SPDX_GLOBS = [
+    "CMakeModules/AddIspcKernel.cmake",
+    "CMakeModules/AddRustCrate.cmake",
+    "rust/crates/*/src/**/*.rs",
+    "rust/crates/*/tests/*.rs",
+    "rust/include/*.h",
+    "src/simd_kernels/CMakeLists.txt",
+    "src/simd_kernels/*.ispc",
+    "src/video_core/host_shaders/*.slang",
+    "src/video_core/renderer_vulkan/vk_temporal_upscaler.h",
+    "src/video_core/renderer_vulkan/vk_xess_upscaler.h",
+    "src/video_core/renderer_vulkan/vk_xess_upscaler.cpp",
+    "src/tests/video_core/ampere_rust_parity.cpp",
+    "src/tests/video_core/ampere_direct_spirv.cpp",
+]
+
 
 def comment_prefix(path):
     name = os.path.basename(path)
@@ -138,6 +154,19 @@ class LicenseHeaderContractTests(unittest.TestCase):
         self.assertIn("trap cleanup EXIT INT TERM", self.script_text)
         self.assertIn("exit 1", self.script_text)
         self.assertIn("'#!'*", self.script_text)
+        self.assertIn("*.rs|*.slang|*.ispc|*.slint", self.script_text)
+
+    def test_polyglot_sources_have_valid_spdx_headers(self):
+        matched = []
+        for pattern in POLYGLOT_SPDX_GLOBS:
+            matched.extend(sorted(glob.glob(os.path.join(ROOT, pattern), recursive=True)))
+        self.assertGreater(len(matched), 0)
+        for path in matched:
+            rel = os.path.relpath(path, ROOT)
+            with self.subTest(path=rel):
+                with open(path, encoding="utf-8") as handle:
+                    lines = handle.readlines()
+                validate_spdx_header(lines, comment_prefix(rel), "2026")
 
     def test_repaired_and_new_files_have_valid_spdx_headers(self):
         for rel in REPAIRED_SPDX_FILES:
@@ -220,12 +249,32 @@ class LicenseHeaderShellExecutionTests(unittest.TestCase):
                 "// Copyright 2023 Skyline Team and Contributors\n"
                 "class Doc {}\n",
             )
-            res = self.run_script("--check", nix_file, cpp_file, kt_file)
+            polyglot_files = []
+            for fname, body in (
+                ("lib.rs", "pub fn ok() {}\n"),
+                ("kernel.slang", "[shader(\"compute\")] void main() {}\n"),
+                ("vec.ispc", "export void mix_pcm() {}\n"),
+                ("ui.slint", "export component MainWindow {}\n"),
+            ):
+                polyglot_files.append(
+                    self.write_temp_file(
+                        tmpdir,
+                        fname,
+                        f"// SPDX-FileCopyrightText: Copyright {self.year} {HOLDER}\n"
+                        f"// SPDX-License-Identifier: {LICENSE}\n\n"
+                        f"{body}",
+                    )
+                )
+            res = self.run_script("--check", nix_file, cpp_file, kt_file, *polyglot_files)
             self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
     def test_rejects_corrupted_and_missing_headers_with_nonzero_exit(self):
         cases = {
             "missing.cpp": "#pragma once\n",
+            "missing.rs": "pub fn nope() {}\n",
+            "missing.slang": "void main() {}\n",
+            "missing.ispc": "export void f() {}\n",
+            "missing.slint": "export component App {}\n",
             "orphan_nix.nix": (
                 f"# SPDX-FileCopyrightText: Copyright {self.year} Eglantine Community\n\n"
                 f"# SPDX-FileCopyrightText: Copyright {self.year} {HOLDER}\n"

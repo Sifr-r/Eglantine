@@ -96,6 +96,37 @@ jobs:
             nlohmann-json openssl pkg-config qt@6 sdl3 speexdsp zlib zstd cmake catch2 molten-vk \
             vulkan-loader spirv-tools vulkan-utility-libraries ccache
 
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Rust build artifacts (restore and save)
+        if: env.CACHE_SAVE == 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Cache Rust build artifacts (restore only)
+        if: env.CACHE_SAVE != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Run Rust workspace tests
+        shell: bash
+        run: cargo test --manifest-path rust/Cargo.toml --locked --offline
+
       - name: Configure
         shell: bash
         run: |

@@ -21,6 +21,7 @@
 #include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
+#include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 
 namespace {
 
@@ -110,7 +111,7 @@ using Tracker = VideoCommon::MemoryTrackerBase<FakeRasterizer>;
 using Ranges = std::vector<std::pair<u64, u64>>;
 
 constexpr u64 PAGE = 4096;
-constexpr u64 WORD = PAGE * 64;
+constexpr u64 TRACKER_WORD = PAGE * 64;
 constexpr u64 MANAGER = 4ULL << 20;
 constexpr DAddr BASE = 16 * MANAGER;
 
@@ -171,23 +172,23 @@ TEST_CASE("Nx2Perf draw-binds: usage survives slot relocation and reset", "[vide
     REQUIRE(std::ranges::all_of(slots[id].Pages(), [](u64 word) { return word == 0; }));
     OldUsageTracker old{size};
     for (u64 i = 0; i < 8; ++i) {
-        slots[id].Track(i * PAGE, 2 * WORD + 64);
-        old.Track(i * PAGE, 2 * WORD + 64);
+        slots[id].Track(i * PAGE, 2 * TRACKER_WORD + 64);
+        old.Track(i * PAGE, 2 * TRACKER_WORD + 64);
     }
     REQUIRE(std::ranges::equal(slots[id].Pages(), old.pages));
     auto copied = slots[id];
     VideoCommon::UsageTracker moved{PAGE};
     moved = std::move(copied);
-    moved.Track(4 * WORD, WORD);
-    old.Track(4 * WORD, WORD);
+    moved.Track(4 * TRACKER_WORD, TRACKER_WORD);
+    old.Track(4 * TRACKER_WORD, TRACKER_WORD);
     REQUIRE(std::ranges::equal(moved.Pages(), old.pages));
     slots.erase(id);
     const auto recycled = slots.insert(size);
     REQUIRE(recycled == id);
     REQUIRE(std::ranges::all_of(slots[recycled].Pages(), [](u64 word) { return word == 0; }));
-    slots[recycled].Track(PAGE, 3 * WORD);
+    slots[recycled].Track(PAGE, 3 * TRACKER_WORD);
     old.Reset();
-    old.Track(PAGE, 3 * WORD);
+    old.Track(PAGE, 3 * TRACKER_WORD);
     REQUIRE(std::ranges::equal(slots[recycled].Pages(), old.pages));
 }
 
@@ -199,8 +200,8 @@ TEST_CASE("Nx2Perf draw-binds: clean words survive manager pool growth", "[video
     for (u64 i = 0; i < 65; ++i) {
         const auto address = BASE + i * MANAGER;
         REQUIRE(Upload(*full, address, MANAGER) == DirtyUpload(*dirty, address, MANAGER));
-        full->CachedCpuWrite(address + 15 * WORD + PAGE, 16);
-        dirty->CachedCpuWrite(address + 15 * WORD + PAGE, 16);
+        full->CachedCpuWrite(address + 15 * TRACKER_WORD + PAGE, 16);
+        dirty->CachedCpuWrite(address + 15 * TRACKER_WORD + PAGE, 16);
     }
     full->FlushCachedWrites();
     dirty->FlushCachedWrites();
@@ -253,36 +254,40 @@ TEST_CASE("Nx2Perf draw-binds: clean words", "[video_core]") {
     FakeRasterizer rasterizer;
     auto tracker = std::make_unique<Tracker>(rasterizer);
     // A new manager is CPU-modified everywhere.
-    REQUIRE(DirtyUpload(*tracker, BASE + 100, 3 * WORD) == Ranges{{BASE, 3 * WORD + PAGE}});
-    REQUIRE(DirtyUpload(*tracker, BASE, MANAGER) == Ranges{{BASE + 3 * WORD + PAGE, MANAGER - 3 * WORD - PAGE}});
+    REQUIRE(DirtyUpload(*tracker, BASE + 100, 3 * TRACKER_WORD) ==
+            Ranges{{BASE, 3 * TRACKER_WORD + PAGE}});
+    REQUIRE(DirtyUpload(*tracker, BASE, MANAGER) ==
+            Ranges{{BASE + 3 * TRACKER_WORD + PAGE, MANAGER - 3 * TRACKER_WORD - PAGE}});
     REQUIRE(tracker->CleanWordsHold(BASE, MANAGER));
     const size_t calls = rasterizer.calls.size();
     REQUIRE(DirtyUpload(*tracker, BASE, MANAGER).empty());
     REQUIRE(rasterizer.calls.size() == calls);
 
-    tracker->MarkRegionAsCpuModified(BASE + 5 * WORD + 3 * PAGE, 16);
+    tracker->MarkRegionAsCpuModified(BASE + 5 * TRACKER_WORD + 3 * PAGE, 16);
     REQUIRE(tracker->CleanWordsHold(BASE, MANAGER));
-    REQUIRE(DirtyUpload(*tracker, BASE + 5 * WORD, PAGE).empty());
-    REQUIRE(DirtyUpload(*tracker, BASE, MANAGER) == Ranges{{BASE + 5 * WORD + 3 * PAGE, PAGE}});
+    REQUIRE(DirtyUpload(*tracker, BASE + 5 * TRACKER_WORD, PAGE).empty());
+    REQUIRE(DirtyUpload(*tracker, BASE, MANAGER) == Ranges{{BASE + 5 * TRACKER_WORD + 3 * PAGE, PAGE}});
 
     // A cached write is Untracked before it is flushed.
-    tracker->CachedCpuWrite(BASE + 9 * WORD, 4);
+    tracker->CachedCpuWrite(BASE + 9 * TRACKER_WORD, 4);
     REQUIRE(tracker->CleanWordsHold(BASE, MANAGER));
     tracker->FlushCachedWrites();
     REQUIRE(tracker->CleanWordsHold(BASE, MANAGER));
-    REQUIRE(DirtyUpload(*tracker, BASE + 9 * WORD, WORD) == Ranges{{BASE + 9 * WORD, PAGE}});
+    REQUIRE(DirtyUpload(*tracker, BASE + 9 * TRACKER_WORD, TRACKER_WORD) ==
+            Ranges{{BASE + 9 * TRACKER_WORD, PAGE}});
 
     // Unmarking makes a word clean again, as the upload would.
-    tracker->MarkRegionAsCpuModified(BASE + 2 * WORD, 2 * PAGE);
-    tracker->UnmarkRegionAsCpuModified(BASE + 2 * WORD, PAGE);
+    tracker->MarkRegionAsCpuModified(BASE + 2 * TRACKER_WORD, 2 * PAGE);
+    tracker->UnmarkRegionAsCpuModified(BASE + 2 * TRACKER_WORD, PAGE);
     REQUIRE(tracker->CleanWordsHold(BASE, MANAGER));
-    tracker->UnmarkRegionAsCpuModified(BASE + 2 * WORD + PAGE, PAGE);
+    tracker->UnmarkRegionAsCpuModified(BASE + 2 * TRACKER_WORD + PAGE, PAGE);
     REQUIRE(tracker->CleanWordsHold(BASE, MANAGER));
     REQUIRE(DirtyUpload(*tracker, BASE, MANAGER).empty());
 
     // GPU writes leave words clean; a range reaching a missing manager creates it.
     tracker->MarkRegionAsGpuModified(BASE, MANAGER);
-    REQUIRE(DirtyUpload(*tracker, BASE + MANAGER - WORD, 2 * WORD) == Ranges{{BASE + MANAGER, WORD}});
+    REQUIRE(DirtyUpload(*tracker, BASE + MANAGER - TRACKER_WORD, 2 * TRACKER_WORD) ==
+            Ranges{{BASE + MANAGER, TRACKER_WORD}});
     REQUIRE(tracker->CleanWordsHold(BASE, 2 * MANAGER));
 }
 
@@ -294,8 +299,10 @@ TEST_CASE("Nx2Perf draw-binds: dirty-word uploads match full uploads", "[video_c
     std::mt19937_64 rng{0x8e0ULL};
     constexpr u64 span = 6 * MANAGER;
     const auto random_range = [&]() -> std::pair<DAddr, u64> {
-        static constexpr u64 sizes[] = {4, 256, PAGE, 3 * PAGE, WORD, 3 * WORD + 100, MANAGER,
-                                        2 * MANAGER + 5 * PAGE};
+        static constexpr u64 sizes[] = {4,           256,
+                                        PAGE,        3 * PAGE,
+                                        TRACKER_WORD, 3 * TRACKER_WORD + 100,
+                                        MANAGER,     2 * MANAGER + 5 * PAGE};
         const u64 size = sizes[rng() % std::size(sizes)];
         const u64 offset = rng() % 2 == 0 ? (rng() % (span / PAGE)) * PAGE : rng() % span;
         return {BASE + offset, (std::min)(size, span - offset)};
@@ -343,4 +350,112 @@ TEST_CASE("Nx2Perf draw-binds: dirty-word uploads match full uploads", "[video_c
         }
     }
     REQUIRE(full->ModifiedCpuRegion(BASE, span) == narrow->ModifiedCpuRegion(BASE, span));
+}
+
+TEST_CASE("Nx2Perf draw-binds: descriptor slice and bind cache skips redundant draws",
+          "[nx2_perf][video_core]") {
+    using Vulkan::DescriptorBindCache;
+    using Vulkan::DescriptorSliceCache;
+    using Vulkan::DescriptorSliceKey;
+    using Vulkan::HashDescriptorBytes;
+    using Vulkan::ParseDrawCacheEnvValue;
+
+    CHECK(ParseDrawCacheEnvValue(nullptr));
+    CHECK(ParseDrawCacheEnvValue("1"));
+    CHECK_FALSE(ParseDrawCacheEnvValue("0"));
+
+    const auto make_layout = [](uintptr_t v) -> VkPipelineLayout {
+        return reinterpret_cast<VkPipelineLayout>(v);
+    };
+
+    SECTION("Per-stage descriptor slice cache respects generation and stage hashes") {
+        DescriptorSliceCache cache{true};
+        DescriptorSliceKey key{
+            .layout_hash = 0x1122334455667788ULL,
+            .stage_hashes = {10ULL, 20ULL, 0ULL, 0ULL, 30ULL},
+            .payload_hash = HashDescriptorBytes("stage-payload-v1", 16),
+            .entry_count = 6,
+            .size = 256,
+        };
+
+        CHECK_FALSE(cache.Lookup(key, 1).has_value());
+        cache.Insert(key, 128, 2, 1);
+
+        const auto hit = cache.Lookup(key, 1);
+        REQUIRE(hit.has_value());
+        CHECK(hit->offset == 128);
+        CHECK(hit->chunk == 2);
+        CHECK(hit->generation == 1);
+
+        // Changing a single stage's slice hash misses instead of aliasing.
+        DescriptorSliceKey changed_stage = key;
+        changed_stage.stage_hashes[4] = 31ULL;
+        CHECK_FALSE(cache.Lookup(changed_stage, 1).has_value());
+
+        // Frame / ring wrap generation bump invalidates old entries.
+        CHECK_FALSE(cache.Lookup(key, 2).has_value());
+
+        // Disabled mode (EDEN_NX2_DRAW_CACHE=0) never caches or hits.
+        DescriptorSliceCache disabled{false};
+        disabled.Insert(key, 128, 2, 1);
+        CHECK_FALSE(disabled.Lookup(key, 1).has_value());
+    }
+
+    SECTION("DescriptorBindCache skips redundant binds when chunk, offset, layout, and tick match") {
+        DescriptorBindCache binds{true};
+        const VkPipelineLayout layout_a = make_layout(0x1000);
+        const VkPipelineLayout layout_b = make_layout(0x2000);
+
+        // First draw must bind buffer and set offsets.
+        auto d = binds.AcquireGraphicsBinding(0, 64, layout_a, 10, 1, true);
+        CHECK(d.bind_buffer);
+        CHECK(d.set_offsets);
+
+        // Matching state on the same command buffer skips both calls.
+        d = binds.AcquireGraphicsBinding(0, 64, layout_a, 10, 1, false);
+        CHECK_FALSE(d.bind_buffer);
+        CHECK_FALSE(d.set_offsets);
+
+        // Same chunk and generation, changed offset or layout skips BindDescriptorBuffersEXT only.
+        d = binds.AcquireGraphicsBinding(0, 192, layout_a, 10, 1, false);
+        CHECK_FALSE(d.bind_buffer);
+        CHECK(d.set_offsets);
+
+        d = binds.AcquireGraphicsBinding(0, 192, layout_b, 10, 1, false);
+        CHECK_FALSE(d.bind_buffer);
+        CHECK(d.set_offsets);
+
+        // Compute / offset invalidation requires re-emitting offsets, not buffer bind when chunk matches.
+        binds.InvalidateOffsets();
+        d = binds.AcquireGraphicsBinding(0, 192, layout_b, 10, 1, false);
+        CHECK_FALSE(d.bind_buffer);
+        CHECK(d.set_offsets);
+
+        // Command buffer tick advance, ring generation advance, or scheduler invalidation re-binds both.
+        d = binds.AcquireGraphicsBinding(0, 192, layout_b, 10, 2, false);
+        CHECK(d.bind_buffer);
+        CHECK(d.set_offsets);
+
+        d = binds.AcquireGraphicsBinding(0, 192, layout_b, 11, 2, false);
+        CHECK(d.bind_buffer);
+        CHECK(d.set_offsets);
+
+        d = binds.AcquireGraphicsBinding(0, 192, layout_b, 11, 2, true);
+        CHECK(d.bind_buffer);
+        CHECK(d.set_offsets);
+
+        binds.InvalidateAll();
+        d = binds.AcquireGraphicsBinding(0, 192, layout_b, 11, 2, false);
+        CHECK(d.bind_buffer);
+        CHECK(d.set_offsets);
+
+        // Disabled mode (EDEN_NX2_DRAW_CACHE=0) always emits both commands.
+        DescriptorBindCache disabled{false};
+        d = disabled.AcquireGraphicsBinding(0, 64, layout_a, 10, 1, false);
+        CHECK(d.bind_buffer);
+        CHECK(d.set_offsets);
+        d = disabled.AcquireGraphicsBinding(0, 64, layout_a, 10, 1, false);
+        CHECK(d.bind_buffer);
+        CHECK(d.set_offsets);
+    }
 }

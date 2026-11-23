@@ -321,6 +321,8 @@ private:
     vk::Pipeline pipeline;
 
     DescriptorBufferLayout descriptor_buffer_layout;
+    u64 descriptor_buffer_layout_hash{};
+    std::array<u32, NUM_STAGES> stage_descriptor_counts{};
     std::vector<DescriptorUpdateEntry> last_descriptor_payload;
     std::vector<u8> last_descriptor_bytes;
     VkDeviceSize last_descriptor_buffer_offset{};

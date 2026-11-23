@@ -84,6 +84,12 @@ cmake_dependent_option(YUZU_USE_BUNDLED_QT "Download bundled Qt binaries" "${MSV
 
 option(ENABLE_DEBUG_TOOLS "Enable debugging tools (maxwell disassembler, SPIRV translator, etc)" OFF)
 option(ENABLE_WERROR "Enable -Werror diagnostics" ON)
+option(ENABLE_RUST_AMPERE "Enable Rust Ampere shader lowering parity backend" ON)
+option(ENABLE_RUST_AMP_SPIRV "Enable Rust direct SM86-to-SPIR-V shader compiler" ON)
+option(ENABLE_RUST_NUP "Enable Rust NUP archive container and writer backend" ON)
+option(ENABLE_RUST_SWITCH2_IO "Enable Rust Switch 2 IO protocol codec" ON)
+option(ENABLE_ISPC_KERNELS "Enable ISPC multi-ISA SIMD kernels when ispc is available" ON)
+option(ENABLE_INTEL_XESS "Enable Intel XeSS dynamic runtime upscaler" ON)
 
 # Handle specific -Werror downgrades safely across platforms
 if(ENABLE_WERROR)
@@ -745,6 +751,17 @@ if (MSVC AND CXX_CLANG)
         IMPORTED_LOCATION "${LIB_PATH}")
 
     link_libraries(llvm-mingw-runtime)
+endif()
+
+if (NOT YUZU_STATIC_ROOM AND (ENABLE_RUST_AMPERE OR ENABLE_RUST_AMP_SPIRV OR ENABLE_RUST_NUP OR ENABLE_RUST_SWITCH2_IO))
+    include(AddRustCrate)
+    add_rust_static_library(
+        TARGET eglantine_rs
+        MANIFEST "${CMAKE_SOURCE_DIR}/rust/Cargo.toml"
+        PACKAGE eglantine_ffi
+        LIB_NAME eglantine_rs
+        INCLUDE_DIR "${CMAKE_SOURCE_DIR}/rust/include"
+    )
 endif()
 
 add_subdirectory(src)

@@ -127,6 +127,73 @@ set(SHADER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/include)
 set(SHADER_DIR ${SHADER_INCLUDE}/video_core/host_shaders)
 set(HOST_SHADERS_INCLUDE ${SHADER_INCLUDE} PARENT_SCOPE)
 
+set(SLANG_SHADER_FILES
+    hmma_tiled_fallback.slang
+    nv12_to_block_linear.slang
+)
+
+find_program(SLANGC_EXECUTABLE slangc)
+if (SLANGC_EXECUTABLE)
+    message(STATUS "Found slangc: ${SLANGC_EXECUTABLE} - enabling Slang host shader compilation")
+    set(SLANG_HEADER_GENERATOR ${CMAKE_CURRENT_BINARY_DIR}/SlangSpvToHeader.cmake)
+    file(WRITE "${SLANG_HEADER_GENERATOR}" [[
+file(READ "${INPUT_SPV}" HEX_CONTENTS HEX)
+string(LENGTH "${HEX_CONTENTS}" HEX_LEN)
+math(EXPR WORD_COUNT "${HEX_LEN} / 8")
+set(LINES "")
+set(ROW_WORDS "")
+set(IDX 0)
+while(IDX LESS WORD_COUNT)
+    math(EXPR OFFSET "${IDX} * 8")
+    string(SUBSTRING "${HEX_CONTENTS}" ${OFFSET} 8 WORD_LE)
+    string(SUBSTRING "${WORD_LE}" 0 2 B0)
+    string(SUBSTRING "${WORD_LE}" 2 2 B1)
+    string(SUBSTRING "${WORD_LE}" 4 2 B2)
+    string(SUBSTRING "${WORD_LE}" 6 2 B3)
+    list(APPEND ROW_WORDS "0x${B3}${B2}${B1}${B0}")
+    math(EXPR IDX "${IDX} + 1")
+    math(EXPR MOD8 "${IDX} % 8")
+    if(MOD8 EQUAL 0)
+        list(JOIN ROW_WORDS ", " ROW_TEXT)
+        list(APPEND LINES "\t${ROW_TEXT},")
+        set(ROW_WORDS "")
+    endif()
+endwhile()
+if(ROW_WORDS)
+    list(JOIN ROW_WORDS ", " ROW_TEXT)
+    list(APPEND LINES "\t${ROW_TEXT}")
+endif()
+list(JOIN LINES "\n" BODY_TEXT)
+get_filename_component(OUT_DIR "${OUTPUT_HEADER}" DIRECTORY)
+file(MAKE_DIRECTORY "${OUT_DIR}")
+file(WRITE "${OUTPUT_HEADER}" "#pragma once\n\nconst uint32_t ${VAR_NAME}[] = {\n${BODY_TEXT}\n};\n")
+]])
+
+    foreach(SLANG_REL IN ITEMS ${SLANG_SHADER_FILES})
+        set(SOURCE_FILE ${CMAKE_CURRENT_SOURCE_DIR}/${SLANG_REL})
+        get_filename_component(FILENAME ${SOURCE_FILE} NAME)
+        string(REPLACE "." "_" SHADER_NAME ${FILENAME})
+        string(TOUPPER ${SHADER_NAME}_SPV SPIRV_VARIABLE_NAME)
+        set(SPIRV_BINARY_FILE ${CMAKE_CURRENT_BINARY_DIR}/slang/${SHADER_NAME}.spv)
+        set(SPIRV_HEADER_FILE ${SHADER_DIR}/${SHADER_NAME}_spv.h)
+        add_custom_command(
+            OUTPUT
+                ${SPIRV_HEADER_FILE}
+            COMMAND
+                ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/slang
+            COMMAND
+                ${SLANGC_EXECUTABLE} ${SOURCE_FILE} -target spirv -profile spirv_1_3 -stage compute -entry main -fvk-use-entrypoint-name -o ${SPIRV_BINARY_FILE}
+            COMMAND
+                ${CMAKE_COMMAND} -DINPUT_SPV=${SPIRV_BINARY_FILE} -DOUTPUT_HEADER=${SPIRV_HEADER_FILE} -DVAR_NAME=${SPIRV_VARIABLE_NAME} -P ${SLANG_HEADER_GENERATOR}
+            MAIN_DEPENDENCY
+                ${SOURCE_FILE}
+        )
+        set(SHADER_HEADERS ${SHADER_HEADERS} ${SPIRV_HEADER_FILE})
+    endforeach()
+else()
+    message(STATUS "slangc not found; skipping optional Slang host shader compilation")
+endif()
+
 set(INPUT_FILE ${CMAKE_CURRENT_SOURCE_DIR}/source_shader.h.in)
 set(HEADER_GENERATOR ${CMAKE_CURRENT_SOURCE_DIR}/StringShaderHeader.cmake)
 
@@ -305,7 +372,7 @@ foreach(FILEPATH IN ITEMS ${FIDELITYFX_FILES})
 endforeach()
 
 set(SHADER_SOURCES ${SHADER_FILES})
-list(APPEND SHADER_SOURCES ${GLSL_INCLUDES})
+list(APPEND SHADER_SOURCES ${GLSL_INCLUDES} ${SLANG_SHADER_FILES})
 
 add_custom_target(host_shaders
     DEPENDS

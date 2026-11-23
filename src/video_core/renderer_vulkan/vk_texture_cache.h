@@ -23,6 +23,8 @@
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_dlss_network_probe.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
+#include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
+#include "video_core/renderer_vulkan/vk_xess_upscaler.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #endif
@@ -119,14 +121,15 @@ public:
                    Tegra::Engines::Fermi2D::Operation operation);
 
     /// Stands in for a DLSS evaluation: temporal upscale of input_color (render_size on the host)
-    /// into dst, with FSR 3.1 when given the depth, else with the temporal stand-in. False when dst
-    /// cannot take it.
+    /// into dst (DLSS -> XeSS -> FSR 3.1 when depth is present, else temporal stand-in). False
+    /// when dst cannot take it.
     bool TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
                          ImageView& motion_vectors, ImageView* depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
                          std::array<f32, 2> motion_scale);
 
-    /// True when TemporalUpscale would use the depth (FSR 3.1 not forced off and not failed).
+    /// True when TemporalUpscale would use the depth (not forced to stand-in and at least one
+    /// depth-based temporal upscaler remains viable).
     [[nodiscard]] bool WantsTemporalUpscaleDepth() const;
 
     /// True while TemporalUpscale would use NVIDIA DLSS (on, Streamline running, not failed).
@@ -232,27 +235,31 @@ public:
     DescriptorPool& descriptor_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
 
-    /// FSR 3.1 in place of a DLSS evaluation (TemporalUpscale), created on first use.
-    bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
-                         ImageView& motion_vectors, ImageView& depth,
-                         std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale);
+    /// Unified depth-based temporal upscaler pipeline (DLSS -> XeSS -> FSR 3.1).
+    bool UpscaleWithTemporalBackends(Framebuffer* dst_framebuffer, ImageView& input_color,
+                                     ImageView& motion_vectors, ImageView& depth,
+                                     std::array<u32, 2> render_size, std::array<f32, 2> jitter,
+                                     std::array<f32, 2> motion_scale);
+    bool TryUpscaleBackend(ITemporalUpscaler& upscaler, Framebuffer* dst_framebuffer,
+                           const TemporalUpscaleInputs& inputs, const char* backend_name,
+                           bool& logged);
+    TemporalUpscaleImage MakeUpscaleImage(ImageView& view, VkImageView handle,
+                                          VkImageAspectFlags aspect) const;
+    XeSSUpscaler* GetXessUpscaler();
+    Fsr3Upscaler* GetFsr3Upscaler();
+
+    std::unique_ptr<XeSSUpscaler> xess_upscaler;
+    bool xess_unsupported{};
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
-    std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
+    std::optional<std::chrono::steady_clock::time_point> temporal_last_evaluation;
 
     /// Draws an upscaler's RGBA16F output into the DLSS output and returns it to GENERAL.
     void DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view, VkImage image,
                             VkSampler sampler);
 #ifdef EGLANTINE_STREAMLINE
-    /// NVIDIA's DLSS (through NVIDIA Streamline) in place of the game's,
-    /// before FSR 3.1, when the setting is on. Returns false to fall back to FSR 3.1.
-    bool UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageView& input_color,
-                         ImageView& motion_vectors, ImageView& depth,
-                         std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale, bool reset);
     /// The NVIDIA DLSS upscaler, created on first use; null when DLSS can't run.
     StreamlineDlssUpscaler* DlssUpscaler();
     std::unique_ptr<StreamlineDlssUpscaler> dlss_upscaler;

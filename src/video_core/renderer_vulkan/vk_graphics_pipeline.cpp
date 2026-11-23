@@ -321,7 +321,9 @@ GraphicsPipeline::GraphicsPipeline(
         num_textures += Shader::NumDescriptors(info->texture_descriptors);
         num_image_elements += Shader::NumDescriptors(info->texture_descriptors);
         num_image_elements += Shader::NumDescriptors(info->image_descriptors);
-        num_descriptor_entries += NumDescriptorEntries(*info);
+        const u32 stage_entries = NumDescriptorEntries(*info);
+        stage_descriptor_counts[stage] = stage_entries;
+        num_descriptor_entries += stage_entries;
         has_render_area_push_constants |= info->uses_render_area;
     }
     fragment_has_color0_output = stage_infos[NUM_STAGES - 1].stores_frag_color[0];
@@ -362,6 +364,14 @@ GraphicsPipeline::GraphicsPipeline(
             descriptor_set_layout = builder.CreateDescriptorSetLayout(uses_push_descriptor);
         } else {
             last_descriptor_payload.reserve(num_descriptor_entries);
+            descriptor_buffer_layout_hash =
+                static_cast<u64>(descriptor_buffer_layout.size) ^
+                (static_cast<u64>(descriptor_buffer_layout.bindings.size()) << 32);
+            if (!descriptor_buffer_layout.bindings.empty()) {
+                descriptor_buffer_layout_hash ^= HashDescriptorBytes(
+                    descriptor_buffer_layout.bindings.data(),
+                    descriptor_buffer_layout.bindings.size() * sizeof(DescriptorBufferBinding));
+            }
         }
     }
 
@@ -903,24 +913,52 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             descriptor_buffer_chunk = last_descriptor_buffer_chunk;
             descriptor_buffer_ring.TouchFrame(scheduler);
         } else {
-            const DescriptorBufferRing::Allocation alloc{
-                descriptor_buffer_ring.Allocate(scheduler, descriptor_buffer_layout.size)};
-            if (!alloc.host) {
-                LOG_DEBUG(Render_Vulkan, "Failed to reserve descriptor memory, skipping draw");
-                return false;
+            DescriptorSliceKey slice_key{};
+            std::optional<DescriptorSliceHit> slice_hit{};
+            if (descriptor_buffer_ring.IsDrawCacheEnabled() && num_descriptor_entries > 0) {
+                slice_key.layout_hash = descriptor_buffer_layout_hash;
+                slice_key.entry_count = num_descriptor_entries;
+                slice_key.size = descriptor_buffer_layout.size;
+                slice_key.payload_hash = HashDescriptorBytes(
+                    entries, num_descriptor_entries * sizeof(DescriptorUpdateEntry));
+                u32 stage_offset = 0;
+                for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+                    const u32 count = stage_descriptor_counts[stage];
+                    if (count > 0 && stage_offset + count <= num_descriptor_entries) {
+                        slice_key.stage_hashes[stage] = HashDescriptorBytes(
+                            entries + stage_offset, count * sizeof(DescriptorUpdateEntry));
+                    }
+                    stage_offset += count;
+                }
+                slice_hit = descriptor_buffer_ring.LookupSlice(slice_key);
             }
-            const bool can_diff = last_descriptor_buffer_generation == alloc.generation &&
-                                  last_descriptor_payload.size() == num_descriptor_entries;
-            if (last_descriptor_payload.size() != num_descriptor_entries) {
-                last_descriptor_payload.resize(num_descriptor_entries);
+            if (slice_hit) {
+                descriptor_buffer_offset = slice_hit->offset;
+                descriptor_buffer_chunk = slice_hit->chunk;
+                descriptor_buffer_ring.TouchFrame(scheduler);
+            } else {
+                const DescriptorBufferRing::Allocation alloc{
+                    descriptor_buffer_ring.Allocate(scheduler, descriptor_buffer_layout.size)};
+                if (!alloc.host) {
+                    LOG_DEBUG(Render_Vulkan, "Failed to reserve descriptor memory, skipping draw");
+                    return false;
+                }
+                const bool can_diff = last_descriptor_buffer_generation == alloc.generation &&
+                                      last_descriptor_payload.size() == num_descriptor_entries;
+                if (last_descriptor_payload.size() != num_descriptor_entries) {
+                    last_descriptor_payload.resize(num_descriptor_entries);
+                }
+                WriteDescriptorBuffer(device, descriptor_buffer_layout, entries, alloc.host,
+                                      last_descriptor_payload, last_descriptor_bytes, can_diff);
+                descriptor_buffer_offset = alloc.offset;
+                descriptor_buffer_chunk = alloc.chunk;
+                last_descriptor_buffer_offset = alloc.offset;
+                last_descriptor_buffer_chunk = alloc.chunk;
+                last_descriptor_buffer_generation = alloc.generation;
+                if (descriptor_buffer_ring.IsDrawCacheEnabled() && num_descriptor_entries > 0) {
+                    descriptor_buffer_ring.CacheSlice(slice_key, alloc.offset, alloc.chunk);
+                }
             }
-            WriteDescriptorBuffer(device, descriptor_buffer_layout, entries, alloc.host,
-                                  last_descriptor_payload, last_descriptor_bytes, can_diff);
-            descriptor_buffer_offset = alloc.offset;
-            descriptor_buffer_chunk = alloc.chunk;
-            last_descriptor_buffer_offset = alloc.offset;
-            last_descriptor_buffer_chunk = alloc.chunk;
-            last_descriptor_buffer_generation = alloc.generation;
         }
     }
 
@@ -1095,9 +1133,21 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     const bool is_rescaling{texture_cache.IsRescaling()};
     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling)};
     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
-    const bool bind_descriptor_buffer{
-        descriptor_set_layout && uses_descriptor_buffer &&
-        scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk)};
+    bool bind_descriptor_buffer{false};
+    bool set_descriptor_offsets{false};
+    if (descriptor_set_layout && uses_descriptor_buffer) {
+        const bool scheduler_chunk_dirty =
+            scheduler.UpdateDescriptorBufferChunk(descriptor_buffer_chunk);
+        const auto decision = descriptor_buffer_ring.AcquireGraphicsBind(
+            descriptor_buffer_chunk, descriptor_buffer_offset, *pipeline_layout,
+            scheduler.CurrentTick(), scheduler_chunk_dirty);
+        bind_descriptor_buffer = decision.bind_buffer;
+        set_descriptor_offsets = decision.set_offsets;
+        if (bind_pipeline && !is_built.load(std::memory_order::relaxed)) {
+            descriptor_buffer_ring.InvalidateDrawOffsetCache();
+            set_descriptor_offsets = true;
+        }
+    }
 
     // Log graphics pipeline binding
     if (bind_pipeline && GPU::Logging::IsActive() &&
@@ -1122,11 +1172,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
     if (descriptor_set_layout && !uses_descriptor_buffer &&
         (uses_push_descriptor || update_descriptors || mesh_emulation)) {
         scheduler.InvalidateDescriptorBuffer();
+        descriptor_buffer_ring.InvalidateDrawBindCache();
     }
     const auto rescaling_data = rescaling.Data();
     scheduler.Record([this, descriptor_data, bind_pipeline, update_descriptors,
                       descriptor_buffer_offset, descriptor_buffer_chunk, bind_descriptor_buffer,
-                      rescaling_data, is_rescaling, update_rescaling,
+                      set_descriptor_offsets, rescaling_data, is_rescaling, update_rescaling,
                       uses_render_area = render_area.uses_render_area,
                       render_area_data = render_area.words](vk::CommandBuffer cmdbuf) {
         if (bind_descriptor_buffer) {
@@ -1173,9 +1224,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
             return;
         }
         if (uses_descriptor_buffer) {
-            const u32 buffer_index{};
-            cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline_layout,
-                                                 0, buffer_index, descriptor_buffer_offset);
+            if (set_descriptor_offsets) {
+                const u32 buffer_index{};
+                cmdbuf.SetDescriptorBufferOffsetsEXT(VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                     *pipeline_layout, 0, buffer_index,
+                                                     descriptor_buffer_offset);
+            }
         } else if (uses_push_descriptor) {
             cmdbuf.PushDescriptorSetWithTemplateKHR(*descriptor_update_template, *pipeline_layout,
                                                     0, descriptor_data);

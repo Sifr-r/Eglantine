@@ -38,6 +38,8 @@ to `shader_recompiler` for shader translation.
 | 15 | `updater` | `src/updater` | The self-update helper |
 | 16 | `web_service` | `src/web_service` | Telemetry and other web services |
 | 17 | `android` | `src/android` | The Android port (JNI glue over `core`) |
+| 18 | `simd_kernels` | `src/simd_kernels` | Multi-ISA ISPC texture/audio kernels (`AddIspcKernel.cmake`; empty `INTERFACE` fallback when `ispc` is absent) |
+| 19 | `eglantine_rs` | `rust/` | Single `staticlib` Cargo FFI bundle (`eglantine_ffi` -> `eglantine_rs`) exporting the Rust domains via `rust/include/*.h` |
 | — | `tests` | `src/tests` | Catch2 unit tests; links against the layers it tests |
 
 `externals/` holds third-party code (FFmpeg, SDL3, Vulkan headers, libusb, FSR, …), mostly
@@ -45,10 +47,31 @@ fetched through CPM into `.cache/cpm/` at configure time. `dist/` holds packagin
 `tools/nx2/` holds the Switch 2 debugging toolchain; `tools/windows/` holds the Vulkan SDK
 bootstrap.
 
-The standalone Rust Ampere prototype under `rust/crates/ampere_core/` exposes its lowering
-and data-format operations through `rust/include/eglantine_ampere.h`. The emulator still
-uses the C++ shader recompiler. The [polyglot migration guide](POLYGLOT_IMPLEMENTATION_PLAN.md)
-tracks the proposed integration and its parity checks.
+### Polyglot Rust, Slang, and ISPC architecture
+
+The [polyglot migration guide](POLYGLOT_IMPLEMENTATION_PLAN.md) tracks the phased integration
+and parity switches. Five `std`-only Cargo crates (zero external `crates.io` dependencies in
+`rust/Cargo.lock`) live under `rust/crates/`:
+
+| Crate | Path | Library | Responsibility & C ABI Header |
+|---|---|---|---|
+| `eglantine_ampere_core` | `rust/crates/ampere_core` | `eglantine_ampere_rs` | SM86 -> Maxwell lowering, capture state machine, native address map, override codec ([`eglantine_ampere.h`](rust/include/eglantine_ampere.h)) |
+| `eglantine_ampere_spirv` | `rust/crates/ampere_spirv` | `eglantine_ampere_spirv` | Direct SM86 -> structured SSA IR -> SPIR-V 1.6 emitter with parameterized `OpTypeCooperativeMatrixKHR` and `std::thread::scope` batching ([`eglantine_ampere_spirv.h`](rust/include/eglantine_ampere_spirv.h)) |
+| `eglantine_nup_fs` | `rust/crates/nup_fs` | `eglantine_nup_fs` | `NUP\x01` archive parser, writer, metadata editor, `.part`/`.journal` resume using C-supplied `EglNupZstdOps`/`EglNupVfsOps` callbacks ([`eglantine_nup_fs.h`](rust/include/eglantine_nup_fs.h)) |
+| `eglantine_switch2_io` | `rust/crates/switch2_io` | `eglantine_switch2_io` | Switch 2 BLE/USB packet framing, stick calibration, gyro/optical mouse processors, HD Rumble 2 encoder ([`eglantine_switch2_io.h`](rust/include/eglantine_switch2_io.h)) |
+| `eglantine_ffi` | `rust/crates/eglantine_ffi` | `eglantine_rs` | Unified `staticlib` re-exporting and anchoring all 57 `#[no_mangle] pub extern "C"` symbols via `#[used] EGLANTINE_EXPORTED_FFI_SYMBOLS` |
+
+**Acyclic DAG & FFI invariants:**
+* **Workspace crate DAG:** `eglantine_ffi` -> `{ampere_core, ampere_spirv, nup_fs, switch2_io}` and `ampere_spirv` -> `ampere_core`. `ampere_core`, `nup_fs`, and `switch2_io` are independent leaves; there are no reverse edges and no external crate dependencies.
+* **CMake dependency DAG:** Root `CMakeLists.txt` defines `ENABLE_RUST_AMPERE`, `ENABLE_RUST_AMP_SPIRV`, `ENABLE_RUST_NUP`, `ENABLE_RUST_SWITCH2_IO`, `ENABLE_ISPC_KERNELS`, and `ENABLE_INTEL_XESS` (all `ON` by default). When `NOT YUZU_STATIC_ROOM` and any `ENABLE_RUST_*` option is `ON`, `CMakeModules/AddRustCrate.cmake` creates `eglantine_rs` (`STATIC IMPORTED GLOBAL` over `eglantine_ffi`) before `add_subdirectory(src)`. Consumer wiring flows strictly downward:
+  * `shader_recompiler` links `PUBLIC eglantine_rs` (`EGLANTINE_ENABLE_RUST_AMPERE=1`, `EGLANTINE_ENABLE_RUST_AMP_SPIRV=1`) -> inherited by `video_core`.
+  * `core` links `PUBLIC eglantine_rs zstd::zstd` (`EGLANTINE_ENABLE_RUST_NUP=1`).
+  * `input_common` links `PUBLIC eglantine_rs` (`EGLANTINE_ENABLE_RUST_SWITCH2_IO=1`).
+  * `src/CMakeLists.txt` loads `src/simd_kernels` before `core`/`audio_core`/`video_core` via `CMakeModules/AddIspcKernel.cmake`; `video_core` links `PRIVATE simd_kernels` (`EGLANTINE_ENABLE_ISPC=1` when `ispc` is found; empty `INTERFACE` no-op with scalar C++ fallback otherwise) and `PUBLIC xbyak::xbyak` (`x86_64`) / `PUBLIC merry::oaknut` (`arm64` for `TuringMacroJit`).
+  * `tests` links `common`, `core`, `input_common`, `video_core`, and `eglantine_rs`.
+* **Flat C ABI boundary:** Every Rust <-> C++ crossing uses `#[repr(C)]` POD structs, primitives, and callback tables declared in `rust/include/*.h`. All Rust domain modules enforce `#![deny(warnings)]` and `#![forbid(unsafe_code)]`, isolating pointer/alignment validation, `catch_unwind`, and idempotent `*_free` helpers inside `ffi.rs`.
+* **Slang & ISPC host-shader scaffolding:** `src/video_core/host_shaders/CMakeLists.txt` optionally compiles `hmma_tiled_fallback.slang` and `nv12_to_block_linear.slang` when `slangc` is on `PATH` (skipping cleanly when absent). `src/simd_kernels/*.ispc` (`tex_etc2.ispc`, `tex_astc_scan.ispc`, `tex_swizzle.ispc`, `audio_mix.ispc`) compile multi-ISA (`sse4-i32x4,avx2-i32x8,avx512skx-i32x16` / `neon-i32x4`) behind `EGLANTINE_ENABLE_ISPC`.
+* **Runtime switches:** `EDEN_NX2_RUST_AMPERE`, `EDEN_NX2_DIRECT_SM86`, `EDEN_NX2_RUST_NUP`, `EDEN_NX2_RUST_SWITCH2_IO`, `EDEN_NX2_ISPC` (plus `*_VERIFY=1` differential modes), `EDEN_NX2_VK_VIDEO=1`, and `EDEN_NX2_DRAW_CACHE`. Temporal upscaling shares `Vulkan::ITemporalUpscaler` (`src/video_core/renderer_vulkan/vk_temporal_upscaler.h`) with runtime fallback `DLSS -> XeSS -> FSR 3.1 -> temporal stand-in` (`vk_xess_upscaler.{h,cpp}`).
 
 ## 3. Core domain contracts
 
@@ -65,7 +88,17 @@ convention.
   `src/tests/core/launch_params.cpp`.
 * Services live in `src/core/hle/service/`. The Switch 2 additions are `nvdrv/` (GPU
   device), `nx2_gsv.h` (graphics server, frame capture) and `nx2_stub_device.h`.
+* **Platform profile resolution (`Core::PlatformProfile`).** `src/core/platform_profile.{h,cpp}`
+  and `Loader::AppLoader::ReadProgramMetadata` (`src/core/loader/loader.h`) resolve `Switch1` vs
+  `Switch2` once before kernel setup from the exact loader, ExeFS, and installed update used to
+  create the application process (`Core::System::Platform()`, honoring `EDEN_NX2_PLATFORM`).
+  `nvhost_ctrl_gpu::GetCharacteristics3` fails closed (`NvResult::NotSupported`) on contradictory
+  `0xD0` Switch 2 queries under `ConfirmedSwitch1`/`OverrideSwitch1`, and warns-and-allows under
+  `DefaultSwitch1` (missing `main.npdm`); covered by `src/tests/core/platform_profile.cpp`.
 * `Core::g_nx2_present_count` is the frame counter the NX2 diagnostics and key scripts use.
+* Guest address arbitration and condition-variable operations serialize wait and wakeup under the
+  kernel scheduler lock. A condition-variable signal can move a waiter directly to the mutex
+  owner's waiter tree, which unlock checks before releasing the mutex.
 * The intrusive kernel object registry unlinks slab-backed objects before their storage is
   released. Initialization independently determines whether resource finalization runs.
   `src/tests/core/process_load.cpp` exercises failed application loads and slab-slot reuse.
@@ -87,6 +120,8 @@ convention.
   present exits the handler before queuing a composite or a buffer release.
 * The NUP metadata editor in `src/core/file_sys/nup_writer.cpp` keeps stored file extents at
   their original offsets when metadata must move to the end of the archive.
+* NUP pack, extract, and metadata-edit verification use a fresh scratch directory for each
+  operation. The verifier cleans up only the directory that operation created.
 * **Save data ownership.** `FileSys::SaveDataFactory` (`src/core/file_sys/savedata_factory.cpp`)
   owns the on-disk save data layout; `Service::FileSystem::SaveDataController`
   (`src/core/hle/service/filesystem/save_data_controller.cpp`) is the only thing the HLE layer
@@ -168,6 +203,11 @@ convention.
 
 * `VideoCommon::Maxwell3D` is the register file. `GetNativeMacroEngine().native_turing`
   selects the Switch 2 path.
+* **Session-owned MME context.** `Tegra::GPU::Impl` (`src/video_core/gpu.cpp`) owns the per-session
+  `NativeMacroContext` (declared before `gpu_thread`, `renderer`, `scheduler`, and `channels`) via
+  `GetOrCreateNativeMacroContext()` / `GetNativeMacroContext()`, so channels in a Switch 2
+  session share one macro RAM without leaking state across sessions or allocating on Switch 1;
+  covered by `src/tests/video_core/nx2_macro_context.cpp`.
 * `VideoCore::MemoryManager` maps guest memory, including the sparse regions Switch 2
   titles use (`Tegra::Nx2Sparse*`).
 * `VideoCore::TextureCache` owns every host image. `ImageBase` carries the per-image
@@ -428,7 +468,7 @@ template applies the same exclusions when a separate CPack configuration uses it
 | `ASSET_PROVENANCE.md` | Record source evidence, attribution and outstanding redistribution questions for audited assets. |
 | `CPackSourceConfig.cmake.in` | Source-package exclusion template used when `CPack` is configured with the repository root on `CMAKE_MODULE_PATH`; preserves CPack’s generated defaults and excludes the repository’s root `ignore/` and `.lab/` from source packages. |
 | `tools/ci/check_release_paths.py` | Reject high-confidence private artifact paths in a Git path list or in ZIP and TAR.GZ members. |
-| `tools/ci/license-header.sh` | Check (exit 1 on failure) and optionally update SPDX headers on branch diffs against `nx2` (excluding `externals/FidelityFX-SDK` and other third-party trees). |
+| `tools/ci/license-header.sh` | Check (exit 1 on failure) and optionally update SPDX headers on branch diffs against `nx2` (covering C/C++, CMake/shell/Python/Nix, and `*.rs`/`*.slang`/`*.ispc`/`*.slint`; excluding `externals/FidelityFX-SDK` and other third-party trees). |
 | `tools/ci/test_check_release_paths.py` | Exercise accepted and rejected scanner inputs with synthetic files. |
 | `tools/ci/test_license_header.py` | Verify `license-header.sh` CLI/stanza contracts, repaired SPDX headers, and unmodified FidelityFX-SDK MIT headers. |
 | `tools/ci/test_workflows.py` | Parse `.github/workflows` / `.github/actions` YAML and verify triggers, timeouts, cache wiring, and script hygiene. |

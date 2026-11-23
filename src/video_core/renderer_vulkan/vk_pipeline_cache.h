@@ -257,7 +257,8 @@ private:
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-        bool build_in_parallel, bool native_turing = false, bool parallel_stages = false);
+        bool build_in_parallel, bool native_turing = false, bool parallel_stages = false,
+        bool has_generic_envs = false);
 
     /// Runs task(0..count-1) on the translation workers and this thread; rethrows the first
     /// exception a task threw.
@@ -275,7 +276,8 @@ private:
                                                     const ComputePipelineCacheKey& key,
                                                     Shader::Environment& env,
                                                     PipelineStatistics* statistics,
-                                                    bool build_in_parallel);
+                                                    bool build_in_parallel,
+                                                    bool is_generic_env = false);
 
     void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);

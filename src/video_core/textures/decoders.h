@@ -57,4 +57,7 @@ void UnswizzleSubrect(std::span<u8> output, std::span<const u8> input, u32 bytes
 u64 GetGOBOffset(u32 width, u32 height, u32 dst_x, u32 dst_y, u32 block_height,
                  u32 bytes_per_pixel);
 
+/// True when compiled with ISPC SIMD support and enabled via EDEN_NX2_ISPC.
+[[nodiscard]] bool IsIspcEnabled() noexcept;
+
 } // namespace Tegra::Texture

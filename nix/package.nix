@@ -81,16 +81,30 @@ let
   #   SDL2, stb (vendored in externals/stb, which defines the target),
   #   unordered_dense (no reference anywhere in the tree), qt6.qtmultimedia and
   #   qt6.qtwebengine (both options default OFF and are never set here)
-  nativeDeps = with pkgs; [
-    cmake
-    ninja
-    glslang
-    pkg-config
-    python3
-    qt6.qttools
-    qt6.wrapQtAppsHook
-    wrapGAppsHook3
-  ];
+  optionalTool =
+    pkgName:
+    lib.optional (
+      pkgs ? ${pkgName}
+      && lib.meta.availableOn pkgs.stdenv.hostPlatform pkgs.${pkgName}
+      && !(pkgs.${pkgName}.meta.broken or false)
+    ) pkgs.${pkgName};
+
+  nativeDeps =
+    (with pkgs; [
+      cargo
+      cmake
+      ninja
+      glslang
+      pkg-config
+      python3
+      qt6.qttools
+      qt6.wrapQtAppsHook
+      wrapGAppsHook3
+      rustPlatform.cargoSetupHook
+      rustc
+    ])
+    ++ optionalTool "shader-slang"
+    ++ optionalTool "ispc";
 
   # nixpkgs' SDL3, pinned to the version cpmfile.json asks for. Using the
   # nixpkgs recipe keeps SDL3's own build dependencies out of this expression:
@@ -240,6 +254,11 @@ buildEdenEmulator (
 
     pname = "eglantine";
 
+    cargoRoot = "rust";
+    cargoDeps = pkgs.rustPlatform.importCargoLock {
+      lockFile = srcPath + "/rust/Cargo.lock";
+    };
+
     nativeBuildInputs = nativeDeps;
     buildInputs = deps;
 
@@ -302,6 +321,7 @@ buildEdenEmulator (
       #    Watch it if nixpkgs moves its unversioned ffmpeg default.
 
       "-DENABLE_WERROR=OFF"
+      "-DEGLANTINE_RUST_OFFLINE=ON"
       # The plain legs turn this on for release and daily builds; keep it off
       # here. A package manager owns updates, and an in-app download would put a
       # tarball or AppImage inside a store-managed tree that the flake input

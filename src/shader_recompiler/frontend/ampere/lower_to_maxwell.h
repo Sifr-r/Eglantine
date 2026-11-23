@@ -19,6 +19,11 @@
 #include <vector>
 #include "common/common_types.h"
 
+#ifdef EGLANTINE_ENABLE_RUST_AMPERE
+#include <cstdio>
+#include "eglantine_ampere.h"
+#endif
+
 namespace Shader::Ampere {
 
 struct Instruction {
@@ -3990,8 +3995,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
     return fail(static_cast<u32>(code.size()), main_exited ? "native program lacks captured library return" : "native program has no unconditional EXIT");
 }
 
-inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
-                                      LoweringOptions options = {}) {
+inline LoweredProgram LowerToMaxwellCpp(std::span<const Instruction> code,
+                                          LoweringOptions options = {}) {
     // Programs using uniform registers above UR27 are lowered again with mirrors for them.
     u32 high_uniforms = 0;
     for (;;) {
@@ -4000,5 +4005,182 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         high_uniforms = lowered.high_uniform_registers;
     }
 }
+
+#ifdef EGLANTINE_ENABLE_RUST_AMPERE
+
+namespace detail {
+
+inline bool IsEnvFlagEnabled(const char* name) {
+    const char* const value = std::getenv(name);
+    return value != nullptr && std::string_view{value} == "1";
+}
+
+struct ScopedAmpereLoweredProgram {
+    EglAmpereLoweredProgram raw{};
+    ScopedAmpereLoweredProgram() = default;
+    ~ScopedAmpereLoweredProgram() {
+        egl_ampere_free_lowered(&raw);
+    }
+    ScopedAmpereLoweredProgram(const ScopedAmpereLoweredProgram&) = delete;
+    ScopedAmpereLoweredProgram& operator=(const ScopedAmpereLoweredProgram&) = delete;
+};
+
+inline bool CopyFromRustLowered(const EglAmpereLoweredProgram& raw, LoweredProgram& out) {
+    if ((raw.instruction_count > 0 && raw.instructions == nullptr) ||
+        (raw.source_instruction_offset_count > 0 && raw.source_instruction_offsets == nullptr) ||
+        (raw.error_len > 0 && raw.error == nullptr)) {
+        return false;
+    }
+    if (raw.instruction_count > 0) {
+        out.instructions.assign(raw.instructions, raw.instructions + raw.instruction_count);
+    }
+    if (raw.source_instruction_offset_count > 0) {
+        out.source_instruction_offsets.assign(
+            raw.source_instruction_offsets,
+            raw.source_instruction_offsets + raw.source_instruction_offset_count);
+    }
+    out.source_size = raw.source_size;
+    out.required_texture_buffer = raw.required_texture_buffer;
+    out.high_uniform_registers = raw.high_uniform_registers;
+    out.error_offset = raw.error_offset;
+    if (raw.error_len > 0) {
+        out.error.assign(raw.error, raw.error_len);
+    }
+    return true;
+}
+
+inline std::optional<std::string> FindLoweredProgramMismatch(const LoweredProgram& cpp_prog,
+                                                             const LoweredProgram& rust_prog) {
+    if (cpp_prog.error != rust_prog.error) {
+        return fmt::format("error mismatch: cpp='{}' rust='{}'", cpp_prog.error, rust_prog.error);
+    }
+    if (cpp_prog.error_offset != rust_prog.error_offset) {
+        return fmt::format("error_offset mismatch: cpp={:#x} rust={:#x}", cpp_prog.error_offset,
+                           rust_prog.error_offset);
+    }
+    if (cpp_prog.source_size != rust_prog.source_size) {
+        return fmt::format("source_size mismatch: cpp={} rust={}", cpp_prog.source_size,
+                           rust_prog.source_size);
+    }
+    if (cpp_prog.required_texture_buffer != rust_prog.required_texture_buffer) {
+        return fmt::format("required_texture_buffer mismatch: cpp={} rust={}",
+                           cpp_prog.required_texture_buffer, rust_prog.required_texture_buffer);
+    }
+    if (cpp_prog.high_uniform_registers != rust_prog.high_uniform_registers) {
+        return fmt::format("high_uniform_registers mismatch: cpp={} rust={}",
+                           cpp_prog.high_uniform_registers, rust_prog.high_uniform_registers);
+    }
+    if (cpp_prog.source_instruction_offsets.size() != rust_prog.source_instruction_offsets.size()) {
+        return fmt::format("source_instruction_offsets count mismatch: cpp={} rust={}",
+                           cpp_prog.source_instruction_offsets.size(),
+                           rust_prog.source_instruction_offsets.size());
+    }
+    for (size_t idx = 0; idx < cpp_prog.source_instruction_offsets.size(); ++idx) {
+        if (cpp_prog.source_instruction_offsets[idx] != rust_prog.source_instruction_offsets[idx]) {
+            return fmt::format("source_instruction_offsets[{}] mismatch: cpp={} rust={}", idx,
+                               cpp_prog.source_instruction_offsets[idx],
+                               rust_prog.source_instruction_offsets[idx]);
+        }
+    }
+    if (cpp_prog.instructions.size() != rust_prog.instructions.size()) {
+        return fmt::format("instructions count mismatch: cpp={} rust={}",
+                           cpp_prog.instructions.size(), rust_prog.instructions.size());
+    }
+    for (size_t idx = 0; idx < cpp_prog.instructions.size(); ++idx) {
+        if (cpp_prog.instructions[idx] != rust_prog.instructions[idx]) {
+            return fmt::format("instructions[{}] mismatch: cpp={:#018x} rust={:#018x}", idx,
+                               cpp_prog.instructions[idx], rust_prog.instructions[idx]);
+        }
+    }
+    return std::nullopt;
+}
+
+[[noreturn]] inline void AbortVerifyMismatch(std::span<const Instruction> code,
+                                             std::string_view caller, std::string_view detail) {
+    const auto* c_code =
+        code.empty() ? nullptr : reinterpret_cast<const EglAmpereInstruction*>(code.data());
+    const u64 program_key = egl_ampere_native_program_key(c_code, code.size());
+    const std::string line = fmt::format("[EDEN_NX2_RUST_AMPERE_VERIFY] {} mismatch (key={:016x}): {}",
+                                         caller, program_key, detail);
+    std::fprintf(stderr, "%s\n", line.c_str());
+    std::fflush(stderr);
+    std::abort();
+}
+
+inline void VerifyLoweredProgramsMatch(std::span<const Instruction> code,
+                                       const LoweredProgram& cpp_prog,
+                                       const LoweredProgram& rust_prog, std::string_view caller) {
+    if (const auto mismatch = FindLoweredProgramMismatch(cpp_prog, rust_prog)) {
+        AbortVerifyMismatch(code, caller, *mismatch);
+    }
+}
+
+inline bool TryLowerToMaxwellRust(std::span<const Instruction> code, LoweringOptions options,
+                                  LoweredProgram& out, int32_t& out_rc) {
+    static_assert(sizeof(Instruction) == sizeof(EglAmpereInstruction));
+    static_assert(alignof(Instruction) == alignof(EglAmpereInstruction));
+    const EglAmpereLoweringOptions c_options{
+        .geometry = static_cast<uint8_t>(options.geometry ? 1U : 0U),
+        .tensor = static_cast<uint8_t>(options.tensor ? 1U : 0U),
+        .compact_tensor = static_cast<uint8_t>(options.compact_tensor ? 1U : 0U),
+        .lower_extended_override = -1,
+        ._pad = {0, 0, 0, 0},
+        .native_code_address = options.native_code_address,
+    };
+    ScopedAmpereLoweredProgram guard;
+    const auto* c_code =
+        code.empty() ? nullptr : reinterpret_cast<const EglAmpereInstruction*>(code.data());
+    out_rc = egl_ampere_lower_to_maxwell(c_code, code.size(), &c_options, &guard.raw);
+    if (out_rc != 0 || !CopyFromRustLowered(guard.raw, out)) {
+        out.instructions.clear();
+        out.source_instruction_offsets.clear();
+        out.error = "rust ampere FFI lowering error";
+        return false;
+    }
+    return true;
+}
+
+} // namespace detail
+
+inline LoweredProgram LowerToMaxwellRust(std::span<const Instruction> code,
+                                           LoweringOptions options = {}) {
+    LoweredProgram result;
+    int32_t rc = 0;
+    if (!detail::TryLowerToMaxwellRust(code, options, result, rc)) {
+        std::fprintf(stderr, "[EDEN_NX2_RUST_AMPERE] egl_ampere_lower_to_maxwell failed (rc=%d)\n",
+                     static_cast<int>(rc));
+        std::fflush(stderr);
+    }
+    return result;
+}
+
+inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+                                       LoweringOptions options = {}) {
+    if (detail::IsEnvFlagEnabled("EDEN_NX2_RUST_AMPERE_VERIFY")) {
+        LoweredProgram cpp_prog = LowerToMaxwellCpp(code, options);
+        LoweredProgram rust_prog;
+        int32_t rc = 0;
+        if (!detail::TryLowerToMaxwellRust(code, options, rust_prog, rc)) {
+            detail::AbortVerifyMismatch(
+                code, "LowerToMaxwell",
+                fmt::format("egl_ampere_lower_to_maxwell FFI failure (rc={})", rc));
+        }
+        detail::VerifyLoweredProgramsMatch(code, cpp_prog, rust_prog, "LowerToMaxwell");
+        return cpp_prog;
+    }
+    if (detail::IsEnvFlagEnabled("EDEN_NX2_RUST_AMPERE")) {
+        return LowerToMaxwellRust(code, options);
+    }
+    return LowerToMaxwellCpp(code, options);
+}
+
+#else
+
+inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+                                       LoweringOptions options = {}) {
+    return LowerToMaxwellCpp(code, options);
+}
+
+#endif
 
 } // namespace Shader::Ampere

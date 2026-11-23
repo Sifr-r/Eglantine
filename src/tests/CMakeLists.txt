@@ -58,6 +58,7 @@ add_executable(tests
     core/nx2_gpu_memory_registry.cpp
     core/nx2_gsv_bounds.cpp
     core/nx2_guest_ranges.cpp
+    core/platform_profile.cpp
     core/priority_queue.cpp
     core/process_load.cpp
     core/shutdown_ordering.cpp
@@ -74,6 +75,7 @@ add_executable(tests
     video_core/memory_manager_runs.cpp
     video_core/memory_manager_page_table.cpp
     video_core/nx2_concurrency.cpp
+    video_core/nx2_macro_context.cpp
     video_core/nx2_sparse_residency.cpp
     video_core/spirv_storage_alignment.cpp
     video_core/pipeline_cache_dir.cpp
@@ -90,7 +92,9 @@ add_executable(tests
     video_core/draw_skip_policy.cpp
     video_core/virtual_range_cache.cpp
     video_core/query_copy.cpp
+    video_core/ampere_direct_spirv.cpp
     video_core/ampere_lowering.cpp
+    video_core/ampere_rust_parity.cpp
     video_core/spirv_software_matrix.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_i2f.cpp
@@ -138,6 +142,9 @@ if (ENABLE_UPDATE_CHECKER)
 endif()
 
 target_link_libraries(tests PRIVATE common core input_common video_core)
+if (TARGET eglantine_rs)
+    target_link_libraries(tests PRIVATE eglantine_rs)
+endif()
 
 if (ENABLE_MCP_SERVER)
     target_sources(tests PRIVATE mcp/protocol.cpp)

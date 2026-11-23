@@ -782,6 +782,9 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
+    if (video_decode_family) {
+        video_decode_queue = logical.GetQueue(*video_decode_family);
+    }
 
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_extensions) {
@@ -1649,20 +1652,70 @@ void Device::RemoveUnsuitableExtensions() {
     // 32-lane warp. The matrices hold 16-bit floats, so the device needs shaderFloat16. Shaders
     // with them use the Vulkan memory model and run with full subgroups.
     {
-        const bool has_shape = std::ranges::any_of(
-            physical.GetCooperativeMatrixPropertiesKHR(),
-            [](const VkCooperativeMatrixPropertiesKHR& shape) {
-                return shape.MSize == 16 && shape.NSize == 8 && shape.KSize == 16 &&
-                       shape.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.saturatingAccumulation == VK_FALSE &&
-                       shape.scope == VK_SCOPE_SUBGROUP_KHR;
+        const auto raw_shapes = physical.GetCooperativeMatrixPropertiesKHR();
+        coop_matrix_capabilities = {};
+        coop_matrix_capabilities.extension_supported = extensions.cooperative_matrix;
+        coop_matrix_capabilities.feature_enabled =
+            features.cooperative_matrix.cooperativeMatrix != VK_FALSE;
+        coop_matrix_capabilities.supported_stages =
+            properties.cooperative_matrix.cooperativeMatrixSupportedStages;
+        coop_matrix_capabilities.compute_stage_supported =
+            (coop_matrix_capabilities.supported_stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+        coop_matrix_capabilities.subgroup_size = properties.subgroup_properties.subgroupSize;
+        coop_matrix_capabilities.min_subgroup_size =
+            extensions.subgroup_size_control ? properties.subgroup_size_control.minSubgroupSize
+                                             : properties.subgroup_properties.subgroupSize;
+        coop_matrix_capabilities.max_subgroup_size =
+            extensions.subgroup_size_control ? properties.subgroup_size_control.maxSubgroupSize
+                                             : properties.subgroup_properties.subgroupSize;
+        coop_matrix_capabilities.shapes.reserve(raw_shapes.size());
+        for (const VkCooperativeMatrixPropertiesKHR& shape : raw_shapes) {
+            coop_matrix_capabilities.shapes.push_back(CoopMatrixShape{
+                .m = shape.MSize,
+                .n = shape.NSize,
+                .k = shape.KSize,
+                .a_type = shape.AType,
+                .b_type = shape.BType,
+                .c_type = shape.CType,
+                .result_type = shape.ResultType,
+                .saturating_accumulation = shape.saturatingAccumulation != VK_FALSE,
+                .scope = shape.scope,
             });
+            const bool is_fp16_subgroup = shape.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                          shape.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                          shape.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                          shape.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                          shape.saturatingAccumulation == VK_FALSE &&
+                                          shape.scope == VK_SCOPE_SUBGROUP_KHR;
+            if (!is_fp16_subgroup) {
+                continue;
+            }
+            if (shape.MSize == 16 && shape.NSize == 8 && shape.KSize == 16) {
+                coop_matrix_capabilities.has_fp16_16x8x16 = true;
+            } else if (shape.MSize == 16 && shape.NSize == 16 && shape.KSize == 16) {
+                coop_matrix_capabilities.has_fp16_16x16x16 = true;
+            } else if (shape.MSize == 8 && shape.NSize == 16 && shape.KSize == 16) {
+                coop_matrix_capabilities.has_fp16_8x16x16 = true;
+            }
+        }
+        if (coop_matrix_capabilities.has_fp16_16x8x16) {
+            coop_matrix_capabilities.preferred_m = 16;
+            coop_matrix_capabilities.preferred_n = 8;
+            coop_matrix_capabilities.preferred_k = 16;
+        } else if (coop_matrix_capabilities.has_fp16_16x16x16) {
+            coop_matrix_capabilities.preferred_m = 16;
+            coop_matrix_capabilities.preferred_n = 16;
+            coop_matrix_capabilities.preferred_k = 16;
+        } else if (coop_matrix_capabilities.has_fp16_8x16x16) {
+            coop_matrix_capabilities.preferred_m = 8;
+            coop_matrix_capabilities.preferred_n = 16;
+            coop_matrix_capabilities.preferred_k = 16;
+        }
+
+        const bool has_shape = coop_matrix_capabilities.has_fp16_16x8x16;
         extensions.cooperative_matrix =
-            extensions.cooperative_matrix && features.cooperative_matrix.cooperativeMatrix &&
-            has_shape &&
+            extensions.cooperative_matrix &&
+            features.cooperative_matrix.cooperativeMatrix != VK_FALSE && has_shape &&
             (properties.cooperative_matrix.cooperativeMatrixSupportedStages &
              VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
             (properties.subgroup_properties.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
@@ -1672,10 +1725,10 @@ void Device::RemoveUnsuitableExtensions() {
             extensions.subgroup_size_control &&
             properties.subgroup_size_control.minSubgroupSize == GuestWarpSize &&
             properties.subgroup_size_control.maxSubgroupSize == GuestWarpSize &&
-            features.subgroup_size_control.computeFullSubgroups &&
-            features.vulkan_memory_model.vulkanMemoryModel &&
-            features.vulkan_memory_model.vulkanMemoryModelDeviceScope &&
-            features.shader_float16_int8.shaderFloat16;
+            features.subgroup_size_control.computeFullSubgroups != VK_FALSE &&
+            features.vulkan_memory_model.vulkanMemoryModel != VK_FALSE &&
+            features.vulkan_memory_model.vulkanMemoryModelDeviceScope != VK_FALSE &&
+            features.shader_float16_int8.shaderFloat16 != VK_FALSE;
         features.cooperative_matrix.cooperativeMatrixRobustBufferAccess = VK_FALSE;
         RemoveExtensionFeatureIfUnsuitable(extensions.cooperative_matrix,
                                            features.cooperative_matrix,
@@ -1726,9 +1779,26 @@ void Device::RemoveUnsuitableExtensions() {
     RemoveExtensionIfUnsuitable(extensions.maintenance8, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
 
     // VK_KHR_synchronization2
-    extensions.synchronization2 = features.synchronization2.synchronization2;
+    extensions.synchronization2 = features.synchronization2.synchronization2 != VK_FALSE;
     RemoveExtensionFeatureIfUnsuitable(extensions.synchronization2, features.synchronization2,
                                        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+
+    // Optional VK_KHR_video_queue / VK_KHR_video_decode_queue / VK_KHR_video_decode_h264
+    {
+        const bool has_video_sync2 =
+            instance_version >= VK_API_VERSION_1_3 || extensions.synchronization2;
+        extensions.video_queue = extensions.video_queue && has_video_sync2;
+        RemoveExtensionIfUnsuitable(extensions.video_queue, VK_KHR_VIDEO_QUEUE_EXTENSION_NAME);
+
+        extensions.video_decode_queue = extensions.video_decode_queue && extensions.video_queue;
+        RemoveExtensionIfUnsuitable(extensions.video_decode_queue,
+                                    VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME);
+
+        extensions.video_decode_h264 =
+            extensions.video_decode_h264 && extensions.video_decode_queue;
+        RemoveExtensionIfUnsuitable(extensions.video_decode_h264,
+                                    VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME);
+    }
 }
 
 void Device::SetupFamilies(VkSurfaceKHR surface) {
@@ -1765,6 +1835,27 @@ void Device::SetupFamilies(VkSurfaceKHR surface) {
     }
     if (present) {
         present_family = *present;
+    }
+
+    video_decode_family.reset();
+    if (extensions.video_decode_queue) {
+        for (u32 index = 0; index < static_cast<u32>(queue_family_properties.size()); ++index) {
+            const VkQueueFamilyProperties& queue_family = queue_family_properties[index];
+            if (queue_family.queueCount == 0) {
+                continue;
+            }
+            if ((queue_family.queueFlags & VK_QUEUE_VIDEO_DECODE_BIT_KHR) != 0) {
+                video_decode_family = index;
+                break;
+            }
+        }
+        if (!video_decode_family) {
+            LOG_INFO(Render_Vulkan,
+                     "VK_KHR_video_decode_queue supported without video decode queue family; disabling");
+            RemoveExtension(extensions.video_decode_h264, VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME);
+            RemoveExtension(extensions.video_decode_queue,
+                            VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME);
+        }
     }
 }
 
@@ -1938,6 +2029,9 @@ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
     static constexpr float QUEUE_PRIORITY = 1.0f;
 
     ::Common::unordered_set<u32> unique_queue_families{graphics_family, present_family};
+    if (video_decode_family) {
+        unique_queue_families.insert(*video_decode_family);
+    }
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
     queue_cis.reserve(unique_queue_families.size());
 

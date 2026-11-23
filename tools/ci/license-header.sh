@@ -130,7 +130,7 @@ comment_prefix_for_file() {
         *.cmake|*.sh|*.ps1|*.py|*.rb|*.perl|*.pl|*.nix|*CMakeLists.txt)
             printf '#'
             ;;
-        *.kt|*.kts|*.cpp|*.h|*.qml|*.c|*.hpp|*.hxx|*.cxx|*.h.in|*.inc)
+        *.kt|*.kts|*.cpp|*.h|*.qml|*.c|*.hpp|*.hxx|*.cxx|*.h.in|*.inc|*.rs|*.slang|*.ispc|*.slint)
             printf '//'
             ;;
         *)

@@ -143,6 +143,35 @@ jobs:
             spirv-tools spirv-headers libusb-1.0-0-dev libboost-dev \
             libboost-fiber-dev libboost-context-dev libopus-dev libasound2-dev
 
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build artifacts (restore and save)
+        if: env.CACHE_SAVE == 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/tests/rust-target
+            rust/target
+          key: rust-v1-linux-x86_64-tests-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-linux-x86_64-tests-
+
+      - name: Cache Rust build artifacts (restore only)
+        if: env.CACHE_SAVE != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            build/tests/rust-target
+            rust/target
+          key: rust-v1-linux-x86_64-tests-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-linux-x86_64-tests-
+
+      - name: Run Rust workspace tests
+        shell: bash
+        run: cargo test --manifest-path rust/Cargo.toml --locked --offline
+
       - name: Configure tests
         shell: bash
         run: |

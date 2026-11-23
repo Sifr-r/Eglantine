@@ -7,6 +7,7 @@
 #pragma once
 
 #include "common/common_types.h"
+#include "core/file_sys/vfs/vfs_types.h"
 #include "core/loader/loader.h"
 
 namespace Core {
@@ -54,10 +55,14 @@ public:
     ResultStatus ReadLogo(std::vector<u8>& buffer) override;
 
     ResultStatus ReadNSOModules(Modules& modules) override;
+    ResultStatus ReadProgramMetadata(Core::System& system,
+                                     FileSys::ProgramMetadata& out_metadata) override;
 
     u64 GetProgramId() const;
 
 private:
+    FileSys::VirtualDir ResolveExeFS(Core::System& system, ResultStatus& out_status) const;
+
     std::unique_ptr<FileSys::NCA> nca;
     u64 update_only_program_id{};
     std::unique_ptr<FileSys::NACP> nacp;
