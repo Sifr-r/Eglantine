@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <limits>
 #include <map>
+#include <new>
 #include <numeric>
 #include <optional>
 #include <tuple>
@@ -226,8 +227,13 @@ void TextureCache<P>::RunGarbageCollector() {
             const auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
             runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
-                         swizzle_data_buffer);
+            try {
+                SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
+                             swizzle_data_buffer);
+            } catch (const std::bad_alloc&) {
+                HandleScratchAllocationFailure(image);
+                return false;
+            }
             ++gc_download_deletes;
         }
         if (True(image.flags & ImageFlagBits::Tracked)) {
@@ -2213,9 +2219,24 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
 }
 
 template <class P>
+void TextureCache<P>::HandleScratchAllocationFailure(const ImageBase& image) {
+    swizzle_data_buffer.release();
+    unswizzle_data_buffer.release();
+    if (frame_tick >= scratch_retry_frame) {
+        LOG_WARNING(HW_GPU, "Host scratch allocation failed for texture {:#x} ({} bytes)",
+                    image.gpu_addr, image.guest_size_bytes);
+    }
+    scratch_retry_frame = frame_tick + 60;
+}
+
+template <class P>
 void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     if (False(image.flags & ImageFlagBits::CpuModified)) {
         // Only upload modified images
+        return;
+    }
+    if (frame_tick < scratch_retry_frame && image.guest_size_bytes >= 64_MiB) {
+        runtime.TransitionImageLayout(image);
         return;
     }
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::TextureUpload};
@@ -2271,24 +2292,36 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         QueueAsyncUnswizzle(image, image_id);
         return;
     }
+    try {
+        bool gpu_uploaded = false;
+        if constexpr (requires { runtime.CanGpuUnswizzle(image); }) {
+            if (runtime.CanGpuUnswizzle(image)) {
+                Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzled(
+                    *gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
+                gpu_uploaded = runtime.UploadGpuUnswizzle(image, {swizzled.data(), swizzled.size()});
+            }
+        }
+        if (gpu_uploaded) {
+            runtime.InsertUploadMemoryBarrier();
+        } else if (!UploadInChunks(image)) {
+            auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+            UploadImageContents(image, staging);
+            runtime.InsertUploadMemoryBarrier();
+        }
+    } catch (const std::bad_alloc&) {
+        image.flags |= ImageFlagBits::CpuModified;
+        if (False(image.flags & ImageFlagBits::Sparse) ||
+            True(image.flags & ImageFlagBits::Registered)) {
+            UntrackImage(image, image_id);
+        }
+        HandleScratchAllocationFailure(image);
+        runtime.InsertUploadMemoryBarrier();
+        runtime.TransitionImageLayout(image);
+        return;
+    }
     ++images_uploaded;
     uploaded_bytes += image.guest_size_bytes;
     largest_upload = (std::max<u64>)(largest_upload, image.guest_size_bytes);
-    bool gpu_uploaded = false;
-    if constexpr (requires { runtime.CanGpuUnswizzle(image); }) {
-        if (runtime.CanGpuUnswizzle(image)) {
-            Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::UnsafeRead> swizzled(
-                *gpu_memory, image.gpu_addr, image.guest_size_bytes, &swizzle_data_buffer);
-            gpu_uploaded = runtime.UploadGpuUnswizzle(image, {swizzled.data(), swizzled.size()});
-        }
-    }
-    if (gpu_uploaded) {
-        runtime.InsertUploadMemoryBarrier();
-    } else if (!UploadInChunks(image)) {
-        auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
-        UploadImageContents(image, staging);
-        runtime.InsertUploadMemoryBarrier();
-    }
     // The host GPU has its own copy now and the guest rarely reads this memory again: TickFrame
     // marks it cold, so the OS pages it out before anything else when it needs RAM (title 1
     // streams several GB of textures through it).
@@ -3417,12 +3450,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         }
         const u32 width = new_info.size.width;
         const u32 height = new_info.size.height;
-        if (regs.clear_control.use_scissor != 0) {
-            const auto& scissor = regs.scissor_test[0];
-            if (scissor.min_x != 0 || scissor.min_y != 0 || scissor.max_x < width ||
-                scissor.max_y < height) {
-                return false;
-            }
+        if (!ClearCovers(width, height)) {
+            return false;
         }
         // The clear covers the framebuffer's render area, the smallest bound target.
         for (u32 index = 0; index < regs.rt_control.count && index < NUM_RT; ++index) {
@@ -3442,7 +3471,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         case VideoCore::Surface::SurfaceType::ColorTexture: {
             const u32 index = surface.RT;
             return surface.R && surface.G && surface.B && surface.A && index < NUM_RT &&
-                   index < regs.rt_control.count && regs.rt[index].Address() == gpu_addr;
+                   index < regs.rt_control.count && regs.rt_control.Map(index) == index &&
+                   regs.rt[index].Address() == gpu_addr;
         }
         case VideoCore::Surface::SurfaceType::Depth:
             return is_depth_target && surface.Z;
@@ -4761,6 +4791,33 @@ std::pair<FramebufferId, ImageViewId> TextureCache<P>::RenderTargetFromImage(
 }
 
 template <class P>
+bool TextureCache<P>::ClearCovers(u32 width, u32 height) const {
+    const auto& regs = maxwell3d->regs;
+    // Vulkan also clips clears to the framebuffer render area, which starts at
+    // surface_clip before it is intersected with the bound attachment sizes.
+    if (regs.surface_clip.width < width || regs.surface_clip.height < height) {
+        return false;
+    }
+    if (regs.clear_control.use_scissor != 0) {
+        const auto& scissor = regs.scissor_test[0];
+        if (scissor.min_x != 0 || scissor.min_y != 0 || scissor.max_x < width ||
+            scissor.max_y < height) {
+            return false;
+        }
+        using WindowOrigin = Tegra::Engines::Maxwell3D::Regs::WindowOrigin;
+        if (scissor.enable && regs.window_origin.mode != WindowOrigin::Mode::UpperLeft) {
+            // Vulkan flips Y around surface_clip.height, then clamps both bounds to zero.
+            // Require the transformed interval to start at zero and cover the new image.
+            const u32 clip_height = regs.surface_clip.height;
+            if (scissor.max_y < clip_height || clip_height - scissor.min_y < height) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+template <class P>
 bool TextureCache<P>::IsFullClear(ImageViewId id) {
     if (!id) {
         return true;
@@ -4772,19 +4829,11 @@ bool TextureCache<P>::IsFullClear(ImageViewId id) {
     }
     const ImageBase& image = slot_images[image_view.image_id];
     const Extent3D size = image_view.size;
-    const auto& regs = maxwell3d->regs;
-    const auto& scissor = regs.scissor_test[0];
     if (image.info.resources.levels > 1 || image.info.resources.layers > 1) {
         // Images with multiple resources can't be cleared in a single call
         return false;
     }
-    if (regs.clear_control.use_scissor == 0) {
-        // If scissor testing is disabled, the clear is always full
-        return true;
-    }
-    // Make sure the clear covers all texels in the subresource
-    return scissor.min_x == 0 && scissor.min_y == 0 && scissor.max_x >= size.width &&
-           scissor.max_y >= size.height;
+    return ClearCovers(size.width, size.height);
 }
 
 template <class P>

@@ -4164,6 +4164,7 @@ void MainWindow::OpenConfigureDialog(bool select_profiles) {
         !UISettings::values.reset_to_defaults) {
         // Runs if the user hit Cancel or closed the window, and did not ever press the Apply button
         // or `Reset to Defaults` button
+        configure_dialog.RestoreInputConfiguration();
         return;
     } else if (result == QDialog::Accepted) {
         // Only apply new changes if user hit Okay
@@ -4236,6 +4237,10 @@ void MainWindow::OpenConfigureDialog(bool select_profiles) {
     UISettings::values.configuration_applied = false;
 
     config->SaveAllValues();
+
+    if (result != QDialog::Accepted) {
+        configure_dialog.RestoreInputConfiguration();
+    }
 
 #ifdef ENABLE_UPDATE_CHECKER
     // Checked right away, as a switch between daily builds and tagged releases is only offered when

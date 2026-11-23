@@ -534,7 +534,8 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
 void GameListWorker::run() {
     const auto started = std::chrono::steady_clock::now();
     watch_list.clear();
-    provider->ClearAllEntries();
+    FileSys::ManualContentProvider previous;
+    provider->SwapEntries(previous);
 
     const auto DirEntryReady = [&](GameListDir* game_list_dir) {
         auto pending = std::make_shared<std::unique_ptr<GameListDir>>(game_list_dir);
@@ -587,6 +588,10 @@ void GameListWorker::run() {
         } else {
             AddTitlesToGameList(game_list_dir, parent_type);
         }
+    }
+
+    if (stop_requested) {
+        provider->SwapEntries(previous);
     }
 
     watch_list.removeDuplicates();

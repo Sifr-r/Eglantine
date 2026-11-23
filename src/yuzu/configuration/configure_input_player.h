@@ -59,6 +59,9 @@ public:
     /// Save all button configurations to settings file.
     void ApplyConfiguration();
 
+    /// Discard unapplied changes and restore the previous controller configuration.
+    void RestoreConfiguration();
+
     /// Set the connection state checkbox (used to sync state).
     void ConnectPlayer(bool connected);
 

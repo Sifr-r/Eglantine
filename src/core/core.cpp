@@ -671,7 +671,8 @@ struct System::Impl {
     /// Service manager
     std::shared_ptr<Service::SM::ServiceManager> service_manager;
     /// ContentProviderUnion instance
-    std::unique_ptr<FileSys::ContentProviderUnion> content_provider;
+    std::unique_ptr<FileSys::ContentProviderUnion> content_provider{
+        std::make_unique<FileSys::ContentProviderUnion>()};
     /// Platform profile resolved for the current session
     PlatformProfile platform_profile{MakePlatformProfile(PlatformResolution::DefaultSwitch1)};
     /// Switch 2 per-session state (nullptr on Switch 1 sessions)

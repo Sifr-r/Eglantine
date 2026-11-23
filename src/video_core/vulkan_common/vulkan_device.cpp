@@ -15,6 +15,8 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <random>
+#include <system_error>
 #include <thread>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
@@ -853,7 +855,11 @@ Device::~Device() {
         Streamline::Stop();
     }
 #endif
-    SaveStaticPipelineCache();
+    try {
+        SaveStaticPipelineCache();
+    } catch (...) {
+        // Best effort: a failed save must not stop the device teardown.
+    }
     ShutdownGPULogging();
     for (auto& pools : separate_pools) {
         for (VmaPool pool : pools) {
@@ -887,30 +893,55 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
 }
 
 void Device::LoadStaticPipelineCache() {
-    const auto create = [this](size_t size, const void* data) {
+    const auto create = [this](std::span<const char> data) {
         static_pipeline_cache = logical.CreatePipelineCache({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .initialDataSize = size,
-            .pInitialData = data,
+            .initialDataSize = data.size(),
+            .pInitialData = data.empty() ? nullptr : data.data(),
         });
     };
     if (!owns_static_pipeline_cache) {
-        create(0, nullptr);
+        create({});
         return;
     }
-    const auto filename = StaticPipelineCacheFilename();
+    // Device can outlive the path manager during process teardown.
+    static_pipeline_cache_filename = StaticPipelineCacheFilename();
+    const auto& filename = static_pipeline_cache_filename;
     if (filename.empty()) {
-        create(0, nullptr);
+        create({});
         return;
     }
+    CreateStaticPipelineCache(ReadStaticPipelineCache(filename), create);
+}
+
+void Device::SaveStaticPipelineCache() const {
+    if (!owns_static_pipeline_cache || !static_pipeline_cache) {
+        return;
+    }
+    const auto& filename = static_pipeline_cache_filename;
+    if (filename.empty()) {
+        return;
+    }
+    size_t size = 0;
+    std::vector<char> data;
+    if (static_pipeline_cache.Read(&size, nullptr) != VK_SUCCESS || size == 0) {
+        return;
+    }
+    data.resize(size);
+    if (static_pipeline_cache.Read(&size, data.data()) != VK_SUCCESS) {
+        return;
+    }
+    WriteStaticPipelineCache(filename, std::span{data}.first(size));
+}
+
+std::vector<char> ReadStaticPipelineCache(const std::filesystem::path& filename) {
     std::vector<char> data;
     try {
         std::ifstream file(filename, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
-            create(0, nullptr);
-            return;
+            return {};
         }
         file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
         const size_t total = static_cast<size_t>(file.tellg());
@@ -918,52 +949,73 @@ void Device::LoadStaticPipelineCache() {
         std::array<char, 8> magic{};
         u32 version{};
         if (total < magic.size() + sizeof(version)) {
-            create(0, nullptr);
-            return;
+            return {};
         }
         file.read(magic.data(), magic.size())
             .read(reinterpret_cast<char*>(&version), sizeof(version));
         if (magic != STATIC_CACHE_MAGIC_NUMBER || version != STATIC_CACHE_VERSION) {
-            create(0, nullptr);
-            return;
+            return {};
         }
         data.resize(total - magic.size() - sizeof(version));
         file.read(data.data(), static_cast<std::streamsize>(data.size()));
-    } catch (const std::ios_base::failure& e) {
-        create(0, nullptr);
-        return;
+    } catch (const std::ios_base::failure&) {
+        return {};
     }
-    create(data.size(), data.empty() ? nullptr : data.data());
+    return data;
 }
 
-void Device::SaveStaticPipelineCache() const {
-    if (!owns_static_pipeline_cache || !static_pipeline_cache) {
-        return;
-    }
-    const auto filename = StaticPipelineCacheFilename();
-    if (filename.empty()) {
-        return;
-    }
-    size_t size = 0;
-    std::vector<char> data;
-    static_pipeline_cache.Read(&size, nullptr);
-    if (size == 0) {
-        return;
-    }
-    data.resize(size);
-    static_pipeline_cache.Read(&size, data.data());
+bool WriteStaticPipelineCache(const std::filesystem::path& filename, std::span<const char> data) {
+    return WriteStaticPipelineCache(filename, data, [] {
+        // Unique per writer: two instances saving at once each rename a whole file.
+        std::random_device random;
+        return fmt::format(".{:08x}{:08x}.tmp", random(), random());
+    });
+}
+
+bool WriteStaticPipelineCache(const std::filesystem::path& filename, std::span<const char> data,
+                              const std::function<std::string()>& unique_suffix) {
+    auto temporary = filename;
     try {
-        std::ofstream file(filename, std::ios::binary | std::ios::trunc);
-        file.exceptions(std::ofstream::failbit);
-        if (!file.is_open()) {
-            return;
-        }
+        temporary += unique_suffix();
+    } catch (const std::exception& e) {
+        LOG_ERROR(Render_Vulkan, "Couldn't name a temporary static pipeline cache: {}", e.what());
+        return false;
+    }
+    try {
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        file.exceptions(std::ofstream::failbit | std::ofstream::badbit);
         file.write(STATIC_CACHE_MAGIC_NUMBER.data(), STATIC_CACHE_MAGIC_NUMBER.size())
             .write(reinterpret_cast<const char*>(&STATIC_CACHE_VERSION),
                    sizeof(STATIC_CACHE_VERSION))
-            .write(data.data(), static_cast<std::streamsize>(size));
-    } catch (const std::ios_base::failure& e) {
-        Common::FS::RemoveFile(filename);
+            .write(data.data(), static_cast<std::streamsize>(data.size()));
+        file.close();
+    } catch (const std::ios_base::failure&) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return false;
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, filename, error);
+    if (error) {
+        LOG_ERROR(Render_Vulkan, "Couldn't replace the static pipeline cache: {}", error.message());
+        Common::FS::RemoveFile(temporary);
+        return false;
+    }
+    return true;
+}
+
+void CreateStaticPipelineCache(std::span<const char> data,
+                               const std::function<void(std::span<const char>)>& create) {
+    if (data.empty()) {
+        create({});
+        return;
+    }
+    try {
+        create(data);
+    } catch (const vk::Exception& e) {
+        LOG_ERROR(Render_Vulkan, "Driver rejected the static pipeline cache ({}), starting empty",
+                  e.what());
+        create({});
     }
 }
 
@@ -1415,13 +1467,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
     // Intel Windows < 27.20.100.0: Broken VertexInputDynamicState
     // Same for NVIDIA Proprietary < 580.119.02, unknown when VIDS was first NOT broken
     // Disable VertexInputDynamicState on old Intel Windows drivers
-    if (extensions.vertex_input_dynamic_state) {
-        const u32 version = (properties.properties.driverVersion << 3) >> 3;
-        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && version < VK_MAKE_API_VERSION(27, 20, 100, 0))
-        || (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && version < VK_MAKE_API_VERSION(580, 119, 02, 0))) {
-            LOG_WARNING(Render_Vulkan, "Disabling broken VK_EXT_vertex_input_dynamic_state");
-            RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
-        }
+    if (extensions.vertex_input_dynamic_state &&
+        HasBrokenVertexInputDynamicState(driver_id, properties.properties.driverVersion)) {
+        LOG_WARNING(Render_Vulkan, "Disabling broken VK_EXT_vertex_input_dynamic_state");
+        RemoveExtensionFeature(extensions.vertex_input_dynamic_state,
+                               features.vertex_input_dynamic_state,
+                               VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     }
 
     if (u32(Settings::values.dyna_state.GetValue()) == 0) {

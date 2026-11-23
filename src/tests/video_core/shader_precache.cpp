@@ -230,7 +230,7 @@ TEST_CASE("ShaderPrecache: programs that cannot be lowered are refused", "[video
 
 TEST_CASE("ShaderPrecache: SM86 warm entries store blobs keyed by ComputeNativeDiscoveryHash",
           "[video_core]") {
-    REQUIRE(ShaderWarm::WarmCacheVersion == 35);
+    REQUIRE(ShaderWarm::WarmCacheVersion == 36);
     REQUIRE(ShaderWarm::WarmBuilderVersion == 4);
 
     constexpr Shader::Ampere::Instruction exit_insn{{0x0000794dU, 0U, 0x03800000U, 0U}};

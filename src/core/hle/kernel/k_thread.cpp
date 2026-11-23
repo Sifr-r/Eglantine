@@ -446,14 +446,17 @@ namespace Kernel {
             }
         }
 
-        // Acquire the scheduler lock.
-        KScopedSchedulerLock sl{kernel};
+        {
+            // Acquire the scheduler lock.
+            KScopedSchedulerLock sl{kernel};
 
-        // Signal.
-        m_signaled = true;
-        KSynchronizationObject::NotifyAvailable(kernel);
+            // Signal.
+            m_signaled = true;
+            KSynchronizationObject::NotifyAvailable(kernel);
+        }
 
-        // Close the thread.
+        // Close the thread after releasing the scheduler lock, since destroying it
+        // may acquire process locks.
         this->Close(kernel);
     }
 

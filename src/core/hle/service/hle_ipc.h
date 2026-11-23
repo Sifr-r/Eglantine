@@ -22,6 +22,7 @@
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/concepts.h"
+#include "common/scratch_buffer.h"
 #include "common/swap.h"
 #include "core/hle/ipc.h"
 #include "core/hle/kernel/k_handle_table.h"
@@ -318,6 +319,10 @@ public:
 
     /// Helper function to get the size of the input buffer
     [[nodiscard]] std::size_t GetReadBufferSize(std::size_t buffer_index = 0) const;
+
+    /// Helper function to read the guest's output buffer into scratch memory
+    void ReadOutputBuffer(Common::ScratchBuffer<u8>& output, bool use_buffer_b,
+                          std::size_t buffer_index) const;
 
     /// Helper function to get the size of the output buffer
     [[nodiscard]] std::size_t GetWriteBufferSize(std::size_t buffer_index = 0) const;

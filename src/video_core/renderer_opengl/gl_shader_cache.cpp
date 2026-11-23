@@ -57,7 +57,7 @@ using VideoCommon::LoadPipelines;
 using VideoCommon::SerializePipeline;
 using Context = ShaderContext::Context;
 
-constexpr u32 CACHE_VERSION = 29;
+constexpr u32 CACHE_VERSION = 30;
 
 template <typename Container>
 auto MakeSpan(Container& container) {

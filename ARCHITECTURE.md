@@ -68,7 +68,7 @@ and parity switches. Five `std`-only Cargo crates (zero external `crates.io` dep
   * `core` links `PUBLIC eglantine_rs zstd::zstd` (`EGLANTINE_ENABLE_RUST_NUP=1`).
   * `input_common` links `PUBLIC eglantine_rs` (`EGLANTINE_ENABLE_RUST_SWITCH2_IO=1`).
   * `src/CMakeLists.txt` loads `src/simd_kernels` before `core`/`audio_core`/`video_core` via `CMakeModules/AddIspcKernel.cmake`; `video_core` links `PRIVATE simd_kernels` (`EGLANTINE_ENABLE_ISPC=1` when `ispc` is found; empty `INTERFACE` no-op with scalar C++ fallback otherwise) and `PUBLIC xbyak::xbyak` (`x86_64`) / `PUBLIC merry::oaknut` (`arm64` for `TuringMacroJit`).
-  * `tests` links `common`, `core`, `input_common`, `video_core`, and `eglantine_rs`.
+  * `tests` links `common`, `core`, `frontend_common`, `input_common`, `video_core`, `eglantine_rs`, and (when `ENABLE_QT`) `qt_common`.
 * **Flat C ABI boundary:** Every Rust <-> C++ crossing uses `#[repr(C)]` POD structs, primitives, and callback tables declared in `rust/include/*.h`. All Rust domain modules enforce `#![deny(warnings)]` and `#![forbid(unsafe_code)]`, isolating pointer/alignment validation, `catch_unwind`, and idempotent `*_free` helpers inside `ffi.rs`.
 * **Slang & ISPC host-shader scaffolding:** `src/video_core/host_shaders/CMakeLists.txt` optionally compiles `hmma_tiled_fallback.slang` and `nv12_to_block_linear.slang` when `slangc` is on `PATH` (skipping cleanly when absent). `src/simd_kernels/*.ispc` (`tex_etc2.ispc`, `tex_astc_scan.ispc`, `tex_swizzle.ispc`, `audio_mix.ispc`) compile multi-ISA (`sse4-i32x4,avx2-i32x8,avx512skx-i32x16` / `neon-i32x4`) behind `EGLANTINE_ENABLE_ISPC`.
 * **Runtime switches:** `EDEN_NX2_RUST_AMPERE`, `EDEN_NX2_DIRECT_SM86`, `EDEN_NX2_RUST_NUP`, `EDEN_NX2_RUST_SWITCH2_IO`, `EDEN_NX2_ISPC` (plus `*_VERIFY=1` differential modes), `EDEN_NX2_VK_VIDEO=1`, and `EDEN_NX2_DRAW_CACHE`. Temporal upscaling shares `Vulkan::ITemporalUpscaler` (`src/video_core/renderer_vulkan/vk_temporal_upscaler.h`) with runtime fallback `DLSS -> XeSS -> FSR 3.1 -> temporal stand-in` (`vk_xess_upscaler.{h,cpp}`).
@@ -219,6 +219,12 @@ convention.
 * **NVMap pin failures.** `NvMap::PinHandle` rejects handles whose session has closed
   before allocating a new mapping. GPU and display callers check the pin result before
   using its address or publishing a preallocated buffer.
+* **Guest timing, Dynarmic code invalidation, thread teardown, CMIF tails, and NUP/provider safety.**
+  * `CoreTiming::GetClockTicks()` (`src/core/core_timing.cpp`) keeps the Switch 2 guest counter on its fixed 31.25 MHz rate across `cpu_clock` Boost/Overclock while retaining Switch 1 scaling; covered by `src/tests/core/core_timing.cpp` (`[guest_counter]`).
+  * `ArmDynarmic64::ClearInstructionCache()` / `InvalidateCacheRange()` (`src/core/arm/dynarmic/arm_dynarmic_64.{h,cpp}`) advance an atomic `code_generation` counter checked by `DynarmicCallbacks64::MemoryReadCode()` rather than racing on `last_code_addr`.
+  * `KThread::FinishTermination()` (`src/core/hle/kernel/k_thread.cpp`) drops `KScopedSchedulerLock` after signaling/notifying before calling `this->Close(kernel)`; covered by `src/tests/core/kernel_finish_termination.cpp`.
+  * `HLERequestContext::ReadOutputBuffer()` (`src/core/hle/service/hle_ipc.{h,cpp}`) prefills `cmif_serialization.h` `OutBuffer` scratch coherently from the selected B/C descriptor so partial writes preserve guest tail bytes; covered by `src/tests/core/cmif_out_buffer.cpp`.
+  * `Core::System::Impl::content_provider` starts initialized with an empty `FileSys::ContentProviderUnion` (`src/core/core.cpp`), `ManualContentProvider::SwapEntries()` (`src/core/file_sys/registered_cache.{h,cpp}`) exchanges `entries` and `multi_version_entries` atomically (`src/tests/core/content_provider_init.cpp`), and `AppLoader_NUP` (`src/core/loader/nup.cpp`, `WithPlatformOf` in `src/core/file_sys/common_funcs.h`) preserves a native Switch 2 base ExeFS when paired with a legacy update (`src/tests/core/nup_writer.cpp`).
 
 ### `common` — host memory
 
@@ -235,6 +241,9 @@ convention.
   pre-commits ranges passed to external drivers (`Vulkan::HostImporter`), `Release()` is idempotent
   on partial `Init()` failure, move operations transfer/clear fallback ownership, and Windows fallback
   teardown calls `VirtualFree(backing_base, 0, MEM_RELEASE)`.
+* **Scratch buffer OOM safety.** `Common::ScratchBuffer::resize_destructive()` (`src/common/scratch_buffer.h`)
+  calls `release()` before allocating and updates `buffer_capacity` only after allocation succeeds;
+  covered by `src/tests/common/scratch_buffer.cpp` (`[scratch_oom]`).
 
 ### `video_core` — the GPU
 
@@ -264,11 +273,17 @@ convention.
 * `VideoCore::TextureCache` owns every host image. `ImageBase` carries the per-image
   bookkeeping; `first_written_frame`, `last_written_frame` and `cleared_frame` are the
   frame counters the render-target predicates read (`RedrawnEveryFrame`,
-  `HasRecentPriorFrameOutput`).
+  `HasRecentPriorFrameOutput`). `TextureCache::ClearCovers()` checks `surface_clip` and
+  lower-left `WindowOrigin` flipped scissors for both `IsFullClear()` (retaining the
+  `RenderSubExtent` guard) and `JoinImages()` clear-skipping (`src/tests/video_core/texture_clear_covers.cpp`);
+  `TextureCache::HandleScratchAllocationFailure()` rolls back failed uploads and keeps
+  GC-evicted images registered on `std::bad_alloc`. Inline I2M uploads
+  (`src/video_core/engines/engine_upload.cpp`) pass `memory_manager.UsesNativeTiling()` to
+  `SwizzleSubrect` (`src/tests/video_core/texture_swizzle.cpp`).
 * `VideoCore::PipelineCache` (`src/video_core/renderer_vulkan/vk_pipeline_cache.cpp`) owns
-  the graphics pipeline cache, its disk format (`CACHE_VERSION`, currently `35`, matching
-  `WarmCacheVersion = 35`, with `MIN_COMPATIBLE_CACHE_VERSION = 20` on Switch 1 and
-  `MIN_COMPATIBLE_NX2_CACHE_VERSION = 35` on Switch 2; OpenGL shader cache `CACHE_VERSION = 29`)
+  the graphics pipeline cache, its disk format (`CACHE_VERSION`, currently `36`, matching
+  `WarmCacheVersion = 36`, with `MIN_COMPATIBLE_CACHE_VERSION = 20` on Switch 1 and
+  `MIN_COMPATIBLE_NX2_CACHE_VERSION = 36` on Switch 2; OpenGL shader cache `CACHE_VERSION = 30`)
   and asynchronous shader build. `src/video_core/renderer_vulkan/draw_skip_policy.h`
   (`EvaluateDrawSkip`) defines the single skip contract shared by `BuiltPipeline`,
   `CanSkipDraw` (async translation), `DeferRuntimeBuild` (build budget), and
@@ -276,6 +291,16 @@ convention.
   unskippable draws). Geometry consistency preserves depth-only draws that count occlusion
   samples or may write shader memory. Non-indexed draws without vertex stream 0 are excluded
   from geometry matching.
+* **Vulkan scaling, driver version checks, enumeration, and static pipeline cache.**
+  `Vulkan::Image::BlitScaleHelper()` (`src/video_core/renderer_vulkan/vk_texture_cache.{h,cpp}`)
+  uses distinct source/target views (`normal_view`/`scale_view`), destination extent, and
+  `dst_undefined` layout barriers. `Vulkan::Device::HasBrokenVertexInputDynamicState()` decodes
+  NVIDIA proprietary versions via `MakeNvidiaDriverVersion()`, `Device::~Device()` guards
+  `SaveStaticPipelineCache()` against exceptions, `WriteStaticPipelineCache()` saves atomically
+  through a sibling temp file + rename (`src/video_core/vulkan_common/vulkan_device.{h,cpp}`),
+  and `Vulkan::vk::Instance::EnumeratePhysicalDevices()` retries `VK_INCOMPLETE` via
+  `Enumerate<VkPhysicalDevice>` (`src/video_core/vulkan_common/vulkan_wrapper.cpp`); covered by
+  `src/tests/video_core/vulkan_device_version.cpp` and `vulkan_static_cache.cpp`.
 * Renderers: `renderer_vulkan/` (the default), `renderer_opengl/`, `renderer_null/`.
 * `src/video_core/gpu_split.h` separates front-thread ring bookkeeping and the back-thread
   engine pointer at 128-byte boundaries. The shared atomics retain their own alignment.
@@ -369,10 +394,10 @@ a change to the wire format has to land in both.
   `LowerToMaxwell` thread-safe and lazy with an observable invocation counter
   (`ResetLowerToMaxwellInvocationCount` / `LowerToMaxwellInvocationCount`). `ComputeNativeDiscoveryHash`
   and `PackNativeSm86Blob` / `TryUnpackNativeSm86Blob` align warm compute precache entries
-  (`WarmCacheVersion = 35`, `WarmBuilderVersion = 4` in `src/video_core/shader_warm/warm_records.{h,cpp}`
+  (`WarmCacheVersion = 36`, `WarmBuilderVersion = 4` in `src/video_core/shader_warm/warm_records.{h,cpp}`
   and `shader_warm_builder.cpp`) with runtime discovery keys, while `Vulkan::PipelineCache`
-  (`src/video_core/renderer_vulkan/vk_pipeline_cache.{h,cpp}`, `CACHE_VERSION = 35`, OpenGL
-  `CACHE_VERSION = 29`) gates direct compilation via `DirectSm86SupportsStage` (`Compute` only),
+  (`src/video_core/renderer_vulkan/vk_pipeline_cache.{h,cpp}`, `CACHE_VERSION = 36`, OpenGL
+  `CACHE_VERSION = 30`) gates direct compilation via `DirectSm86SupportsStage` (`Compute` only),
   invokes `TryCompileDirectSm86` before Maxwell CFG/lowering on cold and warm SM86 compute shaders
   (`0` `LowerToMaxwell` calls), tracks compute `native_key` (`ComputePipeline::NativeKey()` /
   `BuildsUnoptimized` in `vk_compute_pipeline.{h,cpp}` and `pipeline_optimization.h`), and defers
@@ -385,6 +410,14 @@ a change to the wire format has to land in both.
   `out.error == nullptr` / `out.error_len == 0` on graceful `FallbackToMaxwell`; covered by
   `src/tests/video_core/ampere_lazy_lowering.cpp`, `ampere_direct_spirv.cpp`, `shader_precache.cpp`,
   and `shader_precache_identity.cpp`.
+* **Shader IR edge invariants (`src/shader_recompiler/`).** `ConstantPropagationPass` handles
+  zero-width and 32-bit `BitFieldUExtract` without shifting by 32
+  (`src/shader_recompiler/ir_opt/constant_propagation_pass.cpp`), `TexturePass::TryGetConstBuffer()`
+  tracks `CompositeExtractU32x2` word byte offsets (`src/shader_recompiler/ir_opt/texture_pass.cpp`),
+  `IR::Inst::SetArg()` / `AddPhiOperand()` resolve immediate `Phi` operands before DCE
+  (`src/shader_recompiler/frontend/ir/microinstruction.cpp`), and SPIR-V `PatchPhiNodes()` rejects
+  missing definitions (`src/shader_recompiler/backend/spirv/emit_spirv.cpp`); covered by
+  `src/tests/video_core/shader_ir_edges.cpp`.
 
 ### `input_common` — controllers
 
@@ -475,10 +508,18 @@ The executables have an `.exe` suffix on Windows.
 Both read `qt-config.ini` / `sdl2-config.ini` from the config directory. The Qt file
 usually binds a gamepad; the SDL file binds the keyboard by default.
 
-`src/qt_common/config/qt_config.cpp` persists shortcuts under their group and action names.
+`src/qt_common/config/qt_config.cpp` persists shortcuts under their group and action names
+and reloads multiplayer username and IP ban lists from their indexed keys (`src/tests/qt_common/qt_config_ban_list.cpp`).
 An empty binding can be an explicit override of the default. Android's game scanner and
 launch-by-URI handler share the extension allowlist in `model/Game.kt`. The native NUP
 loader publishes a program ID once the selected ExeFS contains both `main` and `main.npdm`.
+
+* **INI persistence, play time, rescan rollback, startup probe, and input cancel rollback.**
+  * `Config::WriteToIni()` (`src/frontend_common/config.cpp`) writes through a unique sibling temporary file, flushes and syncs (`_commit` on Windows, `fsync` + parent dir sync on POSIX), preserves target permissions, and atomically renames into place (`src/tests/frontend_common/config_persistence.cpp`).
+  * `PlayTime::PlayTimeManager` (`src/frontend_common/play_time_manager.{h,cpp}`) tracks a `modified` flag under `database_mutex`, stops its background thread before checking `modified` on destruction, and skips writing `playtime.bin` when nothing changed (`src/tests/frontend_common/play_time.cpp`).
+  * `GameListWorker::run()` (`src/qt_common/game_list/worker.cpp`) preserves prior `ManualContentProvider` entries via `SwapEntries()` and restores them if a rescan is cancelled.
+  * Windows `SpawnChild()` (`src/yuzu/startup_checks.cpp`) probes Vulkan using Unicode `GetModuleFileNameW` and `CreateProcessW`.
+  * `MainWindow::OnConfigure()` / `ConfigureDialog::RestoreInputConfiguration()` (`src/yuzu/main_window.cpp`, `src/yuzu/configuration/configure_{dialog,input,input_player}.{h,cpp}`) revert unapplied controller edits via `EmulatedController::RestoreConfig()` on Cancel (including Apply-then-Cancel).
 
 Qt's legacy-data migration runs before frontend initialization. `src/yuzu/migration_worker.cpp`
 validates source and destination directories, transfers data, and rewrites local storage paths

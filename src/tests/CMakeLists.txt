@@ -43,10 +43,12 @@ add_executable(tests
     common/ring_buffer.cpp
     common/scratch_buffer.cpp
     common/slot_vector.cpp
-    common/undefined_fix.cpp
     common/unique_function.cpp
     common/zstd_compression.cpp
+    core/cmif_out_buffer.cpp
+    core/content_provider_init.cpp
     core/core_timing.cpp
+    core/kernel_finish_termination.cpp
     core/key_code_map.cpp
     core/launch_params.cpp
     core/ldn.cpp
@@ -125,6 +127,12 @@ add_executable(tests
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
     video_core/ocarina_upscale.cpp
+    video_core/shader_ir_edges.cpp
+    video_core/texture_clear_covers.cpp
+    video_core/vulkan_device_version.cpp
+    video_core/vulkan_static_cache.cpp
+    frontend_common/config_persistence.cpp
+    frontend_common/play_time.cpp
     input_common/calibration_configuration_job.cpp
     network/packet_bounds.cpp
     network/room_information.cpp
@@ -141,12 +149,10 @@ create_target_directory_groups(tests)
 if (ENABLE_UPDATE_CHECKER)
     target_sources(tests PRIVATE
         common/update_checker.cpp
-        common/update_installer.cpp
-        ../frontend_common/update_checker.cpp
-        ../frontend_common/update_installer.cpp)
+        common/update_installer.cpp)
 endif()
 
-target_link_libraries(tests PRIVATE common core input_common video_core)
+target_link_libraries(tests PRIVATE common core frontend_common input_common video_core)
 if (TARGET eglantine_rs)
     target_link_libraries(tests PRIVATE eglantine_rs)
 endif()
@@ -154,6 +160,11 @@ endif()
 if (ENABLE_MCP_SERVER)
     target_sources(tests PRIVATE mcp/protocol.cpp)
     target_link_libraries(tests PRIVATE mcp)
+endif()
+if (ENABLE_QT)
+    target_sources(tests PRIVATE qt_common/qt_config_ban_list.cpp)
+    target_link_libraries(tests PRIVATE qt_common Qt6::Core SimpleIni::SimpleIni)
+    add_test(NAME qt_config_ban_list COMMAND tests "[qt_config]")
 endif()
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
