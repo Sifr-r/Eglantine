@@ -13,6 +13,12 @@ public:
     void ReloadAllValues() override;
     void SaveAllValues() override;
 
+    static bool ReadToolValues(const std::string& path);
+
+private:
+    SdlConfig() : save_on_destroy(false) {}
+    bool save_on_destroy{true};
+
 protected:
     void ReadSdlValues();
     void ReadSdlPlayerValues(std::size_t player_index);

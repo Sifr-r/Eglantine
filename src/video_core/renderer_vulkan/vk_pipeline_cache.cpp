@@ -143,14 +143,6 @@ void EnsureEnvironmentLowered(Shader::Environment& env, bool has_generic_envs) {
     }
 }
 
-bool EnvironmentHasNativeInstructions(const Shader::Environment& env,
-                                      bool has_generic_envs) noexcept {
-    if (has_generic_envs) {
-        return static_cast<const GenericEnvironment&>(env).IsNativeProgram();
-    }
-    return static_cast<const FileEnvironment&>(env).HasNativeInstructions();
-}
-
 bool DirectSm86Enabled() noexcept {
     return IsDirectSm86Enabled();
 }
@@ -633,65 +625,8 @@ DirectSm86CompileResult CompileComputeStageImpl(
     }
     return result;
 }
-
-template <typename Env>
-DirectSm86CompileResult CompileGraphicsStageImpl(
-    ShaderPools& pools, Env& env, const Shader::Profile& profile,
-    const Shader::HostTranslateInfo& host_info, const Shader::RuntimeInfo& runtime_info,
-    Shader::Backend::Bindings bindings, size_t stage_program_index, bool uses_vertex_a,
-    bool mesh_unsupported, bool has_geometry) {
-    DirectSm86CompileResult result;
-    result.bindings = bindings;
-    bool has_native = false;
-    if constexpr (std::is_same_v<Env, FileEnvironment>) {
-        has_native = env.HasNativeInstructions();
-    } else {
-        has_native = env.IsNativeProgram();
-    }
-    if (has_native && profile.supported_spirv >= 0x00010600U &&
-        DirectSm86SupportsStage(env.ShaderStage()) &&
-        IsDirectSm86GraphicsStageEligible(env, stage_program_index, uses_vertex_a,
-                                          mesh_unsupported, has_geometry,
-                                          host_info.support_viewport_index_layer)) {
-        result.compiled_direct = TryCompileDirectSm86(
-            env, profile, host_info, result.bindings, result.info, result.spirv, true);
-    }
-    if (!result.compiled_direct) {
-        env.EnsureLoweredNative();
-        const u32 cfg_offset{
-            static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-        Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, cfg_offset,
-                                       stage_program_index == 0};
-        auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
-        ConvertLegacyToGeneric(program, runtime_info);
-        result.spirv = EmitSPIRV(profile, runtime_info, program, result.bindings);
-        result.info = std::move(program.info);
-    }
-    return result;
-}
 } // namespace
 
-bool IsDirectSm86GraphicsStageEligible(const Shader::Environment& env, size_t stage_program_index,
-                                       bool uses_vertex_a, bool mesh_unsupported, bool has_geometry,
-                                       bool supports_viewport_index_layer) noexcept {
-    if (!DirectSm86Enabled() || !env.IsNativeProgram() || mesh_unsupported || has_geometry) {
-        return false;
-    }
-    const Shader::Stage stage = env.ShaderStage();
-    if (uses_vertex_a && (stage == Shader::Stage::VertexA || stage == Shader::Stage::VertexB)) {
-        return false;
-    }
-    if (!supports_viewport_index_layer &&
-        stage_program_index == static_cast<size_t>(Maxwell::ShaderType::VertexB)) {
-        return false;
-    }
-    if (stage != Shader::Stage::VertexB && stage != Shader::Stage::Fragment) {
-        return false;
-    }
-    return stage_program_index == static_cast<size_t>(Maxwell::ShaderType::VertexB) ||
-           stage_program_index == static_cast<size_t>(Maxwell::ShaderType::Pixel);
-}
-
 DirectSm86CompileResult CompileComputeStageWithLazyFallback(
     ShaderPools& pools, GenericEnvironment& env, const Shader::Profile& profile,
     const Shader::HostTranslateInfo& host_info, u32 max_shared_memory, u64 unique_hash) {
@@ -702,26 +637,6 @@ DirectSm86CompileResult CompileComputeStageWithLazyFallback(
     ShaderPools& pools, FileEnvironment& env, const Shader::Profile& profile,
     const Shader::HostTranslateInfo& host_info, u32 max_shared_memory, u64 unique_hash) {
     return CompileComputeStageImpl(pools, env, profile, host_info, max_shared_memory, unique_hash);
-}
-
-DirectSm86CompileResult CompileGraphicsStageWithLazyFallback(
-    ShaderPools& pools, GenericEnvironment& env, const Shader::Profile& profile,
-    const Shader::HostTranslateInfo& host_info, const Shader::RuntimeInfo& runtime_info,
-    Shader::Backend::Bindings bindings, size_t stage_program_index, bool uses_vertex_a,
-    bool mesh_unsupported, bool has_geometry) {
-    return CompileGraphicsStageImpl(pools, env, profile, host_info, runtime_info, bindings,
-                                    stage_program_index, uses_vertex_a, mesh_unsupported,
-                                    has_geometry);
-}
-
-DirectSm86CompileResult CompileGraphicsStageWithLazyFallback(
-    ShaderPools& pools, FileEnvironment& env, const Shader::Profile& profile,
-    const Shader::HostTranslateInfo& host_info, const Shader::RuntimeInfo& runtime_info,
-    Shader::Backend::Bindings bindings, size_t stage_program_index, bool uses_vertex_a,
-    bool mesh_unsupported, bool has_geometry) {
-    return CompileGraphicsStageImpl(pools, env, profile, host_info, runtime_info, bindings,
-                                    stage_program_index, uses_vertex_a, mesh_unsupported,
-                                    has_geometry);
 }
 
 namespace {
@@ -3245,24 +3160,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     using StageCache = VideoCommon::StageCache;
     const bool cache_stages{stage_cache.Enabled() && !uses_vertex_a};
     std::array<Shader::Environment*, Maxwell::MaxShaderProgram> stage_envs{};
-    std::array<bool, Maxwell::MaxShaderProgram> defer_to_direct{};
-    {
-        size_t check_env_index{0};
-        for (size_t index = 0; index < Maxwell::MaxShaderProgram; ++index) {
-            if (key.unique_hashes[index] == 0) {
-                continue;
-            }
-            const Shader::Environment& stage_env{*envs[check_env_index++]};
-            if (profile.supported_spirv >= 0x00010600U &&
-                DirectSm86SupportsStage(stage_env.ShaderStage()) &&
-                EnvironmentHasNativeInstructions(stage_env, has_generic_envs) &&
-                IsDirectSm86GraphicsStageEligible(stage_env, index, uses_vertex_a,
-                                                  pipeline_mesh_unsupported, has_geometry,
-                                                  host_info.support_viewport_index_layer)) {
-                defer_to_direct[index] = true;
-            }
-        }
-    }
     std::array<std::shared_ptr<const StageCache::Translation>, Maxwell::MaxShaderProgram> reused{};
     std::array<std::shared_ptr<StageCache::Translation>, Maxwell::MaxShaderProgram> recorded{};
     std::vector<std::pair<std::shared_ptr<StageCache::Translation>,
@@ -3284,7 +3181,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 continue;
             }
             Shader::Environment& env{*envs[ahead_env_index++]};
-            if (defer_to_direct[index] || !env.IsNativeProgram()) {
+            if (!env.IsNativeProgram()) {
                 continue;
             }
             EnsureEnvironmentLowered(env, has_generic_envs);
@@ -3437,24 +3334,17 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
 
         stage_envs[index] = &env;
-        if (defer_to_direct[index]) {
-            programs[index].stage = env.ShaderStage();
-            programs[index].is_geometry_passthrough = false;
-            continue;
-        }
         if (!translate_fallback_stage(index, env, looked_up[index])) {
             return nullptr;
         }
     }
     translate_timer.reset();
-    size_t total_storage_buffers{};
     if (host_info.max_descriptor_set_storage_buffers != 0) {
+        size_t total_storage_buffers{};
         for (size_t index = uses_vertex_a && uses_vertex_b ? 1 : 0;
              index < Maxwell::MaxShaderProgram; ++index) {
-            if (!defer_to_direct[index]) {
-                total_storage_buffers +=
-                    Shader::NumDescriptors(programs[index].info.storage_buffers_descriptors);
-            }
+            total_storage_buffers +=
+                Shader::NumDescriptors(programs[index].info.storage_buffers_descriptors);
         }
         if (total_storage_buffers > host_info.max_descriptor_set_storage_buffers) {
             throw Shader::NotImplementedException(
@@ -3632,131 +3522,96 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
 
         std::optional<PhaseTimer> emit_timer{std::in_place, BuildPhase::Emit, build_in_parallel};
         std::vector<u32> code;
-        bool compiled_direct = false;
-        if (defer_to_direct[index] && stage_envs[index] != nullptr) {
-            Shader::Info direct_info{};
-            Shader::Backend::Bindings direct_bindings = binding;
-            if (has_generic_envs) {
-                compiled_direct = TryCompileDirectSm86(
-                    *static_cast<GenericEnvironment*>(stage_envs[index]), profile, host_info,
-                    direct_bindings, direct_info, code, true);
-            } else {
-                compiled_direct = TryCompileDirectSm86(
-                    *static_cast<FileEnvironment*>(stage_envs[index]), profile, host_info,
-                    direct_bindings, direct_info, code, true);
-            }
-            if (compiled_direct) {
-                program.info = std::move(direct_info);
-                binding = direct_bindings;
-                if (Settings::values.dump_guest_shaders) {
-                    stage_envs[index]->Dump(hash, key.unique_hashes[index]);
-                }
-            } else if (!translate_fallback_stage(index, *stage_envs[index], false)) {
-                return nullptr;
+        auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        // Mesh emulation and geometry output pruning shape the stage per pipeline beyond what
+        // the runtime key covers: those are emitted again every time.
+        const bool emulated_mesh_stage =
+            mesh_emulation &&
+            (program.stage == Shader::Stage::Mesh || program.stage == Shader::Stage::Task);
+        const bool pruned_geometry = index == static_cast<size_t>(Maxwell::ShaderType::Geometry);
+        const StageCache::Translation* const translation{
+            emulated_mesh_stage || pruned_geometry
+                ? nullptr
+                : (reused[index] ? reused[index].get() : recorded[index].get())};
+        std::vector<u8> runtime_key;
+        std::shared_ptr<const StageCache::Emitted> emitted;
+        if (translation) {
+            runtime_key = StageCache::RuntimeKey(runtime_info, binding);
+            if (reused[index]) {
+                emitted = stage_cache.FindEmitted(*reused[index], runtime_key);
             }
         }
-        if (!compiled_direct) {
-            auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
-            // Mesh emulation and geometry output pruning shape the stage per pipeline beyond what
-            // the runtime key covers: those are emitted again every time.
-            const bool emulated_mesh_stage =
-                mesh_emulation &&
-                (program.stage == Shader::Stage::Mesh || program.stage == Shader::Stage::Task);
-            const bool pruned_geometry = index == static_cast<size_t>(Maxwell::ShaderType::Geometry);
-            const StageCache::Translation* const translation{
-                emulated_mesh_stage || pruned_geometry
-                    ? nullptr
-                    : (reused[index] ? reused[index].get() : recorded[index].get())};
-            std::vector<u8> runtime_key;
-            std::shared_ptr<const StageCache::Emitted> emitted;
-            if (translation) {
-                runtime_key = StageCache::RuntimeKey(runtime_info, binding);
-                if (reused[index]) {
-                    emitted = stage_cache.FindEmitted(*reused[index], runtime_key);
+        if (emitted && !stage_cache.Verify()) {
+            code = emitted->spirv;
+            program = emitted->program;
+            binding = emitted->bindings_out;
+            stage_cache.CountReuse(true);
+        } else {
+            if (reused[index]) {
+                // Emitted for other runtime info only, or verifying: the IR is needed again.
+                Shader::Environment& env{*stage_envs[index]};
+                const u32 cfg_offset{
+                    static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+                Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+                program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+            }
+            if (mesh_emulation &&
+                (program.stage == Shader::Stage::Mesh || program.stage == Shader::Stage::Task)) {
+                runtime_info.mesh_as_compute = true;
+                runtime_info.mesh_output_binding = mesh_emulation->output_binding;
+                if (mesh_emulation->has_task) {
+                    runtime_info.mesh_task_payload_binding = mesh_emulation->payload_binding;
+                    runtime_info.mesh_task_offsets_binding = mesh_emulation->offsets_binding;
+                    runtime_info.mesh_task_args_binding = mesh_emulation->args_binding;
+                    runtime_info.mesh_task_payload_stride = mesh_emulation->payload_stride;
+                }
+                if (program.stage == Shader::Stage::Mesh) {
+                    mesh_emulation->vertex_spirv =
+                        Shader::Backend::SPIRV::EmitMeshEmulationVertex(
+                            profile, program.mesh, mesh_emulation->output_binding,
+                            mesh_emulation->has_task ? mesh_emulation->args_binding : ~0U,
+                            runtime_info.convert_depth_mode && !profile.support_native_ndc);
                 }
             }
-            if (emitted && !stage_cache.Verify()) {
-                code = emitted->spirv;
-                program = emitted->program;
-                binding = emitted->bindings_out;
+            ConvertLegacyToGeneric(program, runtime_info);
+            // EDEN_NX2_MESH_EMULATION_DUMP=<dir>: write the emulation's vertex shader for
+            // spirv-val.
+            if (mesh_emulation && program.stage == Shader::Stage::Mesh) {
+                if (const char* const dump{std::getenv("EDEN_NX2_MESH_EMULATION_DUMP")}) {
+                    const auto& vertex_code{mesh_emulation->vertex_spirv};
+                    std::ofstream file{fmt::format("{}/{:016x}.vert.spv", dump, hash),
+                                       std::ios::binary};
+                    file.write(reinterpret_cast<const char*>(vertex_code.data()),
+                               static_cast<std::streamsize>(vertex_code.size() * sizeof(u32)));
+                }
+            }
+            constexpr size_t pixel_index = static_cast<size_t>(Maxwell::ShaderType::Pixel);
+            if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry)) {
+                PruneUnreadGeometryOutputs(
+                    program, programs[pixel_index], key,
+                    device.IsNvGeometryShaderPassthroughSupported());
+            }
+            code = EmitSPIRV(profile, runtime_info, program, binding);
+            if (emitted) {
+                // The metadata too: it says where descriptors are read from at bind time.
+                if (code != emitted->spirv ||
+                    std::memcmp(&binding, &emitted->bindings_out, sizeof(binding)) != 0 ||
+                    !StageCache::SameSummary(program, emitted->program)) {
+                    stage_cache.CountVerifyMismatch(key.unique_hashes[index]);
+                }
                 stage_cache.CountReuse(true);
-            } else {
+            } else if (translation) {
+                auto entry = std::make_shared<StageCache::Emitted>();
+                entry->runtime_key = std::move(runtime_key);
+                entry->spirv = code;
+                entry->program = StageCache::Summary(program);
+                entry->bindings_out = binding;
                 if (reused[index]) {
-                    // Emitted for other runtime info only, or verifying: the IR is needed again.
-                    Shader::Environment& env{*stage_envs[index]};
-                    const u32 cfg_offset{
-                        static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-                    Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
-                    program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+                    stage_cache.AddEmitted(*reused[index], std::move(entry));
+                    stage_cache.CountReuse(false);
+                } else {
+                    new_translations.emplace_back(recorded[index], std::move(entry));
                 }
-                if (mesh_emulation &&
-                    (program.stage == Shader::Stage::Mesh || program.stage == Shader::Stage::Task)) {
-                    runtime_info.mesh_as_compute = true;
-                    runtime_info.mesh_output_binding = mesh_emulation->output_binding;
-                    if (mesh_emulation->has_task) {
-                        runtime_info.mesh_task_payload_binding = mesh_emulation->payload_binding;
-                        runtime_info.mesh_task_offsets_binding = mesh_emulation->offsets_binding;
-                        runtime_info.mesh_task_args_binding = mesh_emulation->args_binding;
-                        runtime_info.mesh_task_payload_stride = mesh_emulation->payload_stride;
-                    }
-                    if (program.stage == Shader::Stage::Mesh) {
-                        mesh_emulation->vertex_spirv =
-                            Shader::Backend::SPIRV::EmitMeshEmulationVertex(
-                                profile, program.mesh, mesh_emulation->output_binding,
-                                mesh_emulation->has_task ? mesh_emulation->args_binding : ~0U,
-                                runtime_info.convert_depth_mode && !profile.support_native_ndc);
-                    }
-                }
-                ConvertLegacyToGeneric(program, runtime_info);
-                // EDEN_NX2_MESH_EMULATION_DUMP=<dir>: write the emulation's vertex shader for
-                // spirv-val.
-                if (mesh_emulation && program.stage == Shader::Stage::Mesh) {
-                    if (const char* const dump{std::getenv("EDEN_NX2_MESH_EMULATION_DUMP")}) {
-                        const auto& vertex_code{mesh_emulation->vertex_spirv};
-                        std::ofstream file{fmt::format("{}/{:016x}.vert.spv", dump, hash),
-                                           std::ios::binary};
-                        file.write(reinterpret_cast<const char*>(vertex_code.data()),
-                                   static_cast<std::streamsize>(vertex_code.size() * sizeof(u32)));
-                    }
-                }
-                constexpr size_t pixel_index = static_cast<size_t>(Maxwell::ShaderType::Pixel);
-                if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry) &&
-                    !defer_to_direct[pixel_index]) {
-                    PruneUnreadGeometryOutputs(
-                        program, programs[pixel_index], key,
-                        device.IsNvGeometryShaderPassthroughSupported());
-                }
-                code = EmitSPIRV(profile, runtime_info, program, binding);
-                if (emitted) {
-                    // The metadata too: it says where descriptors are read from at bind time.
-                    if (code != emitted->spirv ||
-                        std::memcmp(&binding, &emitted->bindings_out, sizeof(binding)) != 0 ||
-                        !StageCache::SameSummary(program, emitted->program)) {
-                        stage_cache.CountVerifyMismatch(key.unique_hashes[index]);
-                    }
-                    stage_cache.CountReuse(true);
-                } else if (translation) {
-                    auto entry = std::make_shared<StageCache::Emitted>();
-                    entry->runtime_key = std::move(runtime_key);
-                    entry->spirv = code;
-                    entry->program = StageCache::Summary(program);
-                    entry->bindings_out = binding;
-                    if (reused[index]) {
-                        stage_cache.AddEmitted(*reused[index], std::move(entry));
-                        stage_cache.CountReuse(false);
-                    } else {
-                        new_translations.emplace_back(recorded[index], std::move(entry));
-                    }
-                }
-            }
-        }
-        if (defer_to_direct[index] && host_info.max_descriptor_set_storage_buffers != 0) {
-            total_storage_buffers +=
-                Shader::NumDescriptors(program.info.storage_buffers_descriptors);
-            if (total_storage_buffers > host_info.max_descriptor_set_storage_buffers) {
-                throw Shader::NotImplementedException(
-                    "Pipeline binds {} storage buffers; descriptor set limit is {}",
-                    total_storage_buffers, host_info.max_descriptor_set_storage_buffers);
             }
         }
         device.SaveShader(code);

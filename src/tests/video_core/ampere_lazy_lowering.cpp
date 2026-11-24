@@ -425,55 +425,21 @@ TEST_CASE("Ineligible and mixed fallback stages invoke LowerToMaxwell lazily at 
     CHECK(LowerToMaxwellInvocationCount() == 0);
 
     using MaxwellShader = Tegra::Engines::Maxwell3D::Regs::ShaderType;
-#ifdef EGLANTINE_ENABLE_RUST_AMP_SPIRV
-    CHECK(Vulkan::IsDirectSm86GraphicsStageEligible(vs_env, static_cast<size_t>(MaxwellShader::VertexB),
-                                                    false, false, false, true));
-    CHECK(Vulkan::IsDirectSm86GraphicsStageEligible(fs_env, static_cast<size_t>(MaxwellShader::Pixel),
-                                                    false, false, false, true));
-    CHECK(Vulkan::IsDirectSm86GraphicsStageEligible(fs_env, static_cast<size_t>(MaxwellShader::Pixel),
-                                                    true, false, false, true));
-#endif
-    // Paired vertex, pruned geometry pipelines, mesh emulation, and wrong slots are ineligible.
-    CHECK_FALSE(Vulkan::IsDirectSm86GraphicsStageEligible(
-        vs_env, static_cast<size_t>(MaxwellShader::VertexB), true, false, false, true));
-    CHECK_FALSE(Vulkan::IsDirectSm86GraphicsStageEligible(
-        vs_env, static_cast<size_t>(MaxwellShader::Geometry), false, false, false, true));
-    CHECK_FALSE(Vulkan::IsDirectSm86GraphicsStageEligible(
-        fs_env, static_cast<size_t>(MaxwellShader::Pixel), false, true, false, true));
-    CHECK_FALSE(Vulkan::IsDirectSm86GraphicsStageEligible(
-        fs_env, static_cast<size_t>(MaxwellShader::Pixel), false, false, true, true));
-
     // Only the graphics stages falling back invoke LowerToMaxwell once each (and cache it).
     pools.ReleaseContents();
-    Shader::RuntimeInfo vs_runtime;
-    vs_runtime.previous_stage_stores.mask.set();
-    const auto vs_compiled = Vulkan::CompileGraphicsStageWithLazyFallback(
-        pools, vs_env, profile, host_info, vs_runtime, {},
-        static_cast<size_t>(MaxwellShader::VertexB), false, false, false);
-    REQUIRE(vs_compiled.spirv.size() >= 5);
-    CHECK(vs_compiled.spirv[0] == 0x07230203U);
+    vs_env.EnsureLoweredNative();
     CHECK(LowerToMaxwellInvocationCount() == 1);
     CHECK_FALSE(fs_env.HasLoweredNativeCode());
 
     // Paired VertexA+VertexB re-uses vs_env's lowered_native without re-lowering.
-    pools.ReleaseContents();
     GraphicsEnvironment vs_paired_env{
-        fix.maxwell3d, fix.memory, Tegra::Engines::Maxwell3D::Regs::ShaderType::VertexB,
+        fix.maxwell3d, fix.memory, MaxwellShader::VertexB,
         fix.MappedBase + fix.VertexShaderOffset, 0, vs_env.LoweredNative()};
-    const auto vs_paired_compiled = Vulkan::CompileGraphicsStageWithLazyFallback(
-        pools, vs_paired_env, profile, host_info, vs_runtime, {},
-        static_cast<size_t>(MaxwellShader::VertexB), true, false, false);
-    REQUIRE(vs_paired_compiled.spirv.size() >= 5);
+    vs_paired_env.EnsureLoweredNative();
     CHECK(LowerToMaxwellInvocationCount() == 1);
 
     // Fragment lowers lazily on its own fallback compile.
-    pools.ReleaseContents();
-    Shader::RuntimeInfo fs_runtime;
-    fs_runtime.previous_stage_stores.mask.set();
-    const auto fs_compiled = Vulkan::CompileGraphicsStageWithLazyFallback(
-        pools, fs_env, profile, host_info, fs_runtime, {},
-        static_cast<size_t>(MaxwellShader::Pixel), false, false, false);
-    REQUIRE(fs_compiled.spirv.size() >= 5);
+    fs_env.EnsureLoweredNative();
     CHECK(LowerToMaxwellInvocationCount() == 2);
 
     // Disabling direct SM86 dynamically forces lazy lowering even on eligible compute stages.

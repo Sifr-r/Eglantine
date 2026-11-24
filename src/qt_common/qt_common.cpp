@@ -287,6 +287,14 @@ void Init(QWidget* root) {
     RemoveCachedContents();
 }
 
+void Shutdown() {
+    emu_thread.reset();
+    system.reset();
+    provider.reset();
+    vfs.reset();
+    rootObject = nullptr;
+}
+
 std::filesystem::path GetEdenCommand() {
     std::filesystem::path command;
 

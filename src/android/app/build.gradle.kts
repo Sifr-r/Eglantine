@@ -81,6 +81,10 @@ android {
                         "-DENABLE_QT=0", // Don't use QT
                         "-DENABLE_WEB_SERVICE=1", // Enable web service
                         "-DANDROID_ARM_NEON=true", // cryptopp requires Neon to work
+                        "-DENABLE_INTEL_XESS=OFF",
+                        "-DENABLE_ISPC_KERNELS=OFF",
+                        "-DENABLE_SENTRY=OFF",
+                        "-DEGLANTINE_RUST_OFFLINE=ON",
                         "-DYUZU_USE_CPM=ON",
                         "-DCPMUTIL_FORCE_BUNDLED=ON",
                         "-DYUZU_USE_BUNDLED_FFMPEG=ON",

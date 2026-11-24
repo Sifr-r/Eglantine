@@ -126,6 +126,9 @@ public:
     /// Close all active services in use by the kernel instance.
     void CloseServices();
 
+    /// Destroy all stopped service server managers in use by the kernel instance.
+    void DestroyServices();
+
     /// Retrieves a shared pointer to the system resource limit instance.
     const KResourceLimit* GetSystemResourceLimit() const;
 

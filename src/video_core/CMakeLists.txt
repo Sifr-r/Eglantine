@@ -290,6 +290,7 @@ add_library(video_core STATIC
     shader_warm/warm_records.h
     smaa_area_tex.h
     smaa_search_tex.h
+    smaa_tables.cpp
     surface.cpp
     surface.h
     texture_cache/accelerated_swizzle.cpp

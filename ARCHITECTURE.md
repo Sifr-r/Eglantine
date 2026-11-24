@@ -15,7 +15,7 @@ The original architecture baseline was recorded on 2026-11-16 at `upstream/nx2`,
 | Native shader or Vulkan rendering | [Ampere lowering](src/shader_recompiler/frontend/ampere/lower_to_maxwell.h), [pipeline cache](src/video_core/renderer_vulkan/vk_pipeline_cache.cpp), [shader triage](.claude/skills/nx2-shader-triage/SKILL.md) | `[ampere]`, `[draw_skip_policy]`, controlled frame comparison for visual changes |
 | Host memory, GPU readbacks, textures | [Host memory](src/common/host_memory.cpp), [buffer cache](src/video_core/buffer_cache/buffer_cache.h), [texture code](src/video_core/textures) | `[host_memory]`, `[buffer-download-policy]`, `[textures]` |
 | Controllers and frontend settings | [Switch 2 protocol](src/input_common/helpers/switch2_protocol), [shared config](src/frontend_common/config.cpp) | `[switch2]`, `[config_persistence]`, hardware checks for transport changes |
-| Build, CI, and release outputs | [CMake targets](CMakeLists.txt), [source checks](.github/workflows/source-checks.yml), [release workflow](.github/workflows/release.yml) | See [source and release checks](#source-and-release-checks) |
+| Build, CI, and release outputs | [CMake targets](CMakeLists.txt), [source checks](.github/workflows/source-checks.yml), [Android build](.github/workflows/build-android.yml), [release workflow](.github/workflows/release.yml) | See [source and release checks](#source-and-release-checks) |
 | Live debugging and tool interfaces | [Debug server](src/core/debugger/nx2_debug_server.cpp), [tool index](tools/README.md), [live workflow](.claude/skills/nx2-debug-server/SKILL.md) | Read-only status first, then capture targeted evidence |
 
 From a configured desktop build, run `cmake --build build --target yuzu yuzu-cmd tests --parallel`.
@@ -88,8 +88,10 @@ for three existing C++ domains through the common C ABI. The
 
 Retire a duplicate only after the same inputs produce compatible output, failure behavior and
 side effects, with acceptable performance. Prefer C++ on a tie. Before making Rust the sole
-implementation, verify desktop builds and the ARM64 Android link. The current CMake Cargo helper
-does not infer an Android target triple or NDK linker.
+implementation, verify desktop builds and the ARM64 Android link. `CMakeModules/AddRustCrate.cmake`
+cross-compiles `eglantine_rs` for Android ABIs (`arm64-v8a` -> `aarch64-linux-android`,
+`x86_64` -> `x86_64-linux-android`, `armeabi-v7a` -> `armv7-linux-androideabi`) using the NDK
+Clang wrapper, `CMAKE_AR`, and Bionic native libs (`dl m log`).
 
 Five `std`-only Cargo crates (zero external `crates.io` dependencies in `rust/Cargo.lock`)
 live under `rust/crates/`:
@@ -100,11 +102,11 @@ live under `rust/crates/`:
 | `eglantine_ampere_spirv` | `rust/crates/ampere_spirv` | `eglantine_ampere_spirv` | Direct SM86 -> structured SSA IR -> SPIR-V 1.6 emitter with parameterized `OpTypeCooperativeMatrixKHR` and `std::thread::scope` batching ([`eglantine_ampere_spirv.h`](rust/include/eglantine_ampere_spirv.h)) |
 | `eglantine_nup_fs` | `rust/crates/nup_fs` | `eglantine_nup_fs` | `NUP\x01` archive parser, writer, metadata editor, `.part`/`.journal` resume using C-supplied `EglNupZstdOps`/`EglNupVfsOps` callbacks ([`eglantine_nup_fs.h`](rust/include/eglantine_nup_fs.h)) |
 | `eglantine_switch2_io` | `rust/crates/switch2_io` | `eglantine_switch2_io` | Switch 2 BLE/USB packet framing, stick calibration, gyro/optical mouse processors, HD Rumble 2 encoder ([`eglantine_switch2_io.h`](rust/include/eglantine_switch2_io.h)) |
-| `eglantine_ffi` | `rust/crates/eglantine_ffi` | `eglantine_rs` | Unified `staticlib` re-exporting and anchoring all 57 `#[no_mangle] pub extern "C"` symbols via `#[used] EGLANTINE_EXPORTED_FFI_SYMBOLS` |
+| `eglantine_ffi` | `rust/crates/eglantine_ffi` | `eglantine_rs` | Unified `staticlib` re-exporting and anchoring the 57 `#[no_mangle] pub extern "C"` symbols via per-feature `#[used]` anchor arrays (`ampere`, `ampere-spirv`, `nup`, `switch2-io`) |
 
 **Acyclic DAG & FFI invariants:**
 * **Workspace crate DAG:** `eglantine_ffi` -> `{ampere_core, ampere_spirv, nup_fs, switch2_io}` and `ampere_spirv` -> `ampere_core`. `ampere_core`, `nup_fs`, and `switch2_io` are independent leaves; there are no reverse edges and no external crate dependencies.
-* **CMake dependency DAG:** Root `CMakeLists.txt` defines `ENABLE_RUST_AMPERE`, `ENABLE_RUST_AMP_SPIRV`, `ENABLE_RUST_NUP`, `ENABLE_RUST_SWITCH2_IO`, `ENABLE_ISPC_KERNELS`, and `ENABLE_INTEL_XESS` (all `ON` by default). When `NOT YUZU_STATIC_ROOM` and any `ENABLE_RUST_*` option is `ON`, `CMakeModules/AddRustCrate.cmake` creates `eglantine_rs` (`STATIC IMPORTED GLOBAL` over `eglantine_ffi`) before `add_subdirectory(src)`. Consumer wiring flows strictly downward:
+* **CMake dependency DAG:** Root `CMakeLists.txt` defines `ENABLE_RUST_AMPERE`, `ENABLE_RUST_AMP_SPIRV`, `ENABLE_RUST_NUP`, `ENABLE_RUST_SWITCH2_IO` (`ON` by default), plus `ENABLE_ISPC_KERNELS` (`ON` when `NOT ANDROID`, `OFF` on Android) and `ENABLE_INTEL_XESS` (`ON` when `NOT ANDROID AND ARCHITECTURE_x86_64`, `OFF` otherwise). When `NOT YUZU_STATIC_ROOM` and any `ENABLE_RUST_*` option is `ON`, `CMakeModules/AddRustCrate.cmake` creates `eglantine_rs` (`STATIC IMPORTED GLOBAL` over `eglantine_ffi`) passing `--no-default-features` and only the enabled `--features` before `add_subdirectory(src)`. Consumer wiring flows strictly downward:
   * `shader_recompiler` links `PUBLIC eglantine_rs` (`EGLANTINE_ENABLE_RUST_AMPERE=1`, `EGLANTINE_ENABLE_RUST_AMP_SPIRV=1`) -> inherited by `video_core`.
   * `core` links `PUBLIC eglantine_rs zstd::zstd` (`EGLANTINE_ENABLE_RUST_NUP=1`).
   * `input_common` links `PUBLIC eglantine_rs` (`EGLANTINE_ENABLE_RUST_SWITCH2_IO=1`).
@@ -121,6 +123,20 @@ settings. The standalone desktop discovery test passed. On the tested x86-64 mac
 C++ throughput was about 1.4× ISPC for ETC2, 5.0× for ASTC opacity and 5.4–5.7× for swizzle
 on the measured workloads. ARM64 measurements and an Android APK/device smoke run are still
 needed. The Android Kotlin JNI declaration passed a standalone JVM signature check.
+
+**Lean-down & Android Snapdragon verification (2026-11-24).** Deduplicated SMAA lookup tables
+into `src/video_core/smaa_tables.cpp`, removed unreachable direct-SM86 graphics staging in
+`src/video_core/renderer_vulkan/vk_pipeline_cache.{h,cpp}` and `src/tests/video_core/ampere_lazy_lowering.cpp`,
+feature-gated `eglantine_ffi` per `ENABLE_RUST_*` option, added Android NDK Rust cross-compilation
+in `CMakeModules/AddRustCrate.cmake`, fixed a 64-bit Clang `-Wtautological-constant-out-of-range-compare`
+error in `src/core/loader/nso.cpp`, and added `.github/workflows/build-android.yml`. Android Gradle
+`:app:assembleMainlineRelWithDebInfo` (NDK `28.2.13676358`, `arm64-v8a` with `adrenotools` / Turnip
+and `eglantine_rs`) produced `app-mainline-relWithDebInfo.apk` (`52.00 MiB`, packaging
+`lib/arm64-v8a/libyuzu-android.so` at `39.22 MiB`). Windows MSVC `tests.exe` built and passed
+`[ampere]` (92 cases, 98,154 assertions) and `[ampere-lazy-lowering]` (9 cases, 141 assertions);
+`cargo test --manifest-path rust/Cargo.toml --locked --offline` passed 47 tests; `cargo check` with
+`--no-default-features --features ampere-spirv` passed; and `python -I tools/ci/test_workflows.py`
+passed 10 tests. An on-device Snapdragon smoke run is still needed.
 
 ## 3. Core domain contracts
 
@@ -197,8 +213,12 @@ convention.
   A container that walked its list after the arena was freed read freed memory.
 * **Shutdown order.** `System::Impl::ShutdownMainProcess()` keeps the timing thread paused for
   the whole teardown (`core_timing.SyncPause(true)`), and resets the cheat engine before the
-  kernel releases the guest processes. `CoreTiming::Advance()` copies the event it is about to
-  run into locals, so a callback that unschedules the event cannot leave a dangling
+  kernel releases the guest processes. `TeardownSubsystems()` cancels blocking host
+  `ServiceManager::GetService` waits (`CancelBlockingGets`), stops `ServerManager`s in two passes
+  (`KernelCore::CloseServices`) before shutting down cores and joining `Services` host threads,
+  and destroys `ServerManager`s (`KernelCore::DestroyServices`) afterward so in-flight service
+  initialization cannot dereference freed managers. `CoreTiming::Advance()` copies the event it is
+  about to run into locals, so a callback that unschedules the event cannot leave a dangling
   reference. The cheat callbacks resolve the guest process through the kernel on every use
   instead of caching a pointer the kernel released.
 * **NX2 present shutdown.** The emulation stop token wakes the guest fence event used by
@@ -583,6 +603,38 @@ a change to the wire format has to land in both.
 
 ## 4. Frontends
 
+### GPUI desktop preview
+
+The Windows preview builds with `ENABLE_GPUI=ON` and the `eglantine-gpui` CMake
+target. It is distributed beside `eden-cli`. GPUI owns the shell and the SDL
+process owns game rendering, controller input during play, and emulation.
+The separate Cargo workspace keeps desktop dependencies out of the Rust core build.
+
+| Unit | Responsibility |
+| --- | --- |
+| `rust/apps/eglantine_gpui/src/main.rs` | Starts GPUI, opens the window, and handles launch options (`--safe-theme`, `-f`/`--fullscreen`, `-g`/`--game`, `-u`/`--user`). |
+| `rust/apps/eglantine_gpui/src/shell.rs` | Coordinates shell state, actions, focus, and asynchronous tasks. |
+| `rust/apps/eglantine_gpui/src/views.rs` | Renders Home, library, settings, sample theme previews, per-game mods/log actions, and gameplay overlays. |
+| `rust/apps/eglantine_gpui/src/navigation.rs` | Resolves directional focus using the visible control positions. |
+| `rust/apps/eglantine_gpui/src/controller.rs` | Translates physical controller changes (including remappable Home fallback) into shell actions and queries Windows `os_text_scale()`. |
+| `rust/apps/eglantine_gpui/src/appearance.rs` | Owns the theme editor draft, theme duplication, sample screen preview state, and active preview assets. |
+| `rust/apps/eglantine_gpui/src/theme.rs` | Defines the public theme manifest, style, layouts, and validation. |
+| `rust/apps/eglantine_gpui/src/theme_package.rs` | Reads, validates, and atomically writes portable theme archives. |
+| `rust/apps/eglantine_gpui/src/theme_tests.rs` | Checks theme standards, round trips, and malformed packages. |
+| `rust/apps/eglantine_gpui/src/library.rs` | Persists library roots and recency, and applies game metadata. |
+| `rust/apps/eglantine_gpui/src/emulator_config.rs` | Persists preview settings (`HomeKey`, `HomeButton`, `UserProfile`, defaults) and builds scoped launch overrides. |
+| `rust/apps/eglantine_gpui/src/session.rs` | Supervises SDL gameplay processes (`-u` profile and Home fallback env propagation) and acknowledged state changes. |
+| `rust/apps/eglantine_gpui/src/host_tool.rs` | Runs bounded one-shot metadata and content requests over the private host protocol. |
+| `rust/apps/eglantine_gpui/src/content.rs` | Validates content inputs and dispatches content operations. |
+| `rust/apps/eglantine_gpui/src/lib.rs` | Exposes shell-independent library modules and their tests. |
+| `rust/apps/eglantine_gpui/Cargo.toml` and `Cargo.lock` | Declare and lock the isolated preview dependency graph. |
+| `src/yuzu_cmd/gpui_session.{h,cpp}` | Transports versioned session commands and events over inherited pipes. |
+| [Theme authoring](docs/content/user/GpuiThemes.md) | Documents package layout, supported assets, and how users recover the built-in theme. |
+
+Run `cargo test --locked --manifest-path rust/apps/eglantine_gpui/Cargo.toml`
+for the shell tests. The `--no-default-features --lib` variant tests the model,
+package format, library, settings, and protocol parsing without GPUI.
+
 Two frontends share `frontend_common`:
 
 | CMake target | Executable in the build's `bin/` directory | Frontend |
@@ -849,3 +901,11 @@ These are known and deliberately not fixed by the P0 pass; each one names its ow
   test cases), targeted Tier 2 tags passed (`[audio_recovery]` 29/4, `[lifetime]` 27/5,
   `[channel_bridge]` 10/2, `[syncpoint]` 684/5, `[memory_span]` 54/2, `[pending_download]` 76/3,
   `[clear_covers]` 20/3), and `cargo test --manifest-path rust/Cargo.toml` passed across all workspace crates.
+
+### Recorded GPUI Frontend & Session Shutdown Verification
+
+* Windows MSVC + `DENABLE_GPUI=ON` built `eglantine.exe`, `eden-cli.exe`, `tests.exe`, and
+  `eglantine-gpui.exe` (`cmake --build build --target yuzu yuzu-cmd tests eglantine-gpui --parallel`).
+* `python -I src/yuzu_cmd/tests/gpui_session.py build/bin/eden-cli.exe` passed 15/15 consecutive runs cleanly (~0.61–0.75s per run).
+* `cargo test --locked --no-default-features --lib --manifest-path rust/apps/eglantine_gpui/Cargo.toml` passed 15/15 tests; `cargo test --locked --manifest-path rust/apps/eglantine_gpui/Cargo.toml` passed 15/15 lib + 6/6 bin tests; `cargo test --manifest-path rust/Cargo.toml --locked --offline` passed 47/47 workspace tests (`Cargo.lock` unchanged).
+* Catch2 `build/bin/tests.exe` passed targeted runs: `[shutdown-ordering]` (29 assertions in 5 cases), `[config_persistence]` (18 assertions in 2 cases), `[launch_params]` (202 assertions in 6 cases), and `[ampere]` (98,154 assertions in 92 cases).

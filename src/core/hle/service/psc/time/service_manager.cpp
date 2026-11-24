@@ -6,6 +6,7 @@
 
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/hle/kernel/kernel.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/psc/time/power_state_service.h"
 #include "core/hle/service/psc/time/service_manager.h"
@@ -275,6 +276,9 @@ void ServiceManager::CheckAndSetupServicesSAndP() {
 }
 
 void ServiceManager::SetupSAndP() {
+    if (system.Kernel().IsShuttingDown()) {
+        return;
+    }
     if (!m_is_s_and_p_setup) {
         m_is_s_and_p_setup = true;
         m_server_manager.RegisterNamedService(

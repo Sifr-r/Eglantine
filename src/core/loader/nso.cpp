@@ -127,7 +127,7 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
 
     u32 image_size = PageAlignSize(static_cast<u32>(unaligned_image_size));
     Kernel::CodeSet codeset;
-    if (image_size > codeset.memory.max_size()) {
+    if (static_cast<size_t>(image_size) > codeset.memory.max_size()) {
         return std::nullopt;
     }
 

@@ -266,6 +266,9 @@ public:
     /// Disables Home and Screenshot buttons
     void DisableSystemButtons();
 
+    void SetHomeButtonEnabled(bool enabled);
+    [[nodiscard]] bool GetHomeButtonValue() const;
+
     /// Sets Home and Screenshot buttons to false
     void ResetSystemButtons();
 
@@ -617,6 +620,7 @@ private:
     std::atomic<bool> is_configuring{false};
     std::atomic<bool> is_initialized{false};
     std::atomic<bool> system_buttons_enabled{true};
+    bool home_button_enabled{true}; // Guarded by controller_mutex.
 
     ButtonParams button_params;
     StickParams stick_params;

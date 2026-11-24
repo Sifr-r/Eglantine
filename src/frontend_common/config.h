@@ -60,10 +60,11 @@ protected:
 
     void Initialize(const std::string& config_name = "config");
     void Initialize(std::optional<std::string> config_path);
+    bool InitializeReadOnly(const std::string& config_path);
 
     void WriteToIni() const;
 
-    void SetUpIni();
+    bool SetUpIni(bool create_missing = true);
     [[nodiscard]] bool IsCustomConfig() const;
 
     void Reload();

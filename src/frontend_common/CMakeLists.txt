@@ -13,6 +13,9 @@ add_library(frontend_common STATIC
     content_manager.h
     firmware_manager.h
     firmware_manager.cpp
+    game_list_discovery.h
+    game_list_metadata.cpp
+    game_list_metadata.h
     data_manager.h data_manager.cpp
     play_time_manager.cpp
     play_time_manager.h

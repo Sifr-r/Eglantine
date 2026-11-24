@@ -141,6 +141,7 @@ struct KernelCore::Impl {
     }
 
     void Initialize(KernelCore& kernel) {
+        is_shutting_down.store(false, std::memory_order_relaxed);
         hardware_timer.emplace(kernel);
         hardware_timer->Initialize();
 
@@ -190,6 +191,7 @@ struct KernelCore::Impl {
         };
 
         CloseServices();
+        DestroyServices();
 
         if (application_process) {
             // A process still referenced here is never finalized, so its memory stays mapped in
@@ -287,9 +289,33 @@ struct KernelCore::Impl {
     }
 
     void CloseServices() {
-        // Ensures all servers gracefully shutdown.
-        std::scoped_lock lk{server_lock};
-        server_managers.clear();
+        // Ensures all servers stop without holding server_lock while server threads may still be
+        // registering in RunServer, and without destroying ServerManagers while in-flight services
+        // may still hold references to them prior to core/thread shutdown.
+        std::vector<Service::ServerManager*> managers;
+        {
+            std::scoped_lock lk{server_lock};
+            is_shutting_down.store(true, std::memory_order_release);
+            managers.reserve(server_managers.size());
+            for (const auto& manager : server_managers) {
+                managers.push_back(manager.get());
+            }
+        }
+        for (auto* manager : managers) {
+            manager->RequestStop();
+        }
+        for (auto* manager : managers) {
+            manager->WaitStopped();
+        }
+    }
+
+    void DestroyServices() {
+        std::vector<std::unique_ptr<Service::ServerManager>> managers;
+        {
+            std::scoped_lock lk{server_lock};
+            managers.swap(server_managers);
+        }
+        managers.clear();
     }
 
     void InitializePhysicalCores() {
@@ -976,6 +1002,10 @@ void KernelCore::CloseServices() {
     impl->CloseServices();
 }
 
+void KernelCore::DestroyServices() {
+    impl->DestroyServices();
+}
+
 const KResourceLimit* KernelCore::GetSystemResourceLimit() const {
     return impl->system_resource_limit;
 }
@@ -1122,8 +1152,11 @@ void KernelCore::RunServer(std::unique_ptr<Service::ServerManager>&& server_mana
     auto* manager = server_manager.get();
 
     {
-        std::scoped_lock lk{impl->server_lock};
+        std::unique_lock lk{impl->server_lock};
         if (impl->is_shutting_down) {
+            lk.unlock();
+            manager->CancelBeforeRun();
+            server_manager.reset();
             return;
         }
 

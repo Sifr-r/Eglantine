@@ -42,6 +42,7 @@ Core::Frontend::WindowSystemType GetWindowSystemType();
 Core::Frontend::EmuWindow::WindowSystemInfo GetWindowSystemInfo(QWindow* window);
 
 void Init(QWidget* root);
+void Shutdown();
 
 void SetupContentProviders();
 void SetupHID();

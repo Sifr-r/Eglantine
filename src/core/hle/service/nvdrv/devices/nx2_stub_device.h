@@ -53,8 +53,8 @@ public:
     using TileListener = std::function<void(u64 gpu_address, u64 cpu_address, u64 size)>;
 
     static Nx2GpuMemoryRegistry& Get() {
-        static Nx2GpuMemoryRegistry registry;
-        return registry;
+        static auto* const registry = new Nx2GpuMemoryRegistry();
+        return *registry;
     }
 
     void Register(u64 address, u64 size) {

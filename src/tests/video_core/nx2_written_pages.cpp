@@ -16,6 +16,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "video_core/nx2.h"
+#include "video_core/nx2_gpu_latency.h"
 
 namespace {
 
@@ -194,4 +195,44 @@ TEST_CASE("Non-writer proofs retain concurrent insertions and clear between sess
     }
     Tegra::Nx2ClearGpuWrittenPages();
     CHECK_FALSE(Tegra::Nx2IsNonWriterDraw({{0x1000}, 100, 1, true}, 15));
+}
+
+TEST_CASE("Process-wide NX2 registries remain stable and clearable across repeated teardowns",
+          "[video_core][nx2_nonwriter_proof]") {
+    WrittenPages reset;
+
+    auto* const non_writers = &Tegra::Nx2NonWriters();
+    auto* const semaphore_waiters = &Tegra::Nx2SemaphoreWaiters::Get();
+    auto* const sparse_map = &Tegra::Nx2LegacySparseRegionMap();
+    auto* const sparse_backing = &Tegra::Nx2LegacySparseBackingStorage();
+
+    const Tegra::Nx2DrawPrograms key{{0x4000, 0x8000}, 7, 2, true};
+    Tegra::Nx2InsertNonWriterDraw(key, 21);
+    CHECK(Tegra::Nx2IsNonWriterDraw(key, 21));
+
+    int waiter_owner = 0;
+    semaphore_waiters->Add(&waiter_owner, 0x10000, 1, Tegra::Nx2SemaphoreWaiters::AcquireEqual);
+    CHECK(semaphore_waiters->Size() == 1);
+
+    Tegra::Nx2AddSparseSpan(0x200000, 0x20000);
+    Tegra::Nx2SparseRegionCreated(0x200000, 0x20000, 0x10000);
+    CHECK(Tegra::Nx2InSparseRegion(0x200000, 0x10000));
+
+    VideoCommon::Nx2GpuLatency::NotePresent();
+    VideoCommon::Nx2GpuLatency::Reset();
+
+    for (int cycle = 0; cycle < 2; ++cycle) {
+        Tegra::Nx2ClearGpuWrittenPages();
+        Tegra::Nx2ClearSparseRegions();
+        semaphore_waiters->Clear();
+        VideoCommon::Nx2GpuLatency::Reset();
+
+        CHECK(&Tegra::Nx2NonWriters() == non_writers);
+        CHECK(&Tegra::Nx2SemaphoreWaiters::Get() == semaphore_waiters);
+        CHECK(&Tegra::Nx2LegacySparseRegionMap() == sparse_map);
+        CHECK(&Tegra::Nx2LegacySparseBackingStorage() == sparse_backing);
+        CHECK_FALSE(Tegra::Nx2IsNonWriterDraw(key, 21));
+        CHECK(semaphore_waiters->Size() == 0);
+        CHECK_FALSE(Tegra::Nx2InSparseRegion(0x200000, 0x10000));
+    }
 }

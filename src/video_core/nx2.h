@@ -235,8 +235,8 @@ struct Nx2NonWriterSet {
 };
 
 inline Nx2NonWriterSet& Nx2NonWriters() {
-    static Nx2NonWriterSet set;
-    return set;
+    static auto* const set = new Nx2NonWriterSet();
+    return *set;
 }
 
 /// Whether the back proved, in program epoch `epoch`, that a draw binding `programs` writes no
@@ -872,13 +872,21 @@ private:
     std::atomic<u64> high{0};
 };
 
-inline Nx2SparseBackingStorage g_nx2_sparse_backing_storage;
-inline Nx2SparseRegionMap g_nx2_sparse_region_map;
+inline Nx2SparseBackingStorage& Nx2LegacySparseBackingStorage() {
+    static auto* const storage = new Nx2SparseBackingStorage();
+    return *storage;
+}
+
+inline Nx2SparseRegionMap& Nx2LegacySparseRegionMap() {
+    static auto* const map = new Nx2SparseRegionMap();
+    return *map;
+}
+
 inline std::atomic<u64> g_nx2_sparse_low{~u64{0}};
 inline std::atomic<u64> g_nx2_sparse_high{0};
 
 inline void Nx2SetSparseBacking(Nx2SparseBackingHandler handler) {
-    Detail::SetSparseBacking(g_nx2_sparse_backing_storage, g_nx2_sparse_low, g_nx2_sparse_high,
+    Detail::SetSparseBacking(Nx2LegacySparseBackingStorage(), g_nx2_sparse_low, g_nx2_sparse_high,
                              std::move(handler));
 }
 
@@ -888,69 +896,69 @@ inline void Nx2AddSparseSpan(u64 gpu_address, u64 size) {
 }
 
 inline void Nx2BackSparseWrite(u64 gpu_address, u64 size, const void* data) {
-    Detail::BackSparseWrite(g_nx2_sparse_backing_storage, g_nx2_sparse_low, g_nx2_sparse_high,
+    Detail::BackSparseWrite(Nx2LegacySparseBackingStorage(), g_nx2_sparse_low, g_nx2_sparse_high,
                             gpu_address, size, data);
 }
 
 inline void Nx2SparseRegionCreated(u64 gpu_address, u64 size, u64 block_size) {
-    Detail::SparseRegionCreated(g_nx2_sparse_region_map, gpu_address, size, block_size);
+    Detail::SparseRegionCreated(Nx2LegacySparseRegionMap(), gpu_address, size, block_size);
 }
 
 /// An initially GPU-only pool now has explicit tiles. Let the renderer bind only resident tiles,
 /// while preserving the written/mapped state of pools that were sparse from creation.
 inline void Nx2SparseRegionTiled(u64 gpu_address, u64 size, u64 block_size) {
-    Detail::SparseRegionTiled(g_nx2_sparse_region_map, g_nx2_sparse_low, g_nx2_sparse_high,
+    Detail::SparseRegionTiled(Nx2LegacySparseRegionMap(), g_nx2_sparse_low, g_nx2_sparse_high,
                               gpu_address, size, block_size);
 }
 
 inline void Nx2SparseRegionDestroyed(u64 gpu_address) {
-    Detail::SparseRegionDestroyed(g_nx2_sparse_region_map, gpu_address);
+    Detail::SparseRegionDestroyed(Nx2LegacySparseRegionMap(), gpu_address);
 }
 
 /// A new emulation session: the previous game's regions are gone (nvdrv's Module clears them).
 inline void Nx2ClearSparseRegions() {
-    Detail::ClearSparseRegions(g_nx2_sparse_region_map, g_nx2_sparse_low, g_nx2_sparse_high);
+    Detail::ClearSparseRegions(Nx2LegacySparseRegionMap(), g_nx2_sparse_low, g_nx2_sparse_high);
 }
 
 inline void Nx2SparseBlockWritten(u64 region_address, u64 block) {
-    Detail::SparseBlockWritten(g_nx2_sparse_region_map, region_address, block);
+    Detail::SparseBlockWritten(Nx2LegacySparseRegionMap(), region_address, block);
 }
 
 /// True unless the block of the region at region_address is known to hold nothing (no write from
 /// the CPU or the GPU yet).
 inline bool Nx2SparseBlockIsWritten(u64 region_address, u64 block) {
-    return Detail::SparseBlockIsWritten(g_nx2_sparse_region_map, region_address, block);
+    return Detail::SparseBlockIsWritten(Nx2LegacySparseRegionMap(), region_address, block);
 }
 
 /// The game maps its own memory over [offset, +size) of the region at region_address (mapped), or
 /// unmaps it there.
 inline void Nx2SparseTilesMapped(u64 region_address, u64 offset, u64 size, bool mapped) {
-    Detail::SparseTilesMapped(g_nx2_sparse_region_map, region_address, offset, size, mapped);
+    Detail::SparseTilesMapped(Nx2LegacySparseRegionMap(), region_address, offset, size, mapped);
 }
 
 /// The parts of [gpu_address, +size), which lies in one sparse region, that can hold data: the
 /// tiles the game maps there if it maps any, otherwise the blocks written. As (offset from
 /// gpu_address, size) runs.
 inline std::vector<std::pair<u64, u64>> Nx2SparseDataRanges(u64 gpu_address, u64 size) {
-    return Detail::SparseDataRanges(g_nx2_sparse_region_map, gpu_address, size);
+    return Detail::SparseDataRanges(Nx2LegacySparseRegionMap(), gpu_address, size);
 }
 
 /// True when [gpu_address, +size) lies in one sparse region.
 inline bool Nx2InSparseRegion(u64 gpu_address, u64 size) {
-    return Detail::InSparseRegion(g_nx2_sparse_region_map, g_nx2_sparse_low, g_nx2_sparse_high,
+    return Detail::InSparseRegion(Nx2LegacySparseRegionMap(), g_nx2_sparse_low, g_nx2_sparse_high,
                                   gpu_address, size);
 }
 
 /// The GPU renders into [gpu_address, +size): count its blocks as written, so images made there
 /// later get memory (their contents live in the host image, not in guest memory).
 inline void Nx2SparseMarkWritten(u64 gpu_address, u64 size) {
-    Detail::SparseMarkWritten(g_nx2_sparse_region_map, g_nx2_sparse_low, g_nx2_sparse_high,
+    Detail::SparseMarkWritten(Nx2LegacySparseRegionMap(), g_nx2_sparse_low, g_nx2_sparse_high,
                               gpu_address, size);
 }
 
 /// True when [gpu_address, +size) lies in one sparse region and none of it has been written.
 inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
-    return Detail::SparseUnwritten(g_nx2_sparse_region_map, g_nx2_sparse_low, g_nx2_sparse_high,
+    return Detail::SparseUnwritten(Nx2LegacySparseRegionMap(), g_nx2_sparse_low, g_nx2_sparse_high,
                                    gpu_address, size);
 }
 
@@ -1008,8 +1016,8 @@ public:
     static constexpr u32 AcquireMask = 0x8;
 
     static Nx2SemaphoreWaiters& Get() {
-        static Nx2SemaphoreWaiters waiters;
-        return waiters;
+        static auto* const waiters = new Nx2SemaphoreWaiters();
+        return *waiters;
     }
 
     void Add(const void* owner, u64 device_address, u32 value, u32 operation) {

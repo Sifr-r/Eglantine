@@ -633,6 +633,17 @@ void EmulatedController::DisableSystemButtons() {
     controller.capture_button_state.raw = 0;
 }
 
+void EmulatedController::SetHomeButtonEnabled(bool enabled) {
+    std::scoped_lock lock{controller_mutex};
+    home_button_enabled = enabled;
+    controller.home_button_state.raw = 0;
+}
+
+bool EmulatedController::GetHomeButtonValue() const {
+    std::scoped_lock lock{controller_mutex};
+    return controller.button_values[Settings::NativeButton::Home].value;
+}
+
 void EmulatedController::ResetSystemButtons() {
     std::scoped_lock lock{controller_mutex};
     controller.home_button_state.home.Assign(false);
@@ -913,7 +924,7 @@ void EmulatedController::SetButton(const Common::Input::CallbackStatus& callback
                 controller.npad_button_state.right_sr.Assign(current_status.value);
                 break;
             case Settings::NativeButton::Home:
-                if (!system_buttons_enabled) {
+                if (!system_buttons_enabled || !home_button_enabled) {
                     break;
                 }
                 controller.home_button_state.home.Assign(current_status.value);

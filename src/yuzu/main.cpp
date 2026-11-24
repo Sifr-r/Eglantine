@@ -39,6 +39,7 @@
 #endif
 
 #include "main_window.h"
+#include "qt_common/qt_common.h"
 #include "user_data_migration.h"
 
 #ifdef YUZU_CRASH_DUMPS
@@ -307,10 +308,15 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    MainWindow main_window{has_broken_vulkan};
-    // After settings have been loaded by GMainWindow, apply the filter
-    main_window.show();
+    int exit_code = 0;
+    {
+        MainWindow main_window{has_broken_vulkan};
+        // After settings have been loaded by GMainWindow, apply the filter
+        main_window.show();
 
-    app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window, &MainWindow::OnAppFocusStateChanged);
-    return app.exec();
+        app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window, &MainWindow::OnAppFocusStateChanged);
+        exit_code = app.exec();
+    }
+    QtCommon::Shutdown();
+    return exit_code;
 }

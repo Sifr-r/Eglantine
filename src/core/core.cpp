@@ -552,11 +552,18 @@ struct System::Impl {
         // The cheat engine's event callback dereferences the guest process, so it has to go
         // before the kernel releases the processes.
         cheat_engine.reset();
+        if (service_manager) {
+            service_manager->CancelBlockingGets();
+        }
         if (kernel_initialized) {
             kernel.CloseServices();
             kernel.ShutdownCores();
         }
+        cpu_manager.Shutdown();
         services.reset();
+        if (kernel_initialized) {
+            kernel.DestroyServices();
+        }
         service_manager.reset();
         {
             std::scoped_lock lk{general_channel_mutex};
@@ -571,7 +578,6 @@ struct System::Impl {
         gpu_core.reset();
         host1x_core.reset();
         perf_stats.reset();
-        cpu_manager.Shutdown();
         debugger.reset();
         if (kernel_initialized) {
             kernel.Shutdown();

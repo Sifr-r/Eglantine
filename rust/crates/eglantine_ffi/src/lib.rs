@@ -3,9 +3,13 @@
 
 #![deny(warnings)]
 
+#[cfg(feature = "ampere")]
 pub use eglantine_ampere_rs::ffi::*;
+#[cfg(feature = "ampere-spirv")]
 pub use eglantine_ampere_spirv::ffi::*;
+#[cfg(feature = "nup")]
 pub use eglantine_nup_fs::ffi::*;
+#[cfg(feature = "switch2-io")]
 pub use eglantine_switch2_io::ffi::*;
 
 #[repr(transparent)]
@@ -15,11 +19,12 @@ pub struct FfiSymbolAnchor(*const ());
 // SAFETY: Function pointers are immutable process-wide code addresses.
 unsafe impl Sync for FfiSymbolAnchor {}
 
-/// Anchor every `#[no_mangle] pub extern "C"` symbol from the `rlib` workspace
-/// crates so `rustc` retains and exports all C ABI entrypoints in `eglantine_rs`.
+/// Anchor every `#[no_mangle] pub extern "C"` symbol from enabled `rlib` workspace
+/// crates so `rustc` retains and exports their C ABI entrypoints in `eglantine_rs`.
+#[cfg(feature = "ampere")]
 #[used]
 #[no_mangle]
-pub static EGLANTINE_EXPORTED_FFI_SYMBOLS: [FfiSymbolAnchor; 57] = [
+pub static EGLANTINE_EXPORTED_AMPERE_SYMBOLS: [FfiSymbolAnchor; 11] = [
     // eglantine_ampere.h (11)
     FfiSymbolAnchor(egl_ampere_capture_init as *const ()),
     FfiSymbolAnchor(egl_ampere_capture_observe as *const ()),
@@ -32,10 +37,22 @@ pub static EGLANTINE_EXPORTED_FFI_SYMBOLS: [FfiSymbolAnchor; 57] = [
     FfiSymbolAnchor(egl_ampere_lower_to_maxwell as *const ()),
     FfiSymbolAnchor(egl_ampere_free_lowered as *const ()),
     FfiSymbolAnchor(egl_ampere_free_bytes as *const ()),
+];
+
+#[cfg(feature = "ampere-spirv")]
+#[used]
+#[no_mangle]
+pub static EGLANTINE_EXPORTED_AMPERE_SPIRV_SYMBOLS: [FfiSymbolAnchor; 3] = [
     // eglantine_ampere_spirv.h (3)
     FfiSymbolAnchor(egl_ampere_spirv_compile as *const ()),
     FfiSymbolAnchor(egl_ampere_spirv_compile_batch as *const ()),
     FfiSymbolAnchor(egl_ampere_spirv_free as *const ()),
+];
+
+#[cfg(feature = "nup")]
+#[used]
+#[no_mangle]
+pub static EGLANTINE_EXPORTED_NUP_SYMBOLS: [FfiSymbolAnchor; 18] = [
     // eglantine_nup_fs.h (18)
     FfiSymbolAnchor(egl_nup_is_nup_magic as *const ()),
     FfiSymbolAnchor(egl_nup_container_parse as *const ()),
@@ -55,6 +72,12 @@ pub static EGLANTINE_EXPORTED_FFI_SYMBOLS: [FfiSymbolAnchor; 57] = [
     FfiSymbolAnchor(egl_nup_free_bytes as *const ()),
     FfiSymbolAnchor(egl_nup_free_string as *const ()),
     FfiSymbolAnchor(egl_nup_free_metadata as *const ()),
+];
+
+#[cfg(feature = "switch2-io")]
+#[used]
+#[no_mangle]
+pub static EGLANTINE_EXPORTED_SWITCH2_IO_SYMBOLS: [FfiSymbolAnchor; 25] = [
     // eglantine_switch2_io.h (25)
     FfiSymbolAnchor(egl_sw2_is_supported_product_id as *const ()),
     FfiSymbolAnchor(egl_sw2_product_id_to_controller_type as *const ()),

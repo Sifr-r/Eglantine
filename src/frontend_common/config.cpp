@@ -101,6 +101,15 @@ void Config::Initialize(const std::optional<std::string> config_path) {
     Reload();
 }
 
+bool Config::InitializeReadOnly(const std::string& config_path) {
+    config_loc = config_path;
+    if (!SetUpIni(false)) {
+        return false;
+    }
+    ReadValues();
+    return true;
+}
+
 void Config::WriteToIni() const {
     std::string config_type;
     switch (type) {
@@ -189,7 +198,7 @@ void Config::WriteToIni() const {
 #endif
 }
 
-void Config::SetUpIni() {
+bool Config::SetUpIni(bool create_missing) {
     config = std::make_unique<CSimpleIniA>();
     config->SetUnicode(true);
     config->SetSpaces(false);
@@ -197,25 +206,27 @@ void Config::SetUpIni() {
     FILE* fp = nullptr;
 #ifdef _WIN32
     _wfopen_s(&fp, Common::UTF8ToUTF16W(config_loc).data(), L"rb, ccs=UTF-8");
-    if (fp == nullptr) {
+    if (fp == nullptr && create_missing) {
         fp = _wfopen(Common::UTF8ToUTF16W(config_loc).data(), L"wb, ccs=UTF-8");
     }
 #else
     fp = fopen(config_loc.c_str(), "rb");
-    if (fp == nullptr) {
+    if (fp == nullptr && create_missing) {
         fp = fopen(config_loc.c_str(), "wb");
     }
 #endif
 
     if (fp == nullptr) {
         LOG_ERROR(Frontend, "Config file could not be loaded!");
-        return;
+        return false;
     }
 
-    if (SI_Error rc = config->LoadFile(fp); rc < 0) {
+    const SI_Error rc = config->LoadFile(fp);
+    if (rc < 0) {
         LOG_ERROR(Frontend, "Config file could not be loaded!");
     }
     fclose(fp);
+    return rc >= 0;
 }
 
 bool Config::IsCustomConfig() const {

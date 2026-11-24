@@ -68,22 +68,31 @@ struct Pacing {
     size_t count = 0;
     u32 since_off = 0, need = 60, drops = 0;
 };
-inline std::mutex g_pacing_mutex;
-inline Pacing g_pacing;
+struct PacingState {
+    std::mutex mutex;
+    Pacing pacing;
+};
+
+inline PacingState& GetPacingState() {
+    static auto* const state = new PacingState();
+    return *state;
+}
 } // namespace Detail
 
 /// Forgets the previous emulation session's pacing (called with the other Switch 2 resets).
 inline void Reset() {
-    std::scoped_lock lock{Detail::g_pacing_mutex};
-    Detail::g_pacing = {};
+    auto& state = Detail::GetPacingState();
+    std::scoped_lock lock{state.mutex};
+    state.pacing = {};
     g_steady.store(false, std::memory_order_relaxed);
 }
 
 inline void NotePresent() {
     using Clock = std::chrono::steady_clock;
     using Detail::Window;
-    std::scoped_lock lock{Detail::g_pacing_mutex};
-    auto& [last, on_since, intervals, count, since_off, need, drops] = Detail::g_pacing;
+    auto& state = Detail::GetPacingState();
+    std::scoped_lock lock{state.mutex};
+    auto& [last, on_since, intervals, count, since_off, need, drops] = state.pacing;
     const auto now = Clock::now();
     intervals[count++ % Window] = std::chrono::duration<double, std::milli>(now - last).count();
     last = now;

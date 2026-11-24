@@ -25,10 +25,16 @@ Container::Container(Core::System& system) {
 
     m_binder_driver =
         system.ServiceManager().GetService<Nvnflinger::IHOSBinderDriver>("dispdrv", true);
+    if (!m_binder_driver) {
+        return;
+    }
     m_surface_flinger = m_binder_driver->GetSurfaceFlinger();
 
-    const auto nvdrv =
-        system.ServiceManager().GetService<Nvidia::NVDRV>("nvdrv:s", true)->GetModule();
+    const auto nvdrv_service = system.ServiceManager().GetService<Nvidia::NVDRV>("nvdrv:s", true);
+    if (!nvdrv_service) {
+        return;
+    }
+    const auto nvdrv = nvdrv_service->GetModule();
     m_shared_buffer_manager.emplace(system, *this, nvdrv);
 
     m_displays.ForEachDisplay(
@@ -48,8 +54,10 @@ void Container::OnTerminate() {
 
     m_layers.ForEachLayer([&](auto& layer) { this->DestroyLayerLocked(layer.GetId()); });
 
-    m_displays.ForEachDisplay(
-        [&](auto& display) { m_surface_flinger->RemoveDisplay(display.GetId()); });
+    if (m_surface_flinger) {
+        m_displays.ForEachDisplay(
+            [&](auto& display) { m_surface_flinger->RemoveDisplay(display.GetId()); });
+    }
 }
 
 SharedBufferManager* Container::GetSharedBufferManager() {
