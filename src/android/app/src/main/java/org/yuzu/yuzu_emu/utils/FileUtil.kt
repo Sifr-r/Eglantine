@@ -273,20 +273,36 @@ object FileUtil {
         destinationFilename: String = ""
     ): File? =
         try {
-            val fileName =
-                if (destinationFilename == "") getFilename(sourceUri) else "/$destinationFilename"
-            val inputStream = context.contentResolver.openInputStream(sourceUri)!!
+            val rawName = destinationFilename.ifEmpty { getFilename(sourceUri) }
+            val sanitizedName = File(rawName).name
+            if (sanitizedName.isEmpty() ||
+                sanitizedName == "." ||
+                sanitizedName == ".." ||
+                sanitizedName.contains('\u0000')
+            ) {
+                null
+            } else {
+                val parentDir = File(destinationParentPath)
+                val destinationFile = File(parentDir, sanitizedName)
+                if (destinationFile.canonicalFile.parentFile != parentDir.canonicalFile) {
+                    null
+                } else {
+                    val inputStream = context.contentResolver.openInputStream(sourceUri)!!
+                    if (destinationFile.exists()) {
+                        destinationFile.delete()
+                    }
 
-            val destinationFile = File("$destinationParentPath$fileName")
-            if (destinationFile.exists()) {
-                destinationFile.delete()
+                    inputStream.use { input ->
+                        destinationFile.outputStream().use { fos ->
+                            input.copyTo(fos)
+                        }
+                    }
+                    destinationFile
+                }
             }
-
-            destinationFile.outputStream().use { fos ->
-                inputStream.use { it.copyTo(fos) }
-            }
-            destinationFile
         } catch (e: IOException) {
+            null
+        } catch (e: SecurityException) {
             null
         } catch (e: NullPointerException) {
             null
@@ -503,8 +519,7 @@ object FileUtil {
                 DocumentsContract.getDocumentId(uri)
             }
             val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(uri, docId)
-            resolver.query(childrenUri, columns, null, null, null)
-            true
+            resolver.query(childrenUri, columns, null, null, null)?.use { true } ?: false
         } catch (_: Exception) {
             false
         }

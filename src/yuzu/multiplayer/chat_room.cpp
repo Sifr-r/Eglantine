@@ -114,7 +114,7 @@ public:
 
     QString GetSystemChatMessage() const {
         return QStringLiteral("[%1] <font color='%2'>* %3</font>")
-            .arg(timestamp, QString::fromStdString(system_color), message);
+            .arg(timestamp, QString::fromStdString(system_color), message.toHtmlEscaped());
     }
 
 private:
@@ -455,13 +455,15 @@ void ChatRoom::PopupContextMenu(const QPoint& menu_location) {
         cur_nickname = room->GetNickname();
     }
 
+    const QString escaped_nickname = QString::fromStdString(nickname).toHtmlEscaped();
+
     if (nickname != cur_nickname) { // You can't block yourself
         QAction* block_action = context_menu.addAction(tr("Block Player"));
 
         block_action->setCheckable(true);
         block_action->setChecked(block_list.count(nickname) > 0);
 
-        connect(block_action, &QAction::triggered, [this, nickname] {
+        connect(block_action, &QAction::triggered, [this, nickname, escaped_nickname] {
             if (block_list.count(nickname)) {
                 block_list.erase(nickname);
             } else {
@@ -469,7 +471,7 @@ void ChatRoom::PopupContextMenu(const QPoint& menu_location) {
                     this, tr("Block Player"),
                     tr("When you block a player, you will no longer receive chat messages from "
                        "them.<br><br>Are you sure you would like to block %1?")
-                        .arg(QString::fromStdString(nickname)),
+                        .arg(escaped_nickname),
                     QMessageBox::Yes | QMessageBox::No);
                 if (result == QMessageBox::Yes)
                     block_list.emplace(nickname);
@@ -483,21 +485,21 @@ void ChatRoom::PopupContextMenu(const QPoint& menu_location) {
         QAction* kick_action = context_menu.addAction(tr("Kick"));
         QAction* ban_action = context_menu.addAction(tr("Ban"));
 
-        connect(kick_action, &QAction::triggered, [this, nickname] {
+        connect(kick_action, &QAction::triggered, [this, nickname, escaped_nickname] {
             QMessageBox::StandardButton result =
                 QMessageBox::question(this, tr("Kick Player"),
                                       tr("Are you sure you would like to <b>kick</b> %1?")
-                                          .arg(QString::fromStdString(nickname)),
+                                          .arg(escaped_nickname),
                                       QMessageBox::Yes | QMessageBox::No);
             if (result == QMessageBox::Yes)
                 SendModerationRequest(Network::IdModKick, nickname);
         });
-        connect(ban_action, &QAction::triggered, [this, nickname] {
+        connect(ban_action, &QAction::triggered, [this, nickname, escaped_nickname] {
             QMessageBox::StandardButton result = QMessageBox::question(
                 this, tr("Ban Player"),
                 tr("Are you sure you would like to <b>kick and ban</b> %1?\n\nThis would "
                    "ban both their forum username and their IP address.")
-                    .arg(QString::fromStdString(nickname)),
+                    .arg(escaped_nickname),
                 QMessageBox::Yes | QMessageBox::No);
             if (result == QMessageBox::Yes)
                 SendModerationRequest(Network::IdModBan, nickname);

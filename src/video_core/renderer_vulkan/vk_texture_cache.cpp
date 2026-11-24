@@ -25,6 +25,8 @@
 #include "common/literals.h"
 #include "common/settings.h"
 
+#include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
 #include "video_core/gpu_logging/gpu_logging.h"
@@ -180,23 +182,25 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
 // A large image over Switch 2 sparse blocks nobody has written (title 1's terrain layer pools, 2.9
 // GB of R8/RG16/R16 that stay empty in the attract demo) is all zeros: it gets no device memory
 // until a write makes the texture cache replace it.
-[[nodiscard]] bool IsUnwrittenSparse(const Device& device, const ImageInfo& info, GPUVAddr gpu_addr) {
-    if (!device.CanUseUnbackedSparseImages()) {
+[[nodiscard]] bool IsUnwrittenSparse(const Device& device, const Core::Nx2SessionState* session,
+                                     const ImageInfo& info, GPUVAddr gpu_addr) {
+    if (session == nullptr || !device.CanUseUnbackedSparseImages()) {
         return false;
     }
     constexpr u32 MinSize = 32U << 20;
     const u64 size = VideoCommon::CalculateGuestSizeInBytes(info);
     return size >= MinSize && info.type != ImageType::e1D && info.type != ImageType::Buffer &&
-           info.type != ImageType::Linear && Tegra::Nx2SparseUnwritten(gpu_addr, size);
+           info.type != ImageType::Linear && session->SparseState().Unwritten(gpu_addr, size);
 }
 
 // A large color array in a Switch 2 sparse region (title 1's terrain arrays: 13-26% of their
 // blocks written) gets memory by layer, as its layers are written: unbacked at first, then
 // Image::BindLayers. Only formats uploaded layer by layer: huge ASTC arrays (GPU decode) and
 // formats the host samples as they are.
-[[nodiscard]] bool UsesSparseLayers(const Device& device, const ImageInfo& info, GPUVAddr gpu_addr) {
-    if (!device.CanUseUnbackedSparseImages() || !device.IsSparseResidencyImage2DSupported() ||
-        info.type != ImageType::e2D ||
+[[nodiscard]] bool UsesSparseLayers(const Device& device, const Core::Nx2SessionState* session,
+                                    const ImageInfo& info, GPUVAddr gpu_addr) {
+    if (session == nullptr || !device.CanUseUnbackedSparseImages() ||
+        !device.IsSparseResidencyImage2DSupported() || info.type != ImageType::e2D ||
         info.resources.layers <= 1 || info.num_samples != 1 ||
         VideoCore::Surface::GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture) {
         return false;
@@ -207,7 +211,7 @@ constexpr VkBorderColor ConvertBorderColor(const std::array<float, 4>& color) {
          (!IsPixelFormatBCn(info.format) || device.IsOptimalBcnSupported()) &&
          (!IsPixelFormatETC2(info.format) || device.IsOptimalEtc2Supported()));
     const u64 size = VideoCommon::CalculateGuestSizeInBytes(info);
-    return layer_uploads && size >= (32U << 20) && Tegra::Nx2InSparseRegion(gpu_addr, size);
+    return layer_uploads && size >= (32U << 20) && session->SparseState().InRegion(gpu_addr, size);
 }
 
 // How SparseTiles images leave the blocks without data: unbound (reads give zero), or all bound to
@@ -239,10 +243,11 @@ enum class SparseTilesMode {
 
 // Large NX2 masks and BC6H lightmap arrays get memory by sparse block where guest memory
 // is mapped. A whole BC6H layer can cost 85 MiB even if only a few guest tiles are present.
-[[nodiscard]] bool UsesSparseTiles(const Device& device, const ImageInfo& info, GPUVAddr gpu_addr) {
+[[nodiscard]] bool UsesSparseTiles(const Device& device, const Core::Nx2SessionState* session,
+                                   const ImageInfo& info, GPUVAddr gpu_addr) {
     const auto mode = SparseTilesModeOf(device);
-    if (mode == SparseTilesMode::None || info.type != ImageType::e2D || info.num_samples != 1 ||
-        info.size.depth != 1 || info.block.width != 0 ||
+    if (session == nullptr || mode == SparseTilesMode::None || info.type != ImageType::e2D ||
+        info.num_samples != 1 || info.size.depth != 1 || info.block.width != 0 ||
         VideoCore::Surface::GetFormatType(info.format) !=
             VideoCore::Surface::SurfaceType::ColorTexture) {
         return false;
@@ -256,7 +261,7 @@ enum class SparseTilesMode {
                            mode == SparseTilesMode::Unbound && device.IsOptimalBcnSupported();
     const u64 size = VideoCommon::CalculateGuestSizeInBytes(info);
     return (plain_image || hdr_array) && size >= (32U << 20) &&
-           Tegra::Nx2InSparseRegion(gpu_addr, size);
+           session->SparseState().InRegion(gpu_addr, size);
 }
 
 // Vulkan's standard sparse block shape for single-sampled 2D images (64 KiB blocks), in texel
@@ -1324,11 +1329,13 @@ VkBuffer TextureCacheRuntime::GetTemporaryBuffer(size_t needed_size) {
 VkImageView TextureCacheRuntime::GetOrCreateResolveShadow(VkImage msaa_image, VkFormat format,
                                                           VkExtent2D extent, u32 layers,
                                                           VkImageAspectFlags aspect_mask) {
-    ResolveShadow& shadow = resolve_shadows[msaa_image];
-    if (shadow.image && shadow.format == format && shadow.extent.width == extent.width &&
-        shadow.extent.height == extent.height && shadow.layers == layers &&
-        shadow.aspect_mask == aspect_mask) {
-        return *shadow.view;
+    auto& shadows = resolve_shadows[msaa_image];
+    for (const ResolveShadow& shadow : shadows) {
+        if (shadow.image && shadow.format == format && shadow.extent.width == extent.width &&
+            shadow.extent.height == extent.height && shadow.layers == layers &&
+            shadow.aspect_mask == aspect_mask) {
+            return *shadow.view;
+        }
     }
     VkImageUsageFlags shadow_usage =
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -1337,9 +1344,7 @@ VkImageView TextureCacheRuntime::GetOrCreateResolveShadow(VkImage msaa_image, Vk
     } else {
         shadow_usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     }
-    if (shadow.image) {
-        pending_resolve_shadows.emplace_back(scheduler.CurrentTick(), std::move(shadow));
-    }
+    ResolveShadow shadow;
     shadow.image = memory_allocator.CreateImage(VkImageCreateInfo{
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .pNext = nullptr,
@@ -1378,29 +1383,41 @@ VkImageView TextureCacheRuntime::GetOrCreateResolveShadow(VkImage msaa_image, Vk
     shadow.layers = layers;
     shadow.aspect_mask = aspect_mask;
     shadow.up_to_date = false;
-    return *shadow.view;
+    shadows.push_back(std::move(shadow));
+    return *shadows.back().view;
 }
 
 const TextureCacheRuntime::ResolveShadow* TextureCacheRuntime::GetValidResolveShadow(
     VkImage msaa_image) const {
     const auto it = resolve_shadows.find(msaa_image);
-    if (it == resolve_shadows.end() || !it->second.up_to_date || !it->second.image) {
+    if (it == resolve_shadows.end()) {
         return nullptr;
     }
-    return &it->second;
+    for (const ResolveShadow& shadow : it->second) {
+        if (shadow.up_to_date && shadow.image) {
+            return &shadow;
+        }
+    }
+    return nullptr;
 }
 
-void TextureCacheRuntime::MarkResolveShadowUpToDate(VkImage msaa_image) {
+void TextureCacheRuntime::MarkResolveShadowUpToDate(VkImage msaa_image, VkImageView shadow_view) {
     const auto it = resolve_shadows.find(msaa_image);
-    if (it != resolve_shadows.end()) {
-        it->second.up_to_date = true;
+    if (it == resolve_shadows.end()) {
+        return;
+    }
+    for (ResolveShadow& shadow : it->second) {
+        shadow.up_to_date = *shadow.view == shadow_view;
     }
 }
 
 void TextureCacheRuntime::InvalidateResolveShadow(VkImage msaa_image) {
     const auto it = resolve_shadows.find(msaa_image);
-    if (it != resolve_shadows.end()) {
-        it->second.up_to_date = false;
+    if (it == resolve_shadows.end()) {
+        return;
+    }
+    for (ResolveShadow& shadow : it->second) {
+        shadow.up_to_date = false;
     }
 }
 
@@ -1409,8 +1426,10 @@ void TextureCacheRuntime::EraseResolveShadow(VkImage msaa_image) {
     if (it == resolve_shadows.end()) {
         return;
     }
-    if (it->second.image) {
-        pending_resolve_shadows.emplace_back(scheduler.CurrentTick(), std::move(it->second));
+    for (ResolveShadow& shadow : it->second) {
+        if (shadow.image) {
+            pending_resolve_shadows.emplace_back(scheduler.CurrentTick(), std::move(shadow));
+        }
     }
     resolve_shadows.erase(it);
 }
@@ -1423,6 +1442,9 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
                                            std::span<const VideoCommon::ImageCopy> copies) {
     if (ENABLE_MSAA_RESOLVE_CONSUME) {
         InvalidateResolveShadow(dst.Handle());
+    }
+    if (copies.empty()) {
+        return;
     }
     boost::container::small_vector<VkBufferImageCopy, 16> vk_in_copies(copies.size());
     boost::container::small_vector<VkBufferImageCopy, 16> vk_out_copies(copies.size());
@@ -1440,22 +1462,47 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
     const VkImageAspectFlags src_copy_aspect = copy_aspect(src_aspect_mask);
     const VkImageAspectFlags dst_copy_aspect = copy_aspect(dst_aspect_mask);
 
-    const auto bpp_in = BytesPerBlock(src.info.format) / DefaultBlockWidth(src.info.format);
-    const auto bpp_out = BytesPerBlock(dst.info.format) / DefaultBlockWidth(dst.info.format);
-    std::ranges::transform(copies, vk_in_copies.begin(),
-                           [src_copy_aspect, bpp_in, bpp_out](const auto& copy) {
-                               auto copy2 = copy;
-                               copy2.src_offset.x = (bpp_out * copy.src_offset.x) / bpp_in;
-                               copy2.extent.width = (bpp_out * copy.extent.width) / bpp_in;
-                               return MakeBufferImageCopy(copy2, true, src_copy_aspect);
-                           });
-    std::ranges::transform(copies, vk_out_copies.begin(), [dst_copy_aspect](const auto& copy) {
-        return MakeBufferImageCopy(copy, false, dst_copy_aspect);
-    });
-    const u32 img_bpp = BytesPerBlock(dst.info.format);
+    const u32 src_block_bytes = (std::max)(BytesPerBlock(src.info.format), 1U);
+    const u32 dst_block_bytes = (std::max)(BytesPerBlock(dst.info.format), 1U);
+    const u32 src_bw = (std::max)(VideoCore::Surface::DefaultBlockWidth(src.info.format), 1U);
+    const u32 src_bh = (std::max)(VideoCore::Surface::DefaultBlockHeight(src.info.format), 1U);
+    const u32 dst_bw = (std::max)(VideoCore::Surface::DefaultBlockWidth(dst.info.format), 1U);
+    const u32 dst_bh = (std::max)(VideoCore::Surface::DefaultBlockHeight(dst.info.format), 1U);
+    const u32 bpp_in = src_block_bytes / src_bw;
+    const u32 bpp_out = dst_block_bytes / dst_bw;
+    const size_t offset_alignment =
+        std::lcm<size_t>(size_t{4}, std::lcm<size_t>(src_block_bytes, dst_block_bytes));
+
     size_t total_size = 0;
-    for (const auto& copy : copies) {
-        total_size += copy.extent.width * copy.extent.height * copy.extent.depth * img_bpp;
+    for (size_t i = 0; i < copies.size(); ++i) {
+        const auto& copy = copies[i];
+        auto copy2 = copy;
+        copy2.src_offset.x = (bpp_out * copy.src_offset.x) / bpp_in;
+        copy2.extent.width = (bpp_out * copy.extent.width) / bpp_in;
+
+        const size_t region_offset = Common::AlignUp(total_size, offset_alignment);
+        VkBufferImageCopy in_copy = MakeBufferImageCopy(copy2, true, src_copy_aspect);
+        in_copy.bufferOffset = static_cast<VkDeviceSize>(region_offset);
+        vk_in_copies[i] = in_copy;
+
+        VkBufferImageCopy out_copy = MakeBufferImageCopy(copy, false, dst_copy_aspect);
+        out_copy.bufferOffset = static_cast<VkDeviceSize>(region_offset);
+        vk_out_copies[i] = out_copy;
+
+        const size_t src_layers =
+            static_cast<size_t>((std::max)(copy2.src_subresource.num_layers, 1));
+        const size_t dst_layers =
+            static_cast<size_t>((std::max)(copy.dst_subresource.num_layers, 1));
+        const size_t src_size = static_cast<size_t>(Common::DivCeil(copy2.extent.width, src_bw)) *
+                                Common::DivCeil(copy2.extent.height, src_bh) *
+                                (std::max)(copy2.extent.depth, 1U) * src_layers * src_block_bytes;
+        const size_t dst_size = static_cast<size_t>(Common::DivCeil(copy.extent.width, dst_bw)) *
+                                Common::DivCeil(copy.extent.height, dst_bh) *
+                                (std::max)(copy.extent.depth, 1U) * dst_layers * dst_block_bytes;
+        total_size = region_offset + (std::max)(src_size, dst_size);
+    }
+    if (total_size == 0) {
+        return;
     }
     const VkBuffer copy_buffer = GetTemporaryBuffer(total_size);
     const VkImage dst_image = dst.Handle();
@@ -1567,24 +1614,50 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
     });
 }
 
-bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
-    // FSR 3.1 replaces DLSS; the temporal stand-in only runs when FSR cannot (no depth, a device
-    // without the formats, a failed start). EDEN_NX2_DLSS_REPLACEMENT=standin forces
-    // the stand-in for A/B runs.
-    static const bool force_standin = [] {
+namespace {
+
+TemporalUpscalerBackend TemporalReplacementOverride() {
+    static const TemporalUpscalerBackend forced = [] {
         const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "standin";
+        if (value == nullptr) {
+            return TemporalUpscalerBackend::None;
+        }
+        const std::string_view sv{value};
+        if (sv == "standin") {
+            return TemporalUpscalerBackend::StandIn;
+        }
+        if (sv == "fsr") {
+            return TemporalUpscalerBackend::Fsr3;
+        }
+        if (sv == "xess") {
+            return TemporalUpscalerBackend::XeSS;
+        }
+        if (sv == "dlss") {
+            return TemporalUpscalerBackend::Dlss;
+        }
+        return TemporalUpscalerBackend::None;
     }();
-    return !force_standin && !fsr3_unsupported;
+    return forced;
+}
+
+} // Anonymous namespace
+
+bool TextureCacheRuntime::WantsTemporalUpscaleDepth() const {
+    // Priority order is DLSS -> XeSS -> FSR 3.1; the temporal stand-in only runs when no depth
+    // backend can run or EDEN_NX2_DLSS_REPLACEMENT=standin forces it.
+    if (TemporalReplacementOverride() == TemporalUpscalerBackend::StandIn) {
+        return false;
+    }
+    return UsesNvidiaDlss() || !xess_unsupported || !fsr3_unsupported;
 }
 
 bool TextureCacheRuntime::UsesNvidiaDlss() const {
 #ifdef EGLANTINE_STREAMLINE
-    static const bool force_fsr = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "fsr";
-    }();
-    return !force_fsr && !dlss_unsupported && Streamline::IsDlssAvailable();
+    const auto forced = TemporalReplacementOverride();
+    const bool blocked = forced == TemporalUpscalerBackend::Fsr3 ||
+                         forced == TemporalUpscalerBackend::XeSS ||
+                         forced == TemporalUpscalerBackend::StandIn;
+    return !blocked && !dlss_unsupported && Streamline::IsDlssAvailable();
 #else
     return false;
 #endif
@@ -1600,35 +1673,56 @@ std::optional<VideoCore::GameDlssProbe> TextureCacheRuntime::ProbeGameDlssOutput
                                      output.Handle(Shader::TextureType::Color2D));
 }
 
-bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
-                                          ImageView& motion_vectors, ImageView& depth,
-                                          std::array<u32, 2> render_size,
-                                          std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale) {
-    if (!WantsTemporalUpscaleDepth()) {
-        return false;
+TemporalUpscaleImage TextureCacheRuntime::MakeUpscaleImage(ImageView& view, VkImageView handle,
+                                                             VkImageAspectFlags aspect) const {
+    return TemporalUpscaleImage{
+        .view = handle,
+        .image = view.ImageHandle(),
+        .format =
+            MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, view.format).format,
+        .range{
+            .aspectMask = aspect,
+            .baseMipLevel = static_cast<u32>(view.range.base.level),
+            .levelCount = 1,
+            .baseArrayLayer = static_cast<u32>(view.range.base.layer),
+            .layerCount = 1,
+        },
+        .barrier_aspect = ImageAspectMask(view.format),
+    };
+}
+
+XeSSUpscaler* TextureCacheRuntime::GetXessUpscaler() {
+    if (xess_unsupported) {
+        return nullptr;
     }
-    const VkExtent2D extent = dst_framebuffer->RenderArea();
-    // A gap in the evaluations (a menu, a movie, a load) starts the history again.
-    const auto now = std::chrono::steady_clock::now();
-    const f32 frame_time_ms =
-        fsr3_last_evaluation
-            ? std::chrono::duration<f32, std::milli>(now - *fsr3_last_evaluation).count()
-            : 1000.0f / 30.0f;
-    const bool reset = !fsr3_last_evaluation || frame_time_ms > 250.0f;
-    fsr3_last_evaluation = now;
-#ifdef EGLANTINE_STREAMLINE
-    if (UpscaleWithDlss(dst_framebuffer, input_color, motion_vectors, depth, render_size, jitter,
-                        motion_scale, reset)) {
-        return true;
+    if (!xess_upscaler) {
+        if (!XeSSUpscaler::IsSupported(device)) {
+            xess_unsupported = true;
+            return nullptr;
+        }
+        try {
+            xess_upscaler =
+                std::make_unique<XeSSUpscaler>(device, scheduler, memory_allocator);
+        } catch (const vk::Exception& exception) {
+            LOG_WARNING(Render_Vulkan, "Intel XeSS unavailable ({}); falling back to FSR 3.1",
+                        exception.what());
+            xess_unsupported = true;
+            return nullptr;
+        }
     }
-#endif
+    return xess_upscaler.get();
+}
+
+Fsr3Upscaler* TextureCacheRuntime::GetFsr3Upscaler() {
+    if (fsr3_unsupported) {
+        return nullptr;
+    }
     if (!fsr3_upscaler) {
         if (!Fsr3Upscaler::IsSupported(device)) {
             LOG_WARNING(Render_Vulkan, "FSR 3.1 needs formats or features this device lacks; "
                                        "using the temporal stand-in");
             fsr3_unsupported = true;
-            return false;
+            return nullptr;
         }
         try {
             fsr3_upscaler = std::make_unique<Fsr3Upscaler>(device, scheduler, memory_allocator,
@@ -1638,9 +1732,49 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
             LOG_ERROR(Render_Vulkan, "FSR 3.1 failed to start ({}); using the temporal stand-in",
                       exception.what());
             fsr3_unsupported = true;
-            return false;
+            return nullptr;
         }
     }
+    return fsr3_upscaler.get();
+}
+
+bool TextureCacheRuntime::TryUpscaleBackend(ITemporalUpscaler& upscaler,
+                                            Framebuffer* dst_framebuffer,
+                                            const TemporalUpscaleInputs& inputs,
+                                            const char* backend_name, bool& logged) {
+    if (!upscaler.Upscale(inputs)) {
+        return false;
+    }
+    DrawUpscaledOutput(dst_framebuffer, upscaler.OutputView(), upscaler.OutputImage(),
+                       upscaler.PointSampler());
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Render_Vulkan, "DLSS replaced by {}: {}x{} -> {}x{}", backend_name,
+                 inputs.render_size.width, inputs.render_size.height, inputs.upscale_size.width,
+                 inputs.upscale_size.height);
+    }
+    return true;
+}
+
+bool TextureCacheRuntime::UpscaleWithTemporalBackends(Framebuffer* dst_framebuffer,
+                                                       ImageView& input_color,
+                                                       ImageView& motion_vectors, ImageView& depth,
+                                                       std::array<u32, 2> render_size,
+                                                       std::array<f32, 2> jitter,
+                                                       std::array<f32, 2> motion_scale) {
+    if (!WantsTemporalUpscaleDepth()) {
+        return false;
+    }
+    const VkExtent2D extent = dst_framebuffer->RenderArea();
+    // A gap in the evaluations (a menu, a movie, a load) starts the history again.
+    const auto now = std::chrono::steady_clock::now();
+    const f32 frame_time_ms =
+        temporal_last_evaluation
+            ? std::chrono::duration<f32, std::milli>(now - *temporal_last_evaluation).count()
+            : 1000.0f / 30.0f;
+    const bool reset = !temporal_last_evaluation || frame_time_ms > 250.0f;
+    temporal_last_evaluation = now;
+
     // FSR's own RCAS, set by the sharpness slider: FSR takes 0-1 for 2 to 0 stops, and the slider
     // stores stops x 100, so this is the percentage the slider shows; 0% (stored 200) is off.
     // EDEN_NX2_TEMPORAL_SHARPEN=<stops>|off overrides the slider.
@@ -1652,10 +1786,14 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
         sharpen = std::string_view{sharpen_override} != "off";
         stops = static_cast<f32>(std::strtod(sharpen_override, nullptr));
     }
-    fsr3_upscaler->Upscale({
-        .color = input_color.Handle(Shader::TextureType::Color2D),
-        .depth = depth.DepthView(),
-        .motion_vectors = motion_vectors.Handle(Shader::TextureType::Color2D),
+
+    const TemporalUpscaleInputs inputs{
+        .color = MakeUpscaleImage(input_color, input_color.Handle(Shader::TextureType::Color2D),
+                                  VK_IMAGE_ASPECT_COLOR_BIT),
+        .depth = MakeUpscaleImage(depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
+        .motion_vectors =
+            MakeUpscaleImage(motion_vectors, motion_vectors.Handle(Shader::TextureType::Color2D),
+                             VK_IMAGE_ASPECT_COLOR_BIT),
         .render_size = {render_size[0], render_size[1]},
         .upscale_size = extent,
         .jitter = jitter,
@@ -1663,18 +1801,41 @@ bool TextureCacheRuntime::UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageVie
                                 motion_scale[1] * static_cast<f32>(render_size[1])},
         .frame_time_ms = frame_time_ms,
         .reset = reset,
+        .depth_inverted = true,
+        .hdr = true,
         .sharpen = sharpen,
         .sharpness = 1.0f - stops / 2.0f,
-    });
-    DrawUpscaledOutput(dst_framebuffer, fsr3_upscaler->OutputView(), fsr3_upscaler->OutputImage(),
-                       fsr3_upscaler->PointSampler());
-    static bool logged{};
-    if (!logged) {
-        logged = true;
-        LOG_INFO(Render_Vulkan, "DLSS replaced by FSR 3.1: {}x{} -> {}x{}", render_size[0],
-                 render_size[1], extent.width, extent.height);
+    };
+
+    const auto forced = TemporalReplacementOverride();
+#ifdef EGLANTINE_STREAMLINE
+    if (forced != TemporalUpscalerBackend::Fsr3 && forced != TemporalUpscalerBackend::XeSS) {
+        if (auto* dlss = DlssUpscaler()) {
+            static bool dlss_logged{};
+            if (TryUpscaleBackend(*dlss, dst_framebuffer, inputs, "NVIDIA DLSS", dlss_logged)) {
+                return true;
+            }
+            dlss_unsupported = true;
+        }
     }
-    return true;
+#endif
+    if (forced != TemporalUpscalerBackend::Fsr3) {
+        if (auto* xess = GetXessUpscaler()) {
+            static bool xess_logged{};
+            if (TryUpscaleBackend(*xess, dst_framebuffer, inputs, "Intel XeSS", xess_logged)) {
+                return true;
+            }
+            xess_unsupported = true;
+        }
+    }
+    if (auto* fsr3 = GetFsr3Upscaler()) {
+        static bool fsr3_logged{};
+        if (TryUpscaleBackend(*fsr3, dst_framebuffer, inputs, "FSR 3.1", fsr3_logged)) {
+            return true;
+        }
+        fsr3_unsupported = true;
+    }
+    return false;
 }
 
 void TextureCacheRuntime::DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view,
@@ -1716,12 +1877,9 @@ void TextureCacheRuntime::DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkIma
 
 #ifdef EGLANTINE_STREAMLINE
 StreamlineDlssUpscaler* TextureCacheRuntime::DlssUpscaler() {
-    // EDEN_NX2_DLSS_REPLACEMENT=fsr keeps FSR 3.1 for A/B runs.
-    static const bool force_fsr = [] {
-        const char* const value = std::getenv("EDEN_NX2_DLSS_REPLACEMENT");
-        return value && std::string_view{value} == "fsr";
-    }();
-    if (force_fsr || dlss_unsupported) {
+    const auto forced = TemporalReplacementOverride();
+    if (forced == TemporalUpscalerBackend::Fsr3 || forced == TemporalUpscalerBackend::XeSS ||
+        dlss_unsupported) {
         return nullptr;
     }
     if (!dlss_upscaler) {
@@ -1740,67 +1898,6 @@ StreamlineDlssUpscaler* TextureCacheRuntime::DlssUpscaler() {
         }
     }
     return dlss_upscaler.get();
-}
-
-namespace {
-StreamlineDlssUpscaler::Image DlssImage(const Device& device, ImageView& view, VkImageView handle,
-                                        VkImageAspectFlags aspect) {
-    return StreamlineDlssUpscaler::Image{
-        .view = handle,
-        .image = view.ImageHandle(),
-        .format =
-            MaxwellToVK::SurfaceFormat(device, FormatType::Optimal, false, view.format).format,
-        .range{
-            .aspectMask = aspect,
-            .baseMipLevel = static_cast<u32>(view.range.base.level),
-            .levelCount = 1,
-            .baseArrayLayer = static_cast<u32>(view.range.base.layer),
-            .layerCount = 1,
-        },
-        .barrier_aspect = ImageAspectMask(view.format),
-    };
-}
-} // Anonymous namespace
-
-bool TextureCacheRuntime::UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageView& input_color,
-                                          ImageView& motion_vectors, ImageView& depth,
-                                          std::array<u32, 2> render_size,
-                                          std::array<f32, 2> jitter,
-                                          std::array<f32, 2> motion_scale, bool reset) {
-    if (!DlssUpscaler()) {
-        return false;
-    }
-    const auto image = [&](ImageView& view, VkImageView handle, VkImageAspectFlags aspect) {
-        return DlssImage(device, view, handle, aspect);
-    };
-    const VkExtent2D extent = dst_framebuffer->RenderArea();
-    const bool upscaled = dlss_upscaler->Upscale({
-        .color = image(input_color, input_color.Handle(Shader::TextureType::Color2D),
-                       VK_IMAGE_ASPECT_COLOR_BIT),
-        .depth = image(depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
-        .motion_vectors = image(motion_vectors,
-                                motion_vectors.Handle(Shader::TextureType::Color2D),
-                                VK_IMAGE_ASPECT_COLOR_BIT),
-        .render_size = {render_size[0], render_size[1]},
-        .upscale_size = extent,
-        .jitter = jitter,
-        .motion_vector_scale = {motion_scale[0] * static_cast<f32>(render_size[0]),
-                                motion_scale[1] * static_cast<f32>(render_size[1])},
-        .reset = reset,
-    });
-    if (!upscaled) {
-        dlss_unsupported = true;
-        return false;
-    }
-    DrawUpscaledOutput(dst_framebuffer, dlss_upscaler->OutputView(), dlss_upscaler->OutputImage(),
-                       dlss_upscaler->PointSampler());
-    static bool logged{};
-    if (!logged) {
-        logged = true;
-        LOG_INFO(Render_Vulkan, "DLSS replaced by NVIDIA DLSS: {}x{} -> {}x{}", render_size[0],
-                 render_size[1], extent.width, extent.height);
-    }
-    return true;
 }
 #endif
 
@@ -1826,7 +1923,7 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
             device, scheduler, descriptor_pool, compute_pass_descriptor_queue, memory_allocator);
     }
     camera_motion_pass->Record(depth.DepthView(), render_extent, reprojection);
-    const StreamlineDlssUpscaler::Image motion_vectors{
+    const TemporalUpscaleImage motion_vectors{
         .view = camera_motion_pass->View(),
         .image = camera_motion_pass->Image(),
         .format = CameraMotionPass::FORMAT,
@@ -1841,11 +1938,11 @@ bool TextureCacheRuntime::UpscaleWithCameraMotion(Framebuffer* dst_framebuffer,
     };
     bool upscaled{};
     try {
-        upscaled = dlss_upscaler->Upscale({
-            .color = DlssImage(device, input_color,
-                               input_color.Handle(Shader::TextureType::Color2D),
-                               VK_IMAGE_ASPECT_COLOR_BIT),
-            .depth = DlssImage(device, depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
+        upscaled = dlss_upscaler->Upscale(TemporalUpscaleInputs{
+            .color = MakeUpscaleImage(input_color,
+                                      input_color.Handle(Shader::TextureType::Color2D),
+                                      VK_IMAGE_ASPECT_COLOR_BIT),
+            .depth = MakeUpscaleImage(depth, depth.DepthView(), VK_IMAGE_ASPECT_DEPTH_BIT),
             .motion_vectors = motion_vectors,
             .render_size = render_extent,
             .upscale_size = upscale_extent,
@@ -1886,8 +1983,8 @@ bool TextureCacheRuntime::TemporalUpscale(Framebuffer* dst_framebuffer, ImageVie
     if (dst.Samples() != VK_SAMPLE_COUNT_1_BIT || ImageAspectMask(dst.format) != VK_IMAGE_ASPECT_COLOR_BIT) {
         return false;
     }
-    if (depth && UpscaleWithFsr3(dst_framebuffer, input_color, motion_vectors, *depth, render_size,
-                                 jitter, motion_scale)) {
+    if (depth && UpscaleWithTemporalBackends(dst_framebuffer, input_color, motion_vectors, *depth,
+                                             render_size, jitter, motion_scale)) {
         return true;
     }
     const VkFormat format =
@@ -2580,6 +2677,9 @@ void TextureCacheRuntime::CopyImageMSAA(Image& dst, Image& src,
             return;
         }
     }
+    if (ENABLE_MSAA_RESOLVE_CONSUME && dst.info.num_samples > 1) {
+        InvalidateResolveShadow(dst.Handle());
+    }
     const VkImageAspectFlags dst_aspect_mask = dst.AspectMask();
     if ((dst_aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) {
         const bool copies_stencil = (dst_aspect_mask & VK_IMAGE_ASPECT_STENCIL_BIT) != 0 &&
@@ -2965,6 +3065,10 @@ void TextureCacheRuntime::RecycleImage(Image& image, u64 completed_tick) {
     }
 }
 
+std::shared_ptr<Core::Nx2SessionState> TextureCacheRuntime::Nx2Session() const {
+    return system != nullptr ? system->Nx2Session() : nullptr;
+}
+
 void TextureCacheRuntime::TickFrame() {
     if (PlainGpuUnswizzleEnabled()) {
         static const bool log_plain = std::getenv("EDEN_NX2_TC_LOG") != nullptr;
@@ -3045,9 +3149,13 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
       runtime{&runtime_}, aspect_mask(ImageAspectMask(info.format)) {
     const auto host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
-    const bool unbacked = UsesSparseLayers(runtime_.device, info, gpu_addr_) ||
-                          UsesSparseTiles(runtime_.device, info, gpu_addr_) ||
-                          IsUnwrittenSparse(runtime_.device, info, gpu_addr_);
+    const auto nx2_session = runtime_.Nx2Session();
+    const bool uses_sparse_layers =
+        UsesSparseLayers(runtime_.device, nx2_session.get(), info, gpu_addr_);
+    const bool uses_sparse_tiles =
+        UsesSparseTiles(runtime_.device, nx2_session.get(), info, gpu_addr_);
+    const bool unbacked = uses_sparse_layers || uses_sparse_tiles ||
+                          IsUnwrittenSparse(runtime_.device, nx2_session.get(), info, gpu_addr_);
     if (!unbacked) {
         original_image = runtime_.AcquireImageAllocation(host_info);
     }
@@ -3060,16 +3168,16 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    : runtime->ViewFormats(info.format),
                                AstcHostFormat(runtime_.device, info),
                                unbacked,
-                               UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
+                               uses_sparse_tiles &&
                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased);
     }
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
         const u64 texels = u64{host_info.size.width} * host_info.size.height *
                            host_info.size.depth * static_cast<u64>(host_info.resources.layers);
-        if (UsesSparseTiles(runtime_.device, info, gpu_addr_) && InitSparseTiles()) {
+        if (uses_sparse_tiles && InitSparseTiles()) {
             flags |= VideoCommon::ImageFlagBits::SparseTiles;
-        } else if (UsesSparseLayers(runtime_.device, info, gpu_addr_) && InitSparseLayers()) {
+        } else if (uses_sparse_layers && InitSparseLayers()) {
             flags |= VideoCommon::ImageFlagBits::SparseLayers;
         } else if (texels <= (u64{1} << 28)) {
             // Not too big to back (see MemoryAllocator::CreateImage): unbacked because nothing
@@ -4214,7 +4322,8 @@ bool Image::ScaleUp(bool ignore) {
     ASSERT(info.type != ImageType::Linear);
     flags |= ImageFlagBits::Rescaled;
     has_scaled = true;
-    if (!scaled_image) {
+    const bool fresh_scaled = !scaled_image;
+    if (fresh_scaled) {
         const bool is_2d = info.type == ImageType::e2D;
         const u32 scaled_width = resolution.ScaleUp(info.size.width);
         const u32 scaled_height = is_2d ? resolution.ScaleUp(info.size.height) : info.size.height;
@@ -4233,7 +4342,7 @@ bool Image::ScaleUp(bool ignore) {
         aspect_mask = ImageAspectMask(info.format);
     }
     if (NeedsScaleHelper()) {
-        if (!BlitScaleHelper(true)) {
+        if (!BlitScaleHelper(true, fresh_scaled)) {
             current_image = &Image::original_image;
             return false;
         }
@@ -4261,7 +4370,7 @@ bool Image::ScaleDown(bool ignore) {
         aspect_mask = ImageAspectMask(info.format);
     }
     if (NeedsScaleHelper()) {
-        if (!BlitScaleHelper(false)) {
+        if (!BlitScaleHelper(false, !ExchangeInitialization())) {
             current_image = &Image::scaled_image;
             flags |= ImageFlagBits::Rescaled;
             return false;
@@ -4272,7 +4381,7 @@ bool Image::ScaleDown(bool ignore) {
     return true;
 }
 
-bool Image::BlitScaleHelper(bool scale_up) {
+bool Image::BlitScaleHelper(bool scale_up, bool dst_undefined) {
     using namespace VideoCommon;
     static constexpr auto BLIT_OPERATION = Tegra::Engines::Fermi2D::Operation::SrcCopy;
     const bool is_color{aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT};
@@ -4284,12 +4393,19 @@ bool Image::BlitScaleHelper(bool scale_up) {
     const auto& resolution = runtime->resolution;
     const u32 scaled_width = resolution.ScaleUp(info.size.width);
     const u32 scaled_height = is_2d ? resolution.ScaleUp(info.size.height) : info.size.height;
+    const auto make_view = [this](std::unique_ptr<ImageView>& view, vk::Image Image::*image) {
+        if (!view) {
+            const auto previous = std::exchange(current_image, image);
+            const auto view_info = ImageViewInfo(ImageViewType::e2D, info.format);
+            view = std::make_unique<ImageView>(*runtime, view_info, NULL_IMAGE_ID, *this);
+            current_image = previous;
+        }
+    };
+    make_view(scale_view, &Image::scaled_image);
+    make_view(normal_view, &Image::original_image);
+    ImageView& src_view = scale_up ? *normal_view : *scale_view;
     std::unique_ptr<ImageView>& blit_view = scale_up ? scale_view : normal_view;
     std::optional<Framebuffer>& blit_framebuffer = scale_up ? scale_framebuffer : normal_framebuffer;
-    if (!blit_view) {
-        const auto view_info = ImageViewInfo(ImageViewType::e2D, info.format);
-        blit_view = std::make_unique<ImageView>(*runtime, view_info, NULL_IMAGE_ID, *this);
-    }
 
     const auto [samples_x, samples_y] = VideoCommon::SamplesLog2(info.num_samples);
     const u32 src_width = (scale_up ? info.size.width : scaled_width) >> samples_x;
@@ -4304,20 +4420,40 @@ bool Image::BlitScaleHelper(bool scale_up) {
         .start = {0, 0},
         .end = {s32(dst_width), s32(dst_height)},
     };
-    const VkExtent2D extent{
-        .width = (std::max)(scaled_width, info.size.width) >> samples_x,
-        .height = (std::max)(scaled_height, info.size.height) >> samples_y,
-    };
+    const VkExtent2D extent{dst_width, dst_height};
+
+    // An initialised destination keeps GENERAL: a depth-only helper leaves its stencil as is.
+    const VkImage dst_image = scale_up ? *scaled_image : *original_image;
+    const VkImageAspectFlags dst_aspect = aspect_mask;
+    const VkImageLayout dst_layout =
+        dst_undefined ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL;
+    scheduler->RequestOutsideRenderPassOperationContext();
+    scheduler->Record([dst_image, dst_aspect, dst_layout](vk::CommandBuffer cmdbuf) {
+        const VkImageMemoryBarrier barrier{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .oldLayout = dst_layout,
+            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = dst_image,
+            .subresourceRange{dst_aspect, 0, 1, 0, 1},
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, barrier);
+    });
 
     auto* view_ptr = blit_view.get();
     if (aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT) {
         if (!blit_framebuffer)
             blit_framebuffer.emplace(*runtime, view_ptr, nullptr, extent, scale_up);
         if (info.num_samples > 1) {
-            runtime->blit_image_helper.BlitColorMSAA(&*blit_framebuffer, *blit_view,
+            runtime->blit_image_helper.BlitColorMSAA(&*blit_framebuffer, src_view,
                 dst_region, src_region);
         } else {
-            runtime->blit_image_helper.BlitColor(&*blit_framebuffer, *blit_view,
+            runtime->blit_image_helper.BlitColor(&*blit_framebuffer, src_view,
                 dst_region, src_region, operation, BLIT_OPERATION);
         }
     } else if ((aspect_mask & VK_IMAGE_ASPECT_DEPTH_BIT) != 0) {
@@ -4327,13 +4463,13 @@ bool Image::BlitScaleHelper(bool scale_up) {
         const bool can_blit_stencil =
             has_stencil && runtime->device.IsExtShaderStencilExportSupported();
         if (info.num_samples > 1) {
-            runtime->blit_image_helper.BlitDepthStencilMSAA(&*blit_framebuffer, *blit_view,
+            runtime->blit_image_helper.BlitDepthStencilMSAA(&*blit_framebuffer, src_view,
                 dst_region, src_region);
         } else if (can_blit_stencil) {
-            runtime->blit_image_helper.BlitDepthStencil(&*blit_framebuffer, *blit_view,
+            runtime->blit_image_helper.BlitDepthStencil(&*blit_framebuffer, src_view,
                 dst_region, src_region, operation, BLIT_OPERATION);
         } else {
-            runtime->blit_image_helper.BlitDepth(&*blit_framebuffer, *blit_view, dst_region,
+            runtime->blit_image_helper.BlitDepth(&*blit_framebuffer, src_view, dst_region,
                                                  src_region);
         }
     } else {
@@ -4873,6 +5009,10 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
 
     u32 width = (std::numeric_limits<u32>::max)();
     u32 height = (std::numeric_limits<u32>::max)();
+    rt_map.fill(UNBOUND_RT);
+    resolve_shadow_images.fill(VK_NULL_HANDLE);
+    resolve_shadow_views.fill(VK_NULL_HANDLE);
+    num_resolve_shadows = 0;
     for (size_t index = 0; index < NUM_RT; ++index) {
         const ImageView* const color_buffer = color_buffers[index];
         if (!color_buffer) {
@@ -4958,9 +5098,12 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
             const VkFormat vk_format =
                 MaxwellToVK::SurfaceFormat(runtime.device, FormatType::Optimal, true, format).format;
             const VkImage msaa_image = images[rt_map[index]];
-            attachments.push_back(runtime.GetOrCreateResolveShadow(
-                msaa_image, vk_format, render_area, layers, VK_IMAGE_ASPECT_COLOR_BIT));
-            resolve_shadow_images[num_resolve_shadows++] = msaa_image;
+            const VkImageView shadow_view = runtime.GetOrCreateResolveShadow(
+                msaa_image, vk_format, render_area, layers, VK_IMAGE_ASPECT_COLOR_BIT);
+            attachments.push_back(shadow_view);
+            resolve_shadow_images[num_resolve_shadows] = msaa_image;
+            resolve_shadow_views[num_resolve_shadows] = shadow_view;
+            ++num_resolve_shadows;
         }
     }
 
@@ -4970,9 +5113,12 @@ void Framebuffer::CreateFramebuffer(TextureCacheRuntime& runtime,
             MaxwellToVK::SurfaceFormat(runtime.device, FormatType::Optimal, true,
                                        renderpass_key.depth_format)
                 .format;
-        attachments.push_back(runtime.GetOrCreateResolveShadow(depth_image, vk_format, render_area,
-                                                               layers, depth_aspect_mask));
-        resolve_shadow_images[num_resolve_shadows++] = depth_image;
+        const VkImageView shadow_view = runtime.GetOrCreateResolveShadow(
+            depth_image, vk_format, render_area, layers, depth_aspect_mask);
+        attachments.push_back(shadow_view);
+        resolve_shadow_images[num_resolve_shadows] = depth_image;
+        resolve_shadow_views[num_resolve_shadows] = shadow_view;
+        ++num_resolve_shadows;
     }
 
     num_color_buffers = static_cast<u32>(num_colors);
@@ -4994,7 +5140,8 @@ void Framebuffer::MarkResolveShadowsUpToDate() const {
         return;
     }
     for (u32 index = 0; index < num_resolve_shadows; ++index) {
-        runtime_ptr->MarkResolveShadowUpToDate(resolve_shadow_images[index]);
+        runtime_ptr->MarkResolveShadowUpToDate(resolve_shadow_images[index],
+                                               resolve_shadow_views[index]);
     }
 }
 
@@ -5058,23 +5205,37 @@ void TextureCacheRuntime::AccelerateImageUpload(
 void TextureCacheRuntime::AccelerateImageUploadLayers(
     Image& image, const StagingBufferRef& map,
     std::span<const VideoCommon::SwizzleParameters> swizzles, std::span<const u32> layers) {
+    if (WillUseGpuBcnTranscode(device, image.info)) {
+        if (!bc_encoder_pass) {
+            bc_encoder_pass.emplace(device, scheduler, descriptor_pool,
+                                    compute_pass_descriptor_queue);
+        }
+        return TranscodeAstcToBcn(image, map, swizzles, layers);
+    }
     astc_decoder_pass->AssembleLayers(image, map, swizzles, layers);
 }
 
 void TextureCacheRuntime::TranscodeAstcToBcn(
     Image& image, const StagingBufferRef& map,
-    std::span<const VideoCommon::SwizzleParameters> swizzles) {
+    std::span<const VideoCommon::SwizzleParameters> swizzles,
+    std::span<const u32> target_layers) {
     const ImageInfo& info = image.info;
     const u32 width = info.size.width;
     const u32 height = info.size.height;
     const u32 levels = static_cast<u32>(info.resources.levels);
-    const u32 layers = static_cast<u32>(info.resources.layers);
+    const u32 encode_layers = target_layers.empty()
+                                  ? static_cast<u32>(info.resources.layers)
+                                  : static_cast<u32>(target_layers.size());
+    if (encode_layers == 0) {
+        return;
+    }
     constexpr VkFormat DecodeFormat = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
     // A decode image of the same shape the GPU is done with: title 1's title screen decodes
     // dozens of textures a frame, mostly of a few shapes. Making one took 263 us; from VMA's
     // shared blocks 90 us, but freeing them there left ~1 GB of those blocks unused.
     const auto reusable = std::ranges::find_if(free_transcodes, [&](const PendingTranscode& t) {
-        return t.width == width && t.height == height && t.levels == levels && t.layers == layers;
+        return t.width == width && t.height == height && t.levels == levels &&
+               t.layers == encode_layers;
     });
     PendingTranscode pending;
     if (reusable != free_transcodes.end()) {
@@ -5091,7 +5252,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 .format = DecodeFormat,
                 .extent = {width, height, 1},
                 .mipLevels = levels,
-                .arrayLayers = layers,
+                .arrayLayers = encode_layers,
                 .samples = VK_SAMPLE_COUNT_1_BIT,
                 .tiling = VK_IMAGE_TILING_OPTIMAL,
                 .usage = VK_IMAGE_USAGE_STORAGE_BIT,
@@ -5104,7 +5265,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .width = width,
             .height = height,
             .levels = levels,
-            .layers = layers,
+            .layers = encode_layers,
             .unused_frames = 0,
         };
         for (u32 level = 0; level < levels; ++level) {
@@ -5112,8 +5273,12 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
                 MakeStorageView(device.GetLogical(), level, *pending.image, DecodeFormat));
         }
     }
+    ImageInfo decode_info = info;
+    decode_info.resources.layers = static_cast<s32>(encode_layers);
+    const size_t decode_bytes =
+        target_layers.empty() ? image.guest_size_bytes : size_t{info.layer_stride} * encode_layers;
     astc_decoder_pass->AssembleInto(
-        info, 0, image.guest_size_bytes,
+        decode_info, image.host_level_offset, decode_bytes,
         ASTCDecoderPass::Target{
             .image = *pending.image,
             .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -5127,6 +5292,13 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const bool bc3 = !IsOpaqueBc1Astc(device, info) &&
                      Settings::GetAstcRecompression() != Settings::AstcRecompression::Bc1;
     const u64 block_bytes = bc3 ? 16 : 8;
+    struct LevelEncodeInfo {
+        u32 width;
+        u32 height;
+        u64 buffer_offset;
+    };
+    boost::container::small_vector<LevelEncodeInfo, 16> level_infos;
+    level_infos.reserve(levels);
     boost::container::small_vector<VideoCommon::BufferImageCopy, 16> copies;
     u64 total = 0;
     for (u32 level = 0; level < levels; ++level) {
@@ -5134,27 +5306,53 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
         const u32 level_height = (std::max)(height >> level, 1U);
         const u32 blocks_x = Common::DivCeil(level_width, 4U);
         const u32 blocks_y = Common::DivCeil(level_height, 4U);
-        const u64 size = u64{blocks_x} * blocks_y * layers * block_bytes;
-        copies.push_back({
-            .buffer_offset = total,
-            .buffer_size = size,
-            .buffer_row_length = blocks_x * 4,
-            .buffer_image_height = blocks_y * 4,
-            .image_subresource{
-                .base_level = static_cast<s32>(level),
-                .base_layer = 0,
-                .num_layers = static_cast<s32>(layers),
-            },
-            .image_offset{0, 0, 0},
-            .image_extent{level_width, level_height, 1},
-        });
-        total += size;
+        const u64 slice_bytes = u64{blocks_x} * blocks_y * block_bytes;
+        const u64 level_size = slice_bytes * encode_layers;
+        level_infos.push_back({level_width, level_height, total});
+        if (target_layers.empty()) {
+            copies.push_back({
+                .buffer_offset = static_cast<size_t>(total),
+                .buffer_size = static_cast<size_t>(level_size),
+                .buffer_row_length = blocks_x * 4,
+                .buffer_image_height = blocks_y * 4,
+                .image_subresource{
+                    .base_level = static_cast<s32>(level),
+                    .base_layer = 0,
+                    .num_layers = static_cast<s32>(encode_layers),
+                },
+                .image_offset{0, 0, 0},
+                .image_extent{level_width, level_height, 1},
+            });
+        } else {
+            for (size_t i = 0; i < target_layers.size();) {
+                size_t run = 1;
+                while (i + run < target_layers.size() &&
+                       target_layers[i + run] == target_layers[i] + run) {
+                    ++run;
+                }
+                copies.push_back({
+                    .buffer_offset = static_cast<size_t>(total + i * slice_bytes),
+                    .buffer_size = static_cast<size_t>(slice_bytes * run),
+                    .buffer_row_length = blocks_x * 4,
+                    .buffer_image_height = blocks_y * 4,
+                    .image_subresource{
+                        .base_level = static_cast<s32>(level),
+                        .base_layer = static_cast<s32>(target_layers[i]),
+                        .num_layers = static_cast<s32>(run),
+                    },
+                    .image_offset{0, 0, 0},
+                    .image_extent{level_width, level_height, 1},
+                });
+                i += run;
+            }
+        }
+        total += level_size;
     }
     const auto output = staging_buffer_pool.Request(total, MemoryUsage::DeviceLocal);
     for (u32 level = 0; level < levels; ++level) {
-        bc_encoder_pass->Encode(*pending.views[level], copies[level].image_extent.width,
-                                copies[level].image_extent.height, layers, bc3, output.buffer,
-                                output.offset, total, copies[level].buffer_offset);
+        bc_encoder_pass->Encode(*pending.views[level], level_infos[level].width,
+                                level_infos[level].height, encode_layers, bc3, output.buffer,
+                                output.offset, total, level_infos[level].buffer_offset);
     }
     scheduler.Record([](vk::CommandBuffer cmdbuf) {
         const VkMemoryBarrier barrier{

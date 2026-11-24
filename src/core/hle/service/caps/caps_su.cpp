@@ -7,6 +7,8 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <vector>
+
 #include "common/logging.h"
 #include "core/core.h"
 #include "core/hle/service/caps/caps_manager.h"
@@ -79,19 +81,32 @@ void IScreenShotApplicationService::CaptureAndSaveScreenshot(AlbumReportOption r
     Capture::ScreenShotAttribute attribute{};
     attribute.orientation = Capture::AlbumImageOrientation::None;
 
+    auto buffer =
+        std::make_shared<std::vector<u8>>(screenshot_width * screenshot_height * bytes_per_pixel);
+    const std::weak_ptr<SessionRequestHandler> weak_self = weak_from_this();
+
     renderer.RequestScreenshot(
-        image_data.data(),
-        [attribute, report_option, this](bool invert_y) {
+        buffer->data(),
+        [attribute, report_option, buffer, weak_self](bool invert_y) {
+            const auto self_base = weak_self.lock();
+            if (!self_base) {
+                return;
+            }
+            auto* self = static_cast<IScreenShotApplicationService*>(self_base.get());
+            if (self->system.IsShuttingDown() || !self->system.IsPoweredOn()) {
+                return;
+            }
+
             // Convert from BGRA to RGBA
-            for (std::size_t i = 0; i < image_data.size(); i += bytes_per_pixel) {
-                const u8 temp = image_data[i];
-                image_data[i] = image_data[i + 2];
-                image_data[i + 2] = temp;
+            for (std::size_t i = 0; i < buffer->size(); i += bytes_per_pixel) {
+                const u8 temp = (*buffer)[i];
+                (*buffer)[i] = (*buffer)[i + 2];
+                (*buffer)[i + 2] = temp;
             }
 
             Capture::ApplicationAlbumEntry entry{};
-            manager->FlipVerticallyOnWrite(invert_y);
-            manager->SaveScreenShot(entry, attribute, report_option, image_data, {});
+            self->manager->FlipVerticallyOnWrite(invert_y);
+            self->manager->SaveScreenShot(entry, attribute, report_option, *buffer, {});
         },
         layout,
         Nvnflinger::LayerStackId::Screenshot);

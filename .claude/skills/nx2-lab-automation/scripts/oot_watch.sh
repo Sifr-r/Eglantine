@@ -3,14 +3,18 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Run the emulator with the in-emulator white-flash watcher for a while. Usage: oot_watch.sh <tag> <seconds> [launch args]
-TAG=${1:-watch}; SECS=${2:-90}; shift 2
+TAG=${1:-watch}; SECS=${2:-90}; shift $(( $# >= 2 ? 2 : $# ))
 cd ${REPO:-/home/kraibse/clones/Eglantine}
 D=${D:-$HOME/.hermes/cache/scratch/ootlab}
 B=$D/watch_$TAG
 rm -rf $B; mkdir -p $B
 L=(python3 -I tools/nx2/lab_ctl.py -d $D)
-D=$D zsh .claude/skills/nx2-lab-automation/scripts/to_gameplay.sh --max-seconds 300 \
-    --env EDEN_NX2_FRAME_CAPTURE=$B --env EDEN_NX2_FLASH_WATCH=1 "$@" > /tmp/oot_watch_boot.log 2>&1
+if ! D=$D zsh .claude/skills/nx2-lab-automation/scripts/to_gameplay.sh --max-seconds 300 \
+    --env EDEN_NX2_FRAME_CAPTURE=$B --env EDEN_NX2_FLASH_WATCH=1 "$@" > /tmp/oot_watch_boot.log 2>&1; then
+  echo "to_gameplay.sh failed; see /tmp/oot_watch_boot.log" >&2
+  $L stop 2>&1 | tail -1
+  exit 1
+fi
 sleep 3
 for k in ${(s:;:)PRE}; do echo "$k" > $D/keys.txt; sleep $(( ${k#* } / 1000.0 + 0.8 )); done
 sleep $SECS

@@ -1,15 +1,22 @@
 # AGENTS
 
-Read and follow `docs/content/policies/AI.mdx` and `docs/content/policies/Coding.mdx` in the documentation submodule.
+Read and follow the [AI policy](docs/content/policies/AI.md) and [coding guidelines](docs/content/policies/Coding.md). Review and test changes before submission, and ensure commit messages and PR descriptions clearly explain the change and verification.
 
 Keep comments to a reasonable level. Do not overexplain or add/remove comments from unrelated parts of the codebase.
 
+## Start here
+
+- Use the [architecture task map](ARCHITECTURE.md#task-map) to find the subsystem owner, entry point, and test filter. Check the named sources and target definitions before relying on dated reports or migration proposals.
+- Inspect the worktree before editing. Preserve existing changes and limit the diff to the requested domain. Project documentation lives under `docs/`. Treat `.cache/cpm/`, `build/`, and `ignore/` as local inputs or outputs.
+- Reproduce using the smallest relevant test or supported entry point. For shared behavior, check the affected frontends and record the platform, command, result, and limits of the verification. Use the [tool index](tools/README.md) for the exact supported interfaces.
+- Keep console keys, firmware, game files, and raw captures in local-only storage. Use synthetic or independently authored fixtures in tracked tests and docs.
+
 ## Switch 2 (NX2) work
 
-- Build: `cmake --build build --target yuzu yuzu-cmd tests --parallel` (`build/bin/eglantine` is the Qt app and `build/bin/eden-cli` is the SDL app used for unattended runs). Run Ampere lowering tests with `./build/bin/tests "[ampere]"`. Executables have an `.exe` suffix on Windows.
-- Skills under `.claude/skills/`: `nx2-shader-triage` (rejected native shaders, lowering, visual bugs) and `nx2-lab-automation` (booting a game hidden, scripted keys, frame capture with `tools/nx2/lab_ctl.py`).
-- Bound every unattended emulator run (`lab_ctl.py launch --max-seconds`, then `lab_ctl.py stop`): a forgotten hidden instance holds the user's GPU.
-- Live debug server (`EDEN_NX2_DEBUG_SERVER=127.0.0.1:6545`, adapter `tools/nx2/debug_mcp.py`): status, screenshots, log tail, frame captures, shader rejects, guest memory reads and input on a running game, without a relaunch. See `docs/content/nx2/debug-mcp.mdx`. Try a live experiment before asking the user for a new build or run, restore every hash you reject, and never start or stop an emulator the user launched.
+- Build with `cmake --build build --target yuzu yuzu-cmd tests --parallel`. The binaries in `build/bin/` are `eglantine` (Qt), `eden-cli` (SDL), and `tests` (Catch2). Add `.exe` on Windows. Use `./build/bin/tests "[ampere]"` for the lowering suite.
+- Start with [shader triage](.claude/skills/nx2-shader-triage/SKILL.md) for rejected shaders, lowering, or visual bugs. Use [lab automation](.claude/skills/nx2-lab-automation/SKILL.md) for unattended SDL runs, scripted input, and frame capture.
+- Bound unattended runs with `lab_ctl.py launch --max-seconds` and stop the instance with `lab_ctl.py stop` when finished. A hidden instance can keep the GPU busy after the investigation ends.
+- For a running game, use the [live debug workflow](.claude/skills/nx2-debug-server/SKILL.md) with `EDEN_NX2_DEBUG_SERVER=127.0.0.1:6545` and `tools/nx2/debug_mcp.py`. Try a live experiment before requesting a new build or run. Restore every hash you reject, and leave the lifecycle of user-launched instances to the user.
 
 ## Shader catalogue
 

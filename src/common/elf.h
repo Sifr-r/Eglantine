@@ -88,9 +88,9 @@ constexpr u8 ElfVersionCurrent = 1; /* EV_CURRENT */
 constexpr u8 ElfOsAbiNone = 0;      /* System V ABI */
 
 constexpr u16 ElfTypeNone = 0; /* No file type */
-constexpr u16 ElfTypeRel = 0;  /* Relocatable file */
-constexpr u16 ElfTypeExec = 0; /* Executable file */
-constexpr u16 ElfTypeDyn = 0;  /* Shared object file */
+constexpr u16 ElfTypeRel = 1;  /* Relocatable file */
+constexpr u16 ElfTypeExec = 2; /* Executable file */
+constexpr u16 ElfTypeDyn = 3;  /* Shared object file */
 
 constexpr u16 ElfMachineArm = 40;      /* ARM */
 constexpr u16 ElfMachineAArch64 = 183; /* ARM AARCH64 */
@@ -137,7 +137,7 @@ constexpr u32 ElfShtSymtab = 2;   /* Symbol table */
 constexpr u32 ElfShtStrtab = 3;   /* String table */
 constexpr u32 ElfShtRela = 4;     /* Relocation entries with addends */
 constexpr u32 ElfShtDynamic = 6;  /* Dynamic linking information */
-constexpr u32 ElfShtNobits = 7;   /* Program space with no data (bss) */
+constexpr u32 ElfShtNobits = 8;   /* Program space with no data (bss) */
 constexpr u32 ElfShtRel = 9;      /* Relocation entries, no addends */
 constexpr u32 ElfShtDynsym = 11;  /* Dynamic linker symbol table */
 
@@ -283,9 +283,9 @@ constexpr u32 ElfPtTls = 7;     /* Thread-local storage segment */
 
 /* Legal values for p_flags (segment flags).  */
 
-constexpr u32 ElfPfExec = 0;  /* Segment is executable */
-constexpr u32 ElfPfWrite = 1; /* Segment is writable */
-constexpr u32 ElfPfRead = 2;  /* Segment is readable */
+constexpr u32 ElfPfExec = 1;  /* Segment is executable */
+constexpr u32 ElfPfWrite = 2; /* Segment is writable */
+constexpr u32 ElfPfRead = 4;  /* Segment is readable */
 
 /* Dynamic section entry.  */
 

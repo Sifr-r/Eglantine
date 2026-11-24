@@ -8,9 +8,9 @@
 #include <array>
 #include <atomic>
 #include <memory>
-#include <thread>
 
 #include <QDialog>
+#include <QTimer>
 #include <QValidator>
 
 #include "core/frontend/applets/software_keyboard.h"
@@ -219,7 +219,7 @@ private:
     std::atomic<bool> caps_lock_enabled{false};
 
     std::unique_ptr<InputInterpreter> input_interpreter;
-    std::jthread input_thread;
+    QTimer input_timer;
 };
 
 class QtSoftwareKeyboard final : public QObject, public Core::Frontend::SoftwareKeyboardApplet {

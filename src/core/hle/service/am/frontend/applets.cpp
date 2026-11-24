@@ -44,11 +44,16 @@ FrontendApplet::FrontendApplet(Core::System& system_, std::shared_ptr<Applet> ap
 FrontendApplet::~FrontendApplet() = default;
 
 void FrontendApplet::Initialize() {
+    initialized = false;
     std::shared_ptr<IStorage> common = PopInData();
-    ASSERT(common != nullptr);
-    const auto common_data = common->GetData();
+    if (!common) {
+        return;
+    }
+    const auto& common_data = common->GetData();
 
-    ASSERT(common_data.size() >= sizeof(CommonArguments));
+    if (common_data.size() < sizeof(CommonArguments)) {
+        return;
+    }
     std::memcpy(&common_args, common_data.data(), sizeof(CommonArguments));
 
     initialized = true;
@@ -74,10 +79,13 @@ void FrontendApplet::PushInteractiveOutData(std::shared_ptr<IStorage> storage) {
     applet.lock()->caller_applet_broker->GetInteractiveOutData().Push(system.Kernel(), storage);
 }
 
-void FrontendApplet::Exit() {
+void FrontendApplet::Exit(Result result) {
     auto applet_ = applet.lock();
     {
         std::scoped_lock lk{applet_->lock};
+        if (R_FAILED(result)) {
+            applet_->terminate_result = result;
+        }
         applet_->is_completed = true;
         applet_->state_changed_event.Signal(system.Kernel());
     }

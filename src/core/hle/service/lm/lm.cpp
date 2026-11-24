@@ -7,9 +7,9 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <string>
-
+#include <algorithm>
 #include <optional>
+#include <string>
 #include "common/container/unordered_map.h"
 #include <boost/container_hash/hash.hpp>
 #include "common/logging.h"
@@ -172,12 +172,11 @@ private:
         u64 result{};
         u32 shift{};
 
-        for (std::size_t i = 0; i < sizeof(u64); i++) {
-            const auto v = data[offset];
+        for (std::size_t i = 0; i < sizeof(u64) && offset < data.size(); i++) {
+            const auto v = data[offset++];
             result |= (static_cast<u64>(v & 0x7f) << shift);
             shift += 7;
-            offset++;
-            if (offset >= data.size() || ((v & 0x80) == 0)) {
+            if ((v & 0x80) == 0) {
                 break;
             }
         }
@@ -186,7 +185,7 @@ private:
 
     std::optional<std::string> ReadString(std::span<const u8> data, std::size_t& offset,
                                           std::size_t length) {
-        if (length == 0) {
+        if (length == 0 || offset >= data.size()) {
             return std::nullopt;
         }
         const auto length_to_read = (std::min)(length, data.size() - offset);
@@ -197,20 +196,22 @@ private:
         return output;
     }
 
-    u32_le ReadAsU32(std::span<const u8> data, std::size_t& offset, std::size_t length) {
-        ASSERT(length == sizeof(u32));
-        u32_le output{};
-        std::memcpy(&output, data.data() + offset, sizeof(u32));
-        offset += length;
-        return output;
-    }
-
-    u64_le ReadAsU64(std::span<const u8> data, std::size_t& offset, std::size_t length) {
-        ASSERT(length == sizeof(u64));
-        u64_le output{};
-        std::memcpy(&output, data.data() + offset, sizeof(u64));
-        offset += length;
-        return output;
+    template <typename T, typename LittleEndianT>
+    std::optional<T> ReadAs(std::span<const u8> data, std::size_t& offset, u64 length) {
+        if (offset >= data.size()) {
+            return std::nullopt;
+        }
+        const std::size_t remaining = data.size() - offset;
+        if (length != sizeof(LittleEndianT) || remaining < sizeof(LittleEndianT)) {
+            LOG_ERROR(Service_LM, "Invalid log chunk size: length={}, expected={}, remaining={}",
+                      length, sizeof(LittleEndianT), remaining);
+            offset += static_cast<std::size_t>((std::min)(length, static_cast<u64>(remaining)));
+            return std::nullopt;
+        }
+        LittleEndianT output{};
+        std::memcpy(&output, data.data() + offset, sizeof(LittleEndianT));
+        offset += sizeof(LittleEndianT);
+        return static_cast<T>(output);
     }
 
     void ParseLog(const LogPacketHeaderEntry entry, std::span<const u8> log_data) {
@@ -228,17 +229,27 @@ private:
         std::size_t offset{};
         while (offset < log_data.size()) {
             const auto key = static_cast<LogDataChunkKey>(ReadLeb128(log_data, offset));
+            if (offset >= log_data.size()) {
+                break;
+            }
             const auto chunk_size = ReadLeb128(log_data, offset);
+            const auto skip_chunk = [&]() {
+                if (offset < log_data.size()) {
+                    offset += static_cast<std::size_t>(
+                        (std::min)(chunk_size, static_cast<u64>(log_data.size() - offset)));
+                }
+            };
 
             switch (key) {
             case LogDataChunkKey::LogSessionBegin:
             case LogDataChunkKey::LogSessionEnd:
+                skip_chunk();
                 break;
             case LogDataChunkKey::TextLog:
                 text_log = ReadString(log_data, offset, chunk_size);
                 break;
             case LogDataChunkKey::LineNumber:
-                line_number = ReadAsU32(log_data, offset, chunk_size);
+                line_number = ReadAs<u32, u32_le>(log_data, offset, chunk_size);
                 break;
             case LogDataChunkKey::FileName:
                 file_name = ReadString(log_data, offset, chunk_size);
@@ -253,13 +264,18 @@ private:
                 thread_name = ReadString(log_data, offset, chunk_size);
                 break;
             case LogDataChunkKey::LogPacketDropCount:
-                log_pack_drop_count = ReadAsU64(log_data, offset, chunk_size);
+                log_pack_drop_count = ReadAs<u64, u64_le>(log_data, offset, chunk_size);
                 break;
             case LogDataChunkKey::UserSystemClock:
-                user_system_clock = ReadAsU64(log_data, offset, chunk_size);
+                if (const auto clock_val = ReadAs<u64, u64_le>(log_data, offset, chunk_size)) {
+                    user_system_clock = static_cast<s64>(*clock_val);
+                }
                 break;
             case LogDataChunkKey::ProcessName:
                 process_name = ReadString(log_data, offset, chunk_size);
+                break;
+            default:
+                skip_chunk();
                 break;
             }
         }

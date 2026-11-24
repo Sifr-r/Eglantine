@@ -11,7 +11,9 @@
 #include <chrono>
 #include <cstdlib>
 #include <thread>
+#include <utility>
 
+#include "common/overflow.h"
 #include "core/core.h"
 #include "core/file_sys/errors.h"
 #include "core/hle/kernel/k_process.h"
@@ -38,8 +40,11 @@ Result IStorage::Read(
     s64 offset, s64 length) {
     LOG_DEBUG(Service_FS, "called, offset={:#x}, length={}", offset, length);
 
-    R_UNLESS(length >= 0, FileSys::ResultInvalidSize);
-    R_UNLESS(offset >= 0, FileSys::ResultInvalidOffset);
+    R_UNLESS(length >= 0 && static_cast<u64>(length) <= out_bytes.size(), FileSys::ResultInvalidSize);
+    R_UNLESS(std::in_range<size_t>(offset), FileSys::ResultInvalidOffset);
+    R_UNLESS(Common::CanAddWithoutOverflow(offset, length) &&
+                 std::in_range<size_t>(offset + length),
+             FileSys::ResultOutOfRange);
 
     // Custom (EDEN_NX2_FS_READ_MBPS=<n>): the emulated storage speed in MB/s for this read
     // throttle. 0 turns it off. Default: 40 MB/s (a Switch 1 card), 100 MB/s for Switch 2 titles.
@@ -68,8 +73,9 @@ Result IStorage::Read(
                                                   1'000'000'000 / bytes_per_second};
     }
 
-    // Read the data from the Storage backend
-    backend->Read(out_bytes.data(), length, offset);
+    if (length > 0) {
+        backend->Read(out_bytes.data(), static_cast<size_t>(length), static_cast<size_t>(offset));
+    }
 
     R_SUCCEED();
 }

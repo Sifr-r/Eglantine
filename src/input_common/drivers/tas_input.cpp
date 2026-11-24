@@ -152,6 +152,7 @@ void Tas::WriteTasFile(std::u8string_view file_name) {
 }
 
 void Tas::RecordInput(u64 buttons, TasAnalog left_axis, TasAnalog right_axis) {
+    std::scoped_lock lock{tas_mutex};
     last_input = {
         .buttons = buttons,
         .l_axis = left_axis,
@@ -160,6 +161,7 @@ void Tas::RecordInput(u64 buttons, TasAnalog left_axis, TasAnalog right_axis) {
 }
 
 std::tuple<TasState, size_t, std::array<size_t, PLAYER_NUMBER>> Tas::GetStatus() const {
+    std::scoped_lock lock{tas_mutex};
     TasState state;
     std::array<size_t, PLAYER_NUMBER> lengths{0};
     if (is_recording) {
@@ -181,9 +183,10 @@ std::tuple<TasState, size_t, std::array<size_t, PLAYER_NUMBER>> Tas::GetStatus()
 }
 
 void Tas::UpdateThread() {
+    std::unique_lock lock{tas_mutex};
     if (!Settings::values.tas_enable) {
         if (is_running) {
-            Stop();
+            is_running = false;
         }
         return;
     }
@@ -199,18 +202,23 @@ void Tas::UpdateThread() {
     }
 
     if (!is_running) {
+        lock.unlock();
         ClearInput();
         return;
     }
     if (current_command < script_length) {
         LOG_DEBUG(Input, "Playing TAS {}/{}", current_command, script_length);
         const size_t frame = current_command++;
+        std::array<TASCommand, PLAYER_NUMBER> frame_commands{};
         for (size_t player_index = 0; player_index < commands.size(); player_index++) {
-            TASCommand command{};
             if (frame < commands[player_index].size()) {
-                command = commands[player_index][frame];
+                frame_commands[player_index] = commands[player_index][frame];
             }
+        }
+        lock.unlock();
 
+        for (size_t player_index = 0; player_index < frame_commands.size(); player_index++) {
+            const TASCommand& command = frame_commands[player_index];
             PadIdentifier identifier{
                 .guid = Common::UUID{},
                 .port = player_index,
@@ -230,6 +238,7 @@ void Tas::UpdateThread() {
         is_running = Settings::values.tas_loop.GetValue();
         LoadTasFiles();
         current_command = 0;
+        lock.unlock();
         ClearInput();
     }
 }
@@ -303,14 +312,12 @@ void Tas::StartStop() {
     if (!Settings::values.tas_enable) {
         return;
     }
-    if (is_running) {
-        Stop();
-    } else {
-        is_running = true;
-    }
+    std::scoped_lock lock{tas_mutex};
+    is_running = !is_running;
 }
 
 void Tas::Stop() {
+    std::scoped_lock lock{tas_mutex};
     is_running = false;
 }
 
@@ -318,6 +325,7 @@ void Tas::Reset() {
     if (!Settings::values.tas_enable) {
         return;
     }
+    std::scoped_lock lock{tas_mutex};
     needs_reset = true;
 }
 
@@ -325,11 +333,13 @@ bool Tas::Record() {
     if (!Settings::values.tas_enable) {
         return true;
     }
+    std::scoped_lock lock{tas_mutex};
     is_recording = !is_recording;
     return is_recording;
 }
 
 void Tas::SaveRecording(bool overwrite_file) {
+    std::scoped_lock lock{tas_mutex};
     if (is_recording) {
         return;
     }

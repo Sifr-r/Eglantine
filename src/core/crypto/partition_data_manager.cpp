@@ -43,11 +43,15 @@ const u8 PartitionDataManager::MAX_KEYBLOB_SOURCE_HASH = 32;
 
 static FileSys::VirtualFile FindFileInDirWithNames(const FileSys::VirtualDir& dir,
                                                    const std::string& name) {
+    if (dir == nullptr) {
+        return nullptr;
+    }
+
     const auto upper = Common::ToUpper(name);
 
     for (const auto& fname : {name, name + ".bin", upper, upper + ".BIN"}) {
-        if (dir->GetFile(fname) != nullptr) {
-            return dir->GetFile(fname);
+        if (auto file = dir->GetFile(fname); file != nullptr) {
+            return file;
         }
     }
 
@@ -158,19 +162,25 @@ static bool AttemptDecrypt(const std::array<u8, 16>& key, Package2Header& header
 
 void PartitionDataManager::DecryptPackage2(const std::array<Key128, 0x20>& package2_keys,
                                            Package2Type type) {
+    const auto& pkg2_file = package2.at(static_cast<size_t>(type));
+    if (pkg2_file == nullptr || pkg2_file->GetSize() < 0x4000 + sizeof(Package2Header))
+        return;
+
+    const std::size_t pkg2_size = pkg2_file->GetSize() - 0x4000;
     FileSys::VirtualFile file = std::make_shared<FileSys::OffsetVfsFile>(
-        package2[static_cast<size_t>(type)],
-        package2[static_cast<size_t>(type)]->GetSize() - 0x4000, 0x4000);
+        pkg2_file, pkg2_size, 0x4000);
 
     Package2Header header{};
     if (file->ReadObject(&header) != sizeof(Package2Header))
         return;
 
     std::size_t revision = 0xFF;
-    if (header.magic != Common::MakeMagic('P', 'K', '2', '1')) {
+    const bool was_encrypted = header.magic != Common::MakeMagic('P', 'K', '2', '1');
+    if (was_encrypted) {
         for (std::size_t i = 0; i < package2_keys.size(); ++i) {
             if (AttemptDecrypt(package2_keys[i], header)) {
                 revision = i;
+                break;
             }
         }
     }
@@ -178,14 +188,24 @@ void PartitionDataManager::DecryptPackage2(const std::array<Key128, 0x20>& packa
     if (header.magic != Common::MakeMagic('P', 'K', '2', '1'))
         return;
 
+    if (was_encrypted && revision >= package2_keys.size())
+        return;
+
+    const std::size_t section1_offset =
+        static_cast<std::size_t>(header.section_size[0]) + sizeof(Package2Header);
+    if (section1_offset > pkg2_size || header.section_size[1] > pkg2_size - section1_offset)
+        return;
+
     const auto a = std::make_shared<FileSys::OffsetVfsFile>(
-        file, header.section_size[1], header.section_size[0] + sizeof(Package2Header));
+        file, header.section_size[1], section1_offset);
 
     auto c = a->ReadAllBytes();
 
-    AESCipher<Key128> cipher(package2_keys[revision], Mode::CTR);
-    cipher.SetIV(header.section_ctr[1]);
-    cipher.Transcode(c.data(), c.size(), c.data(), Op::Decrypt);
+    if (was_encrypted) {
+        AESCipher<Key128> cipher(package2_keys[revision], Mode::CTR);
+        cipher.SetIV(header.section_ctr[1]);
+        cipher.Transcode(c.data(), c.size(), c.data(), Op::Decrypt);
+    }
 
     const auto ini_file = std::make_shared<FileSys::VectorVfsFile>(c);
     const FileSys::INI ini{ini_file};

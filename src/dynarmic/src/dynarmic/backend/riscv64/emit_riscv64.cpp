@@ -145,9 +145,10 @@ EmittedBlockInfo EmitRV64(biscuit::Assembler& as, IR::Block block, const EmitCon
         default:
             UNREACHABLE();
         }
+
+        reg_alloc.UpdateAllUses();
     }
 
-    reg_alloc.UpdateAllUses();
     reg_alloc.AssertNoMoreUses();
 
     if (emit_conf.enable_cycle_counting) {

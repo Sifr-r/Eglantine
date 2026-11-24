@@ -274,7 +274,7 @@ public:
         const VkIndexType index_type_ = index_type;
         const size_t sub_first_offset = static_cast<size_t>(first % 4) * GetQuadsNum(num_indices);
         const size_t offset =
-            (sub_first_offset + GetQuadsNum(first)) * 6ULL * BytesPerIndex(index_type);
+            (sub_first_offset + GetQuadOffset(first)) * 6ULL * BytesPerIndex(index_type);
         scheduler.Record([buffer_ = *buffer, index_type_, offset](vk::CommandBuffer cmdbuf) {
             cmdbuf.BindIndexBuffer(buffer_, offset, index_type_);
         });
@@ -282,6 +282,8 @@ public:
 
 protected:
     virtual u32 GetQuadsNum(u32 num_indices) const = 0;
+
+    virtual u32 GetQuadOffset(u32 first) const = 0;
 
     virtual void MakeAndUpdateIndices(u8* staging_data, size_t quad_size, u32 quad, u32 first) = 0;
 
@@ -308,6 +310,10 @@ public:
 private:
     u32 GetQuadsNum(u32 num_indices_) const override {
         return num_indices_ / 4;
+    }
+
+    u32 GetQuadOffset(u32 first) const override {
+        return first / 4;
     }
 
     template <typename T>
@@ -348,6 +354,10 @@ public:
 private:
     u32 GetQuadsNum(u32 num_indices_) const override {
         return num_indices_ >= 4 ? (num_indices_ - 2) / 2 : 0;
+    }
+
+    u32 GetQuadOffset(u32 first) const override {
+        return (first / 4) * 2;
     }
 
     template <typename T>

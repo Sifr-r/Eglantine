@@ -37,11 +37,12 @@ Event& LifecycleManager::GetHDCPStateChangedEvent() {
 }
 
 void LifecycleManager::PushUnorderedMessage(Kernel::KernelCore& kernel, AppletMessage message) {
+    std::scoped_lock lk{m_lock};
     m_unordered_messages.push_back(message);
-    this->SignalSystemEventIfNeeded(kernel);
+    this->SignalSystemEventIfNeededLocked(kernel);
 }
 
-AppletMessage LifecycleManager::PopMessageInOrderOfPriority() {
+AppletMessage LifecycleManager::PopMessageInOrderOfPriorityLocked() {
     if (m_has_resume) {
         m_has_resume = false;
         return AppletMessage::Resume;
@@ -130,7 +131,7 @@ AppletMessage LifecycleManager::PopMessageInOrderOfPriority() {
     return AppletMessage::None;
 }
 
-bool LifecycleManager::ShouldSignalSystemEvent() {
+bool LifecycleManager::ShouldSignalSystemEventLocked() const {
     if (m_focus_state_changed_notification_enabled) {
         if (!m_is_application) {
             if (m_requested_focus_state != m_acknowledged_focus_state) {
@@ -153,6 +154,7 @@ bool LifecycleManager::ShouldSignalSystemEvent() {
 }
 
 void LifecycleManager::OnOperationAndPerformanceModeChanged(Kernel::KernelCore& kernel) {
+    std::scoped_lock lk{m_lock};
     if (m_operation_mode_changed_notification_enabled) {
         m_has_operation_mode_changed = true;
     }
@@ -161,15 +163,20 @@ void LifecycleManager::OnOperationAndPerformanceModeChanged(Kernel::KernelCore& 
     }
     m_operation_mode_changed_system_event.Signal(kernel);
     m_operation_mode_refresh_event.Signal(kernel);
-    this->SignalSystemEventIfNeeded(kernel);
+    this->SignalSystemEventIfNeededLocked(kernel);
 }
 
 void LifecycleManager::SignalSystemEventIfNeeded(Kernel::KernelCore& kernel) {
+    std::scoped_lock lk{m_lock};
+    this->SignalSystemEventIfNeededLocked(kernel);
+}
+
+void LifecycleManager::SignalSystemEventIfNeededLocked(Kernel::KernelCore& kernel) {
     // Check our cached value for the system event.
     const bool applet_message_available = m_applet_message_available;
 
     // If it's not current, we need to do an update, either clearing or signaling.
-    if (applet_message_available != this->ShouldSignalSystemEvent()) {
+    if (applet_message_available != this->ShouldSignalSystemEventLocked()) {
         if (!applet_message_available) {
             m_system_event.Signal(kernel);
             m_applet_message_available = true;
@@ -181,6 +188,7 @@ void LifecycleManager::SignalSystemEventIfNeeded(Kernel::KernelCore& kernel) {
 }
 
 void LifecycleManager::ResetForRelaunch() {
+    std::scoped_lock lk{m_lock};
     m_unordered_messages.clear();
 
     m_activity_state = ActivityState::BackgroundVisible;
@@ -193,14 +201,16 @@ void LifecycleManager::ResetForRelaunch() {
 }
 
 bool LifecycleManager::PopMessage(Kernel::KernelCore& kernel, AppletMessage* out_message) {
-    const auto message = this->PopMessageInOrderOfPriority();
-    this->SignalSystemEventIfNeeded(kernel);
+    std::scoped_lock lk{m_lock};
+    const auto message = this->PopMessageInOrderOfPriorityLocked();
+    this->SignalSystemEventIfNeededLocked(kernel);
 
     *out_message = message;
     return message != AppletMessage::None;
 }
 
 void LifecycleManager::SetFocusHandlingMode(bool suspend) {
+    std::scoped_lock lk{m_lock};
     switch (m_focus_handling_mode) {
     case FocusHandlingMode::AlwaysSuspend:
     case FocusHandlingMode::SuspendHomeSleep:
@@ -219,6 +229,7 @@ void LifecycleManager::SetFocusHandlingMode(bool suspend) {
 }
 
 void LifecycleManager::SetOutOfFocusSuspendingEnabled(bool enabled) {
+    std::scoped_lock lk{m_lock};
     switch (m_focus_handling_mode) {
     case FocusHandlingMode::AlwaysSuspend:
         if (!enabled) {
@@ -237,6 +248,7 @@ void LifecycleManager::SetOutOfFocusSuspendingEnabled(bool enabled) {
 }
 
 void LifecycleManager::RemoveForceResumeIfPossible() {
+    std::scoped_lock lk{m_lock};
     // If resume is not forced, we have nothing to do.
     if (m_suspend_mode != SuspendMode::ForceResume) {
         return;
@@ -272,6 +284,7 @@ void LifecycleManager::RemoveForceResumeIfPossible() {
 }
 
 bool LifecycleManager::IsRunnable() const {
+    std::scoped_lock lk{m_lock};
     // If suspend is forced, return that.
     if (m_forced_suspend) {
         return false;
@@ -362,6 +375,7 @@ FocusState LifecycleManager::GetFocusStateWhileBackground(bool is_obscured) cons
 }
 
 bool LifecycleManager::UpdateRequestedFocusState() {
+    std::scoped_lock lk{m_lock};
     FocusState new_state{};
 
     if (m_suspend_mode == SuspendMode::NoOverride) {

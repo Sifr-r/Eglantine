@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -6,10 +9,12 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <thread>
 
 #include "common/fiber.h"
@@ -46,13 +51,22 @@ public:
         is_multicore = is_multi;
     }
 
+    /// Sets the active emulated CPU core count (clamped to [1, NUM_CPU_CORES]), must be set before Initialize
+    void SetActiveCoreCount(u32 core_count);
+
+    [[nodiscard]] std::size_t ActiveCoreCount() const {
+        return active_core_count;
+    }
+
     /// Sets if emulation is using an asynchronous GPU.
     void SetAsyncGpu(bool is_async) {
         is_async_gpu = is_async;
     }
 
     void OnGpuReady() {
-        gpu_barrier->Sync();
+        if (gpu_barrier.has_value()) {
+            gpu_barrier->Sync();
+        }
     }
 
     void Initialize();
@@ -105,6 +119,7 @@ private:
     std::atomic<std::size_t> current_core{};
     std::size_t idle_count{};
     std::size_t num_cores{};
+    std::size_t active_core_count{4};
     bool is_async_gpu{};
     bool is_multicore{};
 };

@@ -7,7 +7,7 @@
 namespace Shader::Maxwell {
 namespace {
 void HSETP2(TranslatorVisitor& v, u64 insn, const IR::U32& src_b, bool neg_b, bool abs_b,
-            Swizzle swizzle_b, FPCompareOp compare_op, bool h_and) {
+            Swizzle swizzle_b, FPCompareOp compare_op, bool h_and, bool ftz) {
     union {
         u64 insn;
         BitField<8, 8, IR::Reg> src_a_reg;
@@ -18,7 +18,6 @@ void HSETP2(TranslatorVisitor& v, u64 insn, const IR::U32& src_b, bool neg_b, bo
         BitField<43, 1, u64> neg_a;
         BitField<45, 2, BooleanOp> bop;
         BitField<44, 1, u64> abs_a;
-        BitField<6, 1, u64> ftz;
         BitField<47, 2, Swizzle> swizzle_a;
     } const hsetp2{insn};
 
@@ -45,7 +44,7 @@ void HSETP2(TranslatorVisitor& v, u64 insn, const IR::U32& src_b, bool neg_b, bo
     const IR::FpControl control{
         .no_contraction = false,
         .rounding = IR::FpRounding::DontCare,
-        .fmz_mode = (hsetp2.ftz != 0 ? IR::FmzMode::FTZ : IR::FmzMode::None),
+        .fmz_mode = (ftz ? IR::FmzMode::FTZ : IR::FmzMode::None),
     };
 
     IR::U1 pred{v.ir.GetPred(hsetp2.pred)};
@@ -71,6 +70,7 @@ void HSETP2(TranslatorVisitor& v, u64 insn, const IR::U32& src_b, bool neg_b, bo
 void TranslatorVisitor::HSETP2_reg(u64 insn) {
     union {
         u64 insn;
+        BitField<6, 1, u64> ftz;
         BitField<30, 1, u64> abs_b;
         BitField<49, 1, u64> h_and;
         BitField<31, 1, u64> neg_b;
@@ -78,20 +78,20 @@ void TranslatorVisitor::HSETP2_reg(u64 insn) {
         BitField<28, 2, Swizzle> swizzle_b;
     } const hsetp2{insn};
     HSETP2(*this, insn, GetReg20(insn), hsetp2.neg_b != 0, hsetp2.abs_b != 0, hsetp2.swizzle_b,
-           hsetp2.compare_op, hsetp2.h_and != 0);
+           hsetp2.compare_op, hsetp2.h_and != 0, hsetp2.ftz != 0);
 }
 
 void TranslatorVisitor::HSETP2_cbuf(u64 insn) {
     union {
         u64 insn;
         BitField<53, 1, u64> h_and;
-        BitField<54, 1, u64> abs_b;
+        BitField<54, 1, u64> ftz;
         BitField<56, 1, u64> neg_b;
         BitField<49, 4, FPCompareOp> compare_op;
     } const hsetp2{insn};
 
-    HSETP2(*this, insn, GetCbuf(insn), hsetp2.neg_b != 0, hsetp2.abs_b != 0, Swizzle::F32,
-           hsetp2.compare_op, hsetp2.h_and != 0);
+    HSETP2(*this, insn, GetCbuf(insn), hsetp2.neg_b != 0, false, Swizzle::F32, hsetp2.compare_op,
+           hsetp2.h_and != 0, hsetp2.ftz != 0);
 }
 
 void TranslatorVisitor::HSETP2_imm(u64 insn) {
@@ -112,7 +112,7 @@ void TranslatorVisitor::HSETP2_imm(u64 insn) {
                   static_cast<u32>((hsetp2.neg_high != 0 ? 1 : 0) << 31)};
 
     HSETP2(*this, insn, ir.Imm32(imm), false, false, Swizzle::H1_H0, hsetp2.compare_op,
-           hsetp2.h_and != 0);
+           hsetp2.h_and != 0, hsetp2.ftz != 0);
 }
 
 } // namespace Shader::Maxwell

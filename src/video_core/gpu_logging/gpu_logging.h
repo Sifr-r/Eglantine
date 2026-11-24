@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -135,15 +136,17 @@ private:
     ~GPULogger();
 
     // Helper functions
+    void ShutdownInternal(bool log_message);
     void WriteToLog(const std::string& message);
     void RotateLogFile();
     std::string FormatTimestamp(std::chrono::microseconds timestamp) const;
     std::string FormatMemorySize(u64 bytes) const;
 
     // State
-    bool initialized = false;
-    LogLevel current_level = LogLevel::Off;
-    DriverType detected_driver = DriverType::Unknown;
+    mutable std::mutex lifecycle_mutex;
+    std::atomic<bool> initialized{false};
+    std::atomic<LogLevel> current_level{LogLevel::Off};
+    std::atomic<DriverType> detected_driver{DriverType::Unknown};
 
     // Ring buffer for API calls
     std::vector<VulkanCallEntry> call_ring_buffer;
@@ -156,21 +159,21 @@ private:
     mutable std::mutex memory_mutex;
 
     // Statistics
-    u64 total_vulkan_calls = 0;
-    u64 total_allocations = 0;
-    u64 total_deallocations = 0;
-    u64 current_allocated_bytes = 0;
-    u64 peak_allocated_bytes = 0;
+    std::atomic<u64> total_vulkan_calls{0};
+    std::atomic<u64> total_allocations{0};
+    std::atomic<u64> total_deallocations{0};
+    std::atomic<u64> current_allocated_bytes{0};
+    std::atomic<u64> peak_allocated_bytes{0};
 
     // File backend for GPU logs
     std::unique_ptr<Common::FS::IOFile> gpu_log_file;
     mutable std::mutex file_mutex;
-    u64 bytes_written = 0;
+    std::atomic<u64> bytes_written{0};
 
     // Feature flags
-    bool track_vulkan_calls = true;
-    bool track_memory = false;
-    bool capture_driver_debug = false;
+    std::atomic<bool> track_vulkan_calls{true};
+    std::atomic<bool> track_memory{false};
+    std::atomic<bool> capture_driver_debug{false};
 
     // Extension usage tracking
     std::set<std::string> used_extensions;

@@ -221,6 +221,10 @@ private:
     /// NVIDIA DLSS in place of Ocarina of Time's anti-aliasing (AccelerateCameraMotionUpscale):
     /// notes the camera of a draw on a scene depth buffer and jitters the draw.
     void NoteCameraMotionDraw();
+
+    void InvalidateDescriptorDrawCache() noexcept {
+        descriptor_buffer_ring.InvalidateDrawBindCache();
+    }
     /// Starts the jitter for a frame when its scene depth is cleared.
     void NoteCameraMotionClear();
 

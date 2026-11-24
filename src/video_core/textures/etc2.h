@@ -23,6 +23,9 @@ enum class Format {
 /// Bytes a single decoded texel occupies for `format`.
 [[nodiscard]] u32 BytesPerTexel(Format format);
 
+/// True when compiled with ISPC SIMD support and enabled via EDEN_NX2_ISPC.
+[[nodiscard]] bool IsIspcEnabled() noexcept;
+
 /// Decodes ETC2/EAC blocks into RGBA8 (or R8 / R8G8 for the EAC formats).
 ///
 /// `data` holds the blocks of one extent: `depth` slices of ceil(width / 4) by ceil(height / 4)

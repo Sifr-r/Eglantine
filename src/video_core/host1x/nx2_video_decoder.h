@@ -20,12 +20,28 @@ class Frame;
 
 namespace Tegra::Host1x {
 
+/// Backend implementation powering an Nx2VideoDecoder instance.
+enum class Nx2VideoBackend : u32 {
+    FFmpegCpu,
+    FFmpegGpu,
+    VulkanVideo,
+};
+
+/// Host Vulkan Video capabilities attached when VK_KHR_video_decode_queue is available.
+struct Nx2VulkanVideoCapabilities {
+    bool decode_queue_available{};
+    bool h264_supported{};
+    u32 decode_queue_family{};
+};
+
 /// A picture decoded by Nx2VideoDecoder, in display order.
 struct Nx2Picture {
     u32 width{};
     u32 height{};
     u64 pts{}; ///< As submitted with the compressed frame
     std::shared_ptr<FFmpeg::Frame> frame;
+    bool vram_resident{}; ///< True when backing image lives in host VRAM without readback
+    u64 vram_handle{};    ///< Opaque host image/buffer identifier for future zero-readback output
 };
 
 /// Pixel layouts of a Switch 2 decoder output image.
@@ -45,11 +61,18 @@ class Nx2VideoDecoder {
 public:
     /// mime: the codec name nn::codec sends with Configure ("video/vp9", "video/vp8", ...).
     explicit Nx2VideoDecoder(std::string_view mime);
+    explicit Nx2VideoDecoder(std::string_view mime, const Nx2VulkanVideoCapabilities& vk_caps);
     ~Nx2VideoDecoder();
 
-    bool IsOpen() const;
+    [[nodiscard]] static bool IsVulkanVideoRequested() noexcept;
 
-    const std::string& Name() const;
+    [[nodiscard]] bool IsOpen() const;
+
+    [[nodiscard]] Nx2VideoBackend Backend() const noexcept;
+
+    [[nodiscard]] bool IsVramResidentCapable() const noexcept;
+
+    [[nodiscard]] const std::string& Name() const;
 
     /// Decodes one compressed frame and appends the pictures it completes.
     void Decode(std::span<const u8> data, u64 pts, std::vector<Nx2Picture>& pictures);

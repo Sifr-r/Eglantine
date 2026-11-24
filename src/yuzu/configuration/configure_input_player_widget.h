@@ -50,6 +50,9 @@ public:
     // Updates input on scheduled interval
     void UpdateInput();
 
+signals:
+    void ControllerUpdateRequested(Core::HID::ControllerTriggerType type);
+
 protected:
     void paintEvent(QPaintEvent* event) override;
 
@@ -213,7 +216,7 @@ private:
     bool is_controller_set{};
     bool is_connected{};
     bool needs_redraw{};
-    Core::HID::NpadStyleIndex controller_type;
+    Core::HID::NpadStyleIndex controller_type{};
 
     bool mapping_active{};
     int blink_counter{};
@@ -222,7 +225,7 @@ private:
     ColorMapping colors{};
     Core::HID::LedPattern led_pattern{0, 0, 0, 0};
     std::size_t player_index{};
-    Core::HID::EmulatedController* controller;
+    Core::HID::EmulatedController* controller{};
     std::size_t button_mapping_index{Settings::NativeButton::NumButtons};
     std::size_t analog_mapping_index{Settings::NativeAnalog::NumAnalogs};
     Core::HID::ButtonValues button_values{};

@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <tuple>
+
 #include "common/input.h"
 #include "common/logging.h"
 #include "input_common/helpers/joycon_protocol/nfc.h"
@@ -365,15 +368,28 @@ Common::Input::DriverResult NfcProtocol::GetAmiiboData(std::vector<u8>& ntag_dat
         }
 
         if (output.mcu_report == MCUReport::NFCReadData && output.mcu_data[1] == 0x07) {
-            std::size_t payload_size = (output.mcu_data[4] << 8 | output.mcu_data[5]) & 0x7FF;
+            const std::size_t payload_size =
+                ((static_cast<std::size_t>(output.mcu_data[4]) << 8) |
+                 static_cast<std::size_t>(output.mcu_data[5])) &
+                0x7FFu;
+            std::size_t src_offset = 6;
+            std::size_t copy_size = payload_size;
             if (output.mcu_data[2] == 0x01) {
-                memcpy(ntag_data.data() + ntag_buffer_pos, output.mcu_data.data() + 66,
-                       payload_size - 60);
-                ntag_buffer_pos += payload_size - 60;
-            } else {
-                memcpy(ntag_data.data() + ntag_buffer_pos, output.mcu_data.data() + 6,
-                       payload_size);
+                if (payload_size < 60) {
+                    return Common::Input::DriverResult::ErrorReadingData;
+                }
+                src_offset = 66;
+                copy_size = payload_size - 60;
             }
+            if (src_offset > output.mcu_data.size() ||
+                copy_size > output.mcu_data.size() - src_offset ||
+                ntag_buffer_pos > ntag_data.size() ||
+                copy_size > ntag_data.size() - ntag_buffer_pos) {
+                return Common::Input::DriverResult::ErrorReadingData;
+            }
+            std::memcpy(ntag_data.data() + ntag_buffer_pos, output.mcu_data.data() + src_offset,
+                        copy_size);
+            ntag_buffer_pos += copy_size;
             package_index++;
             continue;
         }
@@ -389,6 +405,10 @@ Common::Input::DriverResult NfcProtocol::GetAmiiboData(std::vector<u8>& ntag_dat
 
 Common::Input::DriverResult NfcProtocol::WriteAmiiboData(const TagUUID& tag_uuid,
                                                          std::span<const u8> data) {
+    if (data.size() < 20) {
+        return Common::Input::DriverResult::InvalidParameters;
+    }
+
     constexpr std::size_t timeout_limit = 60;
     const auto nfc_data = MakeAmiiboWritePackage(tag_uuid, data);
     const std::vector<u8> nfc_buffer_data = SerializeWritePackage(nfc_data);
@@ -440,8 +460,11 @@ Common::Input::DriverResult NfcProtocol::WriteAmiiboData(const TagUUID& tag_uuid
         const std::size_t block_size = next_position - current_position;
         const bool is_last_packet = block_size < sizeof(NFCRequestState::raw_data);
 
-        SendWriteDataAmiiboRequest(output, block_id, is_last_packet,
-                                   buffer.subspan(current_position, block_size));
+        result = SendWriteDataAmiiboRequest(output, block_id, is_last_packet,
+                                            buffer.subspan(current_position, block_size));
+        if (result != Common::Input::DriverResult::Success) {
+            return result;
+        }
 
         const auto nfc_status = static_cast<NFCStatus>(output.mcu_data[6]);
 
@@ -458,6 +481,10 @@ Common::Input::DriverResult NfcProtocol::WriteAmiiboData(const TagUUID& tag_uuid
             block_id++;
             current_position = next_position;
         }
+    }
+
+    if (current_position < buffer.size()) {
+        return Common::Input::DriverResult::Timeout;
     }
 
     return result;
@@ -486,8 +513,11 @@ Common::Input::DriverResult NfcProtocol::GetMifareData(
         const std::size_t block_size = next_position - current_position;
         const bool is_last_packet = block_size < sizeof(NFCRequestState::raw_data);
 
-        SendReadDataMifareRequest(output, block_id, is_last_packet,
-                                  buffer.subspan(current_position, block_size));
+        result = SendReadDataMifareRequest(output, block_id, is_last_packet,
+                                           buffer.subspan(current_position, block_size));
+        if (result != Common::Input::DriverResult::Success) {
+            return result;
+        }
 
         const auto nfc_status = static_cast<NFCStatus>(output.mcu_data[6]);
 
@@ -504,8 +534,8 @@ Common::Input::DriverResult NfcProtocol::GetMifareData(
         }
     }
 
-    if (result != Common::Input::DriverResult::Success) {
-        return result;
+    if (current_position < buffer.size()) {
+        return Common::Input::DriverResult::Timeout;
     }
 
     // Wait for reply and save the output data
@@ -524,12 +554,19 @@ Common::Input::DriverResult NfcProtocol::GetMifareData(
         if (output.mcu_report == MCUReport::NFCState && output.mcu_data[1] == 0x10) {
             constexpr std::size_t DATA_LENGTH = 0x10 + 1;
             constexpr std::size_t DATA_START = 11;
-            const u8 number_of_elements = output.mcu_data[10];
+            static_assert(DATA_LENGTH == 1 + sizeof(MifareReadData::data));
+            static_assert(DATA_START <= sizeof(output.mcu_data));
+            constexpr std::size_t max_mcu_elements =
+                (sizeof(output.mcu_data) - DATA_START) / DATA_LENGTH;
+            const std::size_t number_of_elements = static_cast<std::size_t>(output.mcu_data[10]);
+            if (number_of_elements > out_data.size() || number_of_elements > max_mcu_elements) {
+                return Common::Input::DriverResult::ErrorReadingData;
+            }
             for (std::size_t i = 0; i < number_of_elements; i++) {
                 out_data[i].sector = output.mcu_data[DATA_START + (i * DATA_LENGTH)];
-                memcpy(out_data[i].data.data(),
-                       output.mcu_data.data() + DATA_START + 1 + (i * DATA_LENGTH),
-                       sizeof(MifareReadData::data));
+                std::memcpy(out_data[i].data.data(),
+                            output.mcu_data.data() + DATA_START + 1 + (i * DATA_LENGTH),
+                            sizeof(MifareReadData::data));
             }
             package_index++;
             continue;
@@ -537,11 +574,11 @@ Common::Input::DriverResult NfcProtocol::GetMifareData(
 
         if (output.mcu_report == MCUReport::NFCState && nfc_status == NFCStatus::MifareDone) {
             LOG_INFO(Input, "Finished reading mifare");
-            break;
+            return Common::Input::DriverResult::Success;
         }
     }
 
-    return result;
+    return Common::Input::DriverResult::Timeout;
 }
 
 Common::Input::DriverResult NfcProtocol::WriteMifareData(
@@ -566,8 +603,11 @@ Common::Input::DriverResult NfcProtocol::WriteMifareData(
         const std::size_t block_size = next_position - current_position;
         const bool is_last_packet = block_size < sizeof(NFCRequestState::raw_data);
 
-        SendReadDataMifareRequest(output, block_id, is_last_packet,
-                                  buffer.subspan(current_position, block_size));
+        result = SendReadDataMifareRequest(output, block_id, is_last_packet,
+                                           buffer.subspan(current_position, block_size));
+        if (result != Common::Input::DriverResult::Success) {
+            return result;
+        }
 
         const auto nfc_status = static_cast<NFCStatus>(output.mcu_data[6]);
 
@@ -584,8 +624,8 @@ Common::Input::DriverResult NfcProtocol::WriteMifareData(
         }
     }
 
-    if (result != Common::Input::DriverResult::Success) {
-        return result;
+    if (current_position < buffer.size()) {
+        return Common::Input::DriverResult::Timeout;
     }
 
     // Wait for reply and ignore the output data
@@ -608,11 +648,11 @@ Common::Input::DriverResult NfcProtocol::WriteMifareData(
 
         if (output.mcu_report == MCUReport::NFCState && nfc_status == NFCStatus::MifareDone) {
             LOG_INFO(Input, "Finished writing mifare");
-            break;
+            return Common::Input::DriverResult::Success;
         }
     }
 
-    return result;
+    return Common::Input::DriverResult::Timeout;
 }
 
 Common::Input::DriverResult NfcProtocol::SendStartPollingRequest(MCUCommandResponse& output,
@@ -842,6 +882,10 @@ std::vector<u8> NfcProtocol::SerializeMifareWritePackage(const MifareWritePackag
 
 NFCWritePackage NfcProtocol::MakeAmiiboWritePackage(const TagUUID& tag_uuid,
                                                     std::span<const u8> data) const {
+    if (data.size() < 20) {
+        return {};
+    }
+
     return {
         .command_data{
             .unknown = 0xd0,
@@ -891,18 +935,20 @@ MifareReadPackage NfcProtocol::MakeMifareReadPackage(
 
 MifareWritePackage NfcProtocol::MakeMifareWritePackage(
     const MifareUUID& tag_uuid, std::span<const MifareWriteChunk> read_request) const {
+    constexpr std::size_t max_chunks = std::tuple_size_v<decltype(MifareWritePackage::data_chunks)>;
+    const std::size_t chunk_count = (std::min)(read_request.size(), max_chunks);
     MifareWritePackage package{
         .command_data{
             .unknown1 = 0xd0,
             .unknown2 = 0x07,
             .number_of_short_bytes = static_cast<u8>(
-                ((read_request.size() * sizeof(MifareReadChunk)) + sizeof(MifareUUID) + 2) / 2),
+                ((chunk_count * sizeof(MifareWriteChunk)) + sizeof(MifareUUID) + 2) / 2),
             .uid = tag_uuid,
         },
         .data_chunks = {},
     };
 
-    for (std::size_t i = 0; i < read_request.size() && i < package.data_chunks.size(); ++i) {
+    for (std::size_t i = 0; i < chunk_count; ++i) {
         package.data_chunks[i] = read_request[i];
     }
 

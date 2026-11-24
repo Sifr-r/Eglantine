@@ -8,6 +8,55 @@
 #include "common/string_util.h"
 
 namespace Common::FS::Android {
+namespace {
+
+class ScopedLocalJString {
+public:
+    ScopedLocalJString(JNIEnv* env_, jstring ref_) noexcept : env{env_}, ref{ref_} {}
+    ~ScopedLocalJString() {
+        if (ref != nullptr && env != nullptr) {
+            env->DeleteLocalRef(ref);
+        }
+    }
+
+    ScopedLocalJString(const ScopedLocalJString&) = delete;
+    ScopedLocalJString& operator=(const ScopedLocalJString&) = delete;
+
+    [[nodiscard]] jstring get() const noexcept {
+        return ref;
+    }
+
+    explicit operator bool() const noexcept {
+        return ref != nullptr;
+    }
+
+private:
+    JNIEnv* env;
+    jstring ref;
+};
+
+std::string CallStringMethod(jmethodID method, const std::string& filepath) {
+    if (method == nullptr) {
+        return {};
+    }
+    auto env = Common::Android::GetEnvForThread();
+    if (env == nullptr) {
+        return {};
+    }
+    const ScopedLocalJString j_filepath{env, Common::Android::ToJString(env, filepath)};
+    if (!j_filepath) {
+        return {};
+    }
+    const ScopedLocalJString j_return{
+        env, static_cast<jstring>(
+                 env->CallStaticObjectMethod(native_library, method, j_filepath.get()))};
+    if (!j_return) {
+        return {};
+    }
+    return Common::Android::GetJString(env, j_return.get());
+}
+
+} // namespace
 
 void RegisterCallbacks(JNIEnv* env, jclass clazz) {
     env->GetJavaVM(&g_jvm);
@@ -58,9 +107,16 @@ s32 OpenContentUri(const std::string& filepath, OpenMode openmode) {
         return -1;
     }
     auto env = Common::Android::GetEnvForThread();
-    jstring j_filepath = Common::Android::ToJString(env, filepath);
-    jstring j_mode = Common::Android::ToJString(env, mode);
-    return env->CallStaticIntMethod(native_library, s_open_content_uri, j_filepath, j_mode);
+    if (env == nullptr) {
+        return -1;
+    }
+    const ScopedLocalJString j_filepath{env, Common::Android::ToJString(env, filepath)};
+    const ScopedLocalJString j_mode{env, Common::Android::ToJString(env, mode)};
+    if (!j_filepath || !j_mode) {
+        return -1;
+    }
+    return env->CallStaticIntMethod(native_library, s_open_content_uri, j_filepath.get(),
+                                    j_mode.get());
 }
 
 u64 GetSize(const std::string& filepath) {
@@ -68,55 +124,55 @@ u64 GetSize(const std::string& filepath) {
         return 0;
     }
     auto env = Common::Android::GetEnvForThread();
-    return static_cast<u64>(env->CallStaticLongMethod(
-        native_library, s_get_size,
-        Common::Android::ToJString(Common::Android::GetEnvForThread(), filepath)));
+    if (env == nullptr) {
+        return 0;
+    }
+    const ScopedLocalJString j_filepath{env, Common::Android::ToJString(env, filepath)};
+    if (!j_filepath) {
+        return 0;
+    }
+    return static_cast<u64>(
+        env->CallStaticLongMethod(native_library, s_get_size, j_filepath.get()));
 }
 
 bool IsDirectory(const std::string& filepath) {
     if (s_is_directory == nullptr) {
-        return 0;
+        return false;
     }
     auto env = Common::Android::GetEnvForThread();
-    return env->CallStaticBooleanMethod(
-        native_library, s_is_directory,
-        Common::Android::ToJString(Common::Android::GetEnvForThread(), filepath));
+    if (env == nullptr) {
+        return false;
+    }
+    const ScopedLocalJString j_filepath{env, Common::Android::ToJString(env, filepath)};
+    if (!j_filepath) {
+        return false;
+    }
+    return env->CallStaticBooleanMethod(native_library, s_is_directory, j_filepath.get()) !=
+           JNI_FALSE;
 }
 
 bool Exists(const std::string& filepath) {
     if (s_file_exists == nullptr) {
-        return 0;
+        return false;
     }
     auto env = Common::Android::GetEnvForThread();
-    return env->CallStaticBooleanMethod(
-        native_library, s_file_exists,
-        Common::Android::ToJString(Common::Android::GetEnvForThread(), filepath));
+    if (env == nullptr) {
+        return false;
+    }
+    const ScopedLocalJString j_filepath{env, Common::Android::ToJString(env, filepath)};
+    if (!j_filepath) {
+        return false;
+    }
+    return env->CallStaticBooleanMethod(native_library, s_file_exists, j_filepath.get()) !=
+           JNI_FALSE;
 }
 
 std::string GetParentDirectory(const std::string& filepath) {
-    if (s_get_parent_directory == nullptr) {
-        return 0;
-    }
-    auto env = Common::Android::GetEnvForThread();
-    jstring j_return = static_cast<jstring>(env->CallStaticObjectMethod(
-        native_library, s_get_parent_directory, Common::Android::ToJString(env, filepath)));
-    if (!j_return) {
-        return {};
-    }
-    return Common::Android::GetJString(env, j_return);
+    return CallStringMethod(s_get_parent_directory, filepath);
 }
 
 std::string GetFilename(const std::string& filepath) {
-    if (s_get_filename == nullptr) {
-        return 0;
-    }
-    auto env = Common::Android::GetEnvForThread();
-    jstring j_return = static_cast<jstring>(env->CallStaticObjectMethod(
-        native_library, s_get_filename, Common::Android::ToJString(env, filepath)));
-    if (!j_return) {
-        return {};
-    }
-    return Common::Android::GetJString(env, j_return);
+    return CallStringMethod(s_get_filename, filepath);
 }
 
 } // namespace Common::FS::Android

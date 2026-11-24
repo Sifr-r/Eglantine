@@ -140,6 +140,18 @@ public:
     }
 
     void Free(PageBuffer* pb) {
+        if (pb == nullptr || m_count == 0) {
+            return;
+        }
+
+        const uintptr_t base_addr = reinterpret_cast<uintptr_t>(m_backing_memory.data());
+        const uintptr_t pb_addr = reinterpret_cast<uintptr_t>(pb);
+        const size_t max_bytes = m_count * sizeof(PageBuffer);
+        if (pb_addr < base_addr || static_cast<size_t>(pb_addr - base_addr) >= max_bytes ||
+            (static_cast<size_t>(pb_addr - base_addr) % sizeof(PageBuffer)) != 0) {
+            return;
+        }
+
         // Ensure all pages in the heap are zero.
         std::memset(pb, 0, PageSize);
 
@@ -148,8 +160,10 @@ public:
         KScopedSpinLock lk(m_lock);
 
         // Set the bit for the free page.
-        size_t offset =
-            (reinterpret_cast<uint64_t>(pb) - GetInteger(m_aligned_address)) / sizeof(PageBuffer);
+        const size_t offset =
+            static_cast<size_t>(GetInteger(m_address) - GetInteger(m_aligned_address)) /
+                sizeof(PageBuffer) +
+            static_cast<size_t>(pb_addr - base_addr) / sizeof(PageBuffer);
         m_page_bitmap.SetBit(offset);
 
         // Decrement our used count.

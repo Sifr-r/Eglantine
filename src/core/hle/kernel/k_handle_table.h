@@ -97,7 +97,8 @@ public:
                 ASSERT(cur_process != nullptr);
                 return {kernel, cur_process};
             }
-        } else if constexpr (std::derived_from<KThread, T>) {
+        }
+        if constexpr (std::derived_from<KThread, T>) {
             if (handle == Svc::PseudoHandle::CurrentThread) {
                 auto* const cur_thread = GetCurrentThreadPointer(kernel);
                 ASSERT(cur_thread != nullptr);

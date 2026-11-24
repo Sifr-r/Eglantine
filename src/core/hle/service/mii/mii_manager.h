@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <span>
 
 #include "core/hle/result.h"
@@ -85,6 +86,8 @@ private:
 
     // This should be a global value
     bool is_broken_with_clear_flag{};
+
+    mutable std::mutex mutex;
 };
 
 }; // namespace Service::Mii

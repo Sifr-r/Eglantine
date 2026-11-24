@@ -24,6 +24,7 @@
 #include "core/frontend/applets/web_browser.h"
 #include "core/hle/result.h"
 #include "core/hle/service/am/am.h"
+#include "core/hle/service/am/am_results.h"
 #include "core/hle/service/am/frontend/applet_web_browser.h"
 #include "core/hle/service/am/service/storage.h"
 #include "core/hle/service/filesystem/filesystem.h"
@@ -35,20 +36,21 @@ namespace Service::AM::Frontend {
 namespace {
 
 template <typename T>
-void ParseRawValue(T& value, std::span<const u8> data) {
+std::optional<T> ParseRawValue(std::optional<std::span<const u8>> data) {
     static_assert(std::is_trivially_copyable_v<T>,
                   "It's undefined behavior to use memcpy with non-trivially copyable objects");
-    std::memcpy(&value, data.data(), data.size());
-}
-
-template <typename T>
-T ParseRawValue(std::span<const u8> data) {
-    T value;
-    ParseRawValue(value, data);
+    if (!data || data->size() != sizeof(T)) {
+        return std::nullopt;
+    }
+    T value{};
+    std::memcpy(&value, data->data(), sizeof(T));
     return value;
 }
 
 std::string ParseStringValue(std::span<const u8> data) {
+    if (data.empty()) {
+        return {};
+    }
     return Common::StringFromFixedZeroTerminatedBuffer(reinterpret_cast<const char*>(data.data()), data.size());
 }
 
@@ -72,37 +74,32 @@ std::string ResolveURL(const std::string& url) {
     return url.substr(0, index) + "lp1" + url.substr(index + 1);
 }
 
-WebArgInputTLVMap ReadWebArgs(std::span<const u8> web_arg, WebArgHeader& web_arg_header) {
-    std::memcpy(&web_arg_header, web_arg.data(), sizeof(WebArgHeader));
-
-    if (web_arg.size() == sizeof(WebArgHeader)) {
-        return {};
+std::optional<WebArgInputTLVMap> ReadWebArgs(std::span<const u8> web_arg,
+                                          WebArgHeader& web_arg_header) {
+    if (web_arg.size() < sizeof(WebArgHeader)) {
+        return std::nullopt;
     }
+    std::memcpy(&web_arg_header, web_arg.data(), sizeof(WebArgHeader));
+    web_arg = web_arg.subspan(sizeof(WebArgHeader));
 
     WebArgInputTLVMap input_tlv_map;
 
-    u64 current_offset = sizeof(WebArgHeader);
-
     for (std::size_t i = 0; i < web_arg_header.total_tlv_entries; ++i) {
-        if (web_arg.size() < current_offset + sizeof(WebArgInputTLV)) {
-            return input_tlv_map;
+        if (web_arg.size() < sizeof(WebArgInputTLV)) {
+            return std::nullopt;
         }
 
-        WebArgInputTLV input_tlv;
-        std::memcpy(&input_tlv, web_arg.data() + current_offset, sizeof(WebArgInputTLV));
-
-        current_offset += sizeof(WebArgInputTLV);
-
-        if (web_arg.size() < current_offset + input_tlv.arg_data_size) {
-            return input_tlv_map;
+        WebArgInputTLV input_tlv{};
+        std::memcpy(&input_tlv, web_arg.data(), sizeof(WebArgInputTLV));
+        web_arg = web_arg.subspan(sizeof(WebArgInputTLV));
+        if (web_arg.size() < input_tlv.arg_data_size) {
+            return std::nullopt;
         }
 
-        std::vector<u8> data(input_tlv.arg_data_size);
-        std::memcpy(data.data(), web_arg.data() + current_offset, input_tlv.arg_data_size);
-
-        current_offset += input_tlv.arg_data_size;
-
-        input_tlv_map.insert_or_assign(input_tlv.input_tlv_type, std::move(data));
+        const auto data = web_arg.first(input_tlv.arg_data_size);
+        input_tlv_map.insert_or_assign(input_tlv.input_tlv_type,
+                                       std::vector<u8>(data.begin(), data.end()));
+        web_arg = web_arg.subspan(input_tlv.arg_data_size);
     }
 
     return input_tlv_map;
@@ -237,6 +234,10 @@ WebBrowser::~WebBrowser() = default;
 
 void WebBrowser::Initialize() {
     FrontendApplet::Initialize();
+    if (!IsInitialized()) {
+        status = ResultNoDataInChannel;
+        return;
+    }
 
     LOG_INFO(Service_AM, "Initializing Web Browser Applet.");
 
@@ -250,12 +251,16 @@ void WebBrowser::Initialize() {
     web_applet_version = WebAppletVersion{common_args.library_version};
 
     const auto web_arg_storage = PopInData();
-    ASSERT(web_arg_storage != nullptr);
-
-    const auto& web_arg = web_arg_storage->GetData();
-    ASSERT_OR_EXECUTE(web_arg.size() >= sizeof(WebArgHeader), { return; });
-
-    web_arg_input_tlv_map = ReadWebArgs(web_arg, web_arg_header);
+    if (!web_arg_storage) {
+        status = ResultNoDataInChannel;
+        return;
+    }
+    auto arguments = ReadWebArgs(web_arg_storage->GetData(), web_arg_header);
+    if (!arguments) {
+        status = ResultInvalidStorageType;
+        return;
+    }
+    web_arg_input_tlv_map = std::move(*arguments);
 
     LOG_DEBUG(Service_AM, "WebArgHeader: total_tlv_entries={}, shim_kind={}",
               web_arg_header.total_tlv_entries, web_arg_header.shim_kind);
@@ -276,13 +281,13 @@ void WebBrowser::Initialize() {
         InitializeLogin();
         break;
     case ShimKind::Offline:
-        InitializeOffline();
+        status = InitializeOffline();
         break;
     case ShimKind::Share:
         InitializeShare();
         break;
     case ShimKind::Web:
-        InitializeWeb();
+        status = InitializeWeb();
         break;
     case ShimKind::Wifi:
         InitializeWifi();
@@ -294,7 +299,7 @@ void WebBrowser::Initialize() {
         InitializeLhub();
         break;
     default:
-        ASSERT_MSG(false, "Invalid ShimKind={}", web_arg_header.shim_kind);
+        status = ResultInvalidStorageType;
         break;
     }
 }
@@ -308,6 +313,16 @@ void WebBrowser::ExecuteInteractive() {
 }
 
 void WebBrowser::Execute() {
+    if (complete) {
+        return;
+    }
+    if (R_FAILED(status)) {
+        LOG_ERROR(Service_AM, "Invalid web browser arguments for shim {} (result {:#x})",
+                  web_arg_header.shim_kind, status.raw);
+        WebBrowserExit(WebExitReason::ErrorDialog);
+        return;
+    }
+
     if (web_arg_header.shim_kind == ShimKind::Web) {
         ExecuteWeb();
         return;
@@ -450,7 +465,7 @@ void WebBrowser::WebBrowserExit(WebExitReason exit_reason, std::string last_url)
 
         complete = true;
         PushOutData(std::make_shared<IStorage>(system, std::move(out_data)));
-        Exit();
+        Exit(status);
         return;
     }
 
@@ -469,7 +484,7 @@ void WebBrowser::WebBrowserExit(WebExitReason exit_reason, std::string last_url)
     std::vector<u8> out_data(sizeof(WebCommonReturnValue));
     std::memcpy(out_data.data(), &web_common_return_value, out_data.size());
     PushOutData(std::make_shared<IStorage>(system, std::move(out_data)));
-    Exit();
+    Exit(status);
 }
 
 Result WebBrowser::RequestExit() {
@@ -477,71 +492,74 @@ Result WebBrowser::RequestExit() {
     R_SUCCEED();
 }
 
-bool WebBrowser::InputTLVExistsInMap(WebArgInputTLVType input_tlv_type) const {
-    return web_arg_input_tlv_map.find(input_tlv_type) != web_arg_input_tlv_map.end();
-}
-
-std::optional<std::vector<u8>> WebBrowser::GetInputTLVData(WebArgInputTLVType input_tlv_type) {
+std::optional<std::span<const u8>> WebBrowser::GetInputTLVData(
+    WebArgInputTLVType input_tlv_type) const {
     const auto map_it = web_arg_input_tlv_map.find(input_tlv_type);
 
     if (map_it == web_arg_input_tlv_map.end()) {
         return std::nullopt;
     }
 
-    return map_it->second;
+    return std::span<const u8>{map_it->second};
 }
 
 void WebBrowser::InitializeShop() {}
 
 void WebBrowser::InitializeLogin() {}
 
-void WebBrowser::InitializeOffline() {
-    const auto document_path =
-        ParseStringValue(GetInputTLVData(WebArgInputTLVType::DocumentPath).value());
-
+Result WebBrowser::InitializeOffline() {
+    const auto document_path = GetInputTLVData(WebArgInputTLVType::DocumentPath);
     const auto document_kind =
-        ParseRawValue<DocumentKind>(GetInputTLVData(WebArgInputTLVType::DocumentKind).value());
+        ParseRawValue<DocumentKind>(GetInputTLVData(WebArgInputTLVType::DocumentKind));
+    R_UNLESS(document_path && document_kind, ResultInvalidStorageType);
 
     std::string additional_paths;
+    const char* resource_type;
 
-    switch (document_kind) {
+    switch (*document_kind) {
     case DocumentKind::OfflineHtmlPage:
-    default:
         title_id = system.GetApplicationProcessProgramID();
         nca_type = FileSys::ContentRecordType::HtmlDocument;
         additional_paths = "html-document";
+        resource_type = "manual";
         break;
-    case DocumentKind::ApplicationLegalInformation:
-        title_id = ParseRawValue<u64>(GetInputTLVData(WebArgInputTLVType::ApplicationID).value());
+    case DocumentKind::ApplicationLegalInformation: {
+        const auto id = ParseRawValue<u64>(GetInputTLVData(WebArgInputTLVType::ApplicationID));
+        R_UNLESS(id, ResultInvalidStorageType);
+        title_id = *id;
         nca_type = FileSys::ContentRecordType::LegalInformation;
-        break;
-    case DocumentKind::SystemDataPage:
-        title_id = ParseRawValue<u64>(GetInputTLVData(WebArgInputTLVType::SystemDataID).value());
-        nca_type = FileSys::ContentRecordType::Data;
+        resource_type = "legal_information";
         break;
     }
-
-    static constexpr std::array<const char*, 3> RESOURCE_TYPES{
-        "manual",
-        "legal_information",
-        "system_data",
-    };
+    case DocumentKind::SystemDataPage: {
+        const auto id = ParseRawValue<u64>(GetInputTLVData(WebArgInputTLVType::SystemDataID));
+        R_UNLESS(id, ResultInvalidStorageType);
+        title_id = *id;
+        nca_type = FileSys::ContentRecordType::Data;
+        resource_type = "system_data";
+        break;
+    }
+    default:
+        R_THROW(ResultInvalidStorageType);
+    }
 
     offline_cache_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::CacheDir) /
-                        fmt::format("offline_web_applet_{}/{:016X}",
-                                    RESOURCE_TYPES[static_cast<u32>(document_kind) - 1], title_id);
+                        fmt::format("offline_web_applet_{}/{:016X}", resource_type, title_id);
 
     offline_document = Common::FS::ConcatPathSafe(
-        offline_cache_dir, fmt::format("{}/{}", additional_paths, document_path));
+        offline_cache_dir, fmt::format("{}/{}", additional_paths, ParseStringValue(*document_path)));
+    R_SUCCEED();
 }
 
 void WebBrowser::InitializeShare() {}
 
-void WebBrowser::InitializeWeb() {
-    external_url = ParseStringValue(GetInputTLVData(WebArgInputTLVType::InitialURL).value());
+Result WebBrowser::InitializeWeb() {
+    const auto url = GetInputTLVData(WebArgInputTLVType::InitialURL);
+    R_UNLESS(url, ResultInvalidStorageType);
 
     // Resolve Nintendo CDN URLs.
-    external_url = ResolveURL(external_url);
+    external_url = ResolveURL(ParseStringValue(*url));
+    R_SUCCEED();
 }
 
 void WebBrowser::InitializeWifi() {}

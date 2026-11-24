@@ -41,6 +41,7 @@ import org.yuzu.yuzu_emu.utils.GameHelper
 
 class NetPlayDialog(context: Context) : BottomSheetDialog(context) {
     private lateinit var adapter: NetPlayAdapter
+    private var isJoinedDialog = false
 
     private val gameNameList: MutableList<Array<String>> = mutableListOf()
     private val gameIdList: MutableList<Array<Long>> = mutableListOf()
@@ -66,6 +67,7 @@ class NetPlayDialog(context: Context) : BottomSheetDialog(context) {
                 layoutInflater
             )
                 .apply {
+                    isJoinedDialog = true
                     setContentView(root)
                     adapter = NetPlayAdapter()
                     listMultiplayer.layoutManager = LinearLayoutManager(context)
@@ -312,14 +314,20 @@ class NetPlayDialog(context: Context) : BottomSheetDialog(context) {
 
     @SuppressLint("NotifyDataSetChanged")
     fun refreshAdapterItems() {
-        val handler = Handler(Looper.getMainLooper())
-
-        NetPlayManager.setOnAdapterRefreshListener() { _, _ ->
-            handler.post {
-                adapter.netPlayItems.clear()
-                adapter.loadMultiplayerMenu()
-                adapter.notifyDataSetChanged()
+        NetPlayManager.setOnAdapterRefreshListener { _, _ ->
+            if (!isShowing) {
+                return@setOnAdapterRefreshListener
             }
+            adapter.netPlayItems.clear()
+            adapter.loadMultiplayerMenu()
+            adapter.notifyDataSetChanged()
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (isJoinedDialog) {
+            NetPlayManager.setOnAdapterRefreshListener(null)
         }
     }
 

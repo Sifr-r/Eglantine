@@ -691,9 +691,9 @@ Result NPadResource::SetNpadSystemExtStateEnabled(u64 aruid, bool is_enabled) {
         return ResultNpadNotConnected;
     }
 
-    state[aruid_index].data.SetNpadAnalogStickUseCenterClamp(is_enabled);
+    state[aruid_index].data.SetNpadSystemExtStateEnabled(is_enabled);
     if (active_data_aruid == aruid) {
-        active_data.SetNpadAnalogStickUseCenterClamp(is_enabled);
+        active_data.SetNpadSystemExtStateEnabled(is_enabled);
     }
     return ResultSuccess;
 }

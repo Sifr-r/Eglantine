@@ -292,6 +292,8 @@ vk::Buffer RendererVulkan::RenderToBuffer(std::span<const Tegra::FramebufferConf
                                           VkDeviceSize buffer_size) {
     auto frame = [&]() {
         Frame f{};
+        f.width = layout.width;
+        f.height = layout.height;
         f.image =
             CreateWrappedImage(memory_allocator, VkExtent2D{layout.width, layout.height}, format);
         f.image_view = CreateWrappedImageView(device, f.image, format);
@@ -371,6 +373,8 @@ void RendererVulkan::RenderAppletCaptureLayer(
         return;
 
     if (!applet_frame.image) {
+        applet_frame.width = CaptureImageSize.width;
+        applet_frame.height = CaptureImageSize.height;
         applet_frame.image = CreateWrappedImage(memory_allocator, CaptureImageSize, CaptureFormat);
         applet_frame.image_view = CreateWrappedImageView(device, applet_frame.image, CaptureFormat);
         applet_frame.framebuffer = blit_applet.CreateFramebuffer(device,

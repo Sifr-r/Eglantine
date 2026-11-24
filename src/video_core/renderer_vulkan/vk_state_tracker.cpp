@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -11,6 +14,7 @@
 #include "common/common_types.h"
 #include "core/core.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/control/channel_state_bridge.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/vk_state_tracker.h"
@@ -234,8 +238,12 @@ void SetupRasterModes(Maxwell3D::DirtyState::Tables &tables) {
 }
 } // Anonymous namespace
 
-void StateTracker::SetupTables(Tegra::Control::ChannelState& channel_state) {
-    auto& tables{channel_state.payload->maxwell_3d.dirty.tables};
+void StateTracker::SetupTables(const Tegra::Control::ChannelStateBridge& bridge) {
+    auto* const table_ptr = bridge.DirtyTablesPtr();
+    if (table_ptr == nullptr) {
+        return;
+    }
+    auto& tables{*table_ptr};
     SetupDirtyFlags(tables);
     SetupDirtyViewports(tables);
     SetupDirtyScissors(tables);
@@ -257,8 +265,21 @@ void StateTracker::SetupTables(Tegra::Control::ChannelState& channel_state) {
     SetupRasterModes(tables);
 }
 
+void StateTracker::SetupTables(Tegra::Control::ChannelState& channel_state) {
+    SetupTables(Tegra::Control::ChannelStateBridge{channel_state});
+}
+
+void StateTracker::ChangeChannel(const Tegra::Control::ChannelStateBridge& bridge) {
+    if (bridge.HasDirtyFlags()) {
+        flags = bridge.DirtyFlagsPtr();
+        channel_bridge = bridge;
+    } else {
+        ClearChannel();
+    }
+}
+
 void StateTracker::ChangeChannel(Tegra::Control::ChannelState& channel_state) {
-    flags = &channel_state.payload->maxwell_3d.dirty.flags;
+    ChangeChannel(Tegra::Control::ChannelStateBridge{channel_state});
 }
 
 void StateTracker::InvalidateState() {
@@ -268,6 +289,9 @@ void StateTracker::InvalidateState() {
 }
 
 StateTracker::StateTracker()
-    : flags{&default_flags}, default_flags{}, invalidation_flags{MakeInvalidationFlags()} {}
+    : flags{&default_flags}
+    , default_flags{}
+    , channel_bridge{Tegra::Control::ChannelStateBridge::FromDirtyFlags(default_flags)}
+    , invalidation_flags{MakeInvalidationFlags()} {}
 
 } // namespace Vulkan

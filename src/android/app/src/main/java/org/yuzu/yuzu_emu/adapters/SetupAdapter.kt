@@ -8,6 +8,7 @@ package org.yuzu.yuzu_emu.adapters
 
 import android.text.Html
 import android.view.LayoutInflater
+import android.view.View
 import android.view.ViewGroup
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.res.ResourcesCompat
@@ -32,38 +33,49 @@ class SetupAdapter(val activity: AppCompatActivity, pages: List<SetupPage>) :
     inner class SetupPageViewHolder(val binding: PageSetupBinding) :
         AbstractViewHolder<SetupPage>(binding), SetupCallback {
         override fun bind(model: SetupPage) {
+            binding.pageButtonContainer.animate().withEndAction(null).cancel()
+            binding.textConfirmation.animate().withEndAction(null).cancel()
+            binding.pageButtonContainer.removeAllViews()
+
             if (model.pageSteps.invoke() == PageState.COMPLETE) {
                 onStepCompleted(0, pageFullyCompleted = true)
-            }
+            } else {
+                binding.pageButtonContainer.alpha = 1f
+                binding.pageButtonContainer.visibility = View.VISIBLE
+                binding.pageButtonContainer.isClickable = true
+                binding.textConfirmation.alpha = 1f
+                binding.textConfirmation.visibility = View.INVISIBLE
+                binding.textConfirmation.isClickable = false
 
-            if (model.pageButtons != null && model.pageSteps.invoke() != PageState.COMPLETE) {
-                for (pageButton in model.pageButtons) {
-                    val pageButtonView = LayoutInflater.from(activity)
-                        .inflate(
-                            R.layout.page_button,
-                            binding.pageButtonContainer,
-                            false
-                        ) as MaterialButton
+                if (model.pageButtons != null) {
+                    for (pageButton in model.pageButtons) {
+                        val pageButtonView = LayoutInflater.from(activity)
+                            .inflate(
+                                R.layout.page_button,
+                                binding.pageButtonContainer,
+                                false
+                            ) as MaterialButton
 
-                    pageButtonView.apply {
-                        id = pageButton.titleId
-                        icon = ResourcesCompat.getDrawable(
-                            activity.resources,
-                            pageButton.iconId,
-                            activity.theme
-                        )
-                        text = activity.resources.getString(pageButton.titleId)
-                    }
+                        pageButtonView.apply {
+                            id = pageButton.titleId
+                            icon = ResourcesCompat.getDrawable(
+                                activity.resources,
+                                pageButton.iconId,
+                                activity.theme
+                            )
+                            text = activity.resources.getString(pageButton.titleId)
+                        }
 
-                    pageButtonView.setOnClickListener {
-                        pageButton.buttonAction.invoke(this@SetupPageViewHolder)
-                    }
+                        pageButtonView.setOnClickListener {
+                            pageButton.buttonAction.invoke(this@SetupPageViewHolder)
+                        }
 
-                    binding.pageButtonContainer.addView(pageButtonView)
+                        binding.pageButtonContainer.addView(pageButtonView)
 
-                    // Disable buton add if its already completed
-                    if (pageButton.buttonState.invoke() == ButtonState.BUTTON_ACTION_COMPLETE) {
-                        onStepCompleted(pageButton.titleId, pageFullyCompleted = false)
+                        // Disable buton add if its already completed
+                        if (pageButton.buttonState.invoke() == ButtonState.BUTTON_ACTION_COMPLETE) {
+                            onStepCompleted(pageButton.titleId, pageFullyCompleted = false)
+                        }
                     }
                 }
             }

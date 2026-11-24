@@ -6,7 +6,10 @@
 
 #pragma once
 
+#include <memory>
+
 #include "core/hle/service/cmif_types.h"
+#include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/ns/async_result.h"
 #include "core/hle/service/ns/language.h"
 #include "core/hle/service/ns/ns_types.h"
@@ -87,14 +90,14 @@ public:
     void ListApplicationIcon(HLERequestContext& ctx);
 
 private:
-    KernelHelpers::ServiceContext service_context;
+    std::shared_ptr<KernelHelpers::ServiceContext> service_context;
     Event record_update_system_event;
     Event sd_card_mount_status_event;
     Event gamecard_update_detection_event;
     Event gamecard_mount_status_event;
     Event gamecard_mount_failure_event;
     Event gamecard_waken_ready_event;
-    Event unknown_event;
+    std::shared_ptr<Event> unknown_event;
 };
 
 } // namespace Service::NS

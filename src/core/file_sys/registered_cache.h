@@ -20,6 +20,7 @@
 #include "core/file_sys/nca_metadata.h"
 
 namespace FileSys {
+class ContentProviderUnion;
 class ExternalContentProvider;
 class CNMT;
 class NCA;
@@ -101,6 +102,12 @@ public:
         std::optional<u64> title_id = {}) const = 0;
 
     [[nodiscard]] std::optional<u64> GetParentApplicationId(u64 program_id) const;
+
+    [[nodiscard]] virtual const ContentProviderUnion* AsUnion() const;
+    [[nodiscard]] virtual const ExternalContentProvider* AsExternal() const;
+    [[nodiscard]] virtual std::vector<ExternalUpdateEntry> ListUpdateVersions(u64 title_id) const;
+    [[nodiscard]] virtual VirtualFile GetEntryForVersion(u64 title_id, ContentRecordType type,
+                                                         u32 version) const;
 
 protected:
     // A single instance of KeyManager to be used by GetEntry()
@@ -243,6 +250,7 @@ public:
         std::optional<TitleType> title_type, std::optional<ContentRecordType> record_type,
         std::optional<u64> title_id) const override;
 
+    [[nodiscard]] const ContentProviderUnion* AsUnion() const override;
     const ExternalContentProvider* GetExternalProvider() const;
     [[nodiscard]] inline const ContentProvider* GetSlotProvider(ContentProviderUnionSlot slot) const {
         return providers[size_t(slot)];
@@ -269,6 +277,7 @@ public:
     bool AddEntriesFromContainer(VirtualFile file, bool only_content = false,
                                  std::optional<u64> base_program_id = std::nullopt);
     void ClearAllEntries();
+    void SwapEntries(ManualContentProvider& other) noexcept;
 
     void Refresh() override;
     bool HasEntry(u64 title_id, ContentRecordType type) const override;
@@ -280,8 +289,9 @@ public:
         std::optional<TitleType> title_type, std::optional<ContentRecordType> record_type,
         std::optional<u64> title_id) const override;
 
-    std::vector<ExternalUpdateEntry> ListUpdateVersions(u64 title_id) const;
-    VirtualFile GetEntryForVersion(u64 title_id, ContentRecordType type, u32 version) const;
+    std::vector<ExternalUpdateEntry> ListUpdateVersions(u64 title_id) const override;
+    VirtualFile GetEntryForVersion(u64 title_id, ContentRecordType type,
+                                   u32 version) const override;
 
 private:
     std::map<std::tuple<TitleType, ContentRecordType, u64>, VirtualFile> entries;
@@ -306,8 +316,10 @@ public:
         std::optional<TitleType> title_type, std::optional<ContentRecordType> record_type,
         std::optional<u64> title_id) const override;
 
-    std::vector<ExternalUpdateEntry> ListUpdateVersions(u64 title_id) const;
-    VirtualFile GetEntryForVersion(u64 title_id, ContentRecordType type, u32 version) const;
+    [[nodiscard]] const ExternalContentProvider* AsExternal() const override;
+    std::vector<ExternalUpdateEntry> ListUpdateVersions(u64 title_id) const override;
+    VirtualFile GetEntryForVersion(u64 title_id, ContentRecordType type,
+                                   u32 version) const override;
 
 private:
     void ScanDirectory(const VirtualDir& dir);

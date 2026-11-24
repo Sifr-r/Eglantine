@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
+
 #include "core/core_timing.h"
 #include "hid_core/resources/applet_resource.h"
 #include "hid_core/resources/shared_memory_format.h"
@@ -17,10 +19,11 @@ void UniquePad::OnInit() {}
 void UniquePad::OnRelease() {}
 
 void UniquePad::OnUpdate(const Core::Timing::CoreTiming& core_timing) {
+    std::scoped_lock shared_lock{*shared_mutex};
     const u64 aruid = applet_resource->GetActiveAruid();
     auto* data = applet_resource->GetAruidData(aruid);
 
-    if (data == nullptr || !data->flag.is_assigned) {
+    if (data == nullptr || !data->flag.is_assigned || data->shared_memory_format == nullptr) {
         return;
     }
 

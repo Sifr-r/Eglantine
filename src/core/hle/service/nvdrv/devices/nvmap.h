@@ -23,6 +23,8 @@ namespace Service::Nvidia::Devices {
 
 class nvmap final : public nvdevice {
 public:
+    static constexpr DeviceKind Kind = DeviceKind::NvMap;
+
     explicit nvmap(Core::System& system_, NvCore::Container& container);
     ~nvmap() override;
 

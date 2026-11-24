@@ -317,13 +317,13 @@ inline GLenum WrapMode(Tegra::Texture::WrapMode wrap_mode) {
     case Tegra::Texture::WrapMode::MirrorOnceClampToEdge:
         return GL_MIRROR_CLAMP_TO_EDGE;
     case Tegra::Texture::WrapMode::MirrorOnceBorder:
-        if (GL_EXT_texture_mirror_clamp) {
+        if (GLAD_GL_EXT_texture_mirror_clamp) {
             return GL_MIRROR_CLAMP_TO_BORDER_EXT;
         } else {
             return GL_MIRROR_CLAMP_TO_EDGE;
         }
     case Tegra::Texture::WrapMode::MirrorOnceClampOGL:
-        if (GL_EXT_texture_mirror_clamp) {
+        if (GLAD_GL_EXT_texture_mirror_clamp) {
             return GL_MIRROR_CLAMP_EXT;
         } else {
             return GL_MIRROR_CLAMP_TO_EDGE;

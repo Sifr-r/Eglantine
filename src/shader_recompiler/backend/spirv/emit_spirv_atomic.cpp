@@ -318,6 +318,10 @@ Id EmitStorageAtomicXor64(EmitContext& ctx, const IR::Value& binding, const IR::
 
 Id EmitStorageAtomicExchange64(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
                                Id value) {
+    if (!ctx.profile.support_descriptor_aliasing) {
+        LOG_WARNING(Shader_SPIRV, "Descriptor aliasing not supported, this cannot be atomic.");
+        return ctx.ConstantNull(ctx.U64);
+    }
     if (ctx.profile.support_int64_atomics) {
         const Id pointer{StoragePointer(ctx, ctx.storage_types.U64, &StorageDefinitions::U64,
                                         binding, offset, sizeof(u64))};
@@ -328,7 +332,7 @@ Id EmitStorageAtomicExchange64(EmitContext& ctx, const IR::Value& binding, const
     const Id pointer{StoragePointer(ctx, ctx.storage_types.U32x2, &StorageDefinitions::U32x2,
                                     binding, offset, sizeof(u32[2]))};
     const Id original{ctx.OpBitcast(ctx.U64, ctx.OpLoad(ctx.U32[2], pointer))};
-    ctx.OpStore(pointer, value);
+    ctx.OpStore(pointer, ctx.OpBitcast(ctx.U32[2], value));
     return original;
 }
 
@@ -374,6 +378,10 @@ Id EmitStorageAtomicXor32x2(EmitContext& ctx, const IR::Value& binding, const IR
 
 Id EmitStorageAtomicExchange32x2(EmitContext& ctx, const IR::Value& binding,
                                  const IR::Value& offset, Id value) {
+    if (!ctx.profile.support_descriptor_aliasing) {
+        LOG_WARNING(Shader_SPIRV, "Descriptor aliasing not supported, this cannot be atomic.");
+        return ctx.ConstantNull(ctx.U32[2]);
+    }
     LOG_WARNING(Shader_SPIRV, "Int64 atomics not supported, fallback to non-atomic");
     const Id pointer{StoragePointer(ctx, ctx.storage_types.U32x2, &StorageDefinitions::U32x2,
                                     binding, offset, sizeof(u32[2]))};

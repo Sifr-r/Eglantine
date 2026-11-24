@@ -4,7 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
+#include <cstring>
 #include <tuple>
 #include <stdint.h>
 
@@ -74,7 +76,11 @@ void SwizzleSurface(std::span<u8> output, u32 out_stride, std::span<const u8> in
         auto offs_line = offs_x;
         for (u32 x = 0; x < in_stride; x += 16) {
             std::memcpy(&dst_line[offs_line * 16], &src_line[x], 16);
-            std::memcpy(&dst_line[offs_line * 16 + 16], &src_line[x + in_stride], 16);
+            if (y + 1 < height) {
+                std::memcpy(&dst_line[offs_line * 16 + 16], &src_line[x + in_stride], 16);
+            } else {
+                std::memset(&dst_line[offs_line * 16 + 16], 0, 16);
+            }
             offs_line = (offs_line - x_mask) & x_mask;
         }
         offs_y = (offs_y - y_mask) & y_mask;
@@ -93,12 +99,17 @@ Vic::Vic(Host1x& host1x_, s32 id_, u32 syncpt) noexcept
 }
 
 Vic::~Vic() noexcept {
+    Stop();
     LOG_INFO(HW_GPU, "Destroying vic {}", id);
     host1x.frame_queue.Close(id);
 }
 
 void Vic::ProcessMethod(u32 method, u32 arg) noexcept {
     LOG_TRACE(HW_GPU, "Vic {} method {:#x}", id, u32(method));
+    if (method >= VicRegisters::NUM_REGS) {
+        LOG_ERROR(HW_GPU, "Invalid Vic {} method {:#x}", id, method);
+        return;
+    }
     regs.reg_array[method] = arg;
     switch (Method(method * sizeof(u32))) {
     case Method::Execute:
@@ -373,16 +384,20 @@ void Vic::ReadInterlacedY8__V8U8_N420(const SlotStruct& slot, std::span<const Pl
         slot_surface.resize(out_luma_width * out_luma_height);
 
         auto const in_luma_width = (std::min)(frame->GetWidth(), s32(out_luma_width));
-        [[maybe_unused]] auto const in_luma_height = (std::min)(frame->GetHeight(), s32(out_luma_height));
+        auto const in_luma_height = (std::min)(frame->GetHeight(), s32(out_luma_height));
         auto const in_luma_stride{frame->GetStride(0)};
 
         [[maybe_unused]] auto const in_chroma_width = (frame->GetWidth() + 1) / 2;
-        auto const in_chroma_height = (frame->GetHeight() + 1) / 2;
+        [[maybe_unused]] auto const in_chroma_height = (frame->GetHeight() + 1) / 2;
         auto const in_chroma_stride{frame->GetStride(1)};
 
         auto const* luma_buffer{frame->GetPlane(0)};
         auto const* chroma_u_buffer{frame->GetPlane(1)};
         auto const* chroma_v_buffer{frame->GetPlane(2)};
+
+        if (in_luma_width <= 0 || in_luma_height <= 0) {
+            return;
+        }
 
         LOG_TRACE(HW_GPU, "Reading frame"
             "\ninput luma {}x{} stride {} chroma {}x{} stride {}\n"
@@ -393,7 +408,7 @@ void Vic::ReadInterlacedY8__V8U8_N420(const SlotStruct& slot, std::span<const Pl
 
         auto DecodeBobField = [&]() {
             auto const alpha = u16(slot.config.planar_alpha.Value());
-            for (s32 y = s32(top_field == false); y < in_chroma_height * 2; y += 2) {
+            for (s32 y = s32(top_field == false); y < in_luma_height; y += 2) {
                 auto const src_luma{y * in_luma_stride};
                 auto const src_chroma{(y / 2) * in_chroma_stride};
                 auto const dst{y * out_luma_stride};
@@ -408,8 +423,11 @@ void Vic::ReadInterlacedY8__V8U8_N420(const SlotStruct& slot, std::span<const Pl
                     }
                     slot_surface[dst + x].a = alpha;
                 }
-                s32 other_line = (top_field ? y + 1 : y - 1) * out_luma_stride;
-                std::memcpy(&slot_surface[other_line], &slot_surface[dst], out_luma_width * sizeof(Pixel));
+                const s32 other_y = top_field ? y + 1 : y - 1;
+                if (other_y >= 0 && other_y < s32(out_luma_height)) {
+                    const s32 other_line = other_y * s32(out_luma_stride);
+                    std::memcpy(&slot_surface[other_line], &slot_surface[dst], out_luma_width * sizeof(Pixel));
+                }
             }
         };
 
@@ -486,17 +504,32 @@ void Vic::Blend(const ConfigStruct& config, const SlotStruct& slot, VideoPixelFo
     auto const out_surface_width = config.output_surface_config.out_surface_width + 1;
     auto const out_surface_height = config.output_surface_config.out_surface_height + 1;
     auto const in_surface_width = slot.surface_config.slot_surface_width + 1;
+    auto const in_surface_height =
+        in_surface_width > 0 ? static_cast<u32>(slot_surface.size() / in_surface_width) : 0U;
 
-    source_bottom = (std::min)(source_bottom, out_surface_height);
-    source_right = (std::min)(source_right, out_surface_width);
+    if (source_left >= in_surface_width || source_top >= in_surface_height ||
+        rect_left >= out_surface_width || source_top >= out_surface_height ||
+        source_right <= source_left || source_bottom <= source_top ||
+        rect_right <= rect_left) {
+        return;
+    }
 
-    [[maybe_unused]] auto const work_width = u32((std::max)(0, s32(source_right) - s32(source_left)));
-    [[maybe_unused]] auto const work_height = u32((std::max)(0, s32(source_bottom) - s32(source_top)));
+    auto const work_width = (std::min)({
+        source_right - source_left,
+        rect_right - rect_left,
+        in_surface_width - source_left,
+        out_surface_width - rect_left,
+    });
+    auto const work_height = (std::min)({
+        source_bottom - source_top,
+        in_surface_height - source_top,
+        out_surface_height - source_top,
+    });
 
     // TODO Alpha blending. No games I've seen use more than a single surface or supply an alpha
     // below max, so it's ignored for now.
     if (slot.color_matrix.matrix_enable) {
-        if (COMPILED_HAS_SSE41 && HasSSE41() && source_left % 8 == 0 && source_right % 8 == 0) {
+        if (COMPILED_HAS_SSE41 && HasSSE41() && work_width >= 8 && work_width % 8 == 0) {
             // MSVC doesn't define __SSE4_1__
 #if COMPILED_HAS_SSE41
             // Fill the columns, e.g
@@ -548,13 +581,15 @@ void Vic::Blend(const ConfigStruct& config, const SlotStruct& slot, VideoPixelFo
                 return _mm_srai_epi32(out, 8);
             };
 
-            for (u32 y = source_top; y < source_bottom; y++) {
-                auto const src{y * in_surface_width + source_left};
-                auto const dst{y * out_surface_width + rect_left};
-                for (u32 x = source_left; x < source_right; x += 8) {
+            for (u32 y = 0; y < work_height; y++) {
+                auto const src{(source_top + y) * in_surface_width + source_left};
+                auto const dst{(source_top + y) * out_surface_width + rect_left};
+                for (u32 x = 0; x < work_width; x += 8) {
                     // clang-format off
                     // Prefetch the next iteration's memory
-                    _mm_prefetch((const char*)&slot_surface[src + x + 8], _MM_HINT_T0);
+                    if (x + 8 < work_width) {
+                        _mm_prefetch(reinterpret_cast<const char*>(slot_surface.data() + src + x + 8), _MM_HINT_T0);
+                    }
 
                     // Load in pixels
                     // p01 = [AA AA] [BB BB] [GG GG] [RR RR] [AA AA] [BB BB] [GG GG] [RR RR]
@@ -668,10 +703,10 @@ void Vic::Blend(const ConfigStruct& config, const SlotStruct& slot, VideoPixelFo
                 b >>= 8;
                 return {r, g, b, s32(in_pixel.a)};
             };
-            for (u32 y = source_top; y < source_bottom; y++) {
-                const auto src{y * in_surface_width + source_left};
-                const auto dst{y * out_surface_width + rect_left};
-                for (u32 x = source_left; x < source_right; x++) {
+            for (u32 y = 0; y < work_height; y++) {
+                const auto src{(source_top + y) * in_surface_width + source_left};
+                const auto dst{(source_top + y) * out_surface_width + rect_left};
+                for (u32 x = 0; x < work_width; x++) {
                     auto [r, g, b, a] = MatMul(slot_surface[src + x]);
                     r = std::clamp(r, clamp_min, clamp_max);
                     g = std::clamp(g, clamp_min, clamp_max);
@@ -682,11 +717,10 @@ void Vic::Blend(const ConfigStruct& config, const SlotStruct& slot, VideoPixelFo
             }
         }
     } else {
-        auto const copy_width = (std::min)(source_right - source_left, rect_right - rect_left);
         for (u32 y = 0; y < work_height; y++) {
             auto const dst_line = (y + source_top) * out_surface_width;
             auto const src_line = (y + source_top) * in_surface_width;
-            std::memcpy(&output_surface[dst_line + rect_left], &slot_surface[src_line + source_left], copy_width * sizeof(Pixel));
+            std::memcpy(&output_surface[dst_line + rect_left], &slot_surface[src_line + source_left], work_width * sizeof(Pixel));
         }
     }
 }
@@ -708,8 +742,8 @@ void Vic::WriteY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config) n
     auto const out_chroma_stride = Common::AlignUp(out_chroma_width * BytesPerPixel * 2, 0x10);
     auto const out_chroma_size = out_chroma_height * out_chroma_stride;
 
-    surface_width = (std::min)(surface_width, out_luma_width);
-    surface_height = (std::min)(surface_height, out_luma_height);
+    surface_width = (std::min)({surface_width, out_luma_width, out_chroma_width * 2});
+    surface_height = (std::min)({surface_height, out_luma_height, out_chroma_height * 2});
 
     auto Decode = [&](u8* out_luma, u8* out_chroma) {
         if (COMPILED_HAS_SSE41 && HasSSE41() && surface_width % 16 == 0) {
@@ -725,8 +759,12 @@ void Vic::WriteY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config) n
                 for (; x < sse_aligned_width; x += 16) {
                     // clang-format off
                     // Prefetch the next cache lines, 2 per iteration
-                    _mm_prefetch((const char*)&output_surface[src + x + 16], _MM_HINT_T0);
-                    _mm_prefetch((const char*)&output_surface[src + x + 24], _MM_HINT_T0);
+                    if (x + 16 < surface_width) {
+                        _mm_prefetch(reinterpret_cast<const char*>(output_surface.data() + src + x + 16), _MM_HINT_T0);
+                        if (x + 24 < surface_width) {
+                            _mm_prefetch(reinterpret_cast<const char*>(output_surface.data() + src + x + 24), _MM_HINT_T0);
+                        }
+                    }
 
                     // Load the 64-bit pixels, 2 per variable.
                     auto pixel01 = _mm_load_si128((__m128i*)&output_surface[src + x + 0]);
@@ -844,7 +882,9 @@ void Vic::WriteY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config) n
                 auto const src_chroma = y * surface_stride;
                 for (; x < surface_width; x += 2) {
                     out_luma[dst_luma + x + 0] = u8(output_surface[src + x + 0].r >> 2);
-                    out_luma[dst_luma + x + 1] = u8(output_surface[src + x + 1].r >> 2);
+                    if (x + 1 < surface_width) {
+                        out_luma[dst_luma + x + 1] = u8(output_surface[src + x + 1].r >> 2);
+                    }
                     out_chroma[dst_chroma + x + 0] = u8(output_surface[src_chroma + x].g >> 2);
                     out_chroma[dst_chroma + x + 1] = u8(output_surface[src_chroma + x].b >> 2);
                 }
@@ -858,7 +898,9 @@ void Vic::WriteY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config) n
                 auto const dst_chroma = (y / 2) * out_chroma_stride;
                 for (size_t x = 0; x < surface_width; x += 2) {
                     out_luma[dst_luma + x + 0] = u8(output_surface[src_luma + x + 0].r >> 2);
-                    out_luma[dst_luma + x + 1] = u8(output_surface[src_luma + x + 1].r >> 2);
+                    if (x + 1 < surface_width) {
+                        out_luma[dst_luma + x + 1] = u8(output_surface[src_luma + x + 1].r >> 2);
+                    }
                     out_chroma[dst_chroma + x + 0] = u8(output_surface[src_chroma + x].g >> 2);
                     out_chroma[dst_chroma + x + 1] = u8(output_surface[src_chroma + x].b >> 2);
                 }
@@ -886,14 +928,21 @@ void Vic::WriteY8__V8U8_N420(const OutputSurfaceConfig& output_surface_config) n
         chroma_scratch.resize_destructive(out_chroma_size);
         Decode(luma_scratch.data(), chroma_scratch.data());
 
-        Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite> out_luma(host1x.gmmu_manager, regs.output_surface.luma.Address(), out_luma_swizzle_size, &swizzle_scratch);
-        Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite> out_chroma(host1x.gmmu_manager, regs.output_surface.chroma_u.Address(), out_chroma_swizzle_size, &swizzle_scratch);
-        if (block_height == 1) {
-            SwizzleSurface(out_luma, out_luma_stride, luma_scratch, out_luma_stride, out_luma_height);
-            SwizzleSurface(out_chroma, out_chroma_stride, chroma_scratch, out_chroma_stride, out_chroma_height);
-        } else {
-            Texture::SwizzleTexture(out_luma, luma_scratch, BytesPerPixel, out_luma_width, out_luma_height, 1, block_height, 0, 1);
-            Texture::SwizzleTexture(out_chroma, chroma_scratch, BytesPerPixel, out_chroma_width, out_chroma_height, 1, block_height, 0, 1);
+        {
+            Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite> out_luma(host1x.gmmu_manager, regs.output_surface.luma.Address(), out_luma_swizzle_size, &swizzle_scratch);
+            if (block_height == 1) {
+                SwizzleSurface(out_luma, out_luma_stride, luma_scratch, out_luma_stride, out_luma_height);
+            } else {
+                Texture::SwizzleTexture(out_luma, luma_scratch, BytesPerPixel, out_luma_width, out_luma_height, 1, block_height, 0, 1);
+            }
+        }
+        {
+            Tegra::Memory::GpuGuestMemoryScoped<u8, Core::Memory::GuestMemoryFlags::SafeWrite> out_chroma(host1x.gmmu_manager, regs.output_surface.chroma_u.Address(), out_chroma_swizzle_size, &swizzle_scratch);
+            if (block_height == 1) {
+                SwizzleSurface(out_chroma, out_chroma_stride, chroma_scratch, out_chroma_stride, out_chroma_height);
+            } else {
+                Texture::SwizzleTexture(out_chroma, chroma_scratch, BytesPerPixel * 2, out_chroma_width, out_chroma_height, 1, block_height, 0, 1);
+            }
         }
     } break;
     case BlkKind::Pitch: {

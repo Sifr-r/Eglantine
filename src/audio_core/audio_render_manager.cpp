@@ -48,7 +48,9 @@ Result Manager::GetWorkBufferSize(const AudioRendererParameterInternal& params,
 
 s32 Manager::GetSessionId() {
     std::scoped_lock l{session_lock};
-    ASSERT(session_count <= session_ids.size());
+    if (session_count >= session_ids.size()) {
+        return -1;
+    }
     auto const session_id = session_ids[session_count];
     if (session_id >= 0) {
         session_ids[session_count] = -1;
@@ -59,6 +61,10 @@ s32 Manager::GetSessionId() {
 
 void Manager::ReleaseSessionId(const s32 session_id) {
     std::scoped_lock l{session_lock};
+    if (session_count == 0 || session_id < 0 ||
+        static_cast<size_t>(session_id) >= session_ids.size()) {
+        return;
+    }
     session_ids[--session_count] = session_id;
 }
 

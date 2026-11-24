@@ -23,7 +23,9 @@ public:
     }
 
     ~LibUSBContext() {
-        libusb_exit(ctx);
+        if (init_result == LIBUSB_SUCCESS && ctx != nullptr) {
+            libusb_exit(ctx);
+        }
     }
 
     LibUSBContext& operator=(const LibUSBContext&) = delete;
@@ -41,8 +43,8 @@ public:
     }
 
 private:
-    libusb_context* ctx;
-    int init_result{};
+    libusb_context* ctx{nullptr};
+    int init_result{LIBUSB_ERROR_OTHER};
 };
 
 class LibUSBDeviceHandle {
@@ -53,7 +55,9 @@ public:
 
     ~LibUSBDeviceHandle() noexcept {
         if (handle) {
-            libusb_release_interface(handle, 1);
+            if (interface_claimed) {
+                libusb_release_interface(handle, 0);
+            }
             libusb_close(handle);
         }
     }
@@ -64,12 +68,17 @@ public:
     LibUSBDeviceHandle& operator=(LibUSBDeviceHandle&&) noexcept = delete;
     LibUSBDeviceHandle(LibUSBDeviceHandle&&) noexcept = delete;
 
+    void SetInterfaceClaimed(bool claimed) noexcept {
+        interface_claimed = claimed;
+    }
+
     [[nodiscard]] libusb_device_handle* get() noexcept {
         return handle;
     }
 
 private:
     libusb_device_handle* handle{};
+    bool interface_claimed{false};
 };
 
 GCAdapter::GCAdapter(std::string input_engine_) : InputEngine(std::move(input_engine_)) {
@@ -81,8 +90,8 @@ GCAdapter::GCAdapter(std::string input_engine_) : InputEngine(std::move(input_en
     libusb_ctx = std::make_unique<LibUSBContext>();
     const int init_res = libusb_ctx->InitResult();
     if (init_res == LIBUSB_SUCCESS) {
-        adapter_scan_thread =
-            std::jthread([this](std::stop_token stop_token) { AdapterScanThread(stop_token); });
+        adapter_thread =
+            std::jthread([this](std::stop_token stop_token) { AdapterThread(stop_token); });
     } else {
         LOG_ERROR(Input, "libusb could not be initialized. failed with error = {}", init_res);
     }
@@ -92,13 +101,35 @@ GCAdapter::~GCAdapter() {
     Reset();
 }
 
-void GCAdapter::AdapterInputThread(std::stop_token stop_token) {
-    LOG_DEBUG(Input, "Input thread started");
+void GCAdapter::AdapterThread(std::stop_token stop_token) {
     Common::SetCurrentThreadName("GCAdapter");
+    while (!stop_token.stop_requested()) {
+        usb_adapter_handle = nullptr;
+        {
+            std::scoped_lock lock{pads_mutex};
+            pads.fill(GCController{});
+        }
+        while (!stop_token.stop_requested() && !Setup()) {
+            if (!Common::StoppableTimedWait(stop_token, std::chrono::seconds{2})) {
+                break;
+            }
+        }
+        if (stop_token.stop_requested()) {
+            break;
+        }
+        RunInputLoop(stop_token);
+    }
+    usb_adapter_handle = nullptr;
+    {
+        std::scoped_lock lock{pads_mutex};
+        pads.fill(GCController{});
+    }
+}
+
+void GCAdapter::RunInputLoop(std::stop_token stop_token) {
+    LOG_DEBUG(Input, "Input thread started");
     s32 payload_size{};
     AdapterPayload adapter_payload{};
-
-    adapter_scan_thread = {};
 
     while (!stop_token.stop_requested()) {
         libusb_interrupt_transfer(usb_adapter_handle->get(), input_endpoint, adapter_payload.data(),
@@ -106,14 +137,11 @@ void GCAdapter::AdapterInputThread(std::stop_token stop_token) {
         if (IsPayloadCorrect(adapter_payload, payload_size)) {
             UpdateControllers(adapter_payload);
             UpdateVibrations();
+        } else if (input_error_counter > 20) {
+            LOG_ERROR(Input, "Timeout, Is the adapter connected?");
+            return;
         }
         std::this_thread::yield();
-    }
-
-    if (restart_scan_thread) {
-        adapter_scan_thread =
-            std::jthread([this](std::stop_token token) { AdapterScanThread(token); });
-        restart_scan_thread = false;
     }
 }
 
@@ -122,11 +150,7 @@ bool GCAdapter::IsPayloadCorrect(const AdapterPayload& adapter_payload, s32 payl
         adapter_payload[0] != LIBUSB_DT_HID) {
         LOG_DEBUG(Input, "Error reading payload (size: {}, type: {:02x})", payload_size,
                   adapter_payload[0]);
-        if (input_error_counter++ > 20) {
-            LOG_ERROR(Input, "Timeout, Is the adapter connected?");
-            adapter_input_thread.request_stop();
-            restart_scan_thread = true;
-        }
+        input_error_counter++;
         return false;
     }
 
@@ -138,8 +162,13 @@ void GCAdapter::UpdateControllers(const AdapterPayload& adapter_payload) {
     for (std::size_t port = 0; port < pads.size(); ++port) {
         const std::size_t offset = 1 + (9 * port);
         const auto type = static_cast<ControllerTypes>(adapter_payload[offset] >> 4);
-        UpdatePadType(port, type);
-        if (DeviceConnected(port)) {
+        bool connected = false;
+        {
+            std::scoped_lock lock{pads_mutex};
+            UpdatePadType(port, type);
+            connected = DeviceConnected(port);
+        }
+        if (connected) {
             const u8 b1 = adapter_payload[offset + 1];
             const u8 b2 = adapter_payload[offset + 2];
             UpdateStateButtons(port, b1, b2);
@@ -166,6 +195,12 @@ void GCAdapter::UpdateStateButtons(std::size_t port, [[maybe_unused]] u8 b1,
         return;
     }
 
+    PadIdentifier port_identifier{};
+    {
+        std::scoped_lock lock{pads_mutex};
+        port_identifier = pads[port].identifier;
+    }
+
     static constexpr std::array<PadButton, 8> b1_buttons{
         PadButton::ButtonA,    PadButton::ButtonB,     PadButton::ButtonX,    PadButton::ButtonY,
         PadButton::ButtonLeft, PadButton::ButtonRight, PadButton::ButtonDown, PadButton::ButtonUp,
@@ -181,13 +216,13 @@ void GCAdapter::UpdateStateButtons(std::size_t port, [[maybe_unused]] u8 b1,
     for (std::size_t i = 0; i < b1_buttons.size(); ++i) {
         const bool button_status = (b1 & (1U << i)) != 0;
         const int button = static_cast<int>(b1_buttons[i]);
-        SetButton(pads[port].identifier, button, button_status);
+        SetButton(port_identifier, button, button_status);
     }
 
     for (std::size_t j = 0; j < b2_buttons.size(); ++j) {
         const bool button_status = (b2 & (1U << j)) != 0;
         const int button = static_cast<int>(b2_buttons[j]);
-        SetButton(pads[port].identifier, button, button_status);
+        SetButton(port_identifier, button, button_status);
     }
 }
 
@@ -202,26 +237,28 @@ void GCAdapter::UpdateStateAxes(std::size_t port, const AdapterPayload& adapter_
         PadAxes::SubstickY, PadAxes::TriggerLeft, PadAxes::TriggerRight,
     };
 
+    PadIdentifier port_identifier{};
+    std::array<f32, 6> axis_values{};
+    {
+        std::scoped_lock lock{pads_mutex};
+        port_identifier = pads[port].identifier;
+        for (const PadAxes axis : axes) {
+            const auto index = static_cast<std::size_t>(axis);
+            const u8 axis_value = adapter_payload[offset + 3 + index];
+            if (pads[port].reset_origin_counter <= 18) {
+                if (pads[port].axis_origin[index] != axis_value) {
+                    pads[port].reset_origin_counter = 0;
+                }
+                pads[port].axis_origin[index] = axis_value;
+                pads[port].reset_origin_counter++;
+            }
+            axis_values[index] = (axis_value - pads[port].axis_origin[index]) / 100.0f;
+        }
+    }
+
     for (const PadAxes axis : axes) {
         const auto index = static_cast<std::size_t>(axis);
-        const u8 axis_value = adapter_payload[offset + 3 + index];
-        if (pads[port].reset_origin_counter <= 18) {
-            if (pads[port].axis_origin[index] != axis_value) {
-                pads[port].reset_origin_counter = 0;
-            }
-            pads[port].axis_origin[index] = axis_value;
-            pads[port].reset_origin_counter++;
-        }
-        const f32 axis_status = (axis_value - pads[port].axis_origin[index]) / 100.0f;
-        SetAxis(pads[port].identifier, static_cast<int>(index), axis_status);
-    }
-}
-
-void GCAdapter::AdapterScanThread(std::stop_token stop_token) {
-    Common::SetCurrentThreadName("ScanGCAdapter");
-    usb_adapter_handle = nullptr;
-    pads = {};
-    while (!Setup() && Common::StoppableTimedWait(stop_token, std::chrono::seconds{2})) {
+        SetAxis(port_identifier, static_cast<int>(index), axis_values[index]);
     }
 }
 
@@ -243,24 +280,31 @@ bool GCAdapter::Setup() {
     LOG_INFO(Input, "GC adapter is now connected");
     // GC Adapter found and accessible, registering it
     if (GetGCEndpoint(device)) {
-        rumble_enabled = true;
+        rumble_enabled.store(true);
         input_error_counter = 0;
         output_error_counter = 0;
 
-        std::size_t port = 0;
-        for (GCController& pad : pads) {
-            pad.identifier = {
-                .guid = Common::UUID{},
-                .port = port++,
-                .pad = 0,
-            };
-            PreSetController(pad.identifier);
+        std::array<PadIdentifier, 4> identifiers{};
+        {
+            std::scoped_lock lock{pads_mutex};
+            std::size_t port = 0;
+            for (GCController& pad : pads) {
+                pad.identifier = {
+                    .guid = Common::UUID{},
+                    .port = port,
+                    .pad = 0,
+                };
+                identifiers[port] = pad.identifier;
+                port++;
+            }
+        }
+        for (const auto& identifier : identifiers) {
+            PreSetController(identifier);
         }
 
-        adapter_input_thread =
-            std::jthread([this](std::stop_token stop_token) { AdapterInputThread(stop_token); });
         return true;
     }
+    usb_adapter_handle = nullptr;
     return false;
 }
 
@@ -285,6 +329,7 @@ bool GCAdapter::CheckDeviceAccess() {
         usb_adapter_handle = nullptr;
         return false;
     }
+    usb_adapter_handle->SetInterfaceClaimed(true);
 
     // This fixes payload problems from offbrand GCAdapters
     const s32 control_transfer_error =
@@ -299,7 +344,7 @@ bool GCAdapter::CheckDeviceAccess() {
 bool GCAdapter::GetGCEndpoint(libusb_device* device) {
     libusb_config_descriptor* config = nullptr;
     const int config_descriptor_return = libusb_get_config_descriptor(device, 0, &config);
-    if (config_descriptor_return != LIBUSB_SUCCESS) {
+    if (config_descriptor_return != LIBUSB_SUCCESS || config == nullptr) {
         LOG_ERROR(Input, "libusb_get_config_descriptor failed with error = {}",
                   config_descriptor_return);
         return false;
@@ -319,6 +364,7 @@ bool GCAdapter::GetGCEndpoint(libusb_device* device) {
             }
         }
     }
+    libusb_free_config_descriptor(config);
     // This transfer seems to be responsible for clearing the state of the adapter
     // Used to clear the "busy" state of when the device is unexpectedly unplugged
     unsigned char clear_payload = 0x13;
@@ -329,20 +375,26 @@ bool GCAdapter::GetGCEndpoint(libusb_device* device) {
 
 Common::Input::DriverResult GCAdapter::SetVibration(
     const PadIdentifier& identifier, const Common::Input::VibrationStatus& vibration) {
+    if (identifier.port >= pads.size()) {
+        return Common::Input::DriverResult::InvalidParameters;
+    }
     const auto mean_amplitude = (vibration.low_amplitude + vibration.high_amplitude) * 0.5f;
     const auto processed_amplitude =
         static_cast<u8>((mean_amplitude + std::pow(mean_amplitude, 0.3f)) * 0.5f * 0x8);
 
-    pads[identifier.port].rumble_amplitude = processed_amplitude;
+    {
+        std::scoped_lock lock{pads_mutex};
+        pads[identifier.port].rumble_amplitude = processed_amplitude;
+    }
 
-    if (!rumble_enabled) {
+    if (!rumble_enabled.load()) {
         return Common::Input::DriverResult::Disabled;
     }
     return Common::Input::DriverResult::Success;
 }
 
 bool GCAdapter::IsVibrationEnabled([[maybe_unused]] const PadIdentifier& identifier) {
-    return rumble_enabled;
+    return rumble_enabled.load();
 }
 
 void GCAdapter::UpdateVibrations() {
@@ -353,25 +405,32 @@ void GCAdapter::UpdateVibrations() {
 
     vibration_counter = (vibration_counter + 1) % vibration_states;
 
-    for (GCController& pad : pads) {
-        const bool vibrate = pad.rumble_amplitude > vibration_counter;
-        vibration_changed |= vibrate != pad.enable_vibration;
-        pad.enable_vibration = vibrate;
+    {
+        std::scoped_lock lock{pads_mutex};
+        for (GCController& pad : pads) {
+            const bool vibrate = pad.rumble_amplitude > vibration_counter;
+            vibration_changed |= vibrate != pad.enable_vibration;
+            pad.enable_vibration = vibrate;
+        }
     }
     SendVibrations();
 }
 
 void GCAdapter::SendVibrations() {
-    if (!rumble_enabled || !vibration_changed) {
+    if (!rumble_enabled.load() || !vibration_changed) {
         return;
     }
     s32 size{};
     constexpr u8 rumble_command = 0x11;
-    const u8 p1 = pads[0].enable_vibration;
-    const u8 p2 = pads[1].enable_vibration;
-    const u8 p3 = pads[2].enable_vibration;
-    const u8 p4 = pads[3].enable_vibration;
-    std::array<u8, 5> payload = {rumble_command, p1, p2, p3, p4};
+    std::array<u8, 5> payload{};
+    {
+        std::scoped_lock lock{pads_mutex};
+        const u8 p1 = pads[0].enable_vibration;
+        const u8 p2 = pads[1].enable_vibration;
+        const u8 p3 = pads[2].enable_vibration;
+        const u8 p4 = pads[3].enable_vibration;
+        payload = {rumble_command, p1, p2, p3, p4};
+    }
     const int err =
         libusb_interrupt_transfer(usb_adapter_handle->get(), output_endpoint, payload.data(),
                                   static_cast<s32>(payload.size()), &size, 16);
@@ -379,7 +438,7 @@ void GCAdapter::SendVibrations() {
         LOG_DEBUG(Input, "Libusb write failed: {}", libusb_error_name(err));
         if (output_error_counter++ > 5) {
             LOG_ERROR(Input, "Output timeout, Rumble disabled");
-            rumble_enabled = false;
+            rumble_enabled.store(false);
         }
         return;
     }
@@ -392,15 +451,18 @@ bool GCAdapter::DeviceConnected(std::size_t port) const {
 }
 
 void GCAdapter::Reset() {
-    adapter_scan_thread = {};
-    adapter_input_thread = {};
+    adapter_thread = std::jthread{};
     usb_adapter_handle = nullptr;
-    pads = {};
+    {
+        std::scoped_lock lock{pads_mutex};
+        pads.fill(GCController{});
+    }
     libusb_ctx = nullptr;
 }
 
 std::vector<Common::ParamPackage> GCAdapter::GetInputDevices() const {
     std::vector<Common::ParamPackage> devices;
+    std::scoped_lock lock{pads_mutex};
     for (std::size_t port = 0; port < pads.size(); ++port) {
         if (!DeviceConnected(port)) {
             continue;

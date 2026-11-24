@@ -13,14 +13,18 @@
 #include <codecvt>
 #include <cstdio>
 #include <cstring>
+#include <exception>
+#include <functional>
 #include <locale>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <dlfcn.h>
 #include <unistd.h>
@@ -155,11 +159,28 @@ EmuWindow_Android& EmulationSession::Window() {
 }
 
 ANativeWindow* EmulationSession::NativeWindow() const {
+    std::scoped_lock window_lock(m_window_mutex);
     return m_native_window;
 }
 
 void EmulationSession::SetNativeWindow(ANativeWindow* native_window) {
-    m_native_window = native_window;
+    ANativeWindow* old_window = nullptr;
+    {
+        std::scoped_lock window_lock(m_window_mutex);
+        old_window = std::exchange(m_native_window, native_window);
+        if (m_window) {
+            m_window->OnSurfaceChanged(m_native_window);
+        }
+    }
+    if (native_window == nullptr) {
+        std::scoped_lock gpu_lock(m_gpu_drain_mutex);
+        if (m_gpu_ready) {
+            m_system.GPU().WaitForIdle();
+        }
+    }
+    if (old_window) {
+        ANativeWindow_release(old_window);
+    }
 }
 
 void EmulationSession::InitializeGpuDriver(const std::string& hook_lib_dir,
@@ -214,7 +235,8 @@ int EmulationSession::ShadersBuilding() {
 }
 
 void EmulationSession::SurfaceChanged() {
-    if (!IsRunning()) {
+    std::scoped_lock window_lock(m_window_mutex);
+    if (!m_window) {
         return;
     }
     m_window->OnSurfaceChanged(m_native_window);
@@ -288,12 +310,18 @@ Core::SystemResultStatus EmulationSession::InitializeEmulation(const std::string
     std::scoped_lock lock(m_mutex);
 
     // Create the render window.
-    m_window = std::make_unique<EmuWindow_Android>(m_native_window, m_vulkan_library);
+    {
+        std::scoped_lock window_lock(m_window_mutex);
+        m_window = std::make_unique<EmuWindow_Android>(m_native_window, m_vulkan_library);
+    }
 
     // Initialize system.
     jauto android_keyboard = std::make_unique<Common::Android::SoftwareKeyboard::AndroidKeyboard>();
     jauto android_webapplet = std::make_unique<Common::Android::WebBrowser::AndroidWebBrowser>();
-    m_software_keyboard = android_keyboard.get();
+    {
+        std::scoped_lock keyboard_lock(m_keyboard_mutex);
+        m_software_keyboard = android_keyboard.get();
+    }
     m_system.SetShuttingDown(false);
     m_system.ApplySettings();
     Settings::LogSettings();
@@ -336,11 +364,17 @@ Core::SystemResultStatus EmulationSession::InitializeEmulation(const std::string
 
     m_load_result = m_system.Load(EmulationSession::GetInstance().Window(), filepath, params);
     if (m_load_result != Core::SystemResultStatus::Success) {
+        std::scoped_lock keyboard_lock(m_keyboard_mutex);
+        m_software_keyboard = nullptr;
         return m_load_result;
     }
 
     // Complete initialization.
     m_system.GPU().Start();
+    {
+        std::scoped_lock gpu_lock(m_gpu_drain_mutex);
+        m_gpu_ready = true;
+    }
     m_system.GetCpuManager().OnGpuReady();
     m_system.RegisterExitCallback([&] { HaltEmulation(); });
 
@@ -367,6 +401,14 @@ void EmulationSession::ShutdownEmulation() {
     }
 
     m_is_running = false;
+    {
+        std::scoped_lock keyboard_lock(m_keyboard_mutex);
+        m_software_keyboard = nullptr;
+    }
+    {
+        std::scoped_lock gpu_lock(m_gpu_drain_mutex);
+        m_gpu_ready = false;
+    }
 
     // Unload user input.
     m_system.HIDCore().UnloadInputDevices();
@@ -379,13 +421,19 @@ void EmulationSession::ShutdownEmulation() {
         m_system.DetachDebugger();
         m_system.ShutdownMainProcess();
         m_load_result = Core::SystemResultStatus::ErrorNotInitialized;
-        m_window.reset();
+        {
+            std::scoped_lock window_lock(m_window_mutex);
+            m_window.reset();
+        }
         OnEmulationStopped(Core::SystemResultStatus::Success);
         return;
     }
 
     // Tear down the render window.
-    m_window.reset();
+    {
+        std::scoped_lock window_lock(m_window_mutex);
+        m_window.reset();
+    }
 }
 
 void EmulationSession::PauseEmulation() {
@@ -480,7 +528,22 @@ void EmulationSession::ReloadDiskShaderCache(u64 program_id) {
 }
 
 Common::Android::SoftwareKeyboard::AndroidKeyboard* EmulationSession::SoftwareKeyboard() {
+    std::scoped_lock lock(m_keyboard_mutex);
     return m_software_keyboard;
+}
+
+void EmulationSession::SubmitInlineKeyboardText(const std::u16string& text) {
+    std::scoped_lock lock(m_keyboard_mutex);
+    if (m_software_keyboard != nullptr) {
+        m_software_keyboard->SubmitInlineKeyboardText(text);
+    }
+}
+
+void EmulationSession::SubmitInlineKeyboardInput(int key_code) {
+    std::scoped_lock lock(m_keyboard_mutex);
+    if (m_software_keyboard != nullptr) {
+        m_software_keyboard->SubmitInlineKeyboardInput(key_code);
+    }
 }
 
 void EmulationSession::LoadDiskCacheProgress(VideoCore::LoadCallbackStage stage, int progress,
@@ -649,15 +712,19 @@ std::pair<u32, std::string> get_pretty_cpus() {
     std::string cpus;
 
     if (!core_layout.empty()) {
-        const CpuPartInfo* lowest_part = nullptr;
-        u32 lowest_part_id = 0xFFFFFFFF;
-
         for (const auto& [midr, count] : core_layout) {
-            const auto vendor = (midr >> 24) & 0xff;
-            const auto part = (midr >> 4) & 0xfff;
+            const auto vendor = static_cast<u32>((midr >> 24) & 0xff);
+            const auto part = static_cast<u32>((midr >> 4) & 0xfff);
+            const char* const name = find_cpu_name(vendor, part);
 
-            if (!cpus.empty()) cpus += " + ";
-            cpus += fmt::format("{}x {}", count, find_cpu_name(vendor, part));
+            if (!cpus.empty()) {
+                cpus += " + ";
+            }
+            if (name != nullptr) {
+                cpus += fmt::format("{}x {}", count, name);
+            } else {
+                cpus += fmt::format("{}x Unknown (0x{:02X}:0x{:03X})", count, vendor, part);
+            }
         }
     }
 
@@ -741,6 +808,132 @@ const char* fallback_cpu_detection() {
     return s_result.c_str();
 }
 
+bool InvokeProgressCallback(JNIEnv* env, jobject j_callback, jmethodID j_invoke_method,
+                            size_t max, size_t progress) {
+    if (env == nullptr || j_callback == nullptr || j_invoke_method == nullptr ||
+        env->ExceptionCheck()) {
+        return env != nullptr && env->ExceptionCheck();
+    }
+
+    jobject j_max = Common::Android::ToJDouble(env, static_cast<double>(max));
+    jobject j_progress = Common::Android::ToJDouble(env, static_cast<double>(progress));
+    SCOPE_EXIT {
+        if (j_progress != nullptr) {
+            env->DeleteLocalRef(j_progress);
+        }
+        if (j_max != nullptr) {
+            env->DeleteLocalRef(j_max);
+        }
+    };
+    if (env->ExceptionCheck()) {
+        return true;
+    }
+    if (j_max == nullptr || j_progress == nullptr) {
+        return false;
+    }
+
+    jobject j_was_cancelled =
+        env->CallObjectMethod(j_callback, j_invoke_method, j_max, j_progress);
+    SCOPE_EXIT {
+        if (j_was_cancelled != nullptr) {
+            env->DeleteLocalRef(j_was_cancelled);
+        }
+    };
+    if (env->ExceptionCheck()) {
+        return true;
+    }
+    if (j_was_cancelled == nullptr) {
+        return false;
+    }
+
+    return Common::Android::GetJBoolean(env, j_was_cancelled);
+}
+
+std::function<bool(size_t, size_t)> MakeProgressCallback(JNIEnv* env, jobject j_callback) {
+    if (env == nullptr || j_callback == nullptr) {
+        return [](size_t, size_t) { return false; };
+    }
+
+    jclass j_lambda_class = env->GetObjectClass(j_callback);
+    if (j_lambda_class == nullptr) {
+        return [](size_t, size_t) { return false; };
+    }
+    SCOPE_EXIT {
+        env->DeleteLocalRef(j_lambda_class);
+    };
+
+    jmethodID j_lambda_invoke_method = env->GetMethodID(
+        j_lambda_class, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
+    if (j_lambda_invoke_method == nullptr || env->ExceptionCheck()) {
+        return [](size_t, size_t) { return false; };
+    }
+
+    return [env, j_callback, j_lambda_invoke_method](size_t max, size_t progress) {
+        return InvokeProgressCallback(env, j_callback, j_lambda_invoke_method, max, progress);
+    };
+}
+
+#ifdef ARCHITECTURE_arm64
+struct AdrenotoolsDriverInfo {
+    std::string version_string;
+    std::string driver_name;
+    std::string model_name;
+};
+
+std::optional<AdrenotoolsDriverInfo> QueryAdrenotoolsDriverInfo(JNIEnv* env, jobject j_surf,
+                                                                 jstring j_hook_lib_dir) {
+    if (j_surf == nullptr) {
+        return std::nullopt;
+    }
+
+    ANativeWindow* const native_window = ANativeWindow_fromSurface(env, j_surf);
+    if (native_window == nullptr) {
+        return std::nullopt;
+    }
+    SCOPE_EXIT {
+        ANativeWindow_release(native_window);
+    };
+
+    const char* file_redirect_dir{};
+    const int feature_flags{};
+    const std::string hook_lib_dir = Common::Android::GetJString(env, j_hook_lib_dir);
+    void* const handle = adrenotools_open_libvulkan(
+        RTLD_NOW, feature_flags, nullptr, hook_lib_dir.c_str(), nullptr, nullptr,
+        file_redirect_dir, nullptr);
+    if (handle == nullptr) {
+        return std::nullopt;
+    }
+
+    auto driver_library = std::make_shared<Common::DynamicLibrary>(handle);
+
+    try {
+        auto window = std::make_unique<EmuWindow_Android>(native_window, driver_library);
+
+        Vulkan::vk::InstanceDispatch dld;
+        Vulkan::vk::Instance vk_instance = Vulkan::CreateInstance(
+            *driver_library, dld, VK_API_VERSION_1_1, Core::Frontend::WindowSystemType::Android);
+
+        auto surface = Vulkan::CreateSurface(vk_instance, window->GetWindowInfo());
+        auto device = Vulkan::CreateDevice(vk_instance, dld, *surface);
+
+        const auto driver_version = device.GetDriverVersion();
+        AdrenotoolsDriverInfo info;
+        info.version_string = fmt::format("{}.{}.{}", VK_API_VERSION_MAJOR(driver_version),
+                                          VK_API_VERSION_MINOR(driver_version),
+                                          VK_API_VERSION_PATCH(driver_version));
+        info.driver_name = device.GetDriverName();
+        info.model_name = device.GetModelName();
+        return info;
+    } catch (const std::exception& e) {
+        LOG_ERROR(Frontend, "Failed to query adrenotools GPU driver info: {}", e.what());
+        return std::nullopt;
+    } catch (...) {
+        LOG_ERROR(Frontend, "Failed to query adrenotools GPU driver info: unknown error");
+        return std::nullopt;
+    }
+}
+#endif
+
 } // namespace
 
 extern "C" {
@@ -754,14 +947,11 @@ extern "C" {
 
 void Java_org_yuzu_yuzu_1emu_NativeLibrary_surfaceChanged(JNIEnv* env, jobject instance,
                                                           [[maybe_unused]] jobject surf) {
-    EmulationSession::GetInstance().SetNativeWindow(ANativeWindow_fromSurface(env, surf));
-    EmulationSession::GetInstance().SurfaceChanged();
+    auto* const native_window = surf ? ANativeWindow_fromSurface(env, surf) : nullptr;
+    EmulationSession::GetInstance().SetNativeWindow(native_window);
 }
 
 void Java_org_yuzu_yuzu_1emu_NativeLibrary_surfaceDestroyed(JNIEnv* env, jobject instance) {
-    if (auto* native_window = EmulationSession::GetInstance().NativeWindow(); native_window) {
-        ANativeWindow_release(native_window);
-    }
     EmulationSession::GetInstance().SetNativeWindow(nullptr);
 }
 
@@ -772,15 +962,10 @@ void Java_org_yuzu_yuzu_1emu_NativeLibrary_setAppDirectory(JNIEnv* env, jobject 
 
 int Java_org_yuzu_yuzu_1emu_NativeLibrary_installFileToNand(JNIEnv* env, jobject instance,
                                                             jstring j_file, jobject jcallback) {
-    auto jlambdaClass = env->GetObjectClass(jcallback);
-    auto jlambdaInvokeMethod = env->GetMethodID(
-        jlambdaClass, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
-    const auto callback = [env, jcallback, jlambdaInvokeMethod](size_t max, size_t progress) {
-        auto jwasCancelled = env->CallObjectMethod(jcallback, jlambdaInvokeMethod,
-                                                   Common::Android::ToJDouble(env, max),
-                                                   Common::Android::ToJDouble(env, progress));
-        return Common::Android::GetJBoolean(env, jwasCancelled);
-    };
+    const auto callback = MakeProgressCallback(env, jcallback);
+    if (env->ExceptionCheck()) {
+        return 0;
+    }
 
     return static_cast<int>(
         ContentManager::InstallNSP(EmulationSession::GetInstance().System(),
@@ -793,20 +978,23 @@ jboolean Java_org_yuzu_yuzu_1emu_NativeLibrary_doesUpdateMatchProgram(JNIEnv* en
                                                                       jstring jupdatePath) {
     const u64 program_id = FileSys::GetBaseTitleID(EmulationSession::GetProgramId(env, jprogramId));
     std::string updatePath = Common::Android::GetJString(env, jupdatePath);
-    std::shared_ptr<FileSys::NSP> nsp = std::make_shared<FileSys::NSP>(
-        EmulationSession::GetInstance().System().GetFilesystem()->OpenFile(
-            updatePath, FileSys::OpenMode::Read));
+    const auto update_file = EmulationSession::GetInstance().System().GetFilesystem()->OpenFile(
+        updatePath, FileSys::OpenMode::Read);
+    if (!update_file) {
+        return JNI_FALSE;
+    }
+    std::shared_ptr<FileSys::NSP> nsp = std::make_shared<FileSys::NSP>(update_file);
     for (const auto& item : nsp->GetNCAs()) {
         for (const auto& nca_details : item.second) {
             if (nca_details.second->GetName().ends_with(".cnmt.nca")) {
                 const auto update_id = FileSys::GetBaseTitleID(nca_details.second->GetTitleId());
                 if (update_id == program_id) {
-                    return true;
+                    return JNI_TRUE;
                 }
             }
         }
     }
-    return false;
+    return JNI_FALSE;
 }
 
 void JNICALL Java_org_yuzu_yuzu_1emu_NativeLibrary_initializeGpuDriver(JNIEnv* env,
@@ -858,70 +1046,42 @@ jboolean JNICALL Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_supportsCustomDri
 #endif
 }
 
-jobjectArray Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_getSystemDriverInfo(
-    JNIEnv* env, jobject j_obj, jobject j_surf, jstring j_hook_lib_dir) {
+jobjectArray Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_getSystemDriverInfoImpl(
+    JNIEnv* env, [[maybe_unused]] jobject j_obj, [[maybe_unused]] jobject j_surf,
+    [[maybe_unused]] jstring j_hook_lib_dir) {
+    std::string version_string = "1.1.0"; // Assume lowest Vulkan level
+    std::string driver_name = "generic";
 #ifdef ARCHITECTURE_arm64
-    const char* file_redirect_dir_{};
-    int featureFlags{};
-    std::string hook_lib_dir = Common::Android::GetJString(env, j_hook_lib_dir);
-    auto handle = adrenotools_open_libvulkan(RTLD_NOW, featureFlags, nullptr, hook_lib_dir.c_str(),
-                                             nullptr, nullptr, file_redirect_dir_, nullptr);
-    auto driver_library = std::make_shared<Common::DynamicLibrary>(handle);
-    InputCommon::InputSubsystem input_subsystem;
-    auto window =
-        std::make_unique<EmuWindow_Android>(ANativeWindow_fromSurface(env, j_surf), driver_library);
-
-    Vulkan::vk::InstanceDispatch dld;
-    Vulkan::vk::Instance vk_instance = Vulkan::CreateInstance(
-        *driver_library, dld, VK_API_VERSION_1_1, Core::Frontend::WindowSystemType::Android);
-
-    auto surface = Vulkan::CreateSurface(vk_instance, window->GetWindowInfo());
-
-    auto device = Vulkan::CreateDevice(vk_instance, dld, *surface);
-
-    auto driver_version = device.GetDriverVersion();
-    auto version_string =
-        fmt::format("{}.{}.{}", VK_API_VERSION_MAJOR(driver_version),
-                    VK_API_VERSION_MINOR(driver_version), VK_API_VERSION_PATCH(driver_version));
-    auto driver_name = device.GetDriverName();
-#else
-    auto driver_version = "1.0.0";
-    auto version_string = "1.1.0"; //Assume lowest Vulkan level
-    auto driver_name = "generic";
+    if (const auto info = QueryAdrenotoolsDriverInfo(env, j_surf, j_hook_lib_dir); info.has_value()) {
+        version_string = info->version_string;
+        driver_name = info->driver_name;
+    }
 #endif
-    jobjectArray j_driver_info = env->NewObjectArray(2, Common::Android::GetStringClass(), Common::Android::ToJString(env, version_string));
-    env->SetObjectArrayElement(j_driver_info, 1, Common::Android::ToJString(env, driver_name));
+    jstring j_version = Common::Android::ToJString(env, version_string);
+    jstring j_driver_name = Common::Android::ToJString(env, driver_name);
+    jobjectArray j_driver_info =
+        env->NewObjectArray(2, Common::Android::GetStringClass(), j_version);
+    if (j_version != nullptr) {
+        env->DeleteLocalRef(j_version);
+    }
+    if (j_driver_info != nullptr && !env->ExceptionCheck()) {
+        env->SetObjectArrayElement(j_driver_info, 1, j_driver_name);
+    }
+    if (j_driver_name != nullptr) {
+        env->DeleteLocalRef(j_driver_name);
+    }
     return j_driver_info;
 }
 
-jstring Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_getGpuModel(JNIEnv *env, jobject j_obj, jobject j_surf, jstring j_hook_lib_dir) {
+jstring Java_org_yuzu_yuzu_1emu_utils_GpuDriverHelper_getGpuModelImpl(
+    JNIEnv* env, [[maybe_unused]] jobject j_obj, [[maybe_unused]] jobject j_surf,
+    [[maybe_unused]] jstring j_hook_lib_dir) {
 #ifdef ARCHITECTURE_arm64
-    const char* file_redirect_dir_{};
-    int featureFlags{};
-    std::string hook_lib_dir = Common::Android::GetJString(env, j_hook_lib_dir);
-    auto handle = adrenotools_open_libvulkan(RTLD_NOW, featureFlags, nullptr, hook_lib_dir.c_str(),
-                                             nullptr, nullptr, file_redirect_dir_, nullptr);
-    auto driver_library = std::make_shared<Common::DynamicLibrary>(handle);
-    InputCommon::InputSubsystem input_subsystem;
-    auto window =
-            std::make_unique<EmuWindow_Android>(ANativeWindow_fromSurface(env, j_surf), driver_library);
-
-    Vulkan::vk::InstanceDispatch dld;
-    Vulkan::vk::Instance vk_instance = Vulkan::CreateInstance(
-            *driver_library, dld, VK_API_VERSION_1_1, Core::Frontend::WindowSystemType::Android);
-
-    auto surface = Vulkan::CreateSurface(vk_instance, window->GetWindowInfo());
-
-    auto device = Vulkan::CreateDevice(vk_instance, dld, *surface);
-
-    const std::string model_name{device.GetModelName()};
-
-    window.release();
-
-    return Common::Android::ToJString(env, model_name);
-#else
-    return Common::Android::ToJString(env, "no-info");
+    if (const auto info = QueryAdrenotoolsDriverInfo(env, j_surf, j_hook_lib_dir); info.has_value()) {
+        return Common::Android::ToJString(env, info->model_name);
+    }
 #endif
+    return Common::Android::ToJString(env, "no-info");
 }
 
 jboolean Java_org_yuzu_yuzu_1emu_NativeLibrary_reloadKeys(JNIEnv* env, jclass clazz) {
@@ -1286,12 +1446,16 @@ jboolean Java_org_yuzu_yuzu_1emu_NativeLibrary_supportsFrameGeneration(JNIEnv* e
 }
 
 jstring Java_org_yuzu_yuzu_1emu_NativeLibrary_getGpuModel(JNIEnv* env, jobject jobj) {
-    const auto props = GetVulkanDeviceProperties();
-    if (props.deviceID == 0) {
+    try {
+        const auto props = GetVulkanDeviceProperties();
+        if (props.deviceID == 0) {
+            return Common::Android::ToJString(env, "Unknown");
+        }
+
+        return Common::Android::ToJString(env, props.deviceName);
+    } catch (...) {
         return Common::Android::ToJString(env, "Unknown");
     }
-
-    return Common::Android::ToJString(env, props.deviceName);
 }
 
 void Java_org_yuzu_yuzu_1emu_NativeLibrary_applySettings(JNIEnv* env, jobject jobj) {
@@ -1366,12 +1530,12 @@ void Java_org_yuzu_yuzu_1emu_NativeLibrary_logDeviceInfo(JNIEnv* env, jclass cla
 void Java_org_yuzu_yuzu_1emu_NativeLibrary_submitInlineKeyboardText(JNIEnv* env, jclass clazz,
                                                                     jstring j_text) {
     const std::u16string input = Common::UTF8ToUTF16(Common::Android::GetJString(env, j_text));
-    EmulationSession::GetInstance().SoftwareKeyboard()->SubmitInlineKeyboardText(input);
+    EmulationSession::GetInstance().SubmitInlineKeyboardText(input);
 }
 
 void Java_org_yuzu_yuzu_1emu_NativeLibrary_submitInlineKeyboardInput(JNIEnv* env, jclass clazz,
                                                                      jint j_key_code) {
-    EmulationSession::GetInstance().SoftwareKeyboard()->SubmitInlineKeyboardInput(j_key_code);
+    EmulationSession::GetInstance().SubmitInlineKeyboardInput(static_cast<int>(j_key_code));
 }
 
 void Java_org_yuzu_yuzu_1emu_NativeLibrary_initializeEmptyUserDirectory(JNIEnv* env,
@@ -1558,6 +1722,9 @@ jobjectArray Java_org_yuzu_yuzu_1emu_NativeLibrary_getPatchesForFile(JNIEnv* env
     const FileSys::PatchManager pm{program_id, system.GetFileSystemController(),
                                    system.GetContentProvider()};
     const auto loader = Loader::GetLoader(system, vFile);
+    if (loader == nullptr) {
+        return nullptr;
+    }
 
     FileSys::VirtualFile update_raw;
     loader->ReadUpdateRaw(update_raw);
@@ -1603,38 +1770,48 @@ void Java_org_yuzu_yuzu_1emu_NativeLibrary_removeMod(JNIEnv* env, jobject jobj, 
 jobjectArray Java_org_yuzu_yuzu_1emu_NativeLibrary_verifyInstalledContents(JNIEnv* env,
                                                                            jobject jobj,
                                                                            jobject jcallback) {
-    auto jlambdaClass = env->GetObjectClass(jcallback);
-    auto jlambdaInvokeMethod = env->GetMethodID(
-        jlambdaClass, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
-    const auto callback = [env, jcallback, jlambdaInvokeMethod](size_t max, size_t progress) {
-        auto jwasCancelled = env->CallObjectMethod(jcallback, jlambdaInvokeMethod,
-                                                   Common::Android::ToJDouble(env, max),
-                                                   Common::Android::ToJDouble(env, progress));
-        return Common::Android::GetJBoolean(env, jwasCancelled);
-    };
+    const auto callback = MakeProgressCallback(env, jcallback);
+    if (env->ExceptionCheck()) {
+        return nullptr;
+    }
 
     auto& session = EmulationSession::GetInstance();
     std::vector<std::string> result = ContentManager::VerifyInstalledContents(
         session.System(), *session.GetContentProvider(), callback);
-    jobjectArray jresult = env->NewObjectArray(result.size(), Common::Android::GetStringClass(),
-                                               Common::Android::ToJString(env, ""));
+    if (env->ExceptionCheck()) {
+        return nullptr;
+    }
+
+    jstring j_empty = Common::Android::ToJString(env, "");
+    jobjectArray jresult = env->NewObjectArray(static_cast<jsize>(result.size()),
+                                               Common::Android::GetStringClass(), j_empty);
+    if (j_empty != nullptr) {
+        env->DeleteLocalRef(j_empty);
+    }
+    if (jresult == nullptr || env->ExceptionCheck()) {
+        return nullptr;
+    }
+
     for (size_t i = 0; i < result.size(); ++i) {
-        env->SetObjectArrayElement(jresult, i, Common::Android::ToJString(env, result[i]));
+        jstring j_str = Common::Android::ToJString(env, result[i]);
+        env->SetObjectArrayElement(jresult, static_cast<jsize>(i), j_str);
+        if (j_str != nullptr) {
+            env->DeleteLocalRef(j_str);
+        }
+        if (env->ExceptionCheck()) {
+            return nullptr;
+        }
     }
     return jresult;
 }
 
 jint Java_org_yuzu_yuzu_1emu_NativeLibrary_verifyGameContents(JNIEnv* env, jobject jobj,
                                                               jstring jpath, jobject jcallback) {
-    auto jlambdaClass = env->GetObjectClass(jcallback);
-    auto jlambdaInvokeMethod = env->GetMethodID(
-        jlambdaClass, "invoke", "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;");
-    const auto callback = [env, jcallback, jlambdaInvokeMethod](size_t max, size_t progress) {
-        auto jwasCancelled = env->CallObjectMethod(jcallback, jlambdaInvokeMethod,
-                                                   Common::Android::ToJDouble(env, max),
-                                                   Common::Android::ToJDouble(env, progress));
-        return Common::Android::GetJBoolean(env, jwasCancelled);
-    };
+    const auto callback = MakeProgressCallback(env, jcallback);
+    if (env->ExceptionCheck()) {
+        return 0;
+    }
+
     auto& session = EmulationSession::GetInstance();
     return static_cast<jint>(ContentManager::VerifyGameContents(
         session.System(), Common::Android::GetJString(env, jpath), callback));
@@ -1746,98 +1923,141 @@ Java_org_yuzu_yuzu_1emu_NativeLibrary_initJvm(JNIEnv *env, jclass clazz) {
     Common::Android::Initialize(vm, env);
 }
 
+static std::mutex s_multiplayer_mutex;
+
+static AndroidMultiplayer* EnsureMultiplayer() {
+    std::scoped_lock lock{s_multiplayer_mutex};
+    if (!multiplayer) {
+        announce_multiplayer_session = std::make_shared<Core::AnnounceMultiplayerSession>();
+        multiplayer = std::make_unique<AndroidMultiplayer>(s_instance.System(),
+                                                           announce_multiplayer_session);
+        multiplayer->NetworkInit();
+    }
+    return multiplayer.get();
+}
+
 JNIEXPORT void JNICALL
 Java_org_yuzu_yuzu_1emu_NativeLibrary_initMultiplayer(
         JNIEnv* env, [[maybe_unused]] jobject obj) {
-    if (multiplayer) {
-        return;
-    }
-
-    announce_multiplayer_session = std::make_shared<Core::AnnounceMultiplayerSession>();
-
-    multiplayer = std::make_unique<AndroidMultiplayer>(s_instance.System(), announce_multiplayer_session);
-    multiplayer->NetworkInit();
+    EnsureMultiplayer();
 }
 
 JNIEXPORT jobjectArray JNICALL
 Java_org_yuzu_yuzu_1emu_network_NetPlayManager_netPlayGetPublicRooms(
         JNIEnv *env, [[maybe_unused]] jobject obj) {
-    return Common::Android::ToJStringArray(env, multiplayer->NetPlayGetPublicRooms());
+    auto* const mp = EnsureMultiplayer();
+    if (!mp) {
+        return Common::Android::ToJStringArray(env, {});
+    }
+    return Common::Android::ToJStringArray(env, mp->NetPlayGetPublicRooms());
 }
 
 JNIEXPORT jint JNICALL Java_org_yuzu_yuzu_1emu_network_NetPlayManager_netPlayCreateRoom(
         JNIEnv* env, [[maybe_unused]] jobject obj, jstring ipaddress, jint port,
         jstring username, jstring preferredGameName, jlong preferredGameId, jstring password,
         jstring room_name, jint max_players, jboolean isPublic) {
+    auto* const mp = EnsureMultiplayer();
+    if (!mp) {
+        return static_cast<jint>(NetPlayStatus::NETWORK_ERROR);
+    }
     return static_cast<jint>(
-            multiplayer->NetPlayCreateRoom(Common::Android::GetJString(env, ipaddress), port,
-                              Common::Android::GetJString(env, username), Common::Android::GetJString(env, preferredGameName),
-                              preferredGameId,Common::Android::GetJString(env, password),
-                              Common::Android::GetJString(env, room_name), max_players, isPublic));
+        mp->NetPlayCreateRoom(Common::Android::GetJString(env, ipaddress), static_cast<int>(port),
+                              Common::Android::GetJString(env, username),
+                              Common::Android::GetJString(env, preferredGameName),
+                              static_cast<u64>(preferredGameId),
+                              Common::Android::GetJString(env, password),
+                              Common::Android::GetJString(env, room_name),
+                              static_cast<int>(max_players), static_cast<bool>(isPublic)));
 }
 
 JNIEXPORT jint JNICALL Java_org_yuzu_yuzu_1emu_network_NetPlayManager_netPlayJoinRoom(
         JNIEnv* env, [[maybe_unused]] jobject obj, jstring ipaddress, jint port,
         jstring username, jstring password) {
+    auto* const mp = EnsureMultiplayer();
+    if (!mp) {
+        return static_cast<jint>(NetPlayStatus::NETWORK_ERROR);
+    }
     return static_cast<jint>(
-            multiplayer->NetPlayJoinRoom(Common::Android::GetJString(env, ipaddress), port,
-                            Common::Android::GetJString(env, username), Common::Android::GetJString(env, password)));
+        mp->NetPlayJoinRoom(Common::Android::GetJString(env, ipaddress), static_cast<int>(port),
+                            Common::Android::GetJString(env, username),
+                            Common::Android::GetJString(env, password)));
 }
 
 JNIEXPORT jobjectArray JNICALL
 Java_org_yuzu_yuzu_1emu_network_NetPlayManager_netPlayRoomInfo(
         JNIEnv* env, [[maybe_unused]] jobject obj) {
-    return Common::Android::ToJStringArray(env, multiplayer->NetPlayRoomInfo());
+    auto* const mp = EnsureMultiplayer();
+    if (!mp) {
+        return Common::Android::ToJStringArray(env, {});
+    }
+    return Common::Android::ToJStringArray(env, mp->NetPlayRoomInfo());
 }
 
 JNIEXPORT jboolean JNICALL
 Java_org_yuzu_yuzu_1emu_network_NetPlayManager_netPlayIsJoined(
         [[maybe_unused]] JNIEnv* env, [[maybe_unused]] jobject obj) {
-    return multiplayer->NetPlayIsJoined();
+    auto* const mp = EnsureMultiplayer();
+    return mp ? static_cast<jboolean>(mp->NetPlayIsJoined()) : JNI_FALSE;
 }
 
 JNIEXPORT jboolean JNICALL
 Java_org_yuzu_yuzu_1emu_network_NetPlayManager_netPlayIsHostedRoom(
         [[maybe_unused]] JNIEnv* env, [[maybe_unused]] jobject obj) {
-    return multiplayer->NetPlayIsHostedRoom();
+    auto* const mp = EnsureMultiplayer();
+    return mp ? static_cast<jboolean>(mp->NetPlayIsHostedRoom()) : JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL
 Java_org_yuzu_yuzu_1emu_network_NetPlayManager_netPlaySendMessage(
         JNIEnv* env, [[maybe_unused]] jobject obj, jstring msg) {
-    multiplayer->NetPlaySendMessage(Common::Android::GetJString(env, msg));
+    if (auto* const mp = EnsureMultiplayer(); mp != nullptr) {
+        mp->NetPlaySendMessage(Common::Android::GetJString(env, msg));
+    }
 }
 
 JNIEXPORT void JNICALL Java_org_yuzu_yuzu_1emu_network_NetPlayManager_netPlayKickUser(
         JNIEnv* env, [[maybe_unused]] jobject obj, jstring username) {
-    multiplayer->NetPlayKickUser(Common::Android::GetJString(env, username));
+    if (auto* const mp = EnsureMultiplayer(); mp != nullptr) {
+        mp->NetPlayKickUser(Common::Android::GetJString(env, username));
+    }
 }
 
 JNIEXPORT void JNICALL Java_org_yuzu_yuzu_1emu_network_NetPlayManager_netPlayLeaveRoom(
         [[maybe_unused]] JNIEnv* env, [[maybe_unused]] jobject obj) {
-    multiplayer->NetPlayLeaveRoom();
+    if (auto* const mp = EnsureMultiplayer(); mp != nullptr) {
+        mp->NetPlayLeaveRoom();
+    }
 }
 
 JNIEXPORT jboolean JNICALL
 Java_org_yuzu_yuzu_1emu_network_NetPlayManager_netPlayIsModerator(
         [[maybe_unused]] JNIEnv* env, [[maybe_unused]] jobject obj) {
-    return multiplayer->NetPlayIsModerator();
+    auto* const mp = EnsureMultiplayer();
+    return mp ? static_cast<jboolean>(mp->NetPlayIsModerator()) : JNI_FALSE;
 }
 
 JNIEXPORT jobjectArray JNICALL
 Java_org_yuzu_yuzu_1emu_network_NetPlayManager_netPlayGetBanList(
         JNIEnv* env, [[maybe_unused]] jobject obj) {
-    return Common::Android::ToJStringArray(env, multiplayer->NetPlayGetBanList());
+    auto* const mp = EnsureMultiplayer();
+    if (!mp) {
+        return Common::Android::ToJStringArray(env, {});
+    }
+    return Common::Android::ToJStringArray(env, mp->NetPlayGetBanList());
 }
 
 JNIEXPORT void JNICALL Java_org_yuzu_yuzu_1emu_network_NetPlayManager_netPlayBanUser(
         JNIEnv* env, [[maybe_unused]] jobject obj, jstring username) {
-    multiplayer->NetPlayBanUser(Common::Android::GetJString(env, username));
+    if (auto* const mp = EnsureMultiplayer(); mp != nullptr) {
+        mp->NetPlayBanUser(Common::Android::GetJString(env, username));
+    }
 }
 
 JNIEXPORT void JNICALL Java_org_yuzu_yuzu_1emu_network_NetPlayManager_netPlayUnbanUser(
         JNIEnv* env, [[maybe_unused]] jobject obj, jstring username) {
-    multiplayer->NetPlayUnbanUser(Common::Android::GetJString(env, username));
+    if (auto* const mp = EnsureMultiplayer(); mp != nullptr) {
+        mp->NetPlayUnbanUser(Common::Android::GetJString(env, username));
+    }
 }
 
 JNIEXPORT void JNICALL Java_org_yuzu_yuzu_1emu_NativeLibrary_updatePowerState(
@@ -2175,63 +2395,97 @@ JNIEXPORT void JNICALL Java_org_yuzu_yuzu_1emu_NativeLibrary_reloadProfiles(
 
 //  for firmware avatar images
 static std::vector<uint8_t> DecompressYaz0(const FileSys::VirtualFile& file) {
+    constexpr uint32_t MaxYaz0Size = 16U * 1024U * 1024U;
+    constexpr std::size_t Yaz0HeaderSize = 16;
+
     if (!file) {
-        return std::vector<uint8_t>();
+        return {};
+    }
+
+    const std::size_t file_size = file->GetSize();
+    if (file_size < Yaz0HeaderSize) {
+        return {};
     }
 
     uint32_t magic{};
-    file->ReadObject(&magic, 0);
-    if (magic != Common::MakeMagic('Y', 'a', 'z', '0')) {
-        return std::vector<uint8_t>();
+    if (file->ReadObject(&magic, 0) != sizeof(magic) ||
+        magic != Common::MakeMagic('Y', 'a', 'z', '0')) {
+        return {};
     }
 
     uint32_t decoded_length{};
-    file->ReadObject(&decoded_length, 4);
+    if (file->ReadObject(&decoded_length, 4) != sizeof(decoded_length)) {
+        return {};
+    }
     decoded_length = Common::swap32(decoded_length);
+    if (decoded_length == 0 || decoded_length > MaxYaz0Size) {
+        return {};
+    }
 
-    std::size_t input_size = file->GetSize() - 16;
+    const std::size_t input_size = file_size - Yaz0HeaderSize;
+    if (input_size == 0 || input_size > static_cast<std::size_t>(MaxYaz0Size)) {
+        return {};
+    }
+
     std::vector<uint8_t> input(input_size);
-    file->ReadBytes(input.data(), input_size, 16);
+    if (file->ReadBytes(input.data(), input_size, Yaz0HeaderSize) != input_size) {
+        return {};
+    }
 
-    uint32_t input_offset{};
-    uint32_t output_offset{};
-    std::vector<uint8_t> output(decoded_length);
+    std::size_t input_offset{};
+    std::size_t output_offset{};
+    const std::size_t target_size = static_cast<std::size_t>(decoded_length);
+    std::vector<uint8_t> output(target_size);
 
-    uint16_t mask{};
+    uint32_t mask{};
     uint8_t header{};
 
-    while (output_offset < decoded_length) {
+    while (output_offset < target_size) {
         if ((mask >>= 1) == 0) {
-            if (input_offset >= input.size()) break;
+            if (input_offset >= input.size()) {
+                return {};
+            }
             header = input[input_offset++];
             mask = 0x80;
         }
 
-        if ((header & mask) != 0) {
-            if (output_offset >= output.size() || input_offset >= input.size()) {
-                break;
+        if ((static_cast<uint32_t>(header) & mask) != 0) {
+            if (input_offset >= input.size()) {
+                return {};
             }
             output[output_offset++] = input[input_offset++];
         } else {
-            if (input_offset + 1 >= input.size()) break;
-            uint8_t byte1 = input[input_offset++];
-            uint8_t byte2 = input[input_offset++];
+            if (input_offset + 1 >= input.size()) {
+                return {};
+            }
+            const uint8_t byte1 = input[input_offset++];
+            const uint8_t byte2 = input[input_offset++];
 
-            uint32_t dist = ((byte1 & 0xF) << 8) | byte2;
-            uint32_t position = output_offset - (dist + 1);
+            const std::size_t dist =
+                (static_cast<std::size_t>(byte1 & 0xF) << 8) | static_cast<std::size_t>(byte2);
+            if (dist + 1 > output_offset) {
+                return {};
+            }
+            std::size_t position = output_offset - (dist + 1);
 
-            uint32_t length = byte1 >> 4;
+            uint32_t length = static_cast<uint32_t>(byte1 >> 4);
             if (length == 0) {
-                if (input_offset >= input.size()) break;
+                if (input_offset >= input.size()) {
+                    return {};
+                }
                 length = static_cast<uint32_t>(input[input_offset++]) + 0x12;
             } else {
                 length += 2;
             }
 
-            for (uint32_t i = 0; i < length && output_offset < decoded_length; ++i) {
+            for (uint32_t i = 0; i < length && output_offset < target_size; ++i) {
                 output[output_offset++] = output[position++];
             }
         }
+    }
+
+    if (output_offset != target_size) {
+        return {};
     }
 
     return output;

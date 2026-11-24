@@ -392,7 +392,7 @@ void EmitImageGather(EmitContext& ctx, IR::Inst& inst, const IR::Value& index,
     }
     // PTP
     const auto offsets{PtpOffsets(offset, offset2)};
-    ctx.AddU1("{}=sparseTexelsResidentARB(sparseTextureGatherOffsetARB({},{},{},{},int({})));",
+    ctx.AddU1("{}=sparseTexelsResidentARB(sparseTextureGatherOffsetsARB({},{},{},{},int({})));",
               *sparse_inst, texture, CastToIntVec(coords, info), offsets, texel,
               info.gather_component);
 }
@@ -437,14 +437,14 @@ void EmitImageGatherDref(EmitContext& ctx, IR::Inst& inst, const IR::Value& inde
         return;
     }
     if (offset2.IsEmpty()) {
-        ctx.AddU1("{}=sparseTexelsResidentARB(sparseTextureGatherOffsetARB({},{},{},,{},{}));",
+        ctx.AddU1("{}=sparseTexelsResidentARB(sparseTextureGatherOffsetARB({},{},{},{},{}));",
                   *sparse_inst, texture, CastToIntVec(coords, info), dref,
                   GetOffsetVec(ctx, offset), texel);
         return;
     }
     // PTP
     const auto offsets{PtpOffsets(offset, offset2)};
-    ctx.AddU1("{}=sparseTexelsResidentARB(sparseTextureGatherOffsetARB({},{},{},,{},{}));",
+    ctx.AddU1("{}=sparseTexelsResidentARB(sparseTextureGatherOffsetsARB({},{},{},{},{}));",
               *sparse_inst, texture, CastToIntVec(coords, info), dref, offsets, texel);
 }
 
@@ -562,7 +562,7 @@ void EmitImageGradient(EmitContext& ctx, IR::Inst& inst, const IR::Value& index,
                     coords, derivatives_vec, offset_vec, derivatives_vec, offset_vec);
             return;
         }
-        ctx.Add("{}=textureGrad({},{},vec2({}.xz),vec2({}.yz));", texel, texture, coords,
+        ctx.Add("{}=textureGrad({},{},vec2({}.xz),vec2({}.yw));", texel, texture, coords,
                 derivatives_vec, derivatives_vec);
     } else {
         ctx.Add("{}=textureGrad({},{},float({}.x),float({}.y));", texel, texture, coords,

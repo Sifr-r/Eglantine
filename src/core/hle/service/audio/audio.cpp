@@ -210,8 +210,12 @@ void LoopProcess(Core::System& system) {
     server_manager->RegisterNamedService("audren:u", std::make_shared<IAudioRendererManager>(system), 30);
     // Switch 2 audio entry point (nn::audio::CreateUserClientSessionByHipc).
     server_manager->RegisterNamedService("aud:u", std::make_shared<IUserClientSession>(system), 30);
-    server_manager->RegisterNamedService("auddmg:u", std::make_shared<Devmgr::IUserSessionManager>(system), 30);
-    server_manager->RegisterNamedService("audsmx:u", std::make_shared<Sysmix::IUserSessionManager>(system), 30);
+    auto sysmix_streams = std::make_shared<Nx2SysmixStreams>();
+    server_manager->RegisterNamedService(
+        "auddmg:u", std::make_shared<Devmgr::IUserSessionManager>(system, sysmix_streams), 30);
+    server_manager->RegisterNamedService(
+        "audsmx:u", std::make_shared<Sysmix::IUserSessionManager>(system, std::move(sysmix_streams)),
+        30);
     server_manager->RegisterNamedService("audren:a", std::make_shared<IAudioRendererManagerForApplet>(system), 30);
     server_manager->RegisterNamedService("hwopus", std::make_shared<IHardwareOpusDecoderManager>(system), 25);
     ServerManager::RunServer(std::move(server_manager));

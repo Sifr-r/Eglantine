@@ -80,5 +80,7 @@ public:
      */
     void UpdateResultState(EffectResultState& cpu_state, EffectResultState& dsp_state) override;
 };
+static_assert(sizeof(BiquadFilterInfo) == sizeof(EffectInfoBase),
+              "BiquadFilterInfo size must match EffectInfoBase!");
 
 } // namespace AudioCore::Renderer

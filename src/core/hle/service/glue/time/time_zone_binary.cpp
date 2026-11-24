@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "core/core.h"
 #include "core/file_sys/content_archive.h"
 #include "core/file_sys/nca_metadata.h"
@@ -140,15 +142,19 @@ u32 TimeZoneBinary::GetTimeZoneCount() {
 }
 
 Result TimeZoneBinary::GetTimeZoneVersion(Service::PSC::Time::RuleVersion& out_rule_version) {
+    out_rule_version = {};
+
     std::string path{};
     GetVersionPath(path);
 
     auto rule_version_buffer{std::span(reinterpret_cast<u8*>(&out_rule_version),
                                        sizeof(Service::PSC::Time::RuleVersion))};
     size_t bytes_read{};
-    R_TRY(Read(bytes_read, rule_version_buffer, rule_version_buffer.size_bytes(), path));
+    R_TRY(Read(bytes_read, rule_version_buffer, rule_version_buffer.size_bytes() - 1, path));
 
-    rule_version_buffer[bytes_read] = 0;
+    if (bytes_read < rule_version_buffer.size()) {
+        rule_version_buffer[bytes_read] = 0;
+    }
     R_SUCCEED();
 }
 
@@ -177,9 +183,12 @@ Result TimeZoneBinary::GetTimeZoneLocationList(
     out_count = 0;
     R_SUCCEED_IF(bytes_read == 0);
 
+    const size_t limit = (std::min)(max_names, out_names.size());
+    R_SUCCEED_IF(limit == 0);
+
     Service::PSC::Time::LocationName current_name{};
     size_t current_name_len{};
-    std::span<const u8> chars{time_zone_scratch_space};
+    std::span<const u8> chars{time_zone_scratch_space.data(), bytes_read};
     u32 name_count{};
 
     for (auto chr : chars) {
@@ -189,9 +198,12 @@ Result TimeZoneBinary::GetTimeZoneLocationList(
 
         if (chr == '\n') {
             if (name_count >= index) {
+                if (out_count >= limit) {
+                    break;
+                }
                 out_names[out_count] = current_name;
                 out_count++;
-                if (out_count >= max_names) {
+                if (out_count >= limit) {
                     break;
                 }
             }
@@ -207,7 +219,7 @@ Result TimeZoneBinary::GetTimeZoneLocationList(
 
         R_UNLESS(current_name_len <= current_name.size() - 2, Service::PSC::Time::ResultFailed);
 
-        current_name[current_name_len++] = chr;
+        current_name[current_name_len++] = static_cast<char>(chr);
     }
 
     R_SUCCEED();

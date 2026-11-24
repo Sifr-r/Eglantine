@@ -6,9 +6,9 @@
 #pragma once
 
 #include <memory>
-#include <thread>
 
 #include <QDialog>
+#include <QTimer>
 
 #include "common/common_types.h"
 
@@ -99,5 +99,5 @@ private:
     bool use_rich_text;
 
     std::unique_ptr<InputInterpreter> input_interpreter;
-    std::jthread input_thread;
+    QTimer input_timer;
 };

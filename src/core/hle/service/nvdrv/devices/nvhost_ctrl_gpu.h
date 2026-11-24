@@ -24,6 +24,8 @@ namespace Service::Nvidia::Devices {
 
 class nvhost_ctrl_gpu final : public nvdevice {
 public:
+    static constexpr DeviceKind Kind = DeviceKind::NvHostCtrlGpu;
+
     explicit nvhost_ctrl_gpu(Core::System& system_, EventInterface& events_interface_);
     ~nvhost_ctrl_gpu() override;
 

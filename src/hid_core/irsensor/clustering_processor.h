@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <mutex>
+
 #include "common/common_types.h"
 #include "hid_core/irsensor/irs_types.h"
 #include "hid_core/irsensor/processor_base.h"
@@ -101,7 +103,9 @@ private:
 
     // Sets config parameters of the camera
     void SetDefaultConfig();
+    void StartProcessorLocked();
 
+    mutable std::mutex mutex;
     ClusteringSharedMemory* shared_memory = nullptr;
     ClusteringProcessorState next_state{};
 

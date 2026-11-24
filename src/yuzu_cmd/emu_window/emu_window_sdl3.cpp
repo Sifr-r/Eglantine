@@ -280,6 +280,20 @@ void EmuWindow_SDL3::OnEvent(SDL_Event& event) {
     }
 }
 
+bool EmuWindow_SDL3::HasInputFocus() const {
+    return (SDL_GetWindowFlags(render_window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+}
+
+bool EmuWindow_SDL3::SetSessionVisible(bool visible) {
+    if (Nx2HiddenWindowFlags() != 0) {
+        return true;
+    }
+    if (visible) {
+        return SDL_ShowWindow(render_window) && SDL_RaiseWindow(render_window);
+    }
+    return SDL_HideWindow(render_window);
+}
+
 // Credits to Samantas5855 and others for this function.
 void EmuWindow_SDL3::SetWindowIcon() {
 #if defined(__EMSCRIPTEN__) || defined(__wasi__)

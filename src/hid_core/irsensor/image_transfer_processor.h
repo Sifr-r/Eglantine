@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <span>
 
 #include "common/typed_address.h"
@@ -73,7 +74,9 @@ private:
                   "ImageTransferProcessorExConfig is an invalid size");
 
     void OnControllerUpdate(Core::HID::ControllerTriggerType type);
+    void StartProcessorLocked();
 
+    mutable std::mutex mutex;
     ImageTransferProcessorExConfig current_config{};
     Core::IrSensor::ImageTransferProcessorState processor_state{};
     Core::IrSensor::DeviceFormat& device;

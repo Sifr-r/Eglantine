@@ -97,10 +97,7 @@ void RewriteAtomic(IR::Block& block, IR::Inst& atomic, u32 invocations) {
 }
 
 void NeutralizePredicate(IR::Inst& ballot) {
-    const IR::Value pred{ballot.Arg(0)};
-    if (!pred.IsImmediate()) {
-        pred.InstRecursive()->ReplaceUsesWith(IR::Value{true});
-    }
+    ballot.SetArg(0, IR::Value{true});
 }
 }
 

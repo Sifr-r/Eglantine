@@ -22,6 +22,7 @@
 #include "common/scope_exit.h"
 #include "common/settings.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/control/channel_state_bridge.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/memory_manager.h"
@@ -85,7 +86,9 @@ RasterizerOpenGL::RasterizerOpenGL(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache),
       blit_image(program_manager_) {}
 
-RasterizerOpenGL::~RasterizerOpenGL() = default;
+RasterizerOpenGL::~RasterizerOpenGL() {
+    state_tracker.ClearChannel();
+}
 
 void RasterizerOpenGL::SyncVertexFormats() {
     auto& flags = maxwell3d->dirty.flags;
@@ -162,8 +165,9 @@ void RasterizerOpenGL::Clear(u32 layer_count) {
     bool use_depth{};
     bool use_stencil{};
 
-    if (regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
-        regs.clear_surface.A) {
+    if ((regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
+         regs.clear_surface.A) &&
+        regs.clear_surface.RT < Maxwell::NumRenderTargets) {
         use_color = true;
 
         const GLuint index = regs.clear_surface.RT;
@@ -356,6 +360,7 @@ void RasterizerOpenGL::DrawTexture() {
         gpu.TickWork();
     };
 
+    std::scoped_lock lock{texture_cache.mutex};
     texture_cache.SynchronizeDescriptors(false);
     texture_cache.UpdateRenderTargets(false);
 
@@ -403,6 +408,7 @@ void RasterizerOpenGL::DispatchCompute() {
     if (!pipeline) {
         return;
     }
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     if (pipeline->UsesLocalMemory()) {
         program_manager.LocalMemoryWarmup();
     }
@@ -418,9 +424,9 @@ void RasterizerOpenGL::DispatchCompute() {
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, buffer->Handle());
         glDispatchComputeIndirect(static_cast<GLintptr>(offset));
-        return;
+    } else {
+        glDispatchCompute(qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z);
     }
-    glDispatchCompute(qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z);
     ++num_queued_commands;
     has_written_global_memory |= pipeline->WritesGlobalMemory();
 }
@@ -528,9 +534,10 @@ VideoCore::RasterizerDownloadArea RasterizerOpenGL::GetFlushArea(DAddr addr, u64
     }
     {
         std::scoped_lock lock{buffer_cache.mutex};
-        auto area = buffer_cache.GetFlushArea(addr, size);
-        if (area) {
-            return *area;
+        if (buffer_cache.FlushesOnCpuRead()) {
+            if (auto area = buffer_cache.GetFlushArea(addr, size)) {
+                return *area;
+            }
         }
     }
     VideoCore::RasterizerDownloadArea new_area{
@@ -1373,7 +1380,8 @@ void RasterizerOpenGL::InitializeChannel(Tegra::Control::ChannelState& channel) 
     }
     shader_cache.CreateChannel(channel);
     query_cache.CreateChannel(channel);
-    state_tracker.SetupTables(channel);
+    const Tegra::Control::ChannelStateBridge bridge{channel};
+    state_tracker.SetupTables(bridge);
 }
 
 void RasterizerOpenGL::BindChannel(Tegra::Control::ChannelState& channel) {
@@ -1386,11 +1394,15 @@ void RasterizerOpenGL::BindChannel(Tegra::Control::ChannelState& channel) {
     }
     shader_cache.BindToChannel(channel_id);
     query_cache.BindToChannel(channel_id);
-    state_tracker.ChangeChannel(channel);
+    const Tegra::Control::ChannelStateBridge bridge{channel};
+    state_tracker.ChangeChannel(bridge);
     state_tracker.InvalidateState();
 }
 
 void RasterizerOpenGL::ReleaseChannel(s32 channel_id) {
+    if (CurrentBridge().BindId() == channel_id) {
+        state_tracker.ClearChannel();
+    }
     EraseChannel(channel_id);
     {
         std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};

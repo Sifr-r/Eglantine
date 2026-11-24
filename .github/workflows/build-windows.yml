@@ -85,10 +85,10 @@ jobs:
           save-cache: ${{ inputs.save_cache }}
 
       - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
       - name: Install Qt on Windows
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4.5.0
         with:
           version: "6.8.3"
           host: windows
@@ -114,6 +114,37 @@ jobs:
       - name: Verify Vulkan tools on Windows
         shell: pwsh
         run: glslangValidator --version
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build artifacts (restore and save)
+        if: env.CACHE_SAVE == 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Cache Rust build artifacts (restore only)
+        if: env.CACHE_SAVE != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Run Rust workspace tests
+        shell: pwsh
+        run: cargo test --manifest-path rust/Cargo.toml --locked --offline
 
       - name: Configure
         shell: bash
@@ -222,13 +253,14 @@ jobs:
       # toolchain that could not compile a single test program ("Detecting C compiler ABI info -
       # failed"), so the saved ~25 s is not worth a leg that dies once the cache is evicted.
       - name: Set up MSYS2
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2.34.0
         with:
           msystem: UCRT64
           update: true
           cache: true
           install: >-
             git make autoconf libtool automake-wrapper patch jq pactoys ninja
+            mingw-w64-ucrt-x86_64-rust
           pacboy: >-
             toolchain:p clang:p lld:p cmake:p python-pip:p
             qt6-base:p qt6-charts:p qt6-tools:p qt6-translations:p qt6-svg:p
@@ -236,6 +268,32 @@ jobs:
             vulkan-memory-allocator:p vulkan-devel:p glslang:p enet:p opus:p
             libusb:p unordered_dense:p jbigkit:p xz:p libdeflate:p bzip2:p
             lerc:p graphite2:p libwebp:p libtiff:p brotli:p ccache:p
+
+      - name: Cache Rust build artifacts (restore and save)
+        if: env.CACHE_SAVE == 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Cache Rust build artifacts (restore only)
+        if: env.CACHE_SAVE != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Run Rust workspace tests
+        shell: msys2 {0}
+        run: cargo test --manifest-path rust/Cargo.toml --locked --offline
 
       # MinGW build: system Qt and libraries from MSYS2, clang plus the repo's PGO profile. The profile
       # path is converted to its Windows form because clang runs with the MSYS mount underneath.
@@ -307,7 +365,7 @@ jobs:
               [ -z "$source" ] && continue
               # The system DLLs ship with Windows, so they never need bundling.
               case "$source" in
-                *System32* | *SysWOW64*) continue ;;
+                *[Ss][Yy][Ss][Tt][Ee][Mm]32* | *[Ss][Yy][Ss][Ww][Oo][Ww]64*) continue ;;
               esac
               if [ ! -f "$dll" ]; then
                 cp "$source" "$dll"

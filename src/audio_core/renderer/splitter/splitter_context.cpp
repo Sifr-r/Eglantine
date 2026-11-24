@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <vector>
+
 #include "audio_core/common/audio_renderer_parameter.h"
 #include "audio_core/common/workbuffer_allocator.h"
 #include "audio_core/renderer/behavior/behavior_info.h"
@@ -74,17 +77,17 @@ bool SplitterContext::Initialize(const BehaviorInfo& behavior,
             return false;
         }
 
-        splitter_destinations =
-            allocator.Allocate<SplitterDestinationData>(params.splitter_destinations, 0x10).data();
-
-        for (s32 i = 0; i < params.splitter_destinations; i++) {
-            std::construct_at<SplitterDestinationData>(&splitter_destinations[i], i);
-        }
-
-        if (params.splitter_destinations <= 0) {
+        auto dests =
+            allocator.Allocate<SplitterDestinationData>(params.splitter_destinations, 0x10);
+        if (dests.empty()) {
             splitter_infos = {};
             splitter_destinations = nullptr;
             return false;
+        }
+        splitter_destinations = dests.data();
+
+        for (s32 i = 0; i < params.splitter_destinations; i++) {
+            std::construct_at<SplitterDestinationData>(&splitter_destinations[i], i);
         }
 
         Setup(splitter_infos, params.splitter_infos, splitter_destinations,
@@ -93,25 +96,81 @@ bool SplitterContext::Initialize(const BehaviorInfo& behavior,
     return true;
 }
 
-bool SplitterContext::Update(const u8* input) {
-    auto in_params{reinterpret_cast<const InParameterHeader*>(input)};
-
+bool SplitterContext::Update(std::span<const u8> input, s32 mix_count) {
     if (destinations_count == 0 || info_count == 0) {
         return true;
     }
 
-    if (in_params->magic != GetSplitterInParamHeaderMagic()) {
+    if (!ValidateUpdate(input, mix_count)) {
         return false;
     }
 
+    const auto* in_params = reinterpret_cast<const InParameterHeader*>(input.data());
     for (auto& splitter_info : splitter_infos) {
         splitter_info.ClearNewConnectionFlag();
     }
 
-    u32 offset{sizeof(InParameterHeader)};
-    offset = UpdateInfo(input, offset, in_params->info_count);
-    offset = UpdateData(input, offset, in_params->destination_count);
+    const u32 offset = UpdateInfo(input.data(), sizeof(InParameterHeader), in_params->info_count);
+    UpdateData(input.data(), offset, in_params->destination_count);
     return true;
+}
+
+bool SplitterContext::ValidateUpdate(std::span<const u8> input, s32 mix_count) const {
+    if (input.size() < sizeof(InParameterHeader)) {
+        return false;
+    }
+    const auto& header = *reinterpret_cast<const InParameterHeader*>(input.data());
+    if (header.magic != GetSplitterInParamHeaderMagic() || header.info_count < 0 ||
+        header.info_count > info_count || header.destination_count < 0 ||
+        header.destination_count > destinations_count) {
+        return false;
+    }
+    input = input.subspan(sizeof(InParameterHeader));
+
+    constexpr size_t info_overhead = sizeof(SplitterInfo::InParameter) + 3 * sizeof(s32);
+    std::vector<s32> last_use(static_cast<size_t>(destinations_count), -1);
+    for (s32 i = 0; i < header.info_count; ++i) {
+        if (input.size() < info_overhead) {
+            return false;
+        }
+        const auto& info = *reinterpret_cast<const SplitterInfo::InParameter*>(input.data());
+        if (info.magic != GetSplitterInfoMagic() || info.id < 0 || info.id >= info_count ||
+            info.destination_count > static_cast<u32>(destinations_count) ||
+            info.destination_count > (input.size() - info_overhead) / sizeof(u32)) {
+            return false;
+        }
+        std::span<const u32> ids{
+            reinterpret_cast<const u32*>(input.data() + sizeof(SplitterInfo::InParameter)),
+            info.destination_count};
+        for (u32 id : ids) {
+            if (id >= last_use.size() || last_use[id] == i) {
+                return false;
+            }
+            last_use[id] = i;
+        }
+        input = input.subspan(info_overhead + ids.size_bytes());
+    }
+
+    const auto validate_destinations = [&]<typename Parameter>() {
+        if (static_cast<size_t>(header.destination_count) > input.size() / sizeof(Parameter)) {
+            return false;
+        }
+        const std::span<const Parameter> params{reinterpret_cast<const Parameter*>(input.data()),
+                                                static_cast<size_t>(header.destination_count)};
+        return std::ranges::all_of(params, [&](const auto& destination) {
+            return destination.magic == GetSplitterSendDataMagic() && destination.id >= 0 &&
+                   destination.id < destinations_count &&
+                   (destination.mix_id == static_cast<u32>(UnusedMixId) ||
+                    destination.mix_id < static_cast<u32>(mix_count));
+        });
+    };
+    if (!splitter_biquad_param_supported) {
+        return validate_destinations.operator()<SplitterDestinationData::InParameter>();
+    }
+    if (!splitter_float_coeff_supported) {
+        return validate_destinations.operator()<SplitterDestinationData::InParameterVersion2a>();
+    }
+    return validate_destinations.operator()<SplitterDestinationData::InParameterVersion2b>();
 }
 
 u32 SplitterContext::UpdateInfo(const u8* input, u32 offset, const u32 splitter_count) {
@@ -119,10 +178,10 @@ u32 SplitterContext::UpdateInfo(const u8* input, u32 offset, const u32 splitter_
         auto info_header{reinterpret_cast<const SplitterInfo::InParameter*>(input + offset)};
 
         if (info_header->magic != GetSplitterInfoMagic()) {
-            continue;
+            break;
         }
 
-        if (info_header->id < 0 || info_header->id > info_count) {
+        if (info_header->id < 0 || info_header->id >= info_count) {
             break;
         }
 
@@ -146,10 +205,10 @@ u32 SplitterContext::UpdateData(const u8* input, u32 offset, const u32 count) {
                 reinterpret_cast<const SplitterDestinationData::InParameter*>(input + offset);
 
             if (data_header->magic != GetSplitterSendDataMagic()) {
-                continue;
+                break;
             }
-            if (data_header->id < 0 || data_header->id > destinations_count) {
-                continue;
+            if (data_header->id < 0 || data_header->id >= destinations_count) {
+                break;
             }
 
             auto modified_params = *data_header;
@@ -165,10 +224,10 @@ u32 SplitterContext::UpdateData(const u8* input, u32 offset, const u32 count) {
                                                                                        offset);
 
             if (data_header_v2a->magic != GetSplitterSendDataMagic()) {
-                continue;
+                break;
             }
-            if (data_header_v2a->id < 0 || data_header_v2a->id > destinations_count) {
-                continue;
+            if (data_header_v2a->id < 0 || data_header_v2a->id >= destinations_count) {
+                break;
             }
 
             // Map common fields to the base format
@@ -207,10 +266,10 @@ u32 SplitterContext::UpdateData(const u8* input, u32 offset, const u32 count) {
                                                                                        offset);
 
             if (data_header_v2b->magic != GetSplitterSendDataMagic()) {
-                continue;
+                break;
             }
-            if (data_header_v2b->id < 0 || data_header_v2b->id > destinations_count) {
-                continue;
+            if (data_header_v2b->id < 0 || data_header_v2b->id >= destinations_count) {
+                break;
             }
 
             // Map common fields to the old format
@@ -255,17 +314,24 @@ void SplitterContext::RecomposeDestination(SplitterInfo& out_info,
         destination = dest;
     }
     out_info.SetDestinations(nullptr);
+    out_info.SetDestinationCount(0);
 
     auto dest_count{info_header->destination_count};
     if (!splitter_bug_fixed) {
         dest_count = (std::min)(dest_count, GetDestCountPerInfoForCompat());
     }
 
-    if (dest_count == 0) {
+    if (dest_count == 0 || destinations_count <= 0 ||
+        dest_count > static_cast<u32>(destinations_count)) {
         return;
     }
 
     std::span<const u32> destination_ids{reinterpret_cast<const u32*>(&info_header[1]), dest_count};
+    for (const u32 id : destination_ids) {
+        if (id >= static_cast<u32>(destinations_count)) {
+            return;
+        }
+    }
 
     auto head{&splitter_destinations[destination_ids[0]]};
     auto current_destination{head};
@@ -274,6 +340,7 @@ void SplitterContext::RecomposeDestination(SplitterInfo& out_info,
         current_destination->SetNext(next_destination);
         current_destination = next_destination;
     }
+    current_destination->SetNext(nullptr);
 
     out_info.SetDestinations(head);
     out_info.SetDestinationCount(dest_count);

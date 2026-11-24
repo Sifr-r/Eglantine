@@ -69,6 +69,9 @@ public:
 
     void ApplyConfiguration();
 
+    /// Discard unapplied changes in the input configuration tab.
+    void RestoreInputConfiguration();
+
     /// Selects the Profiles tab of the System category.
     void SelectProfilesTab();
 

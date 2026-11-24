@@ -318,10 +318,12 @@ public:
         // Get the child path's length
         auto child_len = std::strlen(c);
 
-        // Reset our write buffer
+        // Reset our write buffer while keeping the previous string readable until copied
+        const char* prev_str = m_str;
         WriteBuffer old_write_buffer;
         if (m_write_buffer.Get() != nullptr) {
             old_write_buffer = std::move(m_write_buffer);
+            prev_str = old_write_buffer.Get();
             this->ClearBuffer();
         }
 
@@ -330,8 +332,8 @@ public:
 
         // Get our write buffer
         auto* dst = m_write_buffer.Get();
-        if (old_write_buffer.Get() != nullptr && cur_len > 0) {
-            Strlcpy<char>(dst, old_write_buffer.Get(), cur_len + 1);
+        if (prev_str != nullptr && cur_len > 0) {
+            Strlcpy<char>(dst, prev_str, cur_len + 1);
         }
 
         // Add separator
@@ -371,12 +373,15 @@ public:
     }
 
     Result RemoveChild() {
+        // Empty paths have no child to remove
+        R_UNLESS(m_str != nullptr && m_str[0] != '\x00', ResultNotImplemented);
+
         // If we don't have a write-buffer, ensure that we have one
         if (m_write_buffer.Get() == nullptr) {
-            if (const auto len = std::strlen(m_str); len > 0) {
-                R_TRY(this->Preallocate(len));
-                Strlcpy<char>(m_write_buffer.Get(), m_str, len + 1);
-            }
+            const auto str_len = std::strlen(m_str);
+            const char* const prev_str = m_str;
+            R_TRY(this->Preallocate(str_len + 1));
+            Strlcpy<char>(m_write_buffer.Get(), prev_str, str_len + 1);
         }
 
         // Check that it's possible for us to remove a child

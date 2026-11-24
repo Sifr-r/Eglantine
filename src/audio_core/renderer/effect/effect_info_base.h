@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 
 #include "audio_core/common/common.h"
 #include "audio_core/renderer/behavior/behavior_info.h"
@@ -116,6 +117,7 @@ public:
         mix_id = UnusedMixId;
         process_order = InvalidProcessOrder;
         buffer_unmapped = false;
+        parameter_version2 = false;
         parameter = {};
         for (auto& workbuffer : workbuffers) {
             workbuffer.Setup(CpuAddr(0), 0);
@@ -410,6 +412,8 @@ protected:
     bool enabled{};
     /// Are this effect's buffers unmapped?
     bool buffer_unmapped{};
+    /// Was this effect last updated with ParameterVersion2?
+    bool parameter_version2{false};
     /// Current usage state
     UsageState usage_state{UsageState::Invalid};
     /// Mix id of this effect
@@ -429,7 +433,7 @@ protected:
     /// Parameters of this effect
     std::array<u8, sizeof(InParameterVersion2)> parameter{};
     /// State of this effect used by the AudioRenderer across calls
-    std::array<u8, sizeof(State)> state{};
+    alignas(alignof(std::max_align_t)) std::array<u8, sizeof(State)> state{};
 };
 
 } // namespace AudioCore::Renderer

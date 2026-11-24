@@ -103,8 +103,8 @@ void DataWidget::scan() {
         watcher->deleteLater();
     });
 
-    watcher->setFuture(
-        QtConcurrent::run([this]() { return FrontendCommon::DataManager::DataDirSize(m_dir); }));
+    watcher->setFuture(QtConcurrent::run(
+        [dir = m_dir]() { return FrontendCommon::DataManager::DataDirSize(dir); }));
 }
 
 std::optional<std::string> DataWidget::selectProfile() {

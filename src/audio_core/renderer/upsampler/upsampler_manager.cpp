@@ -12,7 +12,7 @@ UpsamplerManager::UpsamplerManager(const u32 count_, std::span<UpsamplerInfo> in
 UpsamplerInfo* UpsamplerManager::Allocate() {
     std::scoped_lock l{lock};
 
-    if (count == 0) {
+    if (count == 0 || workbuffer.empty()) {
         return nullptr;
     }
 
@@ -24,21 +24,31 @@ UpsamplerInfo* UpsamplerManager::Allocate() {
         free_index++;
     }
 
-    if (free_index >= count) {
+    if (free_index >= count || free_index >= upsampler_infos.size()) {
+        return nullptr;
+    }
+
+    const size_t stride = workbuffer.size() / count;
+    if (stride < TargetSampleCount) {
         return nullptr;
     }
 
     auto& upsampler{upsampler_infos[free_index]};
     upsampler.manager = this;
     upsampler.sample_count = TargetSampleCount;
-    upsampler.samples_pos = CpuAddr(&workbuffer[upsampler.sample_count * MaxChannels]);
+    upsampler.buffer_count = static_cast<u32>(stride / TargetSampleCount);
+    upsampler.samples_pos = CpuAddr(&workbuffer[free_index * stride]);
     upsampler.enabled = true;
     return &upsampler;
 }
 
 void UpsamplerManager::Free(UpsamplerInfo* info) {
+    if (info == nullptr) {
+        return;
+    }
     std::scoped_lock l{lock};
     info->enabled = false;
+    info->buffer_count = 0;
 }
 
 } // namespace AudioCore::Renderer

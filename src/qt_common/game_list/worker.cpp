@@ -41,7 +41,8 @@
 #include "qt_common/game_list/game_list_p.h"
 
 #include "qt_common/game_list/model.h"
-#include "qt_common/game_list/discovery.h"
+#include "frontend_common/game_list_discovery.h"
+#include "frontend_common/game_list_metadata.h"
 #include "qt_common/game_list/worker.h"
 
 namespace {
@@ -464,12 +465,8 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
             const auto addEntry = [this, physical_name,
                                    parent_dir](std::unique_ptr<Loader::AppLoader>& app_loader,
                                                const u64 id) {
-                std::vector<u8> icon;
-                [[maybe_unused]] const auto res1 = app_loader->ReadIcon(icon);
-
-                std::string name = " ";
-                const auto res3 = app_loader->ReadTitle(name);
-                if ((res3 != Loader::ResultStatus::Success || name.empty() || name == " ") &&
+                auto [name, icon, title_valid] = GameListDiscovery::ReadTitleMetadata(*app_loader);
+                if ((!title_valid || name.empty() || name == " ") &&
                     IsExtractedNCAMain(physical_name)) {
                     if (const QString loose = LooseExeFSName(physical_name); !loose.isEmpty()) {
                         name = loose.toStdString();
@@ -534,7 +531,8 @@ void GameListWorker::ScanFileSystem(ScanTarget target, const std::vector<std::fi
 void GameListWorker::run() {
     const auto started = std::chrono::steady_clock::now();
     watch_list.clear();
-    provider->ClearAllEntries();
+    FileSys::ManualContentProvider previous;
+    provider->SwapEntries(previous);
 
     const auto DirEntryReady = [&](GameListDir* game_list_dir) {
         auto pending = std::make_shared<std::unique_ptr<GameListDir>>(game_list_dir);
@@ -587,6 +585,10 @@ void GameListWorker::run() {
         } else {
             AddTitlesToGameList(game_list_dir, parent_type);
         }
+    }
+
+    if (stop_requested) {
+        provider->SwapEntries(previous);
     }
 
     watch_list.removeDuplicates();

@@ -6,13 +6,16 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <random>
 
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "common/scratch_buffer.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_page_group.h"
+#include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_system_resource.h"
 #include "core/hle/service/nvdrv/devices/nvmap.h"
@@ -146,7 +149,7 @@ Result AllocateHandleForBuffer(u32* out_handle, Nvidia::Module& nvdrv, Nvidia::D
                                Common::ProcessAddress buffer, u32 size) {
     // Get the nvmap device.
     auto nvmap = nvdrv.GetDevice<Nvidia::Devices::nvmap>(nvmap_fd);
-    ASSERT(nvmap != nullptr);
+    R_UNLESS(nvmap != nullptr, VI::ResultOperationFailed);
 
     // Create a handle.
     R_TRY(CreateNvMapHandle(out_handle, *nvmap, size));
@@ -162,9 +165,9 @@ Result AllocateHandleForBuffer(u32* out_handle, Nvidia::Module& nvdrv, Nvidia::D
 
 void FreeHandle(u32 handle, Nvidia::Module& nvdrv, Nvidia::DeviceFD nvmap_fd) {
     auto nvmap = nvdrv.GetDevice<Nvidia::Devices::nvmap>(nvmap_fd);
-    ASSERT(nvmap != nullptr);
-
-    R_ASSERT(FreeNvMapHandle(*nvmap, handle, nvmap_fd));
+    if (nvmap != nullptr) {
+        R_ASSERT(FreeNvMapHandle(*nvmap, handle, nvmap_fd));
+    }
 }
 
 constexpr auto SharedBufferBlockLinearFormat = android::PixelFormat::Rgba8888;
@@ -280,6 +283,20 @@ Result SharedBufferManager::CreateSession(Kernel::KProcess* owner_process, u64* 
         const u64 aruid = owner_process->GetProcessId();
         R_UNLESS(!m_sessions.contains(aruid), VI::ResultPermissionDenied);
 
+        // Allocate a non-overlapping presentation slot range for this session.
+        std::optional<u32> slot_base;
+        for (u32 idx = 0; idx < SharedBufferMaxSessions; ++idx) {
+            const u32 candidate = idx * SharedBufferSlotsPerSession;
+            const bool in_use = std::ranges::any_of(m_sessions, [&](const auto& entry) {
+                return entry.second.presentation_slot_base == candidate;
+            });
+            if (!in_use) {
+                slot_base = candidate;
+                break;
+            }
+        }
+        R_UNLESS(slot_base.has_value(), VI::ResultOperationFailed);
+
         // Allocate memory for the shared buffer if needed.
         if (!m_buffer_page_group) {
             R_TRY(AllocateSharedBufferMemory(std::addressof(m_buffer_page_group), m_system,
@@ -304,32 +321,57 @@ Result SharedBufferManager::CreateSession(Kernel::KProcess* owner_process, u64* 
         Common::ProcessAddress map_address{};
         R_TRY(MapSharedBufferIntoProcessAddressSpace(std::addressof(map_address), m_buffer_page_group,
                                                      owner_process, m_system));
+        auto map_guard = SCOPE_GUARD {
+            owner_process->GetPageTable().UnmapPageGroup(map_address, *m_buffer_page_group,
+                                                         Kernel::KMemoryState::IoMemory);
+        };
 
-        // Create new session.
-        auto [it, was_emplaced] = m_sessions.emplace(aruid, SharedBufferSession{});
-        auto& session = it->second;
+        // Create new session locally and commit only once all allocations succeed.
+        SharedBufferSession session{};
+        session.presentation_slot_base = *slot_base;
 
         auto& container = m_nvdrv->GetContainer();
         session.session_id = container.OpenSession(owner_process);
+        auto session_guard = SCOPE_GUARD {
+            container.CloseSession(session.session_id);
+        };
+
         session.nvmap_fd = m_nvdrv->Open("/dev/nvmap", session.session_id);
+        R_UNLESS(session.nvmap_fd != Nvidia::INVALID_NVDRV_FD, VI::ResultOperationFailed);
+        auto fd_guard = SCOPE_GUARD {
+            m_nvdrv->Close(session.nvmap_fd);
+        };
 
         // Create an nvmap handle for the buffer and assign the memory to it.
         R_TRY(AllocateHandleForBuffer(std::addressof(session.buffer_nvmap_handle), *m_nvdrv,
                                       session.nvmap_fd, map_address, SharedBufferSize));
+        auto handle_guard = SCOPE_GUARD {
+            FreeHandle(session.buffer_nvmap_handle, *m_nvdrv, session.nvmap_fd);
+        };
 
         // Create and open a layer for the display.
         s32 producer_binder_id;
         R_TRY(m_container.CreateStrayLayer(std::addressof(producer_binder_id),
                                            std::addressof(session.layer_id), display_id));
+        auto layer_guard = SCOPE_GUARD {
+            m_container.DestroyStrayLayer(session.layer_id);
+        };
 
         // Configure blending and z-index
-        R_ASSERT(m_container.SetLayerBlending(session.layer_id, enable_blending));
+        R_TRY(m_container.SetLayerBlending(session.layer_id, enable_blending));
 
         // Get the producer and set preallocated buffers.
         std::shared_ptr<android::BufferQueueProducer> producer;
         R_TRY(m_container.GetLayerProducerHandle(std::addressof(producer), session.layer_id));
         for (u32 i = 0; i < SharedBufferSlotsPerSession; i++)
             MakeGraphicBuffer(*producer, i, GetPresentationSlot(session.presentation_slot_base, i), session.buffer_nvmap_handle);
+
+        m_sessions.emplace(aruid, session);
+        layer_guard.Cancel();
+        handle_guard.Cancel();
+        fd_guard.Cancel();
+        session_guard.Cancel();
+        map_guard.Cancel();
 
         // Assign outputs.
         *out_buffer_id = m_buffer_id;

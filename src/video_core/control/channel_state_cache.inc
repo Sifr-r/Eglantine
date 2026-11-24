@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -25,15 +28,15 @@ void ChannelSetupCaches<P>::CreateChannel(struct Tegra::Control::ChannelState& c
         if (!free_channel_ids.empty()) {
             auto id = free_channel_ids.front();
             free_channel_ids.pop_front();
-            new (&channel_storage[id]) P(channel);
+            channel_storage[id].emplace(channel);
             return id;
         }
-        channel_storage.emplace_back(channel);
+        channel_storage.emplace_back(std::in_place, channel);
         return channel_storage.size() - 1;
     }();
     channel_map.emplace(channel.bind_id, new_id);
     if (current_channel_id != UNSET_CHANNEL) {
-        channel_state = &channel_storage[current_channel_id];
+        channel_state = &*channel_storage[current_channel_id];
     }
     active_channel_ids.push_back(new_id);
     auto as_it = address_spaces.find(channel.memory_manager->GetID());
@@ -45,6 +48,7 @@ void ChannelSetupCaches<P>::CreateChannel(struct Tegra::Control::ChannelState& c
         .ref_count = 1,
         .storage_id = address_spaces.size(),
         .gpu_memory = channel.memory_manager,
+        .owner = channel.memory_manager->weak_from_this(),
     };
     address_spaces.emplace(channel.memory_manager->GetID(), new_gpu_mem_ref);
     OnGPUASRegister(channel.memory_manager->GetID());
@@ -57,7 +61,9 @@ void ChannelSetupCaches<P>::BindToChannel(s32 id) {
     auto it = channel_map.find(id);
     ASSERT(it != channel_map.end() && id >= 0);
     current_channel_id = it->second;
-    channel_state = &channel_storage[current_channel_id];
+    current_bind_id = id;
+    ASSERT(channel_storage[current_channel_id].has_value());
+    channel_state = &*channel_storage[current_channel_id];
     maxwell3d = &channel_state->maxwell3d;
     kepler_compute = &channel_state->kepler_compute;
     gpu_memory = &channel_state->gpu_memory;
@@ -71,21 +77,26 @@ void ChannelSetupCaches<P>::EraseChannel(s32 id) {
     std::unique_lock<std::mutex> lk(config_mutex);
     const auto it = channel_map.find(id);
     ASSERT(it != channel_map.end() && id >= 0);
+    if (id < 0 || it == channel_map.end()) {
+        return;
+    }
     const auto this_id = it->second;
     free_channel_ids.push_back(this_id);
     channel_map.erase(it);
     if (this_id == current_channel_id) {
         current_channel_id = UNSET_CHANNEL;
+        current_bind_id = Tegra::Control::ChannelStateBridge::UnboundChannelId;
         channel_state = nullptr;
         maxwell3d = nullptr;
         kepler_compute = nullptr;
         gpu_memory = nullptr;
         program_id = 0;
     } else if (current_channel_id != UNSET_CHANNEL) {
-        channel_state = &channel_storage[current_channel_id];
+        channel_state = &*channel_storage[current_channel_id];
     }
     active_channel_ids.erase(
         std::find(active_channel_ids.begin(), active_channel_ids.end(), this_id));
+    channel_storage[this_id].reset();
 }
 
 } // namespace VideoCommon

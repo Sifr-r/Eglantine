@@ -31,6 +31,10 @@ namespace Tegra {
 class MemoryManager;
 } // namespace Tegra
 
+namespace Core {
+class Nx2SessionState;
+}
+
 namespace Service::Nvidia {
 class Module;
 }
@@ -52,6 +56,8 @@ DECLARE_ENUM_FLAG_OPERATORS(MappingFlags);
 
 class nvhost_as_gpu final : public nvdevice {
 public:
+    static constexpr DeviceKind Kind = DeviceKind::NvHostAsGpu;
+
     explicit nvhost_as_gpu(Core::System& system_, Module& module, NvCore::Container& core);
     ~nvhost_as_gpu() override;
 
@@ -240,6 +246,7 @@ private:
     void Nx2Map(u64 gpu_address, u64 cpu_address, u64 size);
     void Nx2Unmap(u64 gpu_address, u64 size);
     NvCore::SessionId nx2_session{};
+    std::weak_ptr<Core::Nx2SessionState> nx2_session_state;
     struct Nx2DeviceRange {
         DAddr address;
         bool heap; ///< Mapped through the session's heap mapper (else an SMMU allocation)

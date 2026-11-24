@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/memory.h"
@@ -34,6 +36,11 @@ ImageTransferProcessor::~ImageTransferProcessor() {
 };
 
 void ImageTransferProcessor::StartProcessor() {
+    std::scoped_lock lock{mutex};
+    StartProcessorLocked();
+}
+
+void ImageTransferProcessor::StartProcessorLocked() {
     is_active = true;
     device.camera_status = Core::IrSensor::IrCameraStatus::Available;
     device.camera_internal_status = Core::IrSensor::IrCameraInternalStatus::Ready;
@@ -49,38 +56,60 @@ void ImageTransferProcessor::OnControllerUpdate(Core::HID::ControllerTriggerType
     if (type != Core::HID::ControllerTriggerType::IrSensor) {
         return;
     }
+
+    const auto camera_data = npad_device->GetCamera();
+
+    std::scoped_lock lock{mutex};
     if (transfer_memory == 0 || transfer_memory_owner == nullptr) {
         return;
     }
 
     auto& memory = transfer_memory_owner->GetMemory();
 
-    const auto& camera_data = npad_device->GetCamera();
-
     // This indicates how much ambient light is present
     processor_state.ambient_noise_level = Core::IrSensor::CameraAmbientNoiseLevel::Low;
     processor_state.sampling_number = camera_data.sample;
 
+    const auto trimming_size = GetDataSize(current_config.trimming_format);
+
     if (camera_data.format != current_config.origin_format) {
         LOG_WARNING(Service_IRS, "Wrong Input format {} expected {}", camera_data.format,
                     current_config.origin_format);
-        memory.ZeroBlock(transfer_memory, GetDataSize(current_config.trimming_format));
+        if (trimming_size > 0) {
+            memory.ZeroBlock(transfer_memory, trimming_size);
+        }
         return;
     }
 
     if (current_config.origin_format > current_config.trimming_format) {
         LOG_WARNING(Service_IRS, "Origin format {} is smaller than trimming format {}",
                     current_config.origin_format, current_config.trimming_format);
-        memory.ZeroBlock(transfer_memory, GetDataSize(current_config.trimming_format));
+        if (trimming_size > 0) {
+            memory.ZeroBlock(transfer_memory, trimming_size);
+        }
         return;
     }
 
-    std::vector<u8> window_data{};
     const auto origin_width = GetDataWidth(current_config.origin_format);
     const auto origin_height = GetDataHeight(current_config.origin_format);
     const auto trimming_width = GetDataWidth(current_config.trimming_format);
     const auto trimming_height = GetDataHeight(current_config.trimming_format);
-    window_data.resize(GetDataSize(current_config.trimming_format));
+
+    if (origin_width == 0 || origin_height == 0 || trimming_width == 0 || trimming_height == 0) {
+        LOG_WARNING(Service_IRS, "Invalid format dimensions origin={} trimming={}",
+                    current_config.origin_format, current_config.trimming_format);
+        if (trimming_size > 0) {
+            memory.ZeroBlock(transfer_memory, trimming_size);
+        }
+        return;
+    }
+
+    if (camera_data.data.size() < origin_width * origin_height) {
+        LOG_WARNING(Service_IRS, "Camera data size {} is smaller than expected {}",
+                    camera_data.data.size(), origin_width * origin_height);
+        memory.ZeroBlock(transfer_memory, trimming_size);
+        return;
+    }
 
     if (trimming_width + current_config.trimming_start_x > origin_width ||
         trimming_height + current_config.trimming_start_y > origin_height) {
@@ -88,9 +117,11 @@ void ImageTransferProcessor::OnControllerUpdate(Core::HID::ControllerTriggerType
                     "Trimming area ({}, {}, {}, {}) is outside of origin area ({}, {})",
                     current_config.trimming_start_x, current_config.trimming_start_y,
                     trimming_width, trimming_height, origin_width, origin_height);
-        memory.ZeroBlock(transfer_memory, GetDataSize(current_config.trimming_format));
+        memory.ZeroBlock(transfer_memory, trimming_size);
         return;
     }
+
+    std::vector<u8> window_data(trimming_size);
 
     for (std::size_t y = 0; y < trimming_height; y++) {
         for (std::size_t x = 0; x < trimming_width; x++) {
@@ -102,56 +133,67 @@ void ImageTransferProcessor::OnControllerUpdate(Core::HID::ControllerTriggerType
         }
     }
 
-    memory.WriteBlock(transfer_memory, window_data.data(),
-                      GetDataSize(current_config.trimming_format));
+    memory.WriteBlock(transfer_memory, window_data.data(), trimming_size);
 
     if (!IsProcessorActive()) {
-        StartProcessor();
+        StartProcessorLocked();
     }
 }
 
 void ImageTransferProcessor::SetConfig(Core::IrSensor::PackedImageTransferProcessorConfig config) {
-    current_config.camera_config.exposure_time = config.camera_config.exposure_time;
-    current_config.camera_config.gain = config.camera_config.gain;
-    current_config.camera_config.is_negative_used = config.camera_config.is_negative_used;
-    current_config.camera_config.light_target =
-        static_cast<Core::IrSensor::CameraLightTarget>(config.camera_config.light_target);
-    current_config.origin_format =
-        static_cast<Core::IrSensor::ImageTransferProcessorFormat>(config.format);
-    current_config.trimming_format =
-        static_cast<Core::IrSensor::ImageTransferProcessorFormat>(config.format);
-    current_config.trimming_start_x = 0;
-    current_config.trimming_start_y = 0;
+    Core::IrSensor::ImageTransferProcessorFormat origin_format{};
+    {
+        std::scoped_lock lock{mutex};
+        current_config.camera_config.exposure_time = config.camera_config.exposure_time;
+        current_config.camera_config.gain = config.camera_config.gain;
+        current_config.camera_config.is_negative_used = config.camera_config.is_negative_used;
+        current_config.camera_config.light_target =
+            static_cast<Core::IrSensor::CameraLightTarget>(config.camera_config.light_target);
+        current_config.origin_format =
+            static_cast<Core::IrSensor::ImageTransferProcessorFormat>(config.format);
+        current_config.trimming_format =
+            static_cast<Core::IrSensor::ImageTransferProcessorFormat>(config.format);
+        current_config.trimming_start_x = 0;
+        current_config.trimming_start_y = 0;
+        origin_format = current_config.origin_format;
+    }
 
-    npad_device->SetCameraFormat(current_config.origin_format);
+    npad_device->SetCameraFormat(origin_format);
 }
 
 void ImageTransferProcessor::SetConfig(
     Core::IrSensor::PackedImageTransferProcessorExConfig config) {
-    current_config.camera_config.exposure_time = config.camera_config.exposure_time;
-    current_config.camera_config.gain = config.camera_config.gain;
-    current_config.camera_config.is_negative_used = config.camera_config.is_negative_used;
-    current_config.camera_config.light_target =
-        static_cast<Core::IrSensor::CameraLightTarget>(config.camera_config.light_target);
-    current_config.origin_format =
-        static_cast<Core::IrSensor::ImageTransferProcessorFormat>(config.origin_format);
-    current_config.trimming_format =
-        static_cast<Core::IrSensor::ImageTransferProcessorFormat>(config.trimming_format);
-    current_config.trimming_start_x = config.trimming_start_x;
-    current_config.trimming_start_y = config.trimming_start_y;
+    Core::IrSensor::ImageTransferProcessorFormat origin_format{};
+    {
+        std::scoped_lock lock{mutex};
+        current_config.camera_config.exposure_time = config.camera_config.exposure_time;
+        current_config.camera_config.gain = config.camera_config.gain;
+        current_config.camera_config.is_negative_used = config.camera_config.is_negative_used;
+        current_config.camera_config.light_target =
+            static_cast<Core::IrSensor::CameraLightTarget>(config.camera_config.light_target);
+        current_config.origin_format =
+            static_cast<Core::IrSensor::ImageTransferProcessorFormat>(config.origin_format);
+        current_config.trimming_format =
+            static_cast<Core::IrSensor::ImageTransferProcessorFormat>(config.trimming_format);
+        current_config.trimming_start_x = config.trimming_start_x;
+        current_config.trimming_start_y = config.trimming_start_y;
+        origin_format = current_config.origin_format;
+    }
 
-    npad_device->SetCameraFormat(current_config.origin_format);
+    npad_device->SetCameraFormat(origin_format);
 }
 
 void ImageTransferProcessor::SetTransferMemoryAddress(Common::ProcessAddress t_mem,
                                                       Kernel::KProcess* owner) {
+    std::scoped_lock lock{mutex};
     transfer_memory = t_mem;
     transfer_memory_owner = owner;
 }
 
 Core::IrSensor::ImageTransferProcessorState ImageTransferProcessor::GetState(
     std::span<u8> data) const {
-    if (transfer_memory_owner == nullptr)
+    std::scoped_lock lock{mutex};
+    if (transfer_memory == 0 || transfer_memory_owner == nullptr)
         return processor_state;
 
     const auto size = (std::min)(GetDataSize(current_config.trimming_format), data.size());

@@ -45,21 +45,28 @@ std::size_t XTSEncryptionLayer::Read(u8* data, std::size_t length, std::size_t o
             if (got == 0)
                 return total_read;
 
+            const std::size_t local_offset = (s == 0) ? sector_offset : 0;
+            if (local_offset >= got)
+                return total_read;
+
             if (got < XTS_SECTOR_SIZE)
                 std::memset(sector.data() + got, 0, XTS_SECTOR_SIZE - got);
 
             cipher.XTSTranscode(sector.data(), XTS_SECTOR_SIZE, sector.data(), index, XTS_SECTOR_SIZE,
                                 Op::Decrypt);
 
-            const std::size_t local_offset = (s == 0) ? sector_offset : 0;
-            const std::size_t available = XTS_SECTOR_SIZE - local_offset;
-            const std::size_t to_copy = std::min<std::size_t>(available, remaining);
+            const std::size_t valid_bytes = (std::min)(got, XTS_SECTOR_SIZE);
+            const std::size_t available = valid_bytes - local_offset;
+            const std::size_t to_copy = (std::min)(available, remaining);
             std::memcpy(out, sector.data() + local_offset, to_copy);
 
             out += to_copy;
             current_offset += to_copy;
             remaining -= to_copy;
             total_read += to_copy;
+
+            if (got < XTS_SECTOR_SIZE)
+                return total_read;
         }
     }
 

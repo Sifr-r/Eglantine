@@ -54,7 +54,7 @@ Result NpadAbstractButtonHandler::UpdateAllButtonWithHomeProtection(u64 aruid) {
     const Core::HID::NpadIdType npad_id = properties_handler->GetNpadId();
     auto* data = applet_resource_holder->applet_resource->GetAruidData(aruid);
 
-    if (data == nullptr) {
+    if (data == nullptr || !data->flag.is_assigned || data->shared_memory_format == nullptr) {
         return ResultSuccess;
     }
 
@@ -79,6 +79,9 @@ void NpadAbstractButtonHandler::UpdateAllButtonLifo() {
     Core::HID::NpadIdType npad_id = properties_handler->GetNpadId();
     for (std::size_t i = 0; i < AruidIndexMax; i++) {
         auto* data = applet_resource_holder->applet_resource->GetAruidDataByIndex(i);
+        if (data == nullptr || !data->flag.is_assigned || data->shared_memory_format == nullptr) {
+            continue;
+        }
         auto& npad_entry = data->shared_memory_format->npad.npad_entry[NpadIdTypeToIndex(npad_id)];
         UpdateButtonLifo(npad_entry, data->aruid);
     }
@@ -88,6 +91,9 @@ void NpadAbstractButtonHandler::UpdateCoreBatteryState() {
     Core::HID::NpadIdType npad_id = properties_handler->GetNpadId();
     for (std::size_t i = 0; i < AruidIndexMax; i++) {
         auto* data = applet_resource_holder->applet_resource->GetAruidDataByIndex(i);
+        if (data == nullptr || !data->flag.is_assigned || data->shared_memory_format == nullptr) {
+            continue;
+        }
         auto& npad_entry = data->shared_memory_format->npad.npad_entry[NpadIdTypeToIndex(npad_id)];
         UpdateButtonLifo(npad_entry, data->aruid);
     }
@@ -96,7 +102,7 @@ void NpadAbstractButtonHandler::UpdateCoreBatteryState() {
 void NpadAbstractButtonHandler::UpdateButtonState(u64 aruid) {
     Core::HID::NpadIdType npad_id = properties_handler->GetNpadId();
     auto* data = applet_resource_holder->applet_resource->GetAruidData(aruid);
-    if (data == nullptr) {
+    if (data == nullptr || !data->flag.is_assigned || data->shared_memory_format == nullptr) {
         return;
     }
     auto& npad_entry = data->shared_memory_format->npad.npad_entry[NpadIdTypeToIndex(npad_id)];
@@ -112,7 +118,7 @@ Result NpadAbstractButtonHandler::SetHomeProtection(bool is_enabled, u64 aruid) 
     }
 
     auto* data = applet_resource_holder->applet_resource->GetAruidData(aruid);
-    if (data == nullptr) {
+    if (data == nullptr || !data->flag.is_assigned || data->shared_memory_format == nullptr) {
         return ResultSuccess;
     }
 

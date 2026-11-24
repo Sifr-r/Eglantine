@@ -1,8 +1,9 @@
 # Phase 1A — Rust CMake Foundation & Ampere SM86 Lowering Parity (`ampere_core`)
 
 > [!NOTE]
-> The Rust crate, C ABI, and Windows differential harness exist under [rust/](../rust/). The [CMake helper](../CMakeModules/AddRustCrate.cmake) exists, but the emulator build does not call it. The emulator currently uses the C++ lowering implementation.
-> Capture the [Phase 0 baseline](00_PREREQUISITES_AND_BASELINE.md) before wiring the prototype into the emulator. All switches and bridge changes below are proposed unless identified as existing.
+> **Integrated, runtime opt-in.** The [current build](../CMakeLists.txt) calls the [CMake helper](../CMakeModules/AddRustCrate.cmake) to link the unified Rust FFI archive. C++ remains the default. The [lowering entry point](../src/shader_recompiler/frontend/ampere/lower_to_maxwell.h) implements `EDEN_NX2_RUST_AMPERE` and `EDEN_NX2_RUST_AMPERE_VERIFY`. Run the [in-tree parity tests](../src/tests/video_core/ampere_rust_parity.cpp) with `[ampere]` and record the [Phase 0 baseline](00_PREREQUISITES_AND_BASELINE.md).
+>
+> The sections below preserve the original integration proposal. Use the [architecture ledger](../ARCHITECTURE.md#first-party-language-and-domain-ownership) for current target names, switches and parity requirements.
 
 ---
 
@@ -138,7 +139,7 @@ Every file in the repository referencing `frontend/ampere/*` or `Shader::Ampere:
 
 ## 5. Verify and roll back
 
-### Standalone checks available now
+### Standalone checks from the original rollout
 
 From the repository root, use Cargo's locked workspace to test and build the prototype.
 
@@ -166,7 +167,7 @@ if ($LASTEXITCODE -ne 0) { throw 'C++ and Rust differ' }
 
 Record the case and mismatch counts with the compiler versions. A passing harness covers its corpus. It does not exercise capture and lowering through an emulator frontend.
 
-### Emulator gates after integration
+### Proposed emulator rollout gates
 
 1. Configure one build with `-DENABLE_RUST_AMPERE=OFF` and one with `-DENABLE_RUST_AMPERE=ON`, using the same project options. In each build run `cmake --build <build-dir> --target yuzu yuzu-cmd tests --parallel` with the actual directory substituted.
 2. Run the built tests with `"[ampere]"` and `"[video_core]"` in the C++ build. Repeat in the enabled build in three fresh processes per suite: both switches unset, verification only, then Rust only. Record the selected implementation and comparison count. Verification must exercise both implementations and report zero differences.

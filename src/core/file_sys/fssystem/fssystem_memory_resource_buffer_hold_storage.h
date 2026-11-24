@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <new>
+
 #include "core/file_sys/fssystem/fs_i_storage.h"
 
 namespace FileSys {
@@ -13,7 +15,7 @@ class MemoryResourceBufferHoldStorage : public IStorage {
 
 public:
     MemoryResourceBufferHoldStorage(VirtualFile storage, size_t buffer_size)
-        : m_storage(std::move(storage)), m_buffer(::operator new(buffer_size)),
+        : m_storage(std::move(storage)), m_buffer(::operator new(buffer_size, std::nothrow)),
           m_buffer_size(buffer_size) {}
 
     virtual ~MemoryResourceBufferHoldStorage() {

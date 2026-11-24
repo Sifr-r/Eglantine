@@ -34,11 +34,12 @@ class RasterizerInterface;
 
 namespace Core {
 class System;
+struct PlatformProfile;
 } // namespace Core
 
 namespace Tegra {
 
-class MemoryManager final {
+class MemoryManager final : public std::enable_shared_from_this<MemoryManager> {
 public:
     explicit MemoryManager(Core::System& system_, u64 address_space_bits_ = 40,
                            GPUVAddr split_address = 1ULL << 34, u64 big_page_bits_ = 16,
@@ -60,6 +61,10 @@ public:
         return native_tiling;
     }
     bool IsShuttingDown() const;
+    [[nodiscard]] const Core::PlatformProfile& Platform() const;
+    [[nodiscard]] Core::System& System() const noexcept {
+        return system;
+    }
 
     static constexpr bool HAS_FLUSH_INVALIDATION = true;
 
@@ -103,7 +108,11 @@ public:
 
     template <typename T>
     [[nodiscard]] inline const T* GetPointer(GPUVAddr addr) const noexcept {
-        return GetPointer<T*>(addr);
+        const auto address = GpuToCpuAddress(addr);
+        if (!address) {
+            return {};
+        }
+        return memory.GetPointer<T>(*address);
     }
 
     /**

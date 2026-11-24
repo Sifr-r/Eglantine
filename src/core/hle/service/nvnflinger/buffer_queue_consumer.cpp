@@ -281,37 +281,49 @@ void BufferQueueConsumer::Transact(u32 code, std::span<const u8> parcel_data,
     InputParcel parcel_in{parcel_data};
     OutputParcel parcel_out{};
 
-    switch (static_cast<TransactionId>(code)) {
-    case TransactionId::AcquireBuffer: {
-        BufferItem item;
-        const s64 present_when = parcel_in.Read<s64>();
+    if (!parcel_in.IsValid()) {
+        status = Status::BadValue;
+    } else {
+        switch (static_cast<TransactionId>(code)) {
+        case TransactionId::AcquireBuffer: {
+            BufferItem item;
+            const s64 present_when = parcel_in.Read<s64>();
+            if (!parcel_in.IsValid()) {
+                status = Status::BadValue;
+                break;
+            }
 
-        status = AcquireBuffer(&item, std::chrono::nanoseconds{present_when});
+            status = AcquireBuffer(&item, std::chrono::nanoseconds{present_when});
 
-        // TODO: can't write this directly, needs a flattener for the sp<GraphicBuffer>
-        // parcel_out.WriteFlattened(item);
-        UNREACHABLE();
-    }
-    case TransactionId::ReleaseBuffer: {
-        const s32 slot = parcel_in.Read<s32>();
-        const u64 frame_number = parcel_in.Read<u64>();
-        const auto release_fence = parcel_in.ReadFlattened<Fence>();
+            // TODO: can't write this directly, needs a flattener for the sp<GraphicBuffer>
+            // parcel_out.WriteFlattened(item);
+            UNREACHABLE();
+        }
+        case TransactionId::ReleaseBuffer: {
+            const s32 slot = parcel_in.Read<s32>();
+            const u64 frame_number = parcel_in.Read<u64>();
+            const auto release_fence = parcel_in.ReadFlattened<Fence>();
+            if (!parcel_in.IsValid()) {
+                status = Status::BadValue;
+                break;
+            }
 
-        status = ReleaseBuffer(slot, frame_number, release_fence);
+            status = ReleaseBuffer(slot, frame_number, release_fence);
 
-        break;
-    }
-    case TransactionId::GetReleasedBuffers: {
-        u64 slot_mask = 0;
+            break;
+        }
+        case TransactionId::GetReleasedBuffers: {
+            u64 slot_mask = 0;
 
-        status = GetReleasedBuffers(&slot_mask);
+            status = GetReleasedBuffers(&slot_mask);
 
-        parcel_out.Write(slot_mask);
-        break;
-    }
-    default:
-        ASSERT_MSG(false, "called, code={} flags={}", code, flags);
-        break;
+            parcel_out.Write(slot_mask);
+            break;
+        }
+        default:
+            ASSERT_MSG(false, "called, code={} flags={}", code, flags);
+            break;
+        }
     }
 
     parcel_out.Write(status);

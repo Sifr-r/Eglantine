@@ -51,8 +51,10 @@ namespace {
 bool IsConnectionBased(Type type) {
     switch (type) {
     case Type::STREAM:
+    case Type::SEQPACKET:
         return true;
     case Type::DGRAM:
+    case Type::RAW:
         return false;
     default:
         UNIMPLEMENTED_MSG("Unimplemented type={}", type);
@@ -2889,6 +2891,53 @@ BSD_USA::~BSD_USA() {
         room_member->Unbind(proxy_packet_received);
     }
     proxy_packet_received.reset();
+
+    std::array<std::optional<FileDescriptor>, MAX_FD> closed_descriptors{};
+    {
+        std::scoped_lock fd_lock{file_descriptors_mutex};
+        for (size_t fd = 0; fd < file_descriptors.size(); ++fd) {
+            if (!file_descriptors[fd]) {
+                continue;
+            }
+            closed_descriptors[fd] = std::move(*file_descriptors[fd]);
+            file_descriptors[fd].reset();
+            ++file_descriptor_generations[fd];
+            if (closed_descriptors[fd]->event_fd) {
+                closed_descriptors[fd]->event_fd->DescriptorClosed();
+            }
+        }
+    }
+
+    std::vector<EventFdState*> closed_event_fds;
+    std::vector<Network::SocketBase*> closed_sockets;
+    for (auto& entry : closed_descriptors) {
+        if (!entry) {
+            continue;
+        }
+        if (entry->event_fd) {
+            auto* const event_fd_ptr = entry->event_fd.get();
+            if (std::find(closed_event_fds.begin(), closed_event_fds.end(), event_fd_ptr) ==
+                closed_event_fds.end()) {
+                closed_event_fds.push_back(event_fd_ptr);
+                if (select_notifier) {
+                    select_notifier->NotifyChange();
+                }
+                entry->event_fd->Close();
+            }
+            continue;
+        }
+        if (entry->socket && !entry->socket_closed) {
+            auto* const socket_ptr = entry->socket.get();
+            if (std::find(closed_sockets.begin(), closed_sockets.end(), socket_ptr) ==
+                closed_sockets.end()) {
+                closed_sockets.push_back(socket_ptr);
+                if (select_notifier) {
+                    select_notifier->NotifyChange(socket_ptr);
+                }
+                entry->socket->Close();
+            }
+        }
+    }
 }
 
 std::unique_lock<std::mutex> BSD_USA::LockService() noexcept {

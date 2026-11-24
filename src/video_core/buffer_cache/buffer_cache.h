@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <string>
 #include <atomic>
 #include <memory>
@@ -550,24 +551,56 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
 
 template <class P>
 bool BufferCache<P>::DMAClear(GPUVAddr dst_address, u64 amount, u32 value) {
+    if (amount == 0 || amount > (std::numeric_limits<size_t>::max)() / sizeof(u32)) {
+        return false;
+    }
     const std::optional<DAddr> cpu_dst_address = gpu_memory->GpuToCpuAddress(dst_address);
     if (!cpu_dst_address) {
         return false;
     }
-    const bool dest_dirty = IsRegionRegistered(*cpu_dst_address, amount);
-    if (!dest_dirty) {
+    const DAddr max_area = device_memory.MaxDeviceArea();
+    if (*cpu_dst_address >= max_area) {
+        return false;
+    }
+    const size_t raw_size = static_cast<size_t>(amount) * sizeof(u32);
+    const size_t size = Common::AlignDown(
+        static_cast<size_t>((std::min)(static_cast<u64>(raw_size), max_area - *cpu_dst_address)),
+        sizeof(u32));
+    if (size == 0 || !IsRegionRegistered(*cpu_dst_address, size)) {
         return false;
     }
 
-    const size_t size = amount * sizeof(u32);
     ClearDownload(*cpu_dst_address, size);
     gpu_modified_ranges.Subtract(*cpu_dst_address, size);
 
-    const BufferId buffer = FindBuffer(*cpu_dst_address, static_cast<u32>(size), false);
-    Buffer& dest_buffer = slot_buffers[buffer];
-    const u32 offset = dest_buffer.Offset(*cpu_dst_address);
-    runtime.ClearBuffer(dest_buffer, offset, size, value);
-    dest_buffer.MarkUsage(offset, size);
+    constexpr size_t max_chunk_size = size_t{1} << 31;
+    if (size <= max_chunk_size) {
+        const BufferId buffer = FindBuffer(*cpu_dst_address, static_cast<u32>(size), false);
+        if (buffer != NULL_BUFFER_ID) {
+            Buffer& dest_buffer = slot_buffers[buffer];
+            const u32 offset = dest_buffer.Offset(*cpu_dst_address);
+            runtime.ClearBuffer(dest_buffer, offset, size, value);
+            dest_buffer.MarkUsage(offset, size);
+        }
+        return true;
+    }
+
+    DAddr cur_addr = *cpu_dst_address;
+    size_t remaining = size;
+    while (remaining > 0) {
+        const u32 chunk_size = static_cast<u32>((std::min)(remaining, max_chunk_size));
+        if (IsRegionRegistered(cur_addr, chunk_size)) {
+            const BufferId buffer = FindBuffer(cur_addr, chunk_size, false);
+            if (buffer != NULL_BUFFER_ID) {
+                Buffer& dest_buffer = slot_buffers[buffer];
+                const u32 offset = dest_buffer.Offset(cur_addr);
+                runtime.ClearBuffer(dest_buffer, offset, chunk_size, value);
+                dest_buffer.MarkUsage(offset, chunk_size);
+            }
+        }
+        cur_addr += chunk_size;
+        remaining -= chunk_size;
+    }
     return true;
 }
 
@@ -2982,6 +3015,9 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
     bool has_stream_leap = false;
     auto expand_begin = [&](DAddr add_value) {
         static constexpr DAddr min_page = CACHING_PAGESIZE + Core::DEVICE_PAGESIZE;
+        if (begin <= min_page) {
+            return;
+        }
         if (add_value > begin - min_page) {
             begin = min_page;
             device_addr = Core::DEVICE_PAGESIZE;
@@ -2991,8 +3027,8 @@ typename BufferCache<P>::OverlapResult BufferCache<P>::ResolveOverlaps(DAddr dev
         device_addr = begin - CACHING_PAGESIZE;
     };
     auto expand_end = [&](DAddr add_value) {
-        static constexpr DAddr max_page = 1ULL << Tegra::MaxwellDeviceMemoryManager::AS_BITS;
-        if (add_value > max_page - end) {
+        const DAddr max_page = device_memory.MaxDeviceArea();
+        if (end >= max_page || add_value > max_page - end) {
             end = max_page;
             return;
         }
@@ -3615,7 +3651,10 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     // (Ocarina of Time draws from several channels: descriptors ended up ~100 MiB past 128 KiB
     // buffers and the GPU faulted).
     for (const size_t other_id : active_channel_ids) {
-        BufferCacheChannelInfo& other = channel_storage[other_id];
+        if (!channel_storage[other_id].has_value()) {
+            continue;
+        }
+        BufferCacheChannelInfo& other = *channel_storage[other_id];
         if (&other == channel_state) {
             continue;
         }

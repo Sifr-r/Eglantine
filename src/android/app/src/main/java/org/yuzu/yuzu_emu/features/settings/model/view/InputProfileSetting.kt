@@ -7,7 +7,7 @@ import org.yuzu.yuzu_emu.R
 import org.yuzu.yuzu_emu.features.input.NativeInput
 import org.yuzu.yuzu_emu.utils.NativeConfig
 
-class InputProfileSetting(private val playerIndex: Int) :
+class InputProfileSetting(val playerIndex: Int) :
     SettingsItem(emptySetting, R.string.profile, "", 0, "") {
     override val type = TYPE_INPUT_PROFILE
 

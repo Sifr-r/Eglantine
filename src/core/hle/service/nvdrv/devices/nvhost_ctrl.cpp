@@ -30,15 +30,45 @@ namespace Service::Nvidia::Devices {
 
 nvhost_ctrl::nvhost_ctrl(Core::System& system_, EventInterface& events_interface_,
                          NvCore::Container& core_)
-    : nvdevice{system_}, events_interface{events_interface_}, core{core_},
-      syncpoint_manager{core_.GetSyncpointManager()} {}
+    : nvdevice{system_, Kind}, events_interface{events_interface_}, core{core_},
+      syncpoint_manager{core_.GetSyncpointManager()},
+      shared_state{std::make_shared<SharedState>()} {}
 
 nvhost_ctrl::~nvhost_ctrl() {
+    auto lock = NvEventsLock();
+    auto& host1x_syncpoint_manager = system.Host1x().GetSyncpointManager();
+    auto& events = shared_state->events;
     for (auto& event : events) {
         if (!event.registered) {
             continue;
         }
+        if (event.status.load(std::memory_order_acquire) == EventState::Waiting) {
+            bool should_deregister = false;
+            {
+                std::scoped_lock cb_lock{shared_state->callback_mutex};
+                if (event.status.load(std::memory_order_relaxed) == EventState::Waiting) {
+                    event.status.store(EventState::Cancelling, std::memory_order_release);
+                    should_deregister = true;
+                }
+            }
+            if (should_deregister) {
+                host1x_syncpoint_manager.DeregisterHostAction(event.assigned_syncpt,
+                                                              event.wait_handle);
+                event.wait_handle = {};
+            }
+        }
+    }
+
+    std::scoped_lock cb_lock{shared_state->callback_mutex};
+    shared_state->alive = false;
+    for (auto& event : events) {
+        if (!event.registered) {
+            continue;
+        }
+        event.status.store(EventState::Cancelled, std::memory_order_release);
         events_interface.FreeEvent(event.kevent);
+        event.kevent = nullptr;
+        event.registered = false;
     }
 }
 
@@ -99,8 +129,10 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
 
     bool must_unmark_fail = !is_allocation;
     const u32 event_id = params.value.raw;
+    auto& events = shared_state->events;
     SCOPE_EXIT {
-        if (must_unmark_fail) {
+        if (must_unmark_fail && event_id < events.size()) {
+            auto lock = NvEventsLock();
             events[event_id].fails = 0;
         }
     };
@@ -207,14 +239,21 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
     }
     params.value.raw |= slot;
 
-    event.wait_handle =
-        host1x_syncpoint_manager.RegisterHostAction(fence_id, target_value, [this, slot]() {
-            auto& event_ = events[slot];
-            if (event_.status.exchange(EventState::Signalling, std::memory_order_acq_rel) ==
-                EventState::Waiting) {
-                event_.kevent->Signal(system.Kernel());
+    event.wait_handle = host1x_syncpoint_manager.RegisterHostAction(
+        fence_id, target_value, [state = shared_state, &kernel = system.Kernel(), slot]() {
+            std::scoped_lock cb_lock{state->callback_mutex};
+            if (!state->alive) {
+                return;
             }
-            event_.status.store(EventState::Signalled, std::memory_order_release);
+            auto& event_ = state->events[slot];
+            EventState expected = EventState::Waiting;
+            if (event_.status.compare_exchange_strong(expected, EventState::Signalling,
+                                                      std::memory_order_acq_rel)) {
+                if (event_.kevent != nullptr) {
+                    event_.kevent->Signal(kernel);
+                }
+                event_.status.store(EventState::Signalled, std::memory_order_release);
+            }
         });
     return NvResult::Timeout;
 }
@@ -224,7 +263,7 @@ NvResult nvhost_ctrl::FreeEvent(u32 slot) {
         return NvResult::BadParameter;
     }
 
-    auto& event = events[slot];
+    auto& event = shared_state->events[slot];
 
     if (!event.registered) {
         return NvResult::Success;
@@ -247,7 +286,7 @@ NvResult nvhost_ctrl::IocCtrlEventRegister(IocCtrlEventRegisterParams& params) {
 
     auto lock = NvEventsLock();
 
-    if (events[event_id].registered) {
+    if (shared_state->events[event_id].registered) {
         const auto result = FreeEvent(event_id);
         if (result != NvResult::Success) {
             return result;
@@ -291,17 +330,32 @@ NvResult nvhost_ctrl::IocCtrlClearEventWait(IocCtrlEventClearParams& params) {
 
     auto lock = NvEventsLock();
 
-    auto& event = events[event_id];
-    if (event.status.exchange(EventState::Cancelling, std::memory_order_acq_rel) ==
-        EventState::Waiting) {
+    auto& event = shared_state->events[event_id];
+    if (!event.registered || event.kevent == nullptr) {
+        return NvResult::BadParameter;
+    }
+
+    bool should_deregister = false;
+    {
+        std::scoped_lock cb_lock{shared_state->callback_mutex};
+        EventState expected = EventState::Waiting;
+        if (event.status.compare_exchange_strong(expected, EventState::Cancelling,
+                                                 std::memory_order_acq_rel)) {
+            should_deregister = true;
+        }
+    }
+    if (should_deregister) {
         auto& host1x_syncpoint_manager = system.Host1x().GetSyncpointManager();
         host1x_syncpoint_manager.DeregisterHostAction(event.assigned_syncpt, event.wait_handle);
         syncpoint_manager.UpdateMin(event.assigned_syncpt);
         event.wait_handle = {};
     }
-    event.fails++;
-    event.status.store(EventState::Cancelled, std::memory_order_release);
-    event.kevent->Clear(system.Kernel());
+    {
+        std::scoped_lock cb_lock{shared_state->callback_mutex};
+        event.fails++;
+        event.status.store(EventState::Cancelled, std::memory_order_release);
+        event.kevent->Clear(system.Kernel());
+    }
 
     return NvResult::Success;
 }
@@ -322,7 +376,7 @@ Kernel::KEvent* nvhost_ctrl::QueryEvent(u32 event_id) {
 
     auto lock = NvEventsLock();
 
-    auto& event = events[slot];
+    auto& event = shared_state->events[slot];
     if (event.registered && event.assigned_syncpt == syncpoint_id) {
         ASSERT(event.kevent);
         return event.kevent;
@@ -337,7 +391,7 @@ std::unique_lock<std::mutex> nvhost_ctrl::NvEventsLock() {
 }
 
 void nvhost_ctrl::CreateNvEvent(u32 event_id) {
-    auto& event = events[event_id];
+    auto& event = shared_state->events[event_id];
     ASSERT(!event.kevent);
     ASSERT(!event.registered);
     ASSERT(!event.IsBeingUsed());
@@ -351,7 +405,8 @@ void nvhost_ctrl::CreateNvEvent(u32 event_id) {
 }
 
 void nvhost_ctrl::FreeNvEvent(u32 event_id) {
-    auto& event = events[event_id];
+    std::scoped_lock cb_lock{shared_state->callback_mutex};
+    auto& event = shared_state->events[event_id];
     ASSERT(event.kevent);
     ASSERT(event.registered);
     ASSERT(!event.IsBeingUsed());
@@ -367,7 +422,7 @@ u32 nvhost_ctrl::FindFreeNvEvent(u32 syncpoint_id) {
     u32 slot{MaxNvEvents};
     u32 free_slot{MaxNvEvents};
     for (u32 i = 0; i < MaxNvEvents; i++) {
-        auto& event = events[i];
+        auto& event = shared_state->events[i];
         if (event.registered) {
             if (!event.IsBeingUsed()) {
                 slot = i;

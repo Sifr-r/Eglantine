@@ -6,12 +6,15 @@
 # Usage: oot_survey.sh <tag> [steps]
 set -u
 TAG=${1:-survey}; STEPS=${2:-8}
-cd ${REPO:-/home/kraibse/clones/Eglantine}
+cd "${REPO:-/home/kraibse/clones/Eglantine}" || exit 1
 D=${D:-$HOME/.hermes/cache/scratch/ootlab}
 OUT=$D/survey_$TAG
 L=(python3 -I tools/nx2/lab_ctl.py -d $D)
 rm -rf $OUT; mkdir -p $OUT
-zsh .claude/skills/nx2-lab-automation/scripts/to_gameplay.sh --max-seconds 300 || exit 1
+D="$D" zsh .claude/skills/nx2-lab-automation/scripts/to_gameplay.sh --max-seconds 300 || {
+  $L stop > /dev/null 2>&1
+  exit 1
+}
 for i in $(seq 1 $STEPS); do
   printf '82 1400\n' > $D/keys.txt
   sleep 2.2
@@ -29,8 +32,13 @@ fi
 /usr/bin/python3 - "$OUT" <<'EOF'
 import sys, glob, os
 from PIL import Image
-files = sorted(glob.glob(os.path.join(sys.argv[1], '*.png')), key=lambda p: (p.split('_')[1][0], p))
-files = sorted(files, key=lambda p: (int(p.split('_')[-1].split('.')[0]), p.split('/')[-1].split('_')[0]))
+files = sorted(
+    glob.glob(os.path.join(sys.argv[1], '*.png')),
+    key=lambda p: (
+        int(os.path.basename(p).rsplit('_', 1)[-1].split('.', 1)[0]),
+        0 if os.path.basename(p).startswith('step_') else 1,
+    ),
+)
 cols = 4
 rows = (len(files) + cols - 1) // cols
 sheet = Image.new('RGB', (cols * 480, rows * 270))

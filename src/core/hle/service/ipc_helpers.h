@@ -44,6 +44,7 @@ struct ResponseBuilder {
 
         IPC::CommandHeader header{};
         auto const mgr = ctx.GetManager().get();
+        const bool is_domain = mgr != nullptr && mgr->IsDomain();
 
         // The entire size of the raw data section in u32 units, including the 16 bytes of mandatory
         // padding.
@@ -51,13 +52,13 @@ struct ResponseBuilder {
         u32 num_handles_to_move{};
         u32 num_domain_objects{};
         const bool always_move_handles = (u32(flags) & u32(Flags::AlwaysMoveHandles)) != 0;
-        if (!mgr->IsDomain() || always_move_handles) {
+        if (!is_domain || always_move_handles) {
             num_handles_to_move = num_objects_to_move;
         } else {
             num_domain_objects = num_objects_to_move;
         }
 
-        if (mgr->IsDomain()) {
+        if (is_domain) {
             raw_data_size += u32(sizeof(DomainMessageHeader) / sizeof(u32) + num_domain_objects);
             ctx.write_size += num_domain_objects;
         }
@@ -65,7 +66,7 @@ struct ResponseBuilder {
         if (ctx.IsTipc()) {
             header.type.Assign(ctx.GetCommandType());
         } else {
-            raw_data_size += u32(sizeof(IPC::DataPayloadHeader) / sizeof(u32) + 4 + normal_params_size);
+            raw_data_size += u32(sizeof(IPC::DataPayloadHeader) / sizeof(u32) + 4);
         }
 
         header.data_size.Assign(raw_data_size);
@@ -86,7 +87,7 @@ struct ResponseBuilder {
         if (!ctx.IsTipc()) {
             AlignWithPadding();
 
-            if (mgr->IsDomain() && ctx.HasDomainMessageHeader()) {
+            if (is_domain && ctx.HasDomainMessageHeader()) {
                 IPC::DomainMessageHeader domain_header{};
                 domain_header.num_objects = num_domain_objects;
                 PushRaw(domain_header);
@@ -100,7 +101,7 @@ struct ResponseBuilder {
 
         ctx.data_payload_offset = index;
         ctx.write_size += index;
-        ctx.domain_offset = u32(index + raw_data_size / sizeof(u32));
+        ctx.domain_offset = index + normal_params_size + num_domain_objects;
     }
 
     inline void Skip(u32 size_in_words, bool set_to_null) {
@@ -289,20 +290,18 @@ struct RequestParser {
     inline explicit RequestParser(u32* command_buffer) : cmdbuf(command_buffer) {}
     inline explicit RequestParser(Service::HLERequestContext& ctx)
         : cmdbuf(ctx.CommandBuffer())
-    {
-        // TIPC does not have data payload offset
-        if (!ctx.IsTipc()) {
-            ASSERT_MSG(ctx.GetDataPayloadOffset(), "context is incomplete");
-            Skip(ctx.GetDataPayloadOffset(), false);
-        }
-        // Skip the u64 command id, it's already stored in the context
-        static constexpr u32 CommandIdSize = 2;
-        Skip(CommandIdSize, false);
-    }
+        , index(ctx.GetRequestArgumentOffset()) {}
 
     inline void Skip(u32 size_in_words, bool set_to_null) {
-        if (set_to_null) std::memset(cmdbuf + index, 0, size_in_words * sizeof(u32));
+        if (!CanRead(size_in_words)) {
+            index = COMMAND_BUFFER_LENGTH;
+            return;
+        }
+        if (set_to_null && size_in_words != 0) std::memset(cmdbuf + index, 0, size_in_words * sizeof(u32));
         index += size_in_words;
+    }
+    inline bool CanRead(std::size_t words) const {
+        return index <= COMMAND_BUFFER_LENGTH && words <= COMMAND_BUFFER_LENGTH - index;
     }
     /// @brief Aligns the current position forward to a 16-byte boundary, padding with zeros.
     inline void AlignWithPadding() { if (index & 3) Skip(u32(4 - (index & 3)), true); }
@@ -328,11 +327,7 @@ struct RequestParser {
     /// @note: The output class must be correctly packed/padded to fit hardware layout.
     template <typename T> T PopRaw();
 
-    template <class T> [[nodiscard]] std::weak_ptr<T> PopIpcInterface(Service::HLERequestContext& ctx) {
-        ASSERT(ctx.GetManager()->IsDomain());
-        ASSERT(ctx.GetDomainMessageHeader().input_object_count > 0);
-        return ctx.GetDomainHandler<T>(Pop<u32>() - 1);
-    }
+    template <class T> [[nodiscard]] std::weak_ptr<T> PopIpcInterface(Service::HLERequestContext& ctx);
 
     u32* cmdbuf;
     u32 index = 0;
@@ -342,7 +337,7 @@ struct RequestParser {
 
 template <>
 inline u32 RequestParser::Pop() {
-    return cmdbuf[index++];
+    return CanRead(1) ? cmdbuf[index++] : 0;
 }
 
 template <>
@@ -358,8 +353,14 @@ inline s32 RequestParser::Pop() {
 template <typename T>
 void RequestParser::PopRaw(T& value) {
     static_assert(std::is_trivially_copyable_v<T>, "It's undefined behavior to use memcpy with non-trivially copyable objects");
+    constexpr std::size_t words = (sizeof(T) + sizeof(u32) - 1) / sizeof(u32);
+    if (!CanRead(words)) {
+        std::memset(&value, 0, sizeof(T));
+        index = COMMAND_BUFFER_LENGTH;
+        return;
+    }
     std::memcpy(&value, cmdbuf + index, sizeof(T));
-    index += (sizeof(T) + 3) / 4; // round up to word length
+    index += static_cast<u32>(words);
 }
 #if defined(__GNUC__) && !defined(__clang__) && !defined(__INTEL_COMPILER)
 #pragma GCC diagnostic pop
@@ -439,6 +440,20 @@ template <typename First, typename... Other>
 void RequestParser::Pop(First& first_value, Other&... other_values) {
     first_value = Pop<First>();
     Pop(other_values...);
+}
+
+template <class T>
+std::weak_ptr<T> RequestParser::PopIpcInterface(Service::HLERequestContext& ctx) {
+    const auto mgr = ctx.GetManager();
+    if (!mgr || !mgr->IsDomain() || !ctx.HasDomainMessageHeader() ||
+        ctx.GetDomainMessageHeader().input_object_count == 0) {
+        return {};
+    }
+    const u32 object_id = Pop<u32>();
+    if (object_id == 0 || object_id > mgr->DomainHandlerCount()) {
+        return {};
+    }
+    return ctx.GetDomainHandler<T>(object_id - 1);
 }
 
 } // namespace IPC

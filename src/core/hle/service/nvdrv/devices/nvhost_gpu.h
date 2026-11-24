@@ -47,6 +47,8 @@ class nvhost_as_gpu;
 class nvmap;
 class nvhost_gpu final : public nvdevice {
 public:
+    static constexpr DeviceKind Kind = DeviceKind::NvHostGpu;
+
     explicit nvhost_gpu(Core::System& system_, EventInterface& events_interface_,
                         NvCore::Container& core);
     ~nvhost_gpu() override;

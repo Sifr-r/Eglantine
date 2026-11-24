@@ -19,14 +19,16 @@ import org.yuzu.yuzu_emu.R
 import org.yuzu.yuzu_emu.databinding.ItemReleaseBinding
 import org.yuzu.yuzu_emu.fragments.DriverFetcherFragment.Release
 import androidx.core.net.toUri
+import androidx.lifecycle.lifecycleScope
 import androidx.transition.ChangeBounds
 import androidx.transition.Fade
 import androidx.transition.TransitionManager
 import androidx.transition.TransitionSet
 import com.google.android.material.color.MaterialColors
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
-import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -47,11 +49,19 @@ class ReleaseAdapter(
     private val driverViewModel: DriverViewModel
 ) : RecyclerView.Adapter<ReleaseAdapter.ReleaseViewHolder>() {
 
+    companion object {
+        private val sharedClient: OkHttpClient by lazy {
+            OkHttpClient.Builder()
+                .followRedirects(true)
+                .followSslRedirects(true)
+                .build()
+        }
+    }
+
     inner class ReleaseViewHolder(
         private val binding: ItemReleaseBinding
     ) : RecyclerView.ViewHolder(binding.root) {
         private var isPreview: Boolean = true
-        private val client = OkHttpClient()
         private val markdownParser = Parser.builder().build()
         private val htmlRenderer = HtmlRenderer.builder().build()
 
@@ -182,6 +192,10 @@ class ReleaseAdapter(
                     )
                     isEnabled = !alreadyInstalled
                     setOnClickListener {
+                        if (activity.isFinishing || activity.isDestroyed) {
+                            return@setOnClickListener
+                        }
+
                         // Double-check just before starting (race-proof)
                         if (GpuDriverHelper.isDriverZipInstalledByName(artifact.name)) {
                             Toast.makeText(
@@ -209,88 +223,146 @@ class ReleaseAdapter(
 
                         progressDialog.show()
 
-                        CoroutineScope(Dispatchers.Main).launch {
+                        activity.lifecycleScope.launch {
+                            var tempFile: File? = null
                             try {
+                                val rawName = artifact.name
+                                    .substringAfterLast('/')
+                                    .substringAfterLast('\\')
+                                    .trim()
+                                if (rawName.isEmpty() ||
+                                    rawName == "." ||
+                                    rawName == ".." ||
+                                    rawName.contains('\u0000')
+                                ) {
+                                    throw IOException(
+                                        context.getString(R.string.failed_install_driver, artifact.name)
+                                    )
+                                }
+
                                 val request = Request.Builder()
                                     .url(artifact.url)
                                     .header("Accept", "application/octet-stream")
                                     .build()
 
-                                val cacheDir = context.externalCacheDir ?: throw IOException(
-                                    context.getString(R.string.failed_cache_dir)
-                                )
+                                val downloadedFile = withContext(Dispatchers.IO) {
+                                    val cacheDir = context.externalCacheDir ?: throw IOException(
+                                        context.getString(R.string.failed_cache_dir)
+                                    )
+                                    cacheDir.mkdirs()
 
-                                cacheDir.mkdirs()
+                                    val canonicalCacheDir = cacheDir.canonicalFile
+                                    val canonicalTarget = File(canonicalCacheDir, rawName).canonicalFile
+                                    val cachePrefix = if (canonicalCacheDir.path.endsWith(File.separator)) {
+                                        canonicalCacheDir.path
+                                    } else {
+                                        canonicalCacheDir.path + File.separator
+                                    }
+                                    if (!canonicalTarget.path.startsWith(cachePrefix)) {
+                                        throw IOException(
+                                            context.getString(
+                                                R.string.failed_install_driver,
+                                                artifact.name
+                                            )
+                                        )
+                                    }
+                                    tempFile = canonicalTarget
 
-                                val file = File(cacheDir, artifact.name)
-
-                                withContext(Dispatchers.IO) {
-                                    client.newBuilder()
-                                        .followRedirects(true)
-                                        .followSslRedirects(true)
-                                        .build()
-                                        .newCall(request).execute().use { response ->
-                                            if (!response.isSuccessful) {
-                                                throw IOException("${response.code}")
-                                            }
-
-                                            response.body?.byteStream()?.use { input ->
-                                                FileOutputStream(file).use { output ->
-                                                    input.copyTo(output)
-                                                }
-                                            }
-                                                ?: throw IOException(
-                                                    context.getString(R.string.empty_response_body)
-                                                )
+                                    sharedClient.newCall(request).execute().use { response ->
+                                        if (!response.isSuccessful) {
+                                            throw IOException("${response.code}")
                                         }
+
+                                        response.body?.byteStream()?.use { input ->
+                                            FileOutputStream(canonicalTarget).use { output ->
+                                                input.copyTo(output)
+                                            }
+                                        }
+                                            ?: throw IOException(
+                                                context.getString(R.string.empty_response_body)
+                                            )
+                                    }
+
+                                    if (canonicalTarget.length() == 0L) {
+                                        throw IOException(context.getString(R.string.driver_empty))
+                                    }
+                                    canonicalTarget
                                 }
 
-                                if (file.length() == 0L) {
-                                    throw IOException(context.getString(R.string.driver_empty))
+                                if (activity.isFinishing || activity.isDestroyed) {
+                                    return@launch
                                 }
-
                                 dialogBinding.status.text = context.getString(R.string.installing)
 
-                                val driverData = GpuDriverHelper.getMetadataFromZip(file)
-                                val driverPath =
-                                    "${GpuDriverHelper.driverStoragePath}${FileUtil.getFilename(
-                                        file.toUri()
-                                    )}"
-
-                                if (GpuDriverHelper.copyDriverToInternalStorage(file.toUri())) {
-                                    driverViewModel.onDriverAdded(Pair(driverPath, driverData))
-
-                                    progressDialog.dismiss()
-                                    // Update button to installed state
-                                    this@apply.isEnabled = false
-                                    this@apply.text = context.getString(R.string.installed_label, artifact.name)
-                                    this@apply.setIconResource(R.drawable.ic_check)
-                                    Toast.makeText(
-                                        context,
-                                        context.getString(
-                                            R.string.successfully_installed,
-                                            driverData.name
-                                        ),
-                                        Toast.LENGTH_SHORT
-                                    ).show()
-                                } else {
-                                    throw IOException(
-                                        context.getString(
-                                            R.string.failed_install_driver,
-                                            artifact.name
+                                val driverInstallResult = withContext(Dispatchers.IO) {
+                                    val driverData = GpuDriverHelper.getMetadataFromZip(downloadedFile)
+                                    val driverPath =
+                                        "${GpuDriverHelper.driverStoragePath}${FileUtil.getFilename(
+                                            downloadedFile.toUri()
+                                        )}"
+                                    if (!GpuDriverHelper.copyDriverToInternalStorage(
+                                            downloadedFile.toUri()
                                         )
-                                    )
-                                }
-                            } catch (e: Exception) {
-                                progressDialog.dismiss()
-
-                                MaterialAlertDialogBuilder(context)
-                                    .setTitle(context.getString(R.string.driver_failed_title))
-                                    .setMessage(e.message)
-                                    .setPositiveButton(R.string.ok) { dialog, _ ->
-                                        dialog.cancel()
+                                    ) {
+                                        throw IOException(
+                                            context.getString(
+                                                R.string.failed_install_driver,
+                                                artifact.name
+                                            )
+                                        )
                                     }
-                                    .show()
+                                    Pair(driverPath, driverData)
+                                }
+
+                                if (activity.isFinishing || activity.isDestroyed) {
+                                    return@launch
+                                }
+
+                                driverViewModel.onDriverAdded(driverInstallResult)
+
+                                if (progressDialog.isShowing) {
+                                    progressDialog.dismiss()
+                                }
+                                // Update button to installed state
+                                this@apply.isEnabled = false
+                                this@apply.text = context.getString(R.string.installed_label, artifact.name)
+                                this@apply.setIconResource(R.drawable.ic_check)
+                                Toast.makeText(
+                                    context,
+                                    context.getString(
+                                        R.string.successfully_installed,
+                                        driverInstallResult.second.name
+                                    ),
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            } catch (e: CancellationException) {
+                                if (!activity.isFinishing &&
+                                    !activity.isDestroyed &&
+                                    progressDialog.isShowing
+                                ) {
+                                    runCatching { progressDialog.dismiss() }
+                                }
+                                throw e
+                            } catch (e: Exception) {
+                                if (!activity.isFinishing && !activity.isDestroyed) {
+                                    if (progressDialog.isShowing) {
+                                        runCatching { progressDialog.dismiss() }
+                                    }
+
+                                    MaterialAlertDialogBuilder(context)
+                                        .setTitle(context.getString(R.string.driver_failed_title))
+                                        .setMessage(e.message)
+                                        .setPositiveButton(R.string.ok) { dialog, _ ->
+                                            dialog.cancel()
+                                        }
+                                        .show()
+                                }
+                            } finally {
+                                tempFile?.let { fileToDelete ->
+                                    withContext(NonCancellable + Dispatchers.IO) {
+                                        fileToDelete.delete()
+                                    }
+                                }
                             }
                         }
                     }

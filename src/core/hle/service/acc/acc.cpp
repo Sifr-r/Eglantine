@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 
 #include "common/common_types.h"
 #include "common/fs/file.h"
@@ -51,11 +52,20 @@ static void JPGToMemory(void* context, void* data, int len) {
 static void SanitizeJPEGImageSize(std::vector<u8>& image) {
     constexpr std::size_t max_jpeg_image_size = 0x20000;
     constexpr int profile_dimensions = 256;
-    int original_width, original_height, color_channels;
+    int original_width{}, original_height{}, color_channels{};
+
+    if (image.empty() || image.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)())) {
+        LOG_ERROR(Service_ACC, "Failed to load user provided image.");
+        return;
+    }
 
     const auto plain_image =
         stbi_load_from_memory(image.data(), static_cast<int>(image.size()), &original_width,
                               &original_height, &color_channels, STBI_rgb);
+    if (plain_image == nullptr) {
+        LOG_ERROR(Service_ACC, "Failed to load user provided image.");
+        return;
+    }
 
     // Resize image to match 256*256
     if (original_width != profile_dimensions || original_height != profile_dimensions) {
@@ -71,6 +81,7 @@ static void SanitizeJPEGImageSize(std::vector<u8>& image) {
         }
     }
 
+    stbi_image_free(plain_image);
     image.resize((std::min)(image.size(), max_jpeg_image_size));
 }
 

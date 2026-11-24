@@ -164,7 +164,10 @@ void NewUserDialog::setAvatar() {
         }
     }
     if (avatar_dialog->exec() == QDialog::Accepted) {
-        setImage(avatar_dialog->GetSelectedAvatar().scaled(64, 64, Qt::IgnoreAspectRatio));
+        const QPixmap avatar = avatar_dialog->GetSelectedAvatar();
+        if (!avatar.isNull()) {
+            setImage(avatar.scaled(64, 64, Qt::IgnoreAspectRatio));
+        }
     }
 }
 
@@ -205,6 +208,7 @@ bool NewUserDialog::LoadAvatarData() {
         return false;
     }
 
+    constexpr std::size_t expected_avatar_bytes = std::size_t{256} * 256 * 4;
     QVector<QPixmap> images;
     for (const auto& item : chara_dir->GetFiles()) {
         if (item->GetExtension() != "szs") {
@@ -212,7 +216,7 @@ bool NewUserDialog::LoadAvatarData() {
         }
 
         auto image_data = DecompressYaz0(item);
-        if (image_data.empty()) {
+        if (image_data.size() < expected_avatar_bytes) {
             continue;
         }
         QImage image(reinterpret_cast<const uchar*>(image_data.data()), 256, 256,
@@ -236,21 +240,35 @@ std::vector<uint8_t> NewUserDialog::DecompressYaz0(const FileSys::VirtualFile& f
         throw std::invalid_argument("Null file pointer passed to DecompressYaz0");
     }
 
+    const std::size_t file_size = file->GetSize();
+    if (file_size < 16) {
+        return {};
+    }
+
     uint32_t magic{};
-    file->ReadObject(&magic, 0);
-    if (magic != Common::MakeMagic('Y', 'a', 'z', '0')) {
-        return std::vector<uint8_t>();
+    if (file->ReadObject(&magic, 0) != sizeof(magic) ||
+        magic != Common::MakeMagic('Y', 'a', 'z', '0')) {
+        return {};
     }
 
     uint32_t decoded_length{};
-    file->ReadObject(&decoded_length, 4);
+    if (file->ReadObject(&decoded_length, 4) != sizeof(decoded_length)) {
+        return {};
+    }
     decoded_length = Common::swap32(decoded_length);
 
-    std::size_t input_size = file->GetSize() - 16;
-    std::vector<uint8_t> input(input_size);
-    file->ReadBytes(input.data(), input_size, 16);
+    constexpr uint32_t max_decoded_length = 64U * 1024U * 1024U;
+    if (decoded_length == 0 || decoded_length > max_decoded_length) {
+        return {};
+    }
 
-    uint32_t input_offset{};
+    const std::size_t input_size = file_size - 16;
+    std::vector<uint8_t> input(input_size);
+    if (file->ReadBytes(input.data(), input_size, 16) != input_size) {
+        return {};
+    }
+
+    std::size_t input_offset{};
     uint32_t output_offset{};
     std::vector<uint8_t> output(decoded_length);
 
@@ -259,30 +277,47 @@ std::vector<uint8_t> NewUserDialog::DecompressYaz0(const FileSys::VirtualFile& f
 
     while (output_offset < decoded_length) {
         if ((mask >>= 1) == 0) {
+            if (input_offset >= input_size) {
+                return {};
+            }
             header = input[input_offset++];
             mask = 0x80;
         }
 
         if ((header & mask) != 0) {
-            if (output_offset == output.size()) {
-                break;
+            if (input_offset >= input_size) {
+                return {};
             }
             output[output_offset++] = input[input_offset++];
         } else {
-            uint8_t byte1 = input[input_offset++];
-            uint8_t byte2 = input[input_offset++];
+            if (input_size - input_offset < 2) {
+                return {};
+            }
+            const uint8_t byte1 = input[input_offset++];
+            const uint8_t byte2 = input[input_offset++];
 
-            uint32_t dist = ((byte1 & 0xF) << 8) | byte2;
+            const uint32_t dist =
+                (static_cast<uint32_t>(byte1 & 0xF) << 8) | static_cast<uint32_t>(byte2);
+            if (dist >= output_offset) {
+                return {};
+            }
             uint32_t position = output_offset - (dist + 1);
 
             uint32_t length = byte1 >> 4;
             if (length == 0) {
+                if (input_offset >= input_size) {
+                    return {};
+                }
                 length = static_cast<uint32_t>(input[input_offset++]) + 0x12;
             } else {
                 length += 2;
             }
 
-            uint32_t gap = output_offset - position;
+            if (length > decoded_length - output_offset) {
+                return {};
+            }
+
+            const uint32_t gap = output_offset - position;
             uint32_t non_overlapping_length = length;
 
             if (non_overlapping_length > gap) {
@@ -318,8 +353,8 @@ void NewUserDialog::updateRevertButton() {
     if (isDefaultAvatar()) {
         ui->revert->setIcon(QIcon{});
     } else {
-        QStyle* style = parentWidget()->style();
-        QIcon icon(style->standardIcon(QStyle::SP_LineEditClearButton));
+        QStyle* style = parentWidget() ? parentWidget()->style() : this->style();
+        QIcon icon = style ? style->standardIcon(QStyle::SP_LineEditClearButton) : QIcon{};
         ui->revert->setIcon(icon);
     }
 }

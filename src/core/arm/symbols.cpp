@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
+#include <limits>
+
 #include "common/bit_field.h"
 #include "common/common_funcs.h"
 #include "common/elf.h"
@@ -50,50 +53,97 @@ struct Mod64 {
 
 template <typename M, typename F>
 static Symbols GetSymbols(F&& ReadBytes) {
-    const auto Read8 = [&](u64 index) {
-        u8 ret;
-        ReadBytes(&ret, index, sizeof(u8));
-        return ret;
+    const auto Read8 = [&](u64 index, u8& out_byte) {
+        return ReadBytes(&out_byte, index, sizeof(u8));
     };
     ModuleHeaderLocation loc{};
-    ReadBytes(&loc, 0, sizeof(ModuleHeaderLocation));
-    ModuleHeader hdr;
-    ReadBytes(&hdr, loc.header_offset, sizeof(ModuleHeader));
+    if (!ReadBytes(&loc, 0, sizeof(ModuleHeaderLocation))) {
+        return {};
+    }
+    ModuleHeader hdr{};
+    if (!ReadBytes(&hdr, loc.header_offset, sizeof(ModuleHeader))) {
+        return {};
+    }
     if (hdr.signature != Common::MakeMagic('M', 'O', 'D', '0')) {
+        return {};
+    }
+    if (u64{loc.header_offset} > std::numeric_limits<u64>::max() - hdr.dynamic_offset) {
         return {};
     }
 
     VAddr strtab_offs{};
     VAddr symtab_offs{};
+    u64 strtab_size{};
     u64 syment_size = sizeof(typename M::Sym);
-    VAddr dynamic_offset = loc.header_offset + hdr.dynamic_offset;
-    while (true) {
-        typename M::Dyn dyn;
-        ReadBytes(&dyn, dynamic_offset, sizeof(typename M::Dyn));
+    VAddr dynamic_offset = u64{loc.header_offset} + hdr.dynamic_offset;
+
+    constexpr size_t MaxDynamicEntries = 4096;
+    bool found_null = false;
+    for (size_t i = 0; i < MaxDynamicEntries; ++i) {
+        typename M::Dyn dyn{};
+        if (!ReadBytes(&dyn, dynamic_offset, sizeof(typename M::Dyn))) {
+            return {};
+        }
+        if (dynamic_offset > std::numeric_limits<u64>::max() - sizeof(typename M::Dyn)) {
+            return {};
+        }
         dynamic_offset += sizeof(typename M::Dyn);
         if (dyn.d_tag == ElfDtNull) {
+            found_null = true;
             break;
         }
         if (dyn.d_tag == ElfDtStrtab) {
             strtab_offs = dyn.d_un.d_ptr;
         } else if (dyn.d_tag == ElfDtSymtab) {
             symtab_offs = dyn.d_un.d_ptr;
+        } else if (dyn.d_tag == ElfDtStrsz) {
+            strtab_size = dyn.d_un.d_val;
         } else if (dyn.d_tag == ElfDtSyment) {
             syment_size = dyn.d_un.d_val;
         }
     }
-    if (strtab_offs > 0 && symtab_offs > 0) {
+    if (!found_null || syment_size < sizeof(typename M::Sym)) {
+        return {};
+    }
+    if (strtab_offs > 0 && symtab_offs > 0 && symtab_offs < strtab_offs &&
+        strtab_offs >= sizeof(typename M::Sym)) {
+        constexpr size_t MaxSymbolNameLength = 4096;
+        const u64 str_end =
+            strtab_size > 0 && strtab_offs <= std::numeric_limits<u64>::max() - strtab_size
+                ? strtab_offs + strtab_size
+                : std::numeric_limits<u64>::max();
         Symbols out;
         VAddr symbol_index = symtab_offs;
-        while (symbol_index < strtab_offs) {
+        while (symbol_index <= strtab_offs - sizeof(typename M::Sym)) {
             typename M::Sym symbol{};
-            ReadBytes(&symbol, symbol_index, sizeof(typename M::Sym));
-            VAddr offs = strtab_offs + symbol.st_name;
-            std::string name{};
-            for (u8 c = Read8(offs); c != 0; c = Read8(++offs))
-                name += char(c);
+            if (!ReadBytes(&symbol, symbol_index, sizeof(typename M::Sym))) {
+                break;
+            }
+            if ((strtab_size == 0 || symbol.st_name < strtab_size) &&
+                strtab_offs <= std::numeric_limits<u64>::max() - symbol.st_name) {
+                VAddr offs = strtab_offs + symbol.st_name;
+                std::string name{};
+                u8 c = 0;
+                bool terminated = false;
+                while (offs < str_end && name.size() < MaxSymbolNameLength && Read8(offs, c)) {
+                    if (c == 0) {
+                        terminated = true;
+                        break;
+                    }
+                    name += static_cast<char>(c);
+                    if (offs == std::numeric_limits<u64>::max()) {
+                        break;
+                    }
+                    ++offs;
+                }
+                if (terminated) {
+                    out[name] = std::make_pair(symbol.st_value, symbol.st_size);
+                }
+            }
+            if (symbol_index > std::numeric_limits<u64>::max() - syment_size) {
+                break;
+            }
             symbol_index += syment_size;
-            out[name] = std::make_pair(symbol.st_value, symbol.st_size);
         }
         return out;
     }
@@ -101,15 +151,24 @@ static Symbols GetSymbols(F&& ReadBytes) {
 }
 
 Symbols GetSymbols(VAddr base, Core::Memory::Memory& memory, bool is_64) {
-    const auto f = [base, &memory](void* ptr, size_t offset, size_t size) {
-        memory.ReadBlock(base + offset, ptr, size);
+    const auto f = [base, &memory](void* ptr, size_t offset, size_t size) -> bool {
+        if (base > std::numeric_limits<VAddr>::max() - offset) {
+            return false;
+        }
+        return memory.ReadBlock(base + offset, ptr, size);
     };
     return is_64 ? GetSymbols<Mod64>(f) : GetSymbols<Mod32>(f);
 }
 
 Symbols GetSymbols(std::span<const u8> data, bool is_64) {
-    const auto f = [data](void* ptr, size_t offset, size_t size) {
-        std::memcpy(ptr, data.data() + offset, size);
+    const auto f = [data](void* ptr, size_t offset, size_t size) -> bool {
+        if (offset > data.size() || size > data.size() - offset) {
+            return false;
+        }
+        if (size > 0) {
+            std::memcpy(ptr, data.data() + offset, size);
+        }
+        return true;
     };
     return is_64 ? GetSymbols<Mod64>(f) : GetSymbols<Mod32>(f);
 }

@@ -7,6 +7,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
+
 #include "video_core/framebuffer_config.h"
 #include "video_core/present.h"
 #include "video_core/renderer_opengl/gl_blit_screen.h"
@@ -141,6 +143,11 @@ FramebufferTextureInfo Layer::LoadFBToScreenInfo(const Tegra::FramebufferConfig&
     const auto pixel_format{
         VideoCore::Surface::PixelFormatFromGPUPixelFormat(framebuffer.pixel_format)};
     const u32 bytes_per_pixel{VideoCore::Surface::BytesPerBlock(pixel_format)};
+    const u64 unpacked_size =
+        static_cast<u64>(framebuffer.width) * framebuffer.height * bytes_per_pixel;
+    if (unpacked_size == 0 || static_cast<u64>(gl_framebuffer_data.size()) < unpacked_size) {
+        return info;
+    }
     const u64 size_in_bytes{Tegra::Texture::CalculateSize(
         true, bytes_per_pixel, framebuffer.stride, framebuffer.height, 1, block_height_log2, 0)};
     const u8* const host_ptr{device_memory.GetPointer<u8>(framebuffer_addr)};
@@ -152,7 +159,7 @@ FramebufferTextureInfo Layer::LoadFBToScreenInfo(const Tegra::FramebufferConfig&
     }
 
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, static_cast<GLint>(framebuffer.stride));
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 
     // Update existing texture
     // TODO: Test what happens on hardware when you change the framebuffer dimensions so that
@@ -163,21 +170,26 @@ FramebufferTextureInfo Layer::LoadFBToScreenInfo(const Tegra::FramebufferConfig&
                         framebuffer.height, framebuffer_texture.gl_format,
                         framebuffer_texture.gl_type, gl_framebuffer_data.data());
 
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-
     return info;
 }
 
 void Layer::ConfigureFramebufferTexture(const Tegra::FramebufferConfig& framebuffer) {
-    framebuffer_texture.width = framebuffer.width;
-    framebuffer_texture.height = framebuffer.height;
+    framebuffer_texture.width = static_cast<GLsizei>(framebuffer.width);
+    framebuffer_texture.height = static_cast<GLsizei>(framebuffer.height);
     framebuffer_texture.pixel_format = framebuffer.pixel_format;
 
     const auto pixel_format{
         VideoCore::Surface::PixelFormatFromGPUPixelFormat(framebuffer.pixel_format)};
     const u32 bytes_per_pixel{VideoCore::Surface::BytesPerBlock(pixel_format)};
-    gl_framebuffer_data.resize(framebuffer_texture.width * framebuffer_texture.height *
-                               bytes_per_pixel);
+    const u64 pixel_count = static_cast<u64>(framebuffer.width) * framebuffer.height;
+    const u64 max_gl_dim = static_cast<u64>((std::numeric_limits<GLsizei>::max)());
+    if (framebuffer.width == 0 || framebuffer.height == 0 || framebuffer.width > max_gl_dim ||
+        framebuffer.height > max_gl_dim || bytes_per_pixel == 0 ||
+        pixel_count > (std::numeric_limits<size_t>::max)() / bytes_per_pixel) {
+        gl_framebuffer_data.clear();
+        return;
+    }
+    gl_framebuffer_data.resize(static_cast<size_t>(pixel_count * bytes_per_pixel));
 
     GLint internal_format;
     switch (framebuffer.pixel_format) {

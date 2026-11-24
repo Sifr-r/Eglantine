@@ -52,7 +52,7 @@ using RightsId = std::array<u8, 0x10>;
 
 inline bool IsDirectoryExeFS(const VirtualDir& pfs) {
     // According to switchbrew, an exefs must only contain these two files:
-    return pfs->GetFile("main") != nullptr && pfs->GetFile("main.npdm") != nullptr;
+    return pfs != nullptr && pfs->GetFile("main") != nullptr && pfs->GetFile("main.npdm") != nullptr;
 }
 
 inline bool IsDirectoryLogoPartition(const VirtualDir& pfs) {

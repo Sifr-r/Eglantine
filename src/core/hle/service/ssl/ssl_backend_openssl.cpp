@@ -124,10 +124,6 @@ inline void LoadCaCertStore(SSL_CTX* ctx, const char* ca_cert, std::size_t size)
 class SSLConnectionBackendOpenSSL final : public SSLConnectionBackend {
 public:
     Result Init() {
-        // on bundled OpenSSL, load ca cert store
-#ifdef YUZU_BUNDLED_OPENSSL
-        LoadCaCertStore(ssl_ctx, kCert, sizeof(kCert));
-#endif
         std::call_once(one_time_init_flag, OneTimeInit);
 
         if (!one_time_init_success) {
@@ -230,10 +226,8 @@ public:
     }
 
     Result Peek(size_t* out_size, std::span<u8> data) override {
-        auto const n = (std::min)(data.size(), *out_size);
-        const int ret = SSL_peek(ssl, data.data(), int(n));
-        *out_size = n;
-        return HandleReturn("SSL_write_ex", out_size, ret);
+        const int ret = SSL_peek_ex(ssl, data.data(), data.size(), out_size);
+        return HandleReturn("SSL_peek_ex", out_size, ret);
     }
 
     Result Write(size_t* out_size, std::span<const u8> data) override {
@@ -453,6 +447,11 @@ void OneTimeInit() {
     if (const auto bundle = Common::Net::FindSystemCaBundle(); !bundle.empty()) {
         SSL_CTX_load_verify_locations(ssl_ctx, bundle.c_str(), nullptr);
     }
+
+#ifdef YUZU_BUNDLED_OPENSSL
+    // on bundled OpenSSL, load ca cert store
+    LoadCaCertStore(ssl_ctx, kCert, sizeof(kCert));
+#endif
 
     OneTimeInitLogFile();
 

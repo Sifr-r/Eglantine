@@ -743,7 +743,7 @@ private:
                 out_component = std::bit_cast<f32>(value);
             } else if constexpr (component_sizes[which_component] == 16) {
                 static constexpr u32 sign_mask = 0x8000;
-                static constexpr u32 mantissa_mask = 0x8000;
+                static constexpr u32 mantissa_mask = 0x03ff;
                 out_component = std::bit_cast<f32>(((value & sign_mask) << 16) |
                                                      (((value & 0x7c00) + 0x1C000) << 13) |
                                                      ((value & mantissa_mask) << 13));
@@ -755,7 +755,7 @@ private:
             if constexpr (component_swizzle[which_component] == Swizzle::A) {
                 out_component = calculate_unorm();
             } else if constexpr (component_sizes[which_component] == 8) {
-                out_component = SRGB_TO_RGB_LUT[value];
+                out_component = SRGB_TO_RGB_LUT[value & 0xffU];
             } else {
                 out_component = calculate_unorm();
                 UNIMPLEMENTED_MSG("SRGB Conversion with component sizes of {} is unimplemented",
@@ -778,10 +778,16 @@ private:
             size_t shift_towards = fp32_mantissa_bits - mantissa;
             return tmp_value >> shift_towards;
         };
+        const auto clamp_unit = [](f32 value) {
+            if (!(value >= 0.0f)) {
+                return 0.0f;
+            }
+            return value > 1.0f ? 1.0f : value;
+        };
         const auto calculate_unorm = [&]() {
+            const f32 clamped = clamp_unit(in_component);
             return static_cast<u32>(
-                static_cast<f32>(in_component) *
-                static_cast<f32>((1ULL << (component_sizes[which_component])) - 1ULL));
+                clamped * static_cast<f32>((1ULL << (component_sizes[which_component])) - 1ULL));
         };
         if constexpr (component_types[which_component] == ComponentType::SNORM ||
                       component_types[which_component] == ComponentType::SNORM_FORCE_FP16) {
@@ -820,7 +826,7 @@ private:
         } else if constexpr (component_types[which_component] == ComponentType::SRGB) {
             if constexpr (component_swizzle[which_component] != Swizzle::A) {
                 if constexpr (component_sizes[which_component] == 8) {
-                    const u32 index = calculate_unorm();
+                    const u32 index = (std::min)(calculate_unorm(), 255U);
                     in_component = RGB_TO_SRGB_LUT[index];
                 } else {
                     UNIMPLEMENTED_MSG("SRGB Conversion with component sizes of {} is unimplemented",

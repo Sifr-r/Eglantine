@@ -13,35 +13,43 @@ Eglantine is free, open-source, copyleft software, licensed under the terms of t
 
 ### Policies
 
-- We are trialing a slightly relaxed AI policy to allow high-quality contributors to use AI *responsibly*. Please read our [detailed AI policy][ai-policy] for more info.
+- AI-assisted contributions are welcome and held to the same review, testing, and licensing standards as all other contributions. See our [AI policy][ai-policy] for details.
 - Usage of any form of profanity or otherwise unsavory language is generally discouraged.
   - This is primarily because it rarely helps to actually understand what's going on.
   - Remember that your comments should be focused and actually address what's happening. With very few exceptions, expletives are actively detrimental at best.
 - New code must follow the same general style as the surrounding codebase. Exceptions may be granted in certain cases.
 - Maintainers reserve the right to change your patches and pull requests at will. We will try to avoid this.
-  - You should generally respect all decisions made by the [code owners][code-owners] in your particular subsystem.
+  - You should generally respect the decisions of the maintainers responsible for your subsystem.
   - However, if you feel they are overstepping or are incorrect, don't be afraid to stand your ground! Maintainers are not always correct.
 - While we do *not* adhere to the terms of a formal code of conduct, you will generally be expected to respect other developers, contributors, and community members.
 - You **must** have basic knowledge of [Git](https://git-scm.com/learn). Knowing how to manage your branches and follow proper fork policies is a necessity.
 
 ### Where do I start?
 
+Read [AGENTS.md](AGENTS.md) for repository constraints and the [architecture task map](ARCHITECTURE.md#task-map) to find the owner, entry point, and relevant tests. If a report or implementation plan names a revision or date, confirm the current behavior in code before applying its instructions.
+
 Anywhere you like! If you are facing an issue and want to fix it, go ahead. For new features, you are heavily encouraged to open a [feature request](https://github.com/Djihads80/Eglantine/issues) first, discussing the motivations, potential implementation, and user flow of your desired feature.
 
 Search the [open issues](https://github.com/Djihads80/Eglantine/issues) and [pull requests](https://github.com/Djihads80/Eglantine/pulls) before starting to avoid duplicating work. For larger features/refactors, you should first express your interest in the issue to ensure another developer isn't already working on it.
+
+### What to include in a report
+
+- Identify the build or commit, OS, relevant hardware and driver, and the frontend used.
+- State the expected and observed behavior, then provide the shortest reproducible steps. For a title-specific issue, include the title version and relevant settings. Specify cold or warm cache when it affects the result.
+- Include the exact checks you ran and where verification stopped. Use a short log excerpt or a synthetic fixture where possible. Omit console keys, firmware, game data, and private paths.
 
 ### Great! Can I contribute already?
 
 Submit a pull request to [Djihads80/Eglantine](https://github.com/Djihads80/Eglantine). You need a GitHub account; the Eden Forgejo account registration process does not apply here.
 
 1. Fork the Eglantine repository to your GitHub account.
-2. Clone your fork and create a branch for your change based on Eglantine's `nx2` branch. To read the documentation locally, run `git submodule update --init docs` from the repository root.
+2. Clone your fork and create a branch for your change based on Eglantine's `nx2` branch.
 3. Make a focused change, following the policies above and the [coding guidelines][coding-policy].
 4. Review and test your changes. For code changes, follow the [build documentation][build-docs] for your platform and verify the affected behavior. For documentation changes, preview the Markdown and check the instructions and links.
 5. Commit your changes and push your branch to your fork.
 6. Open a pull request from your branch to `Djihads80/Eglantine`, selecting `nx2` as the base branch. Explain the problem, the change, and how you verified it, and link any related issue.
 
-Before opening a pull request, make sure your branch is up-to-date with Eglantine's `nx2` branch. Follow the [AI policy][ai-policy], including its requirements for human-written commit messages and pull request descriptions, disclosure, review, testing, and sign-off.
+Before opening a pull request, make sure your branch is up-to-date with Eglantine's `nx2` branch. Ensure your changes are reviewed, tested, and follow the [AI policy][ai-policy] and [coding guidelines][coding-policy].
 
 For changes involving assets, record the source and license in [Asset provenance](ASSET_PROVENANCE.md). Keep console content, keys, and raw captures in `ignore/`. Check staged paths in a shell that passes bytes through the pipe.
 
@@ -53,9 +61,8 @@ git diff --cached --name-only --diff-filter=ACMR -z | python3 -I tools/ci/check_
 
 Alongside the other contribution methods listed up top, you can also choose to contribute through documentation, organization, or community guides. These can be done either through the code contribution methods described above, or created externally and shared via our Discord community.
 
-If you have an external tool/page that you believe would be handy to integrate/link into Eglantine, please discuss it with the developers on [Discord](https://discord.gg/XkS5NVPTUY). **Do not submit vibe-coded or AI generated tools or applications**.
+If you have an external tool/page that you believe would be handy to integrate/link into Eglantine, please discuss it with the developers on [Discord](https://discord.gg/XkS5NVPTUY).
 
-[build-docs]: https://github.com/Eglantine-Community/docs/blob/master/content/Build.mdx
-[code-owners]: https://github.com/Eglantine-Community/docs/blob/master/content/CODEOWNERS
-[coding-policy]: https://github.com/Eglantine-Community/docs/blob/master/content/policies/Coding.mdx
-[ai-policy]: https://github.com/Eglantine-Community/docs/blob/master/content/policies/AI.mdx
+[build-docs]: docs/content/Build.md
+[coding-policy]: docs/content/policies/Coding.md
+[ai-policy]: docs/content/policies/AI.md

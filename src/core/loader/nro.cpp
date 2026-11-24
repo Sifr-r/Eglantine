@@ -7,6 +7,8 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <optional>
 #include <string>
 #include <utility>
@@ -85,48 +87,69 @@ struct AssetHeader {
 static_assert(sizeof(AssetHeader) == 0x38, "AssetHeader has incorrect size.");
 
 AppLoader_NRO::AppLoader_NRO(FileSys::VirtualFile file_) : AppLoader(std::move(file_)) {
+    if (file == nullptr) {
+        return;
+    }
+
     NroHeader nro_header{};
     if (file->ReadObject(&nro_header) != sizeof(NroHeader)) {
         return;
     }
 
-    if (file->GetSize() >= nro_header.file_size + sizeof(AssetHeader)) {
-        const u64 offset = nro_header.file_size;
-        AssetHeader asset_header{};
-        if (file->ReadObject(&asset_header, offset) != sizeof(AssetHeader)) {
-            return;
-        }
+    const u64 file_size = file->GetSize();
+    const u64 asset_offset = nro_header.file_size;
+    if (file_size < sizeof(NroHeader) || asset_offset > file_size ||
+        file_size - asset_offset < sizeof(AssetHeader)) {
+        return;
+    }
 
-        if (asset_header.format_version != 0) {
-            LOG_WARNING(Loader,
-                        "NRO Asset Header has format {}, currently supported format is 0. If "
-                        "strange glitches occur with metadata, check NRO assets.",
-                        asset_header.format_version);
-        }
+    AssetHeader asset_header{};
+    if (file->ReadObject(&asset_header, asset_offset) != sizeof(AssetHeader)) {
+        return;
+    }
 
-        if (asset_header.magic != Common::MakeMagic('A', 'S', 'E', 'T')) {
-            return;
-        }
+    if (asset_header.format_version != 0) {
+        LOG_WARNING(Loader,
+                    "NRO Asset Header has format {}, currently supported format is 0. If "
+                    "strange glitches occur with metadata, check NRO assets.",
+                    asset_header.format_version);
+    }
 
-        if (asset_header.nacp.size > 0) {
-            nacp = std::make_unique<FileSys::NACP>(std::make_shared<FileSys::OffsetVfsFile>(
-                file, asset_header.nacp.size, offset + asset_header.nacp.offset, "Control.nacp"));
-        }
+    if (asset_header.magic != Common::MakeMagic('A', 'S', 'E', 'T')) {
+        return;
+    }
 
-        if (asset_header.romfs.size > 0) {
-            romfs = std::make_shared<FileSys::OffsetVfsFile>(
-                file, asset_header.romfs.size, offset + asset_header.romfs.offset, "game.romfs");
-        }
+    const u64 asset_region_size = file_size - asset_offset;
+    const auto valid_asset_section = [asset_region_size](const AssetSection& section) {
+        return section.size > 0 && section.offset <= asset_region_size &&
+               section.size <= asset_region_size - section.offset;
+    };
 
-        if (asset_header.icon.size > 0) {
-            icon_data = file->ReadBytes(asset_header.icon.size, offset + asset_header.icon.offset);
-        }
+    if (valid_asset_section(asset_header.nacp)) {
+        nacp = std::make_unique<FileSys::NACP>(std::make_shared<FileSys::OffsetVfsFile>(
+            file, static_cast<std::size_t>(asset_header.nacp.size),
+            static_cast<std::size_t>(asset_offset + asset_header.nacp.offset), "Control.nacp"));
+    }
+
+    if (valid_asset_section(asset_header.romfs)) {
+        romfs = std::make_shared<FileSys::OffsetVfsFile>(
+            file, static_cast<std::size_t>(asset_header.romfs.size),
+            static_cast<std::size_t>(asset_offset + asset_header.romfs.offset), "game.romfs");
+    }
+
+    if (valid_asset_section(asset_header.icon)) {
+        icon_data = file->ReadBytes(static_cast<std::size_t>(asset_header.icon.size),
+                                    static_cast<std::size_t>(asset_offset + asset_header.icon.offset));
     }
 }
 
 AppLoader_NRO::~AppLoader_NRO() = default;
 
 FileType AppLoader_NRO::IdentifyType(const FileSys::VirtualFile& nro_file) {
+    if (nro_file == nullptr) {
+        return FileType::Error;
+    }
+
     // Read NSO header
     NroHeader nro_header{};
     if (sizeof(NroHeader) != nro_file->ReadObject(&nro_header)) {
@@ -165,24 +188,54 @@ static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
         return {};
     }
 
-    // Build program image
-    std::vector<u8> program_image(PageAlignSize(nro_header.file_size));
-    std::memcpy(program_image.data(), data.data(), program_image.size());
-    if (program_image.size() != PageAlignSize(nro_header.file_size)) {
+    constexpr u64 max_u32_aligned =
+        (std::numeric_limits<u32>::max)() & ~Core::Memory::YUZU_PAGEMASK;
+    if (nro_header.file_size < sizeof(NroHeader) || nro_header.file_size > data.size() ||
+        nro_header.file_size > max_u32_aligned) {
         return {};
     }
 
-    Kernel::CodeSet codeset;
-    for (std::size_t i = 0; i < nro_header.segments.size(); ++i) {
-        codeset.segments[i].addr = nro_header.segments[i].offset;
-        codeset.segments[i].offset = nro_header.segments[i].offset;
-        codeset.segments[i].size = PageAlignSize(nro_header.segments[i].size);
+    const u64 aligned_file_size =
+        Common::AlignUp(u64{nro_header.file_size}, Core::Memory::YUZU_PAGESIZE);
+    if (aligned_file_size > max_u32_aligned) {
+        return {};
     }
 
+    // Build program image
+    std::vector<u8> program_image;
+    try {
+        program_image.resize(static_cast<std::size_t>(aligned_file_size));
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
+    std::memcpy(program_image.data(), data.data(), nro_header.file_size);
+
+    Kernel::CodeSet codeset;
+    for (std::size_t i = 0; i < nro_header.segments.size(); ++i) {
+        const auto& seg = nro_header.segments[i];
+        if (seg.size > max_u32_aligned) {
+            return {};
+        }
+        const u64 aligned_seg_size = Common::AlignUp(u64{seg.size}, Core::Memory::YUZU_PAGESIZE);
+        if (u64{seg.offset} > aligned_file_size ||
+            aligned_seg_size > aligned_file_size - seg.offset) {
+            return {};
+        }
+        codeset.segments[i].addr = seg.offset;
+        codeset.segments[i].offset = seg.offset;
+        codeset.segments[i].size = static_cast<u32>(aligned_seg_size);
+    }
+
+    if (nro_header.bss_size > max_u32_aligned) {
+        return {};
+    }
     // Default .bss to NRO header bss size if MOD0 section doesn't exist
-    u32 bss_size{PageAlignSize(nro_header.bss_size)};
+    u64 bss_size_u64 = Common::AlignUp(u64{nro_header.bss_size}, Core::Memory::YUZU_PAGESIZE);
 
     // Read MOD header
+    if (u64{nro_header.module_header_offset} > program_image.size() - sizeof(ModHeader)) {
+        return {};
+    }
     ModHeader mod_header{};
     std::memcpy(&mod_header, program_image.data() + nro_header.module_header_offset,
                 sizeof(ModHeader));
@@ -190,11 +243,26 @@ static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
     const bool has_mod_header{mod_header.magic == Common::MakeMagic('M', 'O', 'D', '0')};
     if (has_mod_header) {
         // Resize program image to include .bss section and page align each section
-        bss_size = PageAlignSize(mod_header.bss_end_offset - mod_header.bss_start_offset);
+        if (mod_header.bss_end_offset < mod_header.bss_start_offset) {
+            return {};
+        }
+        const u32 raw_bss_size = mod_header.bss_end_offset - mod_header.bss_start_offset;
+        if (raw_bss_size > max_u32_aligned) {
+            return {};
+        }
+        bss_size_u64 = Common::AlignUp(u64{raw_bss_size}, Core::Memory::YUZU_PAGESIZE);
     }
 
-    codeset.DataSegment().size += bss_size;
-    program_image.resize(static_cast<u32>(program_image.size()) + bss_size);
+    if (u64{codeset.DataSegment().size} + bss_size_u64 > max_u32_aligned ||
+        program_image.size() + bss_size_u64 > max_u32_aligned) {
+        return {};
+    }
+    codeset.DataSegment().size += static_cast<u32>(bss_size_u64);
+    try {
+        program_image.resize(program_image.size() + static_cast<std::size_t>(bss_size_u64));
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
     struct ConfigEntry {
         u32_le key;
         u32_le flags;
@@ -231,10 +299,18 @@ static bool LoadNroImpl(Core::System& system, Kernel::KProcess& process,
 
         const size_t entries_and_argv =
             Common::AlignUp(kConfigTableSize + argv_string.size(), Core::Memory::YUZU_PAGESIZE);
+        if (entries_and_argv > (std::numeric_limits<u32>::max)() - codeset.DataSegment().size ||
+            entries_and_argv > program_image.max_size() - program_image.size()) {
+            return {};
+        }
 
         args_offset_in_image = program_image.size();
         codeset.DataSegment().size += static_cast<u32>(entries_and_argv);
-        program_image.resize(args_offset_in_image + entries_and_argv);
+        try {
+            program_image.resize(args_offset_in_image + entries_and_argv);
+        } catch (const std::bad_alloc&) {
+            return {};
+        }
     }
     size_t image_size = program_image.size();
 

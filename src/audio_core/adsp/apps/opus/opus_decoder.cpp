@@ -30,11 +30,12 @@ bool IsValidChannelCount(u32 channel_count) {
 }
 
 bool IsValidMultiStreamChannelCount(u32 channel_count) {
-    return channel_count <= OpusStreamCountMax;
+    return channel_count > 0 && channel_count <= OpusStreamCountMax;
 }
 
 bool IsValidMultiStreamStreamCounts(s32 total_stream_count, s32 stereo_stream_count) {
-    return IsValidMultiStreamChannelCount(total_stream_count) && total_stream_count > 0 &&
+    return total_stream_count > 0 &&
+           static_cast<u32>(total_stream_count) <= OpusStreamCountMax &&
            stereo_stream_count >= 0 && stereo_stream_count <= total_stream_count;
 }
 } // namespace
@@ -93,37 +94,41 @@ void OpusDecoder::Main(std::stop_token stop_token) {
             return;
 
         case GetWorkBufferSize: {
-            auto channel_count = static_cast<s32>(shared_memory->host_send_data[0]);
+            auto channel_count = static_cast<s32>(shared_memory.host_send_data[0]);
 
-            ASSERT(IsValidChannelCount(channel_count));
-
-            shared_memory->dsp_return_data[0] = OpusDecodeObject::GetWorkBufferSize(channel_count);
+            shared_memory.dsp_return_data[0] =
+                IsValidChannelCount(channel_count)
+                    ? OpusDecodeObject::GetWorkBufferSize(channel_count)
+                    : 0;
             Send(Direction::Host, Message::GetWorkBufferSizeOK);
         } break;
 
         case InitializeDecodeObject: {
-            auto buffer = shared_memory->host_send_data[0];
-            auto buffer_size = shared_memory->host_send_data[1];
-            auto sample_rate = static_cast<s32>(shared_memory->host_send_data[2]);
-            auto channel_count = static_cast<s32>(shared_memory->host_send_data[3]);
+            auto buffer = shared_memory.host_send_data[0];
+            auto buffer_size = shared_memory.host_send_data[1];
+            auto sample_rate = static_cast<s32>(shared_memory.host_send_data[2]);
+            auto channel_count = static_cast<s32>(shared_memory.host_send_data[3]);
 
-            ASSERT(sample_rate >= 0);
-            ASSERT(IsValidChannelCount(channel_count));
-            ASSERT(buffer_size >= OpusDecodeObject::GetWorkBufferSize(channel_count));
+            if (buffer == 0 || sample_rate <= 0 || !IsValidChannelCount(channel_count) ||
+                buffer_size < OpusDecodeObject::GetWorkBufferSize(channel_count)) {
+                shared_memory.dsp_return_data[0] = static_cast<u64>(OPUS_BAD_ARG);
+                Send(Direction::Host, Message::InitializeDecodeObjectOK);
+                break;
+            }
 
             auto& decoder_object = OpusDecodeObject::Initialize(buffer, buffer);
-            shared_memory->dsp_return_data[0] =
+            shared_memory.dsp_return_data[0] =
                 decoder_object.InitializeDecoder(sample_rate, channel_count);
 
             Send(Direction::Host, Message::InitializeDecodeObjectOK);
         } break;
 
         case ShutdownDecodeObject: {
-            auto buffer = shared_memory->host_send_data[0];
-            [[maybe_unused]] auto buffer_size = shared_memory->host_send_data[1];
+            auto buffer = shared_memory.host_send_data[0];
+            [[maybe_unused]] auto buffer_size = shared_memory.host_send_data[1];
 
             auto& decoder_object = OpusDecodeObject::Initialize(buffer, buffer);
-            shared_memory->dsp_return_data[0] = decoder_object.Shutdown();
+            shared_memory.dsp_return_data[0] = decoder_object.Shutdown();
 
             Send(Direction::Host, Message::ShutdownDecodeObjectOK);
         } break;
@@ -131,13 +136,13 @@ void OpusDecoder::Main(std::stop_token stop_token) {
         case DecodeInterleaved: {
             auto start_time = system.CoreTiming().GetGlobalTimeUs();
 
-            auto buffer = shared_memory->host_send_data[0];
-            auto input_data = shared_memory->host_send_data[1];
-            auto input_data_size = shared_memory->host_send_data[2];
-            auto output_data = shared_memory->host_send_data[3];
-            auto output_data_size = shared_memory->host_send_data[4];
-            auto final_range = static_cast<u32>(shared_memory->host_send_data[5]);
-            auto reset_requested = shared_memory->host_send_data[6];
+            auto buffer = shared_memory.host_send_data[0];
+            auto input_data = shared_memory.host_send_data[1];
+            auto input_data_size = shared_memory.host_send_data[2];
+            auto output_data = shared_memory.host_send_data[3];
+            auto output_data_size = shared_memory.host_send_data[4];
+            auto final_range = static_cast<u32>(shared_memory.host_send_data[5]);
+            auto reset_requested = shared_memory.host_send_data[6];
 
             u32 decoded_samples{0};
 
@@ -159,69 +164,75 @@ void OpusDecoder::Main(std::stop_token stop_token) {
             }
 
             auto end_time = system.CoreTiming().GetGlobalTimeUs();
-            shared_memory->dsp_return_data[0] = error_code;
-            shared_memory->dsp_return_data[1] = decoded_samples;
-            shared_memory->dsp_return_data[2] = (end_time - start_time).count();
+            shared_memory.dsp_return_data[0] = error_code;
+            shared_memory.dsp_return_data[1] = decoded_samples;
+            shared_memory.dsp_return_data[2] = (end_time - start_time).count();
 
             Send(Direction::Host, Message::DecodeInterleavedOK);
         } break;
 
         case MapMemory: {
-            [[maybe_unused]] auto buffer = shared_memory->host_send_data[0];
-            [[maybe_unused]] auto buffer_size = shared_memory->host_send_data[1];
+            [[maybe_unused]] auto buffer = shared_memory.host_send_data[0];
+            [[maybe_unused]] auto buffer_size = shared_memory.host_send_data[1];
             Send(Direction::Host, Message::MapMemoryOK);
         } break;
 
         case UnmapMemory: {
-            [[maybe_unused]] auto buffer = shared_memory->host_send_data[0];
-            [[maybe_unused]] auto buffer_size = shared_memory->host_send_data[1];
+            [[maybe_unused]] auto buffer = shared_memory.host_send_data[0];
+            [[maybe_unused]] auto buffer_size = shared_memory.host_send_data[1];
             Send(Direction::Host, Message::UnmapMemoryOK);
         } break;
 
         case GetWorkBufferSizeForMultiStream: {
-            auto total_stream_count = static_cast<s32>(shared_memory->host_send_data[0]);
-            auto stereo_stream_count = static_cast<s32>(shared_memory->host_send_data[1]);
+            auto total_stream_count = static_cast<s32>(shared_memory.host_send_data[0]);
+            auto stereo_stream_count = static_cast<s32>(shared_memory.host_send_data[1]);
 
-            ASSERT(IsValidMultiStreamStreamCounts(total_stream_count, stereo_stream_count));
-
-            shared_memory->dsp_return_data[0] = OpusMultiStreamDecodeObject::GetWorkBufferSize(
-                total_stream_count, stereo_stream_count);
+            shared_memory.dsp_return_data[0] =
+                IsValidMultiStreamStreamCounts(total_stream_count, stereo_stream_count)
+                    ? OpusMultiStreamDecodeObject::GetWorkBufferSize(total_stream_count,
+                                                                     stereo_stream_count)
+                    : 0;
             Send(Direction::Host, Message::GetWorkBufferSizeForMultiStreamOK);
         } break;
 
         case InitializeMultiStreamDecodeObject: {
-            auto buffer = shared_memory->host_send_data[0];
-            auto buffer_size = shared_memory->host_send_data[1];
-            auto sample_rate = static_cast<s32>(shared_memory->host_send_data[2]);
-            auto channel_count = static_cast<s32>(shared_memory->host_send_data[3]);
-            auto total_stream_count = static_cast<s32>(shared_memory->host_send_data[4]);
-            auto stereo_stream_count = static_cast<s32>(shared_memory->host_send_data[5]);
+            auto buffer = shared_memory.host_send_data[0];
+            auto buffer_size = shared_memory.host_send_data[1];
+            auto sample_rate = static_cast<s32>(shared_memory.host_send_data[2]);
+            auto channel_count = static_cast<s32>(shared_memory.host_send_data[3]);
+            auto total_stream_count = static_cast<s32>(shared_memory.host_send_data[4]);
+            auto stereo_stream_count = static_cast<s32>(shared_memory.host_send_data[5]);
             // Nintendo seem to have a bug here, they try to use &host_send_data[6] for the channel
             // mappings, but [6] is never set, and there is not enough room in the argument data for
             // more than 40 channels, when 255 are possible.
             // It also means the mapping values are undefined, though likely always 0,
             // and the mappings given by the game are ignored. The mappings are copied to this
             // dedicated buffer host side, so let's do as intended.
-            auto mappings = shared_memory->channel_mapping.data();
+            auto mappings = shared_memory.channel_mapping.data();
 
-            ASSERT(IsValidMultiStreamStreamCounts(total_stream_count, stereo_stream_count));
-            ASSERT(sample_rate >= 0);
-            ASSERT(buffer_size >= OpusMultiStreamDecodeObject::GetWorkBufferSize(
-                                      total_stream_count, stereo_stream_count));
+            if (buffer == 0 || sample_rate <= 0 ||
+                !IsValidMultiStreamChannelCount(static_cast<u32>(channel_count)) ||
+                !IsValidMultiStreamStreamCounts(total_stream_count, stereo_stream_count) ||
+                buffer_size < OpusMultiStreamDecodeObject::GetWorkBufferSize(
+                                  total_stream_count, stereo_stream_count)) {
+                shared_memory.dsp_return_data[0] = static_cast<u64>(OPUS_BAD_ARG);
+                Send(Direction::Host, Message::InitializeMultiStreamDecodeObjectOK);
+                break;
+            }
 
             auto& decoder_object = OpusMultiStreamDecodeObject::Initialize(buffer, buffer);
-            shared_memory->dsp_return_data[0] = decoder_object.InitializeDecoder(
+            shared_memory.dsp_return_data[0] = decoder_object.InitializeDecoder(
                 sample_rate, total_stream_count, channel_count, stereo_stream_count, mappings);
 
             Send(Direction::Host, Message::InitializeMultiStreamDecodeObjectOK);
         } break;
 
         case ShutdownMultiStreamDecodeObject: {
-            auto buffer = shared_memory->host_send_data[0];
-            [[maybe_unused]] auto buffer_size = shared_memory->host_send_data[1];
+            auto buffer = shared_memory.host_send_data[0];
+            [[maybe_unused]] auto buffer_size = shared_memory.host_send_data[1];
 
             auto& decoder_object = OpusMultiStreamDecodeObject::Initialize(buffer, buffer);
-            shared_memory->dsp_return_data[0] = decoder_object.Shutdown();
+            shared_memory.dsp_return_data[0] = decoder_object.Shutdown();
 
             Send(Direction::Host, Message::ShutdownMultiStreamDecodeObjectOK);
         } break;
@@ -229,13 +240,13 @@ void OpusDecoder::Main(std::stop_token stop_token) {
         case DecodeInterleavedForMultiStream: {
             auto start_time = system.CoreTiming().GetGlobalTimeUs();
 
-            auto buffer = shared_memory->host_send_data[0];
-            auto input_data = shared_memory->host_send_data[1];
-            auto input_data_size = shared_memory->host_send_data[2];
-            auto output_data = shared_memory->host_send_data[3];
-            auto output_data_size = shared_memory->host_send_data[4];
-            auto final_range = static_cast<u32>(shared_memory->host_send_data[5]);
-            auto reset_requested = shared_memory->host_send_data[6];
+            auto buffer = shared_memory.host_send_data[0];
+            auto input_data = shared_memory.host_send_data[1];
+            auto input_data_size = shared_memory.host_send_data[2];
+            auto output_data = shared_memory.host_send_data[3];
+            auto output_data_size = shared_memory.host_send_data[4];
+            auto final_range = static_cast<u32>(shared_memory.host_send_data[5]);
+            auto reset_requested = shared_memory.host_send_data[6];
 
             u32 decoded_samples{0};
 
@@ -257,9 +268,9 @@ void OpusDecoder::Main(std::stop_token stop_token) {
             }
 
             auto end_time = system.CoreTiming().GetGlobalTimeUs();
-            shared_memory->dsp_return_data[0] = error_code;
-            shared_memory->dsp_return_data[1] = decoded_samples;
-            shared_memory->dsp_return_data[2] = (end_time - start_time).count();
+            shared_memory.dsp_return_data[0] = error_code;
+            shared_memory.dsp_return_data[1] = decoded_samples;
+            shared_memory.dsp_return_data[2] = (end_time - start_time).count();
 
             Send(Direction::Host, Message::DecodeInterleavedForMultiStreamOK);
         } break;

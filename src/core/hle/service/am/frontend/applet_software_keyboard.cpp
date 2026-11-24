@@ -7,10 +7,14 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <string_view>
+
 #include "common/string_util.h"
 #include "core/core.h"
 #include "core/frontend/applets/software_keyboard.h"
 #include "core/hle/service/am/am.h"
+#include "core/hle/service/am/am_results.h"
 #include "core/hle/service/am/frontend/applet_software_keyboard.h"
 #include "core/hle/service/am/service/storage.h"
 
@@ -46,6 +50,44 @@ void SetReplyBase(std::vector<u8>& reply, SwkbdState state, SwkbdReplyType reply
     std::memcpy(reply.data() + sizeof(SwkbdState), &reply_type, sizeof(SwkbdReplyType));
 }
 
+template <typename Arg>
+std::vector<u8> MakeUtf16Reply(SwkbdState state, SwkbdReplyType reply_type, std::u16string_view text,
+                               Arg arg, bool with_trailing_flag = false) {
+    constexpr std::size_t max_chars = REPLY_UTF16_SIZE / sizeof(char16_t);
+    const std::size_t copy_chars = (std::min)(text.size(), max_chars);
+    arg.text_length = static_cast<u32>(copy_chars);
+
+    std::vector<u8> reply(REPLY_BASE_SIZE + REPLY_UTF16_SIZE + sizeof(Arg) +
+                          (with_trailing_flag ? 1 : 0));
+    SetReplyBase(reply, state, reply_type);
+    std::memcpy(reply.data() + REPLY_BASE_SIZE, text.data(), copy_chars * sizeof(char16_t));
+    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF16_SIZE, &arg, sizeof(Arg));
+    return reply;
+}
+
+template <typename Arg>
+std::vector<u8> MakeUtf8Reply(SwkbdState state, SwkbdReplyType reply_type, std::u16string_view text,
+                              Arg arg, bool with_trailing_flag = false) {
+    const std::string utf8_text = Common::UTF16ToUTF8(text);
+    std::size_t copy_bytes = (std::min)(utf8_text.size(), REPLY_UTF8_SIZE);
+    if (copy_bytes < utf8_text.size()) {
+        while (copy_bytes > 0 && (static_cast<u8>(utf8_text[copy_bytes]) & 0xC0) == 0x80) {
+            --copy_bytes;
+        }
+        arg.text_length = static_cast<u32>(
+            Common::UTF8ToUTF16(std::string_view{utf8_text}.substr(0, copy_bytes)).size());
+    } else {
+        arg.text_length = static_cast<u32>(text.size());
+    }
+
+    std::vector<u8> reply(REPLY_BASE_SIZE + REPLY_UTF8_SIZE + sizeof(Arg) +
+                          (with_trailing_flag ? 1 : 0));
+    SetReplyBase(reply, state, reply_type);
+    std::memcpy(reply.data() + REPLY_BASE_SIZE, utf8_text.data(), copy_bytes);
+    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF8_SIZE, &arg, sizeof(Arg));
+    return reply;
+}
+
 } // Anonymous namespace
 
 SoftwareKeyboard::SoftwareKeyboard(Core::System& system_, std::shared_ptr<Applet> applet_,
@@ -57,6 +99,13 @@ SoftwareKeyboard::~SoftwareKeyboard() = default;
 
 void SoftwareKeyboard::Initialize() {
     FrontendApplet::Initialize();
+    if (!IsInitialized()) {
+        LOG_ERROR(Service_AM, "Missing or incomplete software keyboard common arguments");
+        status = ResultNoDataInChannel;
+        complete = true;
+        Exit(status);
+        return;
+    }
 
     LOG_INFO(Service_AM, "Initializing Software Keyboard Applet with LibraryAppletMode={}",
              applet_mode);
@@ -72,15 +121,21 @@ void SoftwareKeyboard::Initialize() {
 
     switch (applet_mode) {
     case LibraryAppletMode::AllForeground:
-        InitializeForeground();
+        status = InitializeForeground();
         break;
     case LibraryAppletMode::PartialForeground:
     case LibraryAppletMode::PartialForegroundIndirectDisplay:
-        InitializePartialForeground(applet_mode);
+        status = InitializePartialForeground(applet_mode);
         break;
     default:
-        ASSERT_MSG(false, "Invalid LibraryAppletMode={}", applet_mode);
+        status = ResultInvalidStorageType;
         break;
+    }
+    if (R_FAILED(status)) {
+        LOG_ERROR(Service_AM, "Invalid software keyboard arguments for mode {} and revision {}",
+                  applet_mode, swkbd_applet_version);
+        complete = true;
+        Exit(status);
     }
 }
 
@@ -183,99 +238,92 @@ void SoftwareKeyboard::SubmitTextInline(SwkbdReplyType reply_type, std::u16strin
     SendReply(reply_type);
 }
 
-void SoftwareKeyboard::InitializeForeground() {
+Result SoftwareKeyboard::InitializeForeground() {
     LOG_INFO(Service_AM, "Initializing Normal Software Keyboard Applet.");
 
     is_background = false;
 
     const auto swkbd_config_storage = PopInData();
-    ASSERT(swkbd_config_storage != nullptr);
+    R_UNLESS(swkbd_config_storage, ResultNoDataInChannel);
 
     const auto& swkbd_config_data = swkbd_config_storage->GetData();
-    ASSERT(swkbd_config_data.size() >= sizeof(SwkbdConfigCommon));
+    if (swkbd_applet_version == SwkbdAppletVersion::Version1441810) {
+        R_UNLESS(DecodeNativeSwkbdConfig(swkbd_config_data, swkbd_config_common, swkbd_config_new),
+                 ResultInvalidStorageType);
+    } else {
+        R_UNLESS(swkbd_config_data.size() >= sizeof(SwkbdConfigCommon), ResultInvalidStorageType);
+        std::memcpy(&swkbd_config_common, swkbd_config_data.data(), sizeof(SwkbdConfigCommon));
+    }
 
-    std::memcpy(&swkbd_config_common, swkbd_config_data.data(), sizeof(SwkbdConfigCommon));
+    const auto read_version_config = [&](auto& config) {
+        if (swkbd_config_data.size() < sizeof(SwkbdConfigCommon) + sizeof(config)) {
+            return false;
+        }
+        std::memcpy(&config, swkbd_config_data.data() + sizeof(SwkbdConfigCommon), sizeof(config));
+        return true;
+    };
 
     switch (swkbd_applet_version) {
     case SwkbdAppletVersion::Version5:
     case SwkbdAppletVersion::Version65542:
-        ASSERT(swkbd_config_data.size() == sizeof(SwkbdConfigCommon) + sizeof(SwkbdConfigOld));
-        std::memcpy(&swkbd_config_old, swkbd_config_data.data() + sizeof(SwkbdConfigCommon),
-                    sizeof(SwkbdConfigOld));
+        R_UNLESS(read_version_config(swkbd_config_old), ResultInvalidStorageType);
         break;
     case SwkbdAppletVersion::Version196615:
     case SwkbdAppletVersion::Version262152:
     case SwkbdAppletVersion::Version327689:
-        ASSERT(swkbd_config_data.size() == sizeof(SwkbdConfigCommon) + sizeof(SwkbdConfigOld2));
-        std::memcpy(&swkbd_config_old2, swkbd_config_data.data() + sizeof(SwkbdConfigCommon),
-                    sizeof(SwkbdConfigOld2));
+        R_UNLESS(read_version_config(swkbd_config_old2), ResultInvalidStorageType);
         break;
     case SwkbdAppletVersion::Version393227:
     case SwkbdAppletVersion::Version524301:
-        ASSERT(swkbd_config_data.size() == sizeof(SwkbdConfigCommon) + sizeof(SwkbdConfigNew));
-        std::memcpy(&swkbd_config_new, swkbd_config_data.data() + sizeof(SwkbdConfigCommon),
-                    sizeof(SwkbdConfigNew));
+        R_UNLESS(read_version_config(swkbd_config_new), ResultInvalidStorageType);
         break;
     case SwkbdAppletVersion::Version1310736:
         // The common and 8.0.0 parts keep their layout; the 0x68 bytes after them are unknown.
         // This revision exchanges UTF-8 text: the game's text check replies are UTF-8, and a
         // UTF-16 result reached it as its first character only.
-        ASSERT(swkbd_config_data.size() >= sizeof(SwkbdConfigCommon) + sizeof(SwkbdConfigNew));
-        std::memcpy(&swkbd_config_new, swkbd_config_data.data() + sizeof(SwkbdConfigCommon),
-                    sizeof(SwkbdConfigNew));
+        R_UNLESS(read_version_config(swkbd_config_new), ResultInvalidStorageType);
         swkbd_config_common.use_utf8 = true;
         break;
-    case SwkbdAppletVersion::Version1441810: {
-        // Fire Emblem: Fortune's Weave asks for UTF-8 and keeps the reply up to the first NUL, so the
-        // Switch 1 layout's use_utf8 (a byte of the native initial_string_offset) left one letter.
-        const bool decoded =
-            DecodeNativeSwkbdConfig(swkbd_config_data, swkbd_config_common, swkbd_config_new);
-        ASSERT(decoded);
+    case SwkbdAppletVersion::Version1441810:
         break;
-    }
     default:
         UNIMPLEMENTED_MSG("Unknown SwkbdConfig revision={} with size={}", swkbd_applet_version,
                           swkbd_config_data.size());
-        ASSERT(swkbd_config_data.size() >= sizeof(SwkbdConfigCommon) + sizeof(SwkbdConfigNew));
-        std::memcpy(&swkbd_config_new, swkbd_config_data.data() + sizeof(SwkbdConfigCommon),
-                    sizeof(SwkbdConfigNew));
+        R_UNLESS(read_version_config(swkbd_config_new), ResultInvalidStorageType);
         break;
     }
 
     const auto work_buffer_storage = PopInData();
-    ASSERT(work_buffer_storage != nullptr);
+    const size_t length = swkbd_config_common.initial_string_length;
+    if (length != 0) {
+        R_UNLESS(work_buffer_storage, ResultNoDataInChannel);
+        const auto& work_buffer = work_buffer_storage->GetData();
+        const size_t offset = swkbd_config_common.initial_string_offset;
+        R_UNLESS(offset <= work_buffer.size() &&
+                     length <= (work_buffer.size() - offset) / sizeof(char16_t) &&
+                     length <= DEFAULT_MAX_TEXT_LENGTH,
+                 ResultInvalidOffset);
 
-    if (swkbd_config_common.initial_string_length == 0) {
-        InitializeFrontendNormalKeyboard();
-        return;
+        std::array<char16_t, DEFAULT_MAX_TEXT_LENGTH> initial_string;
+        std::memcpy(initial_string.data(), work_buffer.data() + offset, length * sizeof(char16_t));
+        initial_text = Common::UTF16StringFromFixedZeroTerminatedBuffer(initial_string.data(), length);
+        LOG_DEBUG(Service_AM, "\nInitial Text: {}", Common::UTF16ToUTF8(initial_text));
     }
 
-    const auto& work_buffer = work_buffer_storage->GetData();
-
-    std::vector<char16_t> initial_string(swkbd_config_common.initial_string_length);
-
-    std::memcpy(initial_string.data(),
-                work_buffer.data() + swkbd_config_common.initial_string_offset,
-                swkbd_config_common.initial_string_length * sizeof(char16_t));
-
-    initial_text = Common::UTF16StringFromFixedZeroTerminatedBuffer(initial_string.data(),
-                                                                    initial_string.size());
-
-    LOG_DEBUG(Service_AM, "\nInitial Text: {}", Common::UTF16ToUTF8(initial_text));
-
     InitializeFrontendNormalKeyboard();
+    R_SUCCEED();
 }
 
-void SoftwareKeyboard::InitializePartialForeground(LibraryAppletMode library_applet_mode) {
+Result SoftwareKeyboard::InitializePartialForeground(LibraryAppletMode library_applet_mode) {
     LOG_INFO(Service_AM, "Initializing Inline Software Keyboard Applet.");
 
     is_background = true;
 
     const auto swkbd_inline_initialize_arg_storage = PopInData();
-    ASSERT(swkbd_inline_initialize_arg_storage != nullptr);
+    R_UNLESS(swkbd_inline_initialize_arg_storage, ResultNoDataInChannel);
 
     const auto& swkbd_inline_initialize_arg = swkbd_inline_initialize_arg_storage->GetData();
-    ASSERT(swkbd_inline_initialize_arg.size() == sizeof(SwkbdInitializeArg));
+    R_UNLESS(swkbd_inline_initialize_arg.size() == sizeof(SwkbdInitializeArg), ResultInvalidStorageType);
 
     std::memcpy(&swkbd_initialize_arg, swkbd_inline_initialize_arg.data(),
                 swkbd_inline_initialize_arg.size());
@@ -285,6 +333,7 @@ void SoftwareKeyboard::InitializePartialForeground(LibraryAppletMode library_app
     } else {
         ASSERT(library_applet_mode == LibraryAppletMode::PartialForegroundIndirectDisplay);
     }
+    R_SUCCEED();
 }
 
 void SoftwareKeyboard::ProcessTextCheck() {
@@ -1004,82 +1053,51 @@ void SoftwareKeyboard::ReplyDefault() {
 void SoftwareKeyboard::ReplyChangedString() {
     LOG_DEBUG(Service_AM, "Sending Reply: ChangedString");
 
-    std::vector<u8> reply(REPLY_BASE_SIZE + REPLY_UTF16_SIZE + sizeof(SwkbdChangedStringArg));
-
-    SetReplyBase(reply, swkbd_state, SwkbdReplyType::ChangedString);
-
     const SwkbdChangedStringArg changed_string_arg{
-        .text_length{static_cast<u32>(current_text.size())},
+        .text_length{},
         .dictionary_start_cursor_position{-1},
         .dictionary_end_cursor_position{-1},
         .cursor_position{current_cursor_position},
     };
 
-    std::memcpy(reply.data() + REPLY_BASE_SIZE, current_text.data(),
-                current_text.size() * sizeof(char16_t));
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF16_SIZE, &changed_string_arg,
-                sizeof(SwkbdChangedStringArg));
-
-    PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(reply)));
+    PushInteractiveOutData(std::make_shared<IStorage>(
+        system, MakeUtf16Reply(swkbd_state, SwkbdReplyType::ChangedString, current_text,
+                               changed_string_arg)));
 }
 
 void SoftwareKeyboard::ReplyMovedCursor() {
     LOG_DEBUG(Service_AM, "Sending Reply: MovedCursor");
 
-    std::vector<u8> reply(REPLY_BASE_SIZE + REPLY_UTF16_SIZE + sizeof(SwkbdMovedCursorArg));
-
-    SetReplyBase(reply, swkbd_state, SwkbdReplyType::MovedCursor);
-
     const SwkbdMovedCursorArg moved_cursor_arg{
-        .text_length{static_cast<u32>(current_text.size())},
+        .text_length{},
         .cursor_position{current_cursor_position},
     };
 
-    std::memcpy(reply.data() + REPLY_BASE_SIZE, current_text.data(),
-                current_text.size() * sizeof(char16_t));
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF16_SIZE, &moved_cursor_arg,
-                sizeof(SwkbdMovedCursorArg));
-
-    PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(reply)));
+    PushInteractiveOutData(std::make_shared<IStorage>(
+        system,
+        MakeUtf16Reply(swkbd_state, SwkbdReplyType::MovedCursor, current_text, moved_cursor_arg)));
 }
 
 void SoftwareKeyboard::ReplyMovedTab() {
     LOG_DEBUG(Service_AM, "Sending Reply: MovedTab");
 
-    std::vector<u8> reply(REPLY_BASE_SIZE + REPLY_UTF16_SIZE + sizeof(SwkbdMovedTabArg));
-
-    SetReplyBase(reply, swkbd_state, SwkbdReplyType::MovedTab);
-
     const SwkbdMovedTabArg moved_tab_arg{
-        .text_length{static_cast<u32>(current_text.size())},
+        .text_length{},
         .cursor_position{current_cursor_position},
     };
 
-    std::memcpy(reply.data() + REPLY_BASE_SIZE, current_text.data(),
-                current_text.size() * sizeof(char16_t));
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF16_SIZE, &moved_tab_arg,
-                sizeof(SwkbdMovedTabArg));
-
-    PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(reply)));
+    PushInteractiveOutData(std::make_shared<IStorage>(
+        system, MakeUtf16Reply(swkbd_state, SwkbdReplyType::MovedTab, current_text, moved_tab_arg)));
 }
 
 void SoftwareKeyboard::ReplyDecidedEnter() {
     LOG_DEBUG(Service_AM, "Sending Reply: DecidedEnter");
 
-    std::vector<u8> reply(REPLY_BASE_SIZE + REPLY_UTF16_SIZE + sizeof(SwkbdDecidedEnterArg));
+    const SwkbdDecidedEnterArg decided_enter_arg{};
 
-    SetReplyBase(reply, swkbd_state, SwkbdReplyType::DecidedEnter);
-
-    const SwkbdDecidedEnterArg decided_enter_arg{
-        .text_length{static_cast<u32>(current_text.size())},
-    };
-
-    std::memcpy(reply.data() + REPLY_BASE_SIZE, current_text.data(),
-                current_text.size() * sizeof(char16_t));
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF16_SIZE, &decided_enter_arg,
-                sizeof(SwkbdDecidedEnterArg));
-
-    PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(reply)));
+    PushInteractiveOutData(std::make_shared<IStorage>(
+        system, MakeUtf16Reply(swkbd_state, SwkbdReplyType::DecidedEnter, current_text,
+                               decided_enter_arg)));
 
     HideInlineKeyboard();
 }
@@ -1099,65 +1117,39 @@ void SoftwareKeyboard::ReplyDecidedCancel() {
 void SoftwareKeyboard::ReplyChangedStringUtf8() {
     LOG_DEBUG(Service_AM, "Sending Reply: ChangedStringUtf8");
 
-    std::vector<u8> reply(REPLY_BASE_SIZE + REPLY_UTF8_SIZE + sizeof(SwkbdChangedStringArg));
-
-    SetReplyBase(reply, swkbd_state, SwkbdReplyType::ChangedStringUtf8);
-
-    std::string utf8_current_text = Common::UTF16ToUTF8(current_text);
-
     const SwkbdChangedStringArg changed_string_arg{
-        .text_length{static_cast<u32>(current_text.size())},
+        .text_length{},
         .dictionary_start_cursor_position{-1},
         .dictionary_end_cursor_position{-1},
         .cursor_position{current_cursor_position},
     };
 
-    std::memcpy(reply.data() + REPLY_BASE_SIZE, utf8_current_text.data(), utf8_current_text.size());
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF8_SIZE, &changed_string_arg,
-                sizeof(SwkbdChangedStringArg));
-
-    PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(reply)));
+    PushInteractiveOutData(std::make_shared<IStorage>(
+        system, MakeUtf8Reply(swkbd_state, SwkbdReplyType::ChangedStringUtf8, current_text,
+                              changed_string_arg)));
 }
 
 void SoftwareKeyboard::ReplyMovedCursorUtf8() {
     LOG_DEBUG(Service_AM, "Sending Reply: MovedCursorUtf8");
 
-    std::vector<u8> reply(REPLY_BASE_SIZE + REPLY_UTF8_SIZE + sizeof(SwkbdMovedCursorArg));
-
-    SetReplyBase(reply, swkbd_state, SwkbdReplyType::MovedCursorUtf8);
-
-    std::string utf8_current_text = Common::UTF16ToUTF8(current_text);
-
     const SwkbdMovedCursorArg moved_cursor_arg{
-        .text_length{static_cast<u32>(current_text.size())},
+        .text_length{},
         .cursor_position{current_cursor_position},
     };
 
-    std::memcpy(reply.data() + REPLY_BASE_SIZE, utf8_current_text.data(), utf8_current_text.size());
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF8_SIZE, &moved_cursor_arg,
-                sizeof(SwkbdMovedCursorArg));
-
-    PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(reply)));
+    PushInteractiveOutData(std::make_shared<IStorage>(
+        system, MakeUtf8Reply(swkbd_state, SwkbdReplyType::MovedCursorUtf8, current_text,
+                              moved_cursor_arg)));
 }
 
 void SoftwareKeyboard::ReplyDecidedEnterUtf8() {
     LOG_DEBUG(Service_AM, "Sending Reply: DecidedEnterUtf8");
 
-    std::vector<u8> reply(REPLY_BASE_SIZE + REPLY_UTF8_SIZE + sizeof(SwkbdDecidedEnterArg));
+    const SwkbdDecidedEnterArg decided_enter_arg{};
 
-    SetReplyBase(reply, swkbd_state, SwkbdReplyType::DecidedEnterUtf8);
-
-    std::string utf8_current_text = Common::UTF16ToUTF8(current_text);
-
-    const SwkbdDecidedEnterArg decided_enter_arg{
-        .text_length{static_cast<u32>(current_text.size())},
-    };
-
-    std::memcpy(reply.data() + REPLY_BASE_SIZE, utf8_current_text.data(), utf8_current_text.size());
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF8_SIZE, &decided_enter_arg,
-                sizeof(SwkbdDecidedEnterArg));
-
-    PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(reply)));
+    PushInteractiveOutData(std::make_shared<IStorage>(
+        system, MakeUtf8Reply(swkbd_state, SwkbdReplyType::DecidedEnterUtf8, current_text,
+                              decided_enter_arg)));
 
     HideInlineKeyboard();
 }
@@ -1195,103 +1187,57 @@ void SoftwareKeyboard::ReplyUnsetCustomizedDictionaries() {
 void SoftwareKeyboard::ReplyChangedStringV2() {
     LOG_DEBUG(Service_AM, "Sending Reply: ChangedStringV2");
 
-    std::vector<u8> reply(REPLY_BASE_SIZE + REPLY_UTF16_SIZE + sizeof(SwkbdChangedStringArg) + 1);
-
-    SetReplyBase(reply, swkbd_state, SwkbdReplyType::ChangedStringV2);
-
     const SwkbdChangedStringArg changed_string_arg{
-        .text_length{static_cast<u32>(current_text.size())},
+        .text_length{},
         .dictionary_start_cursor_position{-1},
         .dictionary_end_cursor_position{-1},
         .cursor_position{current_cursor_position},
     };
 
-    constexpr u8 flag = 0;
-
-    std::memcpy(reply.data() + REPLY_BASE_SIZE, current_text.data(),
-                current_text.size() * sizeof(char16_t));
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF16_SIZE, &changed_string_arg,
-                sizeof(SwkbdChangedStringArg));
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF16_SIZE + sizeof(SwkbdChangedStringArg),
-                &flag, 1);
-
-    PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(reply)));
+    PushInteractiveOutData(std::make_shared<IStorage>(
+        system, MakeUtf16Reply(swkbd_state, SwkbdReplyType::ChangedStringV2, current_text,
+                               changed_string_arg, true)));
 }
 
 void SoftwareKeyboard::ReplyMovedCursorV2() {
     LOG_DEBUG(Service_AM, "Sending Reply: MovedCursorV2");
 
-    std::vector<u8> reply(REPLY_BASE_SIZE + REPLY_UTF16_SIZE + sizeof(SwkbdMovedCursorArg) + 1);
-
-    SetReplyBase(reply, swkbd_state, SwkbdReplyType::MovedCursorV2);
-
     const SwkbdMovedCursorArg moved_cursor_arg{
-        .text_length{static_cast<u32>(current_text.size())},
+        .text_length{},
         .cursor_position{current_cursor_position},
     };
 
-    constexpr u8 flag = 0;
-
-    std::memcpy(reply.data() + REPLY_BASE_SIZE, current_text.data(),
-                current_text.size() * sizeof(char16_t));
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF16_SIZE, &moved_cursor_arg,
-                sizeof(SwkbdMovedCursorArg));
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF16_SIZE + sizeof(SwkbdMovedCursorArg),
-                &flag, 1);
-
-    PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(reply)));
+    PushInteractiveOutData(std::make_shared<IStorage>(
+        system, MakeUtf16Reply(swkbd_state, SwkbdReplyType::MovedCursorV2, current_text,
+                               moved_cursor_arg, true)));
 }
 
 void SoftwareKeyboard::ReplyChangedStringUtf8V2() {
     LOG_DEBUG(Service_AM, "Sending Reply: ChangedStringUtf8V2");
 
-    std::vector<u8> reply(REPLY_BASE_SIZE + REPLY_UTF8_SIZE + sizeof(SwkbdChangedStringArg) + 1);
-
-    SetReplyBase(reply, swkbd_state, SwkbdReplyType::ChangedStringUtf8V2);
-
-    std::string utf8_current_text = Common::UTF16ToUTF8(current_text);
-
     const SwkbdChangedStringArg changed_string_arg{
-        .text_length{static_cast<u32>(current_text.size())},
+        .text_length{},
         .dictionary_start_cursor_position{-1},
         .dictionary_end_cursor_position{-1},
         .cursor_position{current_cursor_position},
     };
 
-    constexpr u8 flag = 0;
-
-    std::memcpy(reply.data() + REPLY_BASE_SIZE, utf8_current_text.data(), utf8_current_text.size());
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF8_SIZE, &changed_string_arg,
-                sizeof(SwkbdChangedStringArg));
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF8_SIZE + sizeof(SwkbdChangedStringArg),
-                &flag, 1);
-
-    PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(reply)));
+    PushInteractiveOutData(std::make_shared<IStorage>(
+        system, MakeUtf8Reply(swkbd_state, SwkbdReplyType::ChangedStringUtf8V2, current_text,
+                              changed_string_arg, true)));
 }
 
 void SoftwareKeyboard::ReplyMovedCursorUtf8V2() {
     LOG_DEBUG(Service_AM, "Sending Reply: MovedCursorUtf8V2");
 
-    std::vector<u8> reply(REPLY_BASE_SIZE + REPLY_UTF8_SIZE + sizeof(SwkbdMovedCursorArg) + 1);
-
-    SetReplyBase(reply, swkbd_state, SwkbdReplyType::MovedCursorUtf8V2);
-
-    std::string utf8_current_text = Common::UTF16ToUTF8(current_text);
-
     const SwkbdMovedCursorArg moved_cursor_arg{
-        .text_length{static_cast<u32>(current_text.size())},
+        .text_length{},
         .cursor_position{current_cursor_position},
     };
 
-    constexpr u8 flag = 0;
-
-    std::memcpy(reply.data() + REPLY_BASE_SIZE, utf8_current_text.data(), utf8_current_text.size());
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF8_SIZE, &moved_cursor_arg,
-                sizeof(SwkbdMovedCursorArg));
-    std::memcpy(reply.data() + REPLY_BASE_SIZE + REPLY_UTF8_SIZE + sizeof(SwkbdMovedCursorArg),
-                &flag, 1);
-
-    PushInteractiveOutData(std::make_shared<IStorage>(system, std::move(reply)));
+    PushInteractiveOutData(std::make_shared<IStorage>(
+        system, MakeUtf8Reply(swkbd_state, SwkbdReplyType::MovedCursorUtf8V2, current_text,
+                              moved_cursor_arg, true)));
 }
 
 } // namespace Service::AM::Frontend

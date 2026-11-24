@@ -8,10 +8,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <mutex>
+#include <new>
 #include <unordered_set>
 
 #include "common/settings.h"
 #include "core/hle/kernel/k_transfer_memory.h"
+#include "core/hle/kernel/svc_results.h"
 #include "core/hle/service/am/applet_data_broker.h"
 #include "core/hle/service/am/applet_manager.h"
 #include "core/hle/service/am/frontend/applets.h"
@@ -29,6 +31,29 @@
 namespace Service::AM {
 
 namespace {
+
+constexpr s64 MaxBufferStorageSize = 128LL * 1024 * 1024;
+
+Result ValidateTransferMemoryStorage(
+    s64 size, const InCopyHandle<Kernel::KTransferMemory>& transfer_memory_handle) {
+    if (size <= 0) {
+        LOG_ERROR(Service_AM, "size is less than or equal to 0");
+        R_THROW(ResultUnknown);
+    }
+
+    if (!transfer_memory_handle || transfer_memory_handle->GetOwner() == nullptr) {
+        LOG_ERROR(Service_AM, "transfer_memory_handle is null or has no owner");
+        R_THROW(ResultUnknown);
+    }
+
+    if (static_cast<u64>(size) > transfer_memory_handle->GetSize()) {
+        LOG_ERROR(Service_AM, "size {:#x} exceeds transfer memory size {:#x}", size,
+                  transfer_memory_handle->GetSize());
+        R_THROW(ResultUnknown);
+    }
+
+    R_SUCCEED();
+}
 
 bool ShouldCreateGuestApplet(AppletId applet_id) {
 #define X(Name, name)                                                                              \
@@ -278,12 +303,20 @@ Result ILibraryAppletCreator::CreateLibraryAppletEx(
 Result ILibraryAppletCreator::CreateStorage(Out<SharedPointer<IStorage>> out_storage, s64 size) {
     LOG_DEBUG(Service_AM, "called, size={}", size);
 
-    if (size <= 0) {
-        LOG_ERROR(Service_AM, "size is less than or equal to 0");
+    if (size <= 0 || size > MaxBufferStorageSize) {
+        LOG_ERROR(Service_AM, "size {} is out of range", size);
         R_THROW(ResultUnknown);
     }
 
-    *out_storage = std::make_shared<IStorage>(system, AM::CreateStorage(std::vector<u8>(size)));
+    std::vector<u8> data;
+    try {
+        data.resize(static_cast<std::size_t>(size));
+    } catch (const std::bad_alloc&) {
+        LOG_ERROR(Service_AM, "Failed to allocate {} bytes for storage", size);
+        R_THROW(Kernel::ResultOutOfMemory);
+    }
+
+    *out_storage = std::make_shared<IStorage>(system, AM::CreateStorage(std::move(data)));
     R_SUCCEED();
 }
 
@@ -292,15 +325,7 @@ Result ILibraryAppletCreator::CreateTransferMemoryStorage(
     InCopyHandle<Kernel::KTransferMemory> transfer_memory_handle) {
     LOG_DEBUG(Service_AM, "called, is_writable={} size={}", is_writable, size);
 
-    if (size <= 0) {
-        LOG_ERROR(Service_AM, "size is less than or equal to 0");
-        R_THROW(ResultUnknown);
-    }
-
-    if (!transfer_memory_handle) {
-        LOG_ERROR(Service_AM, "transfer_memory_handle is null");
-        R_THROW(ResultUnknown);
-    }
+    R_TRY(ValidateTransferMemoryStorage(size, transfer_memory_handle));
 
     *out_storage = std::make_shared<IStorage>(
         system, AM::CreateTransferMemoryStorage(system.Kernel(), transfer_memory_handle->GetOwner()->GetMemory(),
@@ -313,15 +338,7 @@ Result ILibraryAppletCreator::CreateHandleStorage(
     InCopyHandle<Kernel::KTransferMemory> transfer_memory_handle) {
     LOG_DEBUG(Service_AM, "called, size={}", size);
 
-    if (size <= 0) {
-        LOG_ERROR(Service_AM, "size is less than or equal to 0");
-        R_THROW(ResultUnknown);
-    }
-
-    if (!transfer_memory_handle) {
-        LOG_ERROR(Service_AM, "transfer_memory_handle is null");
-        R_THROW(ResultUnknown);
-    }
+    R_TRY(ValidateTransferMemoryStorage(size, transfer_memory_handle));
 
     *out_storage = std::make_shared<IStorage>(
         system, AM::CreateHandleStorage(system.Kernel(), transfer_memory_handle->GetOwner()->GetMemory(),

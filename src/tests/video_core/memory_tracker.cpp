@@ -163,10 +163,13 @@ TEST_CASE("MemoryTracker: Border upload", "[video_core]") {
     std::optional<MemoryTracker> memory_track(rasterizer);
     memory_track->UnmarkRegionAsCpuModified(c, WORD * 2);
     memory_track->MarkRegionAsCpuModified(c + WORD - PAGE, PAGE * 2);
-    memory_track->ForEachUploadRange(c, WORD * 2, [](u64 offset, u64 size) {
+    int num = 0;
+    memory_track->ForEachUploadRange(c, WORD * 2, [&](u64 offset, u64 size) {
         REQUIRE(offset == c + WORD - PAGE);
         REQUIRE(size == PAGE * 2);
+        ++num;
     });
+    REQUIRE(num == 1);
 }
 
 TEST_CASE("MemoryTracker: Border upload range", "[video_core]") {
@@ -174,19 +177,26 @@ TEST_CASE("MemoryTracker: Border upload range", "[video_core]") {
     std::optional<MemoryTracker> memory_track(rasterizer);
     memory_track->UnmarkRegionAsCpuModified(c, WORD * 2);
     memory_track->MarkRegionAsCpuModified(c + WORD - PAGE, PAGE * 2);
-    memory_track->ForEachUploadRange(c + WORD - PAGE, PAGE * 2, [](u64 offset, u64 size) {
+    int num = 0;
+    memory_track->ForEachUploadRange(c + WORD - PAGE, PAGE * 2, [&](u64 offset, u64 size) {
         REQUIRE(offset == c + WORD - PAGE);
         REQUIRE(size == PAGE * 2);
+        ++num;
     });
+    REQUIRE(num == 1);
     memory_track->MarkRegionAsCpuModified(c + WORD - PAGE, PAGE * 2);
-    memory_track->ForEachUploadRange(c + WORD - PAGE, PAGE, [](u64 offset, u64 size) {
+    memory_track->ForEachUploadRange(c + WORD - PAGE, PAGE, [&](u64 offset, u64 size) {
         REQUIRE(offset == c + WORD - PAGE);
         REQUIRE(size == PAGE);
+        ++num;
     });
-    memory_track->ForEachUploadRange(c + WORD, PAGE, [](u64 offset, u64 size) {
+    REQUIRE(num == 2);
+    memory_track->ForEachUploadRange(c + WORD, PAGE, [&](u64 offset, u64 size) {
         REQUIRE(offset == c + WORD);
         REQUIRE(size == PAGE);
+        ++num;
     });
+    REQUIRE(num == 3);
 }
 
 TEST_CASE("MemoryTracker: Border upload partial range", "[video_core]") {
@@ -194,19 +204,26 @@ TEST_CASE("MemoryTracker: Border upload partial range", "[video_core]") {
     std::optional<MemoryTracker> memory_track(rasterizer);
     memory_track->UnmarkRegionAsCpuModified(c, WORD * 2);
     memory_track->MarkRegionAsCpuModified(c + WORD - PAGE, PAGE * 2);
-    memory_track->ForEachUploadRange(c + WORD - 1, 2, [](u64 offset, u64 size) {
+    int num = 0;
+    memory_track->ForEachUploadRange(c + WORD - 1, 2, [&](u64 offset, u64 size) {
         REQUIRE(offset == c + WORD - PAGE);
         REQUIRE(size == PAGE * 2);
+        ++num;
     });
+    REQUIRE(num == 1);
     memory_track->MarkRegionAsCpuModified(c + WORD - PAGE, PAGE * 2);
-    memory_track->ForEachUploadRange(c + WORD - 1, 1, [](u64 offset, u64 size) {
+    memory_track->ForEachUploadRange(c + WORD - 1, 1, [&](u64 offset, u64 size) {
         REQUIRE(offset == c + WORD - PAGE);
         REQUIRE(size == PAGE);
+        ++num;
     });
-    memory_track->ForEachUploadRange(c + WORD + 50, 1, [](u64 offset, u64 size) {
+    REQUIRE(num == 2);
+    memory_track->ForEachUploadRange(c + WORD + 50, 1, [&](u64 offset, u64 size) {
         REQUIRE(offset == c + WORD);
         REQUIRE(size == PAGE);
+        ++num;
     });
+    REQUIRE(num == 3);
 }
 
 TEST_CASE("MemoryTracker: Partial word uploads", "[video_core]") {
@@ -325,10 +342,13 @@ TEST_CASE("MemoryTracker: Empty right bits", "[video_core]") {
     std::optional<MemoryTracker> memory_track(rasterizer);
     memory_track->UnmarkRegionAsCpuModified(c, WORD * 2048);
     memory_track->MarkRegionAsCpuModified(c + WORD - PAGE, PAGE * 2);
-    memory_track->ForEachUploadRange(c, WORD * 2048, [](u64 offset, u64 size) {
+    int num = 0;
+    memory_track->ForEachUploadRange(c, WORD * 2048, [&](u64 offset, u64 size) {
         REQUIRE(offset == c + WORD - PAGE);
         REQUIRE(size == PAGE * 2);
+        ++num;
     });
+    REQUIRE(num == 1);
 }
 
 TEST_CASE("MemoryTracker: Out of bound ranges 1", "[video_core]") {
@@ -378,13 +398,16 @@ TEST_CASE("MemoryTracker: Sparse regions 1", "[video_core]") {
     memory_track->UnmarkRegionAsCpuModified(c, WORD);
     memory_track->MarkRegionAsCpuModified(c + PAGE * 1, PAGE);
     memory_track->MarkRegionAsCpuModified(c + PAGE * 3, PAGE * 4);
-    memory_track->ForEachUploadRange(c, WORD, [i = 0](u64 offset, u64 size) mutable {
+    std::size_t num = 0;
+    memory_track->ForEachUploadRange(c, WORD, [&](u64 offset, u64 size) {
         static constexpr std::array<u64, 2> offsets{c + PAGE, c + PAGE * 3};
         static constexpr std::array<u64, 2> sizes{PAGE, PAGE * 4};
-        REQUIRE(offset == offsets.at(i));
-        REQUIRE(size == sizes.at(i));
-        ++i;
+        REQUIRE(num < offsets.size());
+        REQUIRE(offset == offsets.at(num));
+        REQUIRE(size == sizes.at(num));
+        ++num;
     });
+    REQUIRE(num == std::size_t{2});
 }
 
 TEST_CASE("MemoryTracker: Sparse regions 2", "[video_core]") {
@@ -394,13 +417,16 @@ TEST_CASE("MemoryTracker: Sparse regions 2", "[video_core]") {
     REQUIRE(rasterizer.Count() == 0x23);
     memory_track->MarkRegionAsCpuModified(c + PAGE * 0x1B, PAGE);
     memory_track->MarkRegionAsCpuModified(c + PAGE * 0x21, PAGE);
-    memory_track->ForEachUploadRange(c, PAGE * 0x23, [i = 0](u64 offset, u64 size) mutable {
-        static constexpr std::array<u64, 3> offsets{c + PAGE * 0x1B, c + PAGE * 0x21};
-        static constexpr std::array<u64, 3> sizes{PAGE, PAGE};
-        REQUIRE(offset == offsets.at(i));
-        REQUIRE(size == sizes.at(i));
-        ++i;
+    std::size_t num = 0;
+    memory_track->ForEachUploadRange(c, PAGE * 0x23, [&](u64 offset, u64 size) {
+        static constexpr std::array<u64, 2> offsets{c + PAGE * 0x1B, c + PAGE * 0x21};
+        static constexpr std::array<u64, 2> sizes{PAGE, PAGE};
+        REQUIRE(num < offsets.size());
+        REQUIRE(offset == offsets.at(num));
+        REQUIRE(size == sizes.at(num));
+        ++num;
     });
+    REQUIRE(num == std::size_t{2});
 }
 
 TEST_CASE("MemoryTracker: Single page modified range", "[video_core]") {

@@ -4,12 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <numbers>
 #include <ranges>
 
 #include "audio_core/adsp/apps/audio_renderer/command_list_processor.h"
 #include "audio_core/renderer/command/effect/reverb.h"
-#include <ranges>
 
 namespace AudioCore::Renderer {
 
@@ -89,8 +89,9 @@ static void UpdateReverbEffectParameter(const ReverbInfo::ParameterVersion2& par
         return std::cos(degrees * std::numbers::pi_v<f32> / 180.0f);
     };
 
-    static bool unk_initialized{false};
-    static Common::FixedPoint<50, 14> unk_value{};
+    const u32 early_mode{(std::min)(params.early_mode, ReverbInfo::NumEarlyModes - 1)};
+    const s32 late_mode{
+        std::clamp(params.late_mode, s32{0}, static_cast<s32>(ReverbInfo::NumLateModes) - 1)};
 
     auto sample_rate = Common::FixedPoint<50, 14>::from_base(params.sample_rate);
     if (sample_rate.to_float() < 1.0f) sample_rate = Common::FixedPoint<50, 14>(1.0f);
@@ -99,7 +100,7 @@ static void UpdateReverbEffectParameter(const ReverbInfo::ParameterVersion2& par
     if (pre_delay_time.to_float() < 0.0f) pre_delay_time = Common::FixedPoint<50, 14>(0.0f);
 
     for (u32 i = 0; i < ReverbInfo::MaxDelayTaps; i++) {
-        int target_delay = ((pre_delay_time + EarlyDelayTimes[params.early_mode][i]) * sample_rate).to_int();
+        int target_delay = ((pre_delay_time + EarlyDelayTimes[early_mode][i]) * sample_rate).to_int();
         if (target_delay < 0) target_delay = 0;
         if (target_delay > state.pre_delay_line.sample_count_max) target_delay = state.pre_delay_line.sample_count_max;
 
@@ -107,7 +108,7 @@ static void UpdateReverbEffectParameter(const ReverbInfo::ParameterVersion2& par
         int smooth_delay = old_delay + (target_delay - old_delay) / 4;
         state.early_delay_times[i] = smooth_delay + 1;
 
-        auto target_gain = Common::FixedPoint<50, 14>::from_base(params.early_gain) * EarlyDelayGains[params.early_mode][i];
+        auto target_gain = Common::FixedPoint<50, 14>::from_base(params.early_gain) * EarlyDelayGains[early_mode][i];
         if (target_gain.to_float() < 0.0f) target_gain = Common::FixedPoint<50, 14>(0.0f);
         if (target_gain.to_float() > 1.0f) target_gain = Common::FixedPoint<50, 14>(1.0f);
 
@@ -119,34 +120,44 @@ static void UpdateReverbEffectParameter(const ReverbInfo::ParameterVersion2& par
         state.early_gains[5] *= Common::FixedPoint<50, 14>(0.5f);
     }
 
-    int target_pre_time = ((pre_delay_time + EarlyDelayTimes[params.early_mode][10]) * sample_rate).to_int();
+    int target_pre_time = ((pre_delay_time + EarlyDelayTimes[early_mode][10]) * sample_rate).to_int();
     if (target_pre_time < 0) target_pre_time = 0;
     if (target_pre_time > state.pre_delay_line.sample_count_max) target_pre_time = state.pre_delay_line.sample_count_max;
 
     int old_pre_time = state.pre_delay_time;
     state.pre_delay_time = old_pre_time + (target_pre_time - old_pre_time) / 4;
 
-    if (!unk_initialized) {
-        unk_value = cos((1280.0f / sample_rate).to_float());
-        unk_initialized = true;
+    if (!state.unk_initialized) {
+        state.unk_value = cos((1280.0f / sample_rate).to_float());
+        state.unk_initialized = true;
     }
 
     for (u32 i = 0; i < ReverbInfo::MaxDelayLines; i++) {
-        int target_fdn_delay = (FdnDelayTimes[params.late_mode][i] * sample_rate).to_int();
+        int target_fdn_delay = (FdnDelayTimes[late_mode][i] * sample_rate).to_int();
         if (target_fdn_delay < 0) target_fdn_delay = 0;
         if (target_fdn_delay > state.fdn_delay_lines[i].sample_count_max) target_fdn_delay = state.fdn_delay_lines[i].sample_count_max;
 
         int old_fdn = state.fdn_delay_lines[i].sample_count;
         state.fdn_delay_lines[i].sample_count = old_fdn + (target_fdn_delay - old_fdn) / 4;
-        state.fdn_delay_lines[i].buffer_end = &state.fdn_delay_lines[i].buffer[state.fdn_delay_lines[i].sample_count - 1];
+        if (!state.fdn_delay_lines[i].buffer.empty()) {
+            const s32 max_idx{static_cast<s32>(state.fdn_delay_lines[i].buffer.size()) - 1};
+            const s32 end_idx{std::clamp(state.fdn_delay_lines[i].sample_count - 1, 0, max_idx)};
+            state.fdn_delay_lines[i].buffer_end =
+                &state.fdn_delay_lines[i].buffer[static_cast<size_t>(end_idx)];
+        }
 
-        int target_decay_delay = (DecayDelayTimes[params.late_mode][i] * sample_rate).to_int();
+        int target_decay_delay = (DecayDelayTimes[late_mode][i] * sample_rate).to_int();
         if (target_decay_delay < 0) target_decay_delay = 0;
         if (target_decay_delay > state.decay_delay_lines[i].sample_count_max) target_decay_delay = state.decay_delay_lines[i].sample_count_max;
 
         int old_decay = state.decay_delay_lines[i].sample_count;
         state.decay_delay_lines[i].sample_count = old_decay + (target_decay_delay - old_decay) / 4;
-        state.decay_delay_lines[i].buffer_end = &state.decay_delay_lines[i].buffer[state.decay_delay_lines[i].sample_count - 1];
+        if (!state.decay_delay_lines[i].buffer.empty()) {
+            const s32 max_idx{static_cast<s32>(state.decay_delay_lines[i].buffer.size()) - 1};
+            const s32 end_idx{std::clamp(state.decay_delay_lines[i].sample_count - 1, 0, max_idx)};
+            state.decay_delay_lines[i].buffer_end =
+                &state.decay_delay_lines[i].buffer[static_cast<size_t>(end_idx)];
+        }
 
         auto colouration = Common::FixedPoint<50, 14>::from_base(params.colouration);
         if (colouration.to_float() < 0.0f) colouration = Common::FixedPoint<50, 14>(0.0f);
@@ -176,7 +187,7 @@ static void UpdateReverbEffectParameter(const ReverbInfo::ParameterVersion2& par
             auto f = 1.0f - e;
             if (f < 0.0001f) f = 0.0001f;
 
-            auto g = 2.0f - (unk_value.to_float() * e * 2);
+            auto g = 2.0f - (state.unk_value.to_float() * e * 2);
 
             auto h_sq = g * g - f * f * 4;
             if (h_sq < 0.0f) h_sq = 0.0f;
@@ -208,6 +219,11 @@ static void InitializeReverbEffect(const ReverbInfo::ParameterVersion2& params,
     state = {};
 
     auto delay{Common::FixedPoint<50, 14>::from_base(params.sample_rate)};
+    if (delay.to_float() < 0.0f) {
+        delay = Common::FixedPoint<50, 14>(0.0f);
+    } else if (delay.to_float() > 192.0f) {
+        delay = Common::FixedPoint<50, 14>(192.0f);
+    }
 
     for (u32 i = 0; i < ReverbInfo::MaxDelayLines; i++) {
         auto fdn_delay_time{(FdnMaxDelayLineTimes[i] * delay).to_uint_floor()};
@@ -407,7 +423,20 @@ static void ApplyReverbEffect(const ReverbInfo::ParameterVersion2& params, Rever
 static void ApplyReverbEffect(const ReverbInfo::ParameterVersion2& params, ReverbInfo::State& state,
                               const bool enabled, std::span<std::span<const s32>> inputs,
                               std::span<std::span<s32>> outputs, const u32 sample_count) {
-    if (enabled) {
+    auto delay_lines_ready = [&state]() -> bool {
+        if (state.pre_delay_line.buffer.empty() || state.center_delay_line.buffer.empty()) {
+            return false;
+        }
+        for (u32 i = 0; i < ReverbInfo::MaxDelayLines; i++) {
+            if (state.decay_delay_lines[i].buffer.empty() ||
+                state.fdn_delay_lines[i].buffer.empty()) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (enabled && delay_lines_ready()) {
         switch (params.channel_count) {
         case 0:
             return;
@@ -448,17 +477,31 @@ void ReverbCommand::Dump([[maybe_unused]] const AudioRenderer::CommandListProces
 }
 
 void ReverbCommand::Process(const AudioRenderer::CommandListProcessor& processor) {
+    if (parameter.channel_count == 0 || !IsChannelCountValid(parameter.channel_count)) {
+        return;
+    }
+
+    auto state_{reinterpret_cast<ReverbInfo::State*>(state)};
+    if (state_ == nullptr) {
+        return;
+    }
+
     std::array<std::span<const s32>, MaxChannels> input_buffers{};
     std::array<std::span<s32>, MaxChannels> output_buffers{};
 
     for (u32 i = 0; i < parameter.channel_count; i++) {
+        if (inputs[i] < 0 || outputs[i] < 0 ||
+            static_cast<size_t>(inputs[i] + 1) * processor.sample_count >
+                processor.mix_buffers.size() ||
+            static_cast<size_t>(outputs[i] + 1) * processor.sample_count >
+                processor.mix_buffers.size()) {
+            return;
+        }
         input_buffers[i] = processor.mix_buffers.subspan(inputs[i] * processor.sample_count,
                                                          processor.sample_count);
         output_buffers[i] = processor.mix_buffers.subspan(outputs[i] * processor.sample_count,
                                                           processor.sample_count);
     }
-
-    auto state_{reinterpret_cast<ReverbInfo::State*>(state)};
 
     if (effect_enabled) {
         if (parameter.state == ReverbInfo::ParameterState::Updating) {

@@ -132,9 +132,15 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     patch_control_points_minus_one.Assign(std::clamp<u32>(regs.patch_vertices, 1, 32) - 1);
     const bool can_collapse_topology_class =
         features.has_extended_dynamic_state && features.has_extended_dynamic_state_2;
-    topology.Assign(can_collapse_topology_class
-                        ? TOPOLOGY_CLASS_REPRESENTATIVE_LUT[static_cast<size_t>(topology_)]
-                        : topology_);
+    const size_t topology_index = static_cast<size_t>(topology_);
+    const auto valid_topology = topology_index < TOPOLOGY_CLASS_REPRESENTATIVE_LUT.size()
+                                    ? topology_
+                                    : Maxwell::PrimitiveTopology::Points;
+    const auto collapsed_topology =
+        topology_index < TOPOLOGY_CLASS_REPRESENTATIVE_LUT.size()
+            ? TOPOLOGY_CLASS_REPRESENTATIVE_LUT[topology_index]
+            : Maxwell::PrimitiveTopology::Points;
+    topology.Assign(can_collapse_topology_class ? collapsed_topology : valid_topology);
     msaa_mode.Assign(regs.anti_alias_samples_mode);
     attachment0_dual_source_blend.Assign(ComputeAttachment0DualSourceBlend(regs) ? 1 : 0);
 
@@ -386,11 +392,14 @@ void FixedPipelineState::DynamicState::Refresh2(const Maxwell& regs,
         regs.polygon_offset_line_enable,
         regs.polygon_offset_fill_enable,
     };
-    const u32 topology_index = static_cast<u32>(topology_);
+    const size_t topology_index = static_cast<size_t>(topology_);
+    const size_t offset_kind = topology_index < POLYGON_OFFSET_ENABLE_LUT.size()
+                                   ? POLYGON_OFFSET_ENABLE_LUT[topology_index]
+                                   : POINT;
 
     rasterize_enable.Assign(regs.rasterize_enable != 0 ? 1 : 0);
     primitive_restart_enable.Assign(regs.primitive_restart.enabled != 0 ? 1 : 0);
-    depth_bias_enable.Assign(enabled_lut[POLYGON_OFFSET_ENABLE_LUT[topology_index]] != 0 ? 1 : 0);
+    depth_bias_enable.Assign(enabled_lut[offset_kind] != 0 ? 1 : 0);
 }
 
 void FixedPipelineState::DynamicState::Refresh3(const Maxwell& regs,

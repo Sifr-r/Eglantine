@@ -12,9 +12,11 @@
 #include <cstdlib>
 #include <chrono>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include "video_core/texture_cache/texture_cache_base.h"
 
@@ -23,6 +25,8 @@
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_dlss_network_probe.h"
 #include "video_core/renderer_vulkan/vk_fsr3_upscaler.h"
+#include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
+#include "video_core/renderer_vulkan/vk_xess_upscaler.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/renderer_vulkan/vk_streamline_dlss.h"
 #endif
@@ -32,6 +36,11 @@
 #include "video_core/texture_cache/image_allocation_pool.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
+
+namespace Core {
+class Nx2SessionState;
+class System;
+} // namespace Core
 
 namespace Settings {
 struct ResolutionScalingInfo;
@@ -64,6 +73,12 @@ public:
                                  RenderPassCache& render_pass_cache_,
                                  DescriptorPool& descriptor_pool,
                                  ComputePassDescriptorQueue& compute_pass_descriptor_queue);
+
+    void SetSystem(Core::System* system_) noexcept {
+        system = system_;
+    }
+
+    [[nodiscard]] std::shared_ptr<Core::Nx2SessionState> Nx2Session() const;
 
     void Finish();
 
@@ -119,14 +134,15 @@ public:
                    Tegra::Engines::Fermi2D::Operation operation);
 
     /// Stands in for a DLSS evaluation: temporal upscale of input_color (render_size on the host)
-    /// into dst, with FSR 3.1 when given the depth, else with the temporal stand-in. False when dst
-    /// cannot take it.
+    /// into dst (DLSS -> XeSS -> FSR 3.1 when depth is present, else temporal stand-in). False
+    /// when dst cannot take it.
     bool TemporalUpscale(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& input_color,
                          ImageView& motion_vectors, ImageView* depth,
                          std::array<u32, 2> render_size, std::array<f32, 2> jitter,
                          std::array<f32, 2> motion_scale);
 
-    /// True when TemporalUpscale would use the depth (FSR 3.1 not forced off and not failed).
+    /// True when TemporalUpscale would use the depth (not forced to stand-in and at least one
+    /// depth-based temporal upscaler remains viable).
     [[nodiscard]] bool WantsTemporalUpscaleDepth() const;
 
     /// True while TemporalUpscale would use NVIDIA DLSS (on, Streamline running, not failed).
@@ -208,7 +224,7 @@ public:
 
     void InvalidateResolveShadow(VkImage msaa_image);
 
-    void MarkResolveShadowUpToDate(VkImage msaa_image);
+    void MarkResolveShadowUpToDate(VkImage msaa_image, VkImageView shadow_view);
 
     void EraseResolveShadow(VkImage msaa_image);
 
@@ -232,27 +248,31 @@ public:
     DescriptorPool& descriptor_pool;
     ComputePassDescriptorQueue& compute_pass_descriptor_queue;
 
-    /// FSR 3.1 in place of a DLSS evaluation (TemporalUpscale), created on first use.
-    bool UpscaleWithFsr3(Framebuffer* dst_framebuffer, ImageView& input_color,
-                         ImageView& motion_vectors, ImageView& depth,
-                         std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale);
+    /// Unified depth-based temporal upscaler pipeline (DLSS -> XeSS -> FSR 3.1).
+    bool UpscaleWithTemporalBackends(Framebuffer* dst_framebuffer, ImageView& input_color,
+                                     ImageView& motion_vectors, ImageView& depth,
+                                     std::array<u32, 2> render_size, std::array<f32, 2> jitter,
+                                     std::array<f32, 2> motion_scale);
+    bool TryUpscaleBackend(ITemporalUpscaler& upscaler, Framebuffer* dst_framebuffer,
+                           const TemporalUpscaleInputs& inputs, const char* backend_name,
+                           bool& logged);
+    TemporalUpscaleImage MakeUpscaleImage(ImageView& view, VkImageView handle,
+                                          VkImageAspectFlags aspect) const;
+    XeSSUpscaler* GetXessUpscaler();
+    Fsr3Upscaler* GetFsr3Upscaler();
+
+    std::unique_ptr<XeSSUpscaler> xess_upscaler;
+    bool xess_unsupported{};
     std::unique_ptr<Fsr3Upscaler> fsr3_upscaler;
     bool fsr3_unsupported{};
     /// The game DLSS network's health check (ProbeGameDlssOutput), created on first use.
     std::unique_ptr<DlssNetworkProbe> dlss_network_probe;
-    std::optional<std::chrono::steady_clock::time_point> fsr3_last_evaluation;
+    std::optional<std::chrono::steady_clock::time_point> temporal_last_evaluation;
 
     /// Draws an upscaler's RGBA16F output into the DLSS output and returns it to GENERAL.
     void DrawUpscaledOutput(Framebuffer* dst_framebuffer, VkImageView view, VkImage image,
                             VkSampler sampler);
 #ifdef EGLANTINE_STREAMLINE
-    /// NVIDIA's DLSS (through NVIDIA Streamline) in place of the game's,
-    /// before FSR 3.1, when the setting is on. Returns false to fall back to FSR 3.1.
-    bool UpscaleWithDlss(Framebuffer* dst_framebuffer, ImageView& input_color,
-                         ImageView& motion_vectors, ImageView& depth,
-                         std::array<u32, 2> render_size, std::array<f32, 2> jitter,
-                         std::array<f32, 2> motion_scale, bool reset);
     /// The NVIDIA DLSS upscaler, created on first use; null when DLSS can't run.
     StreamlineDlssUpscaler* DlssUpscaler();
     std::unique_ptr<StreamlineDlssUpscaler> dlss_upscaler;
@@ -277,7 +297,8 @@ public:
     /// ASTC decoded on the GPU and re-compressed to BC1/BC3 there (accelerate_astc=Gpu with
     /// astc_recompression=Bc1/Bc3): decode into a temporary RGBA8 image, encode, copy.
     void TranscodeAstcToBcn(Image& image, const StagingBufferRef& map,
-                            std::span<const VideoCommon::SwizzleParameters> swizzles);
+                            std::span<const VideoCommon::SwizzleParameters> swizzles,
+                            std::span<const u32> target_layers = {});
 
     /// Temporary decode images, reusable once the GPU is past `tick`.
     struct PendingTranscode {
@@ -351,8 +372,9 @@ public:
     u64 allocation_pool_frames{};
     u32 allocation_pool_pressure_events{};
     u32 allocation_pool_pressure_frames{};
-    ::Common::unordered_map<VkImage, ResolveShadow> resolve_shadows;
+    ::Common::unordered_map<VkImage, std::vector<ResolveShadow>> resolve_shadows;
     std::vector<std::pair<u64, ResolveShadow>> pending_resolve_shadows;
+    Core::System* system = nullptr;
 };
 
 class Framebuffer {
@@ -416,6 +438,9 @@ public:
     }
 
     [[nodiscard]] bool HasAspectColorBit(size_t index) const noexcept {
+        if (index >= rt_map.size() || rt_map[index] == UNBOUND_RT) {
+            return false;
+        }
         return (image_ranges.at(rt_map[index]).aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
     }
 
@@ -445,6 +470,7 @@ public:
 
 private:
     static constexpr size_t NUM_MEMOIZED_RENDER_PASS_VARIANTS = 8;
+    static constexpr size_t UNBOUND_RT = (std::numeric_limits<size_t>::max)();
 
     vk::Framebuffer framebuffer;
     VkRenderPass renderpass{};
@@ -454,11 +480,16 @@ private:
     u32 num_images = 0;
     std::array<VkImage, 9> images{};
     std::array<VkImageSubresourceRange, 9> image_ranges{};
-    std::array<size_t, NUM_RT> rt_map{};
+    std::array<size_t, NUM_RT> rt_map{
+        UNBOUND_RT, UNBOUND_RT, UNBOUND_RT, UNBOUND_RT,
+        UNBOUND_RT, UNBOUND_RT, UNBOUND_RT, UNBOUND_RT,
+    };
+    static_assert(NUM_RT == 8);
     bool has_depth{};
     bool has_stencil{};
     bool is_rescaled{};
     std::array<VkImage, 9> resolve_shadow_images{};
+    std::array<VkImageView, 9> resolve_shadow_views{};
     u32 num_resolve_shadows = 0;
     TextureCacheRuntime* runtime_ptr{nullptr};
     RenderPassKey render_pass_key{};
@@ -573,7 +604,7 @@ public:
     friend class TextureCacheRuntime;
 
 private:
-    bool BlitScaleHelper(bool scale_up);
+    bool BlitScaleHelper(bool scale_up, bool dst_undefined);
 
     bool NeedsScaleHelper() const;
 

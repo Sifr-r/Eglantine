@@ -13,9 +13,23 @@ VsyncManager::VsyncManager() = default;
 VsyncManager::~VsyncManager() = default;
 
 void VsyncManager::SignalVsync(Kernel::KernelCore& kernel) {
+    std::scoped_lock lk{m_lock};
     for (auto* event : m_vsync_events) {
         event->Signal(kernel);
     }
+}
+
+void VsyncManager::LinkVsyncEvent(Event* event) {
+    if (event == nullptr) {
+        return;
+    }
+    std::scoped_lock lk{m_lock};
+    m_vsync_events.insert(event);
+}
+
+void VsyncManager::UnlinkVsyncEvent(Event* event) {
+    std::scoped_lock lk{m_lock};
+    m_vsync_events.erase(event);
 }
 
 } // namespace Service::VI

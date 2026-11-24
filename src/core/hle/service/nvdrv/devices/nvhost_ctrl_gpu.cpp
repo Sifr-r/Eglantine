@@ -15,6 +15,8 @@
 #include "common/logging.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/nx2_session_state.h"
+#include "core/platform_profile.h"
 #include "core/hle/service/nvdrv/devices/ioctl_serialization.h"
 #include "core/hle/service/nvdrv/devices/nvhost_ctrl_gpu.h"
 #include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
@@ -28,7 +30,7 @@ void ApplyNx2CharacteristicsTail(std::span<u8> block);
 } // namespace
 
 nvhost_ctrl_gpu::nvhost_ctrl_gpu(Core::System& system_, EventInterface& events_interface_)
-    : nvdevice{system_}, events_interface{events_interface_} {
+    : nvdevice{system_, Kind}, events_interface{events_interface_} {
     error_notifier_event = events_interface.CreateEvent("CtrlGpuErrorNotifier");
     unknown_event = events_interface.CreateEvent("CtrlGpuUnknownEvent");
 }
@@ -108,7 +110,7 @@ NvResult nvhost_ctrl_gpu::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8>
         case 0x5: {
             const auto result = WrapFixedInlOut(this, &nvhost_ctrl_gpu::GetCharacteristics3,
                                                 input, output, inline_output);
-            if (nx2_caller) {
+            if (result == NvResult::Success && nx2_caller) {
                 ApplyNx2CharacteristicsTail(inline_output);
             }
             return result;
@@ -305,8 +307,20 @@ NvResult nvhost_ctrl_gpu::GetCharacteristics1(IoctlCharacteristics& params) {
 
 NvResult nvhost_ctrl_gpu::GetCharacteristics3(
     IoctlCharacteristics& params, std::span<IoctlGpuCharacteristics> gpu_characteristics) {
-    LOG_DEBUG(Service_NVDRV, "called, buf_size={:#x}", params.gpu_characteristics_buf_size);
-    const bool nx2 = params.gpu_characteristics_buf_size >= Nx2CharacteristicsSize;
+    const u64 requested_buf_size = params.gpu_characteristics_buf_size;
+    LOG_DEBUG(Service_NVDRV, "called, buf_size={:#x}", requested_buf_size);
+    const bool nx2 = requested_buf_size >= Nx2CharacteristicsSize;
+    if (nx2) {
+        const auto& platform = system.Platform();
+        if (!platform.IsSwitch2() && !platform.allow_contradictory_nx2_gpu_query) {
+            LOG_CRITICAL(
+                Service_NVDRV,
+                "Rejecting contradictory Switch 2 GPU characteristics query (buf_size={:#x}) under "
+                "{} platform profile",
+                requested_buf_size, Core::PlatformResolutionName(platform.resolution));
+            return NvResult::NotSupported;
+        }
+    }
 
     params.gc.arch = 0x120;
     params.gc.impl = 0xb;
@@ -346,12 +360,25 @@ NvResult nvhost_ctrl_gpu::GetCharacteristics3(
     params.gpu_characteristics_buf_size = 0xA0;
     params.gpu_characteristics_buf_addr = 0xdeadbeef; // Cannot be 0 (UNUSED)
     if (nx2) {
+        const auto& platform = system.Platform();
+        if (!platform.IsSwitch2()) {
+            LOG_WARNING(
+                Service_NVDRV,
+                "Allowing Switch 2 GPU characteristics query (buf_size={:#x}) under {} "
+                "(missing main.npdm)",
+                requested_buf_size, Core::PlatformResolutionName(platform.resolution));
+        } else {
+            LOG_WARNING(Service_NVDRV, "Switch 2 caller, reporting Ampere chip 0x17E");
+        }
         nx2_caller = true;
+        if (const auto nx2_session = system.EnsureNx2Session()) {
+            nx2_session->SetDriverActive(true);
+            nx2_session->SetAmpere(true);
+        }
         g_nx2_driver = true;
         Tegra::g_nx2_ampere = true;
         ApplyNx2Characteristics(params.gc);
         params.gpu_characteristics_buf_size = Nx2CharacteristicsSize;
-        LOG_WARNING(Service_NVDRV, "Switch 2 caller, reporting Ampere chip 0x17E");
     }
     if (!gpu_characteristics.empty()) {
         gpu_characteristics.front() = params.gc;

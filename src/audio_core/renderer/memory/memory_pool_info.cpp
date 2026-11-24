@@ -31,7 +31,7 @@ void MemoryPoolInfo::SetDspAddress(const CpuAddr address) {
 }
 
 bool MemoryPoolInfo::Contains(const CpuAddr address_, const u64 size_) const {
-    return cpu_address <= address_ && (address_ + size_) <= (cpu_address + size);
+    return size_ <= size && address_ >= cpu_address && (address_ - cpu_address) <= (size - size_);
 }
 
 bool MemoryPoolInfo::IsMapped() const {

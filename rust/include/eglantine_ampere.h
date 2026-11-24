@@ -21,6 +21,8 @@ typedef enum EglAmpereCaptureResult {
 } EglAmpereCaptureResult;
 
 typedef struct EglAmpereCaptureState {
+    EglAmpereInstruction exit_setup[5];
+    uint32_t exit_handler_end;
     uint32_t last_call_target;
     uint32_t last_forward_target;
     uint8_t main_exited;

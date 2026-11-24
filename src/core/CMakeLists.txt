@@ -28,6 +28,10 @@ add_library(core STATIC
     cpu_manager.h
     launch_params.cpp
     launch_params.h
+    nx2_session_state.cpp
+    nx2_session_state.h
+    platform_profile.cpp
+    platform_profile.h
     crypto/aes_util.cpp
     crypto/aes_util.h
     crypto/ctr_encryption_layer.cpp
@@ -1251,6 +1255,11 @@ target_link_libraries(core PRIVATE
     ZLIB::ZLIB)
 
 target_link_libraries(core PUBLIC httplib::httplib zstd::zstd)
+
+if (ENABLE_RUST_NUP AND TARGET eglantine_rs)
+    target_link_libraries(core PUBLIC eglantine_rs zstd::zstd)
+    target_compile_definitions(core PUBLIC EGLANTINE_ENABLE_RUST_NUP=1)
+endif()
 
 if (ENABLE_WEB_SERVICE)
     target_compile_definitions(core PUBLIC ENABLE_WEB_SERVICE)

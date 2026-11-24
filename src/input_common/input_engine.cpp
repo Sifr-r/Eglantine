@@ -211,7 +211,12 @@ BasicMotion InputEngine::GetMotion(const PadIdentifier& identifier, int motion) 
         return {};
     }
     const ControllerData& controller = controller_iter->second;
-    return controller.motions.at(motion);
+    const auto motion_iter = controller.motions.find(motion);
+    if (motion_iter == controller.motions.cend()) {
+        LOG_ERROR(Input, "Invalid motion {}", motion);
+        return {};
+    }
+    return motion_iter->second;
 }
 
 Common::Input::CameraStatus InputEngine::GetCamera(const PadIdentifier& identifier) const {
@@ -239,21 +244,39 @@ Common::Input::NfcStatus InputEngine::GetNfc(const PadIdentifier& identifier) co
 }
 
 void InputEngine::ResetButtonState() {
-    for (const auto& controller : controller_list) {
-        for (const auto& button : controller.second.buttons) {
-            SetButton(controller.first, button.first, false);
+    std::vector<std::pair<PadIdentifier, int>> buttons_to_reset;
+    std::vector<std::pair<PadIdentifier, int>> hat_buttons_to_reset;
+    {
+        std::scoped_lock lock{mutex};
+        for (const auto& controller : controller_list) {
+            for (const auto& button : controller.second.buttons) {
+                buttons_to_reset.emplace_back(controller.first, button.first);
+            }
+            for (const auto& button : controller.second.hat_buttons) {
+                hat_buttons_to_reset.emplace_back(controller.first, button.first);
+            }
         }
-        for (const auto& button : controller.second.hat_buttons) {
-            SetHatButton(controller.first, button.first, 0);
-        }
+    }
+    for (const auto& [identifier, button] : buttons_to_reset) {
+        SetButton(identifier, button, false);
+    }
+    for (const auto& [identifier, button] : hat_buttons_to_reset) {
+        SetHatButton(identifier, button, 0);
     }
 }
 
 void InputEngine::ResetAnalogState() {
-    for (const auto& controller : controller_list) {
-        for (const auto& axis : controller.second.axes) {
-            SetAxis(controller.first, axis.first, 0.0f);
+    std::vector<std::pair<PadIdentifier, int>> axes_to_reset;
+    {
+        std::scoped_lock lock{mutex};
+        for (const auto& controller : controller_list) {
+            for (const auto& axis : controller.second.axes) {
+                axes_to_reset.emplace_back(controller.first, axis.first);
+            }
         }
+    }
+    for (const auto& [identifier, axis] : axes_to_reset) {
+        SetAxis(identifier, axis, 0.0f);
     }
 }
 
@@ -383,6 +406,7 @@ void InputEngine::TriggerOnMotionChange(const PadIdentifier& identifier, int mot
     if (!configuring || !mapping_callback.on_data) {
         return;
     }
+    PreSetMotion(identifier, motion);
     const auto old_value = GetMotion(identifier, motion);
     bool is_active = false;
     if (std::abs(value.accel_x - old_value.accel_x) > 1.5f ||

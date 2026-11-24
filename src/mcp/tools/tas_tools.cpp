@@ -112,9 +112,10 @@ std::string Axis(const json& stick) {
 }
 
 /// Expands [{frames, buttons?, left?, right?}] into TAS-nx lines (one per non-neutral frame,
-/// plus the last frame so the script has its full length).
-std::string ExpandSteps(const json& steps, size_t& total_frames) {
-    std::string out;
+/// plus the last frame so the script has its full length). Returns false if it exceeds
+/// kMaxScriptBytes.
+bool ExpandSteps(const json& steps, std::string& out, size_t& total_frames) {
+    out.clear();
     size_t frame = 0;
     for (const auto& step : steps) {
         const size_t frames = step.value("frames", size_t{1});
@@ -128,15 +129,27 @@ std::string ExpandSteps(const json& steps, size_t& total_frames) {
         const std::string left = Axis(step.value("left", json{}));
         const std::string right = Axis(step.value("right", json{}));
         const bool neutral = keys == "NONE" && left == "0;0" && right == "0;0";
-        for (size_t i = 0; i < frames; ++i, ++frame) {
-            const bool last = &step == &steps.back() && i + 1 == frames;
-            if (!neutral || last) {
+        if (neutral) {
+            if (frames > 0) {
+                frame += frames;
+                if (&step == &steps.back()) {
+                    out += fmt::format("{} {} {} {}\n", frame - 1, keys, left, right);
+                    if (out.size() > kMaxScriptBytes) {
+                        return false;
+                    }
+                }
+            }
+        } else {
+            for (size_t i = 0; i < frames; ++i, ++frame) {
                 out += fmt::format("{} {} {} {}\n", frame, keys, left, right);
+                if (out.size() > kMaxScriptBytes) {
+                    return false;
+                }
             }
         }
     }
     total_frames = frame;
-    return out;
+    return true;
 }
 
 /// tas_status: the engine's StatusJson, or an error if the frontend has no TAS engine.
@@ -156,7 +169,9 @@ ToolResult TasWriteScript(ToolContext& ctx, const json& args) {
     std::string text;
     size_t frames = 0;
     if (args.contains("steps")) {
-        text = ExpandSteps(args["steps"], frames);
+        if (!ExpandSteps(args["steps"], text, frames)) {
+            return ToolResult::Error("script larger than 4 MiB");
+        }
     } else if (args.contains("script")) {
         text = args["script"].get<std::string>();
         if (!text.empty() && text.back() != '\n') {
@@ -264,9 +279,12 @@ ToolResult TasPlay(ToolContext& ctx, const json& args) {
     while (steady_clock::now() < deadline && !ServerStopping()) {
         const auto [state, frame, lengths] = tas->GetStatus();
         length = *std::max_element(lengths.begin(), lengths.end());
+        const bool wrapped = seen_running && state == TasState::Running && frame < last_frame;
         if (state == TasState::Running) {
             seen_running = true;
-            last_frame = frame;
+            if (!wrapped) {
+                last_frame = frame;
+            }
         }
         while (next_checkpoint < checkpoints.size() && seen_running &&
                frame >= checkpoints[next_checkpoint]) {
@@ -283,7 +301,7 @@ ToolResult TasPlay(ToolContext& ctx, const json& args) {
             ++next_checkpoint;
         }
         // Done once it ran and is stopped again (or wrapped, when looping).
-        if (seen_running && (state == TasState::Stopped || frame < last_frame)) {
+        if (seen_running && (state == TasState::Stopped || wrapped)) {
             completed = true;
             break;
         }

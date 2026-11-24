@@ -3,6 +3,7 @@
 
 #include "video_core/gpu_logging/gpu_logging.h"
 
+#include <algorithm>
 #include <fmt/format.h>
 #include <mutex>
 #include <thread>
@@ -16,32 +17,28 @@
 
 namespace GPU::Logging {
 
-// Static instance
-static GPULogger* g_instance = nullptr;
-
 GPULogger& GPULogger::GetInstance() {
-    if (!g_instance) {
-        g_instance = new GPULogger();
-    }
-    return *g_instance;
+    static GPULogger instance;
+    return instance;
 }
 
 GPULogger::GPULogger() = default;
 
 GPULogger::~GPULogger() {
-    Shutdown();
+    ShutdownInternal(false);
 }
 
 void GPULogger::Initialize(LogLevel level, DriverType driver) {
-    if (initialized) {
+    std::lock_guard lifecycle_lock(lifecycle_mutex);
+    if (initialized.load(std::memory_order_acquire)) {
         LOG_WARNING(Render_Vulkan, "[GPU Logging] Already initialized");
         return;
     }
 
-    current_level = level;
-    detected_driver = driver;
+    current_level.store(level, std::memory_order_release);
+    detected_driver.store(driver, std::memory_order_release);
 
-    if (current_level == LogLevel::Off) {
+    if (level == LogLevel::Off) {
         return;
     }
 
@@ -62,21 +59,19 @@ void GPULogger::Initialize(LogLevel level, DriverType driver) {
     RemoveFile(old_log_path);
     [[maybe_unused]] const bool log_renamed = RenameFile(gpu_log_path, old_log_path);
 
-    // Open new log file
-    gpu_log_file = std::make_unique<Common::FS::IOFile>(
-        gpu_log_path, Common::FS::FileAccessMode::Write, Common::FS::FileType::TextFile);
-
-    if (!gpu_log_file->IsOpen()) {
-        LOG_ERROR(Render_Vulkan, "[GPU Logging] Failed to open GPU log file");
-        return;
-    }
-
     // Initialize ring buffer
-    call_ring_buffer.resize(ring_buffer_size);
+    size_t configured_ring_size = 0;
+    {
+        std::lock_guard ring_lock(ring_buffer_mutex);
+        ring_buffer_size = (std::max)(ring_buffer_size, size_t{1});
+        configured_ring_size = ring_buffer_size;
+        call_ring_buffer.assign(ring_buffer_size, VulkanCallEntry{});
+        ring_buffer_index = 0;
+    }
 
     // Write header
     const char* driver_name = "Unknown";
-    switch (detected_driver) {
+    switch (driver) {
     case DriverType::Turnip:
         driver_name = "Turnip (Mesa Freedreno)";
         break;
@@ -89,7 +84,7 @@ void GPULogger::Initialize(LogLevel level, DriverType driver) {
     }
 
     const char* level_name = "Unknown";
-    switch (current_level) {
+    switch (level) {
     case LogLevel::Off:
         level_name = "Off";
         break;
@@ -116,20 +111,38 @@ void GPULogger::Initialize(LogLevel level, DriverType driver) {
         "================================\n\n",
         FormatTimestamp(std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch())),
-        level_name, driver_name, ring_buffer_size);
+        level_name, driver_name, configured_ring_size);
 
-    WriteToLog(header);
+    {
+        std::lock_guard file_lock(file_mutex);
+        gpu_log_file = std::make_unique<Common::FS::IOFile>(
+            gpu_log_path, Common::FS::FileAccessMode::Write, Common::FS::FileType::TextFile);
+
+        if (!gpu_log_file->IsOpen()) {
+            gpu_log_file.reset();
+            LOG_ERROR(Render_Vulkan, "[GPU Logging] Failed to open GPU log file");
+            return;
+        }
+
+        bytes_written.store(static_cast<u64>(gpu_log_file->WriteString(header)),
+                            std::memory_order_relaxed);
+    }
 
     // Note: Crash handler is initialized independently in EmulationSession::InitializeSystem()
     // to ensure it remains active even if Vulkan device initialization fails
 
-    initialized = true;
+    initialized.store(true, std::memory_order_release);
     LOG_INFO(Render_Vulkan, "[GPU Logging] Initialized with level: {}, driver: {}", level_name,
              driver_name);
 }
 
 void GPULogger::Shutdown() {
-    if (!initialized) {
+    ShutdownInternal(true);
+}
+
+void GPULogger::ShutdownInternal(bool log_message) {
+    std::lock_guard lifecycle_lock(lifecycle_mutex);
+    if (!initialized.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
 
@@ -143,38 +156,48 @@ void GPULogger::Shutdown() {
         "Current Memory Usage: {}\n"
         "Log Size: {} bytes\n"
         "==============================\n",
-        total_vulkan_calls, total_allocations, total_deallocations,
-        FormatMemorySize(peak_allocated_bytes), FormatMemorySize(current_allocated_bytes),
-        bytes_written);
-
-    WriteToLog(stats);
+        total_vulkan_calls.load(std::memory_order_relaxed),
+        total_allocations.load(std::memory_order_relaxed),
+        total_deallocations.load(std::memory_order_relaxed),
+        FormatMemorySize(peak_allocated_bytes.load(std::memory_order_relaxed)),
+        FormatMemorySize(current_allocated_bytes.load(std::memory_order_relaxed)),
+        bytes_written.load(std::memory_order_relaxed));
 
     // Close file
-    if (gpu_log_file) {
-        gpu_log_file->Flush();
-        gpu_log_file->Close();
-        gpu_log_file.reset();
+    {
+        std::lock_guard file_lock(file_mutex);
+        if (gpu_log_file) {
+            if (gpu_log_file->IsOpen()) {
+                bytes_written.fetch_add(static_cast<u64>(gpu_log_file->WriteString(stats)),
+                                        std::memory_order_relaxed);
+                gpu_log_file->Flush();
+                gpu_log_file->Close();
+            }
+            gpu_log_file.reset();
+        }
     }
 
     // Note: Crash handler is NOT shut down here - it remains active throughout app lifetime
     // It will be shut down when EmulationSession is destroyed
 
-    initialized = false;
-    LOG_INFO(Render_Vulkan, "[GPU Logging] Shutdown complete");
+    if (log_message) {
+        LOG_INFO(Render_Vulkan, "[GPU Logging] Shutdown complete");
+    }
 }
 
 void GPULogger::LogVulkanCall(const std::string& call_name, const std::string& params,
                               int result) {
-    if (!initialized || current_level == LogLevel::Off) {
+    const LogLevel level = current_level.load(std::memory_order_acquire);
+    if (!initialized.load(std::memory_order_acquire) || level == LogLevel::Off) {
         return;
     }
 
-    if (!track_vulkan_calls) {
+    if (!track_vulkan_calls.load(std::memory_order_relaxed)) {
         return;
     }
 
     // Only log all calls in Verbose or All mode
-    if (current_level != LogLevel::Verbose && current_level != LogLevel::All) {
+    if (level != LogLevel::Verbose && level != LogLevel::All) {
         // In Standard mode, only log important calls
         if (call_name.find("vkCmd") == std::string::npos &&
             call_name.find("vkCreate") == std::string::npos &&
@@ -190,15 +213,21 @@ void GPULogger::LogVulkanCall(const std::string& call_name, const std::string& p
     // Add to ring buffer
     {
         std::lock_guard lock(ring_buffer_mutex);
-        call_ring_buffer[ring_buffer_index] = {
-            .timestamp = timestamp,
-            .call_name = call_name,
-            .parameters = params,
-            .result = result,
-            .thread_id = thread_id,
-        };
-        ring_buffer_index = (ring_buffer_index + 1) % ring_buffer_size;
-        total_vulkan_calls++;
+        const size_t capacity = call_ring_buffer.size();
+        if (capacity > 0) {
+            if (ring_buffer_index >= capacity) {
+                ring_buffer_index = 0;
+            }
+            call_ring_buffer[ring_buffer_index] = {
+                .timestamp = timestamp,
+                .call_name = call_name,
+                .parameters = params,
+                .result = result,
+                .thread_id = thread_id,
+            };
+            ring_buffer_index = (ring_buffer_index + 1) % capacity;
+        }
+        total_vulkan_calls.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Log to file
@@ -209,11 +238,12 @@ void GPULogger::LogVulkanCall(const std::string& call_name, const std::string& p
 }
 
 void GPULogger::LogMemoryAllocation(uintptr_t memory, u64 size, u32 memory_flags) {
-    if (!initialized || current_level == LogLevel::Off) {
+    if (!initialized.load(std::memory_order_acquire) ||
+        current_level.load(std::memory_order_acquire) == LogLevel::Off) {
         return;
     }
 
-    if (!track_memory) {
+    if (!track_memory.load(std::memory_order_relaxed)) {
         return;
     }
 
@@ -234,10 +264,11 @@ void GPULogger::LogMemoryAllocation(uintptr_t memory, u64 size, u32 memory_flags
             .is_host_visible = is_host_visible,
         };
 
-        total_allocations++;
-        current_allocated_bytes += size;
-        if (current_allocated_bytes > peak_allocated_bytes) {
-            peak_allocated_bytes = current_allocated_bytes;
+        total_allocations.fetch_add(1, std::memory_order_relaxed);
+        const u64 new_current =
+            current_allocated_bytes.fetch_add(size, std::memory_order_relaxed) + size;
+        if (new_current > peak_allocated_bytes.load(std::memory_order_relaxed)) {
+            peak_allocated_bytes.store(new_current, std::memory_order_relaxed);
         }
     }
 
@@ -249,11 +280,12 @@ void GPULogger::LogMemoryAllocation(uintptr_t memory, u64 size, u32 memory_flags
 }
 
 void GPULogger::LogMemoryDeallocation(uintptr_t memory) {
-    if (!initialized || current_level == LogLevel::Off) {
+    if (!initialized.load(std::memory_order_acquire) ||
+        current_level.load(std::memory_order_acquire) == LogLevel::Off) {
         return;
     }
 
-    if (!track_memory) {
+    if (!track_memory.load(std::memory_order_relaxed)) {
         return;
     }
 
@@ -266,9 +298,11 @@ void GPULogger::LogMemoryDeallocation(uintptr_t memory) {
         auto it = memory_allocations.find(memory);
         if (it != memory_allocations.end()) {
             size = it->second.size;
-            current_allocated_bytes -= size;
+            const u64 prev_current = current_allocated_bytes.load(std::memory_order_relaxed);
+            current_allocated_bytes.store(prev_current >= size ? prev_current - size : 0,
+                                          std::memory_order_relaxed);
             memory_allocations.erase(it);
-            total_deallocations++;
+            total_deallocations.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -282,11 +316,12 @@ void GPULogger::LogMemoryDeallocation(uintptr_t memory) {
 
 void GPULogger::LogShaderCompilation(const std::string& shader_name,
                                      const std::string& shader_info) {
-    if (!initialized || current_level == LogLevel::Off) {
+    const LogLevel level = current_level.load(std::memory_order_acquire);
+    if (!initialized.load(std::memory_order_acquire) || level == LogLevel::Off) {
         return;
     }
 
-    if (current_level < LogLevel::Verbose) {
+    if (level < LogLevel::Verbose) {
         return;
     }
 
@@ -327,7 +362,8 @@ void DumpSpirvShader(u64 shader_hash, std::span<const u32> spirv_code) {
 }
 
 void GPULogger::LogPipelineStateChange(const std::string& state_info) {
-    if (!initialized || current_level == LogLevel::Off) {
+    const LogLevel level = current_level.load(std::memory_order_acquire);
+    if (!initialized.load(std::memory_order_acquire) || level == LogLevel::Off) {
         return;
     }
 
@@ -337,7 +373,7 @@ void GPULogger::LogPipelineStateChange(const std::string& state_info) {
         stored_pipeline_state = state_info;
     }
 
-    if (current_level < LogLevel::Verbose) {
+    if (level < LogLevel::Verbose) {
         return;
     }
 
@@ -350,7 +386,8 @@ void GPULogger::LogPipelineStateChange(const std::string& state_info) {
 }
 
 void GPULogger::LogDriverDebugInfo(const std::string& debug_info) {
-    if (!initialized || current_level == LogLevel::Off) {
+    if (!initialized.load(std::memory_order_acquire) ||
+        current_level.load(std::memory_order_acquire) == LogLevel::Off) {
         return;
     }
 
@@ -360,7 +397,7 @@ void GPULogger::LogDriverDebugInfo(const std::string& debug_info) {
         stored_driver_debug_info = debug_info;
     }
 
-    if (!capture_driver_debug) {
+    if (!capture_driver_debug.load(std::memory_order_relaxed)) {
         return;
     }
 
@@ -373,7 +410,8 @@ void GPULogger::LogDriverDebugInfo(const std::string& debug_info) {
 }
 
 void GPULogger::LogExtensionUsage(const std::string& extension_name, const std::string& function_name) {
-    if (!initialized || current_level == LogLevel::Off) {
+    const LogLevel level = current_level.load(std::memory_order_acquire);
+    if (!initialized.load(std::memory_order_acquire) || level == LogLevel::Off) {
         return;
     }
 
@@ -393,7 +431,7 @@ void GPULogger::LogExtensionUsage(const std::string& extension_name, const std::
         WriteToLog(log_entry);
         LOG_INFO(Render_Vulkan, "[GPU Logging] First use of extension {} in {}",
                  extension_name, function_name);
-    } else if (current_level >= LogLevel::Verbose) {
+    } else if (level >= LogLevel::Verbose) {
         const auto log_entry = fmt::format("[{}] [Extension] {} used in {}\n",
             FormatTimestamp(timestamp), extension_name, function_name);
         WriteToLog(log_entry);
@@ -401,11 +439,12 @@ void GPULogger::LogExtensionUsage(const std::string& extension_name, const std::
 }
 
 void GPULogger::LogRenderPassBegin(const std::string& render_pass_info) {
-    if (!initialized || current_level == LogLevel::Off) {
+    const LogLevel level = current_level.load(std::memory_order_acquire);
+    if (!initialized.load(std::memory_order_acquire) || level == LogLevel::Off) {
         return;
     }
 
-    if (!track_vulkan_calls && current_level < LogLevel::Verbose) {
+    if (!track_vulkan_calls.load(std::memory_order_relaxed) && level < LogLevel::Verbose) {
         return;
     }
 
@@ -418,11 +457,12 @@ void GPULogger::LogRenderPassBegin(const std::string& render_pass_info) {
 }
 
 void GPULogger::LogRenderPassEnd() {
-    if (!initialized || current_level == LogLevel::Off) {
+    const LogLevel level = current_level.load(std::memory_order_acquire);
+    if (!initialized.load(std::memory_order_acquire) || level == LogLevel::Off) {
         return;
     }
 
-    if (!track_vulkan_calls && current_level < LogLevel::Verbose) {
+    if (!track_vulkan_calls.load(std::memory_order_relaxed) && level < LogLevel::Verbose) {
         return;
     }
 
@@ -434,11 +474,12 @@ void GPULogger::LogRenderPassEnd() {
 }
 
 void GPULogger::LogPipelineBind(bool is_compute, const std::string& pipeline_info) {
-    if (!initialized || current_level == LogLevel::Off) {
+    const LogLevel level = current_level.load(std::memory_order_acquire);
+    if (!initialized.load(std::memory_order_acquire) || level == LogLevel::Off) {
         return;
     }
 
-    if (!track_vulkan_calls && current_level < LogLevel::Verbose) {
+    if (!track_vulkan_calls.load(std::memory_order_relaxed) && level < LogLevel::Verbose) {
         return;
     }
 
@@ -452,11 +493,12 @@ void GPULogger::LogPipelineBind(bool is_compute, const std::string& pipeline_inf
 }
 
 void GPULogger::LogDescriptorSetBind(const std::string& descriptor_info) {
-    if (!initialized || current_level == LogLevel::Off) {
+    const LogLevel level = current_level.load(std::memory_order_acquire);
+    if (!initialized.load(std::memory_order_acquire) || level == LogLevel::Off) {
         return;
     }
 
-    if (current_level < LogLevel::Verbose) {
+    if (level < LogLevel::Verbose) {
         return;
     }
 
@@ -469,11 +511,12 @@ void GPULogger::LogDescriptorSetBind(const std::string& descriptor_info) {
 }
 
 void GPULogger::LogPipelineBarrier(const std::string& barrier_info) {
-    if (!initialized || current_level == LogLevel::Off) {
+    const LogLevel level = current_level.load(std::memory_order_acquire);
+    if (!initialized.load(std::memory_order_acquire) || level == LogLevel::Off) {
         return;
     }
 
-    if (current_level < LogLevel::Verbose) {
+    if (level < LogLevel::Verbose) {
         return;
     }
 
@@ -486,11 +529,12 @@ void GPULogger::LogPipelineBarrier(const std::string& barrier_info) {
 }
 
 void GPULogger::LogImageOperation(const std::string& operation, const std::string& image_info) {
-    if (!initialized || current_level == LogLevel::Off) {
+    const LogLevel level = current_level.load(std::memory_order_acquire);
+    if (!initialized.load(std::memory_order_acquire) || level == LogLevel::Off) {
         return;
     }
 
-    if (!track_vulkan_calls && current_level < LogLevel::Verbose) {
+    if (!track_vulkan_calls.load(std::memory_order_relaxed) && level < LogLevel::Verbose) {
         return;
     }
 
@@ -503,11 +547,12 @@ void GPULogger::LogImageOperation(const std::string& operation, const std::strin
 }
 
 void GPULogger::LogClearOperation(const std::string& clear_info) {
-    if (!initialized || current_level == LogLevel::Off) {
+    const LogLevel level = current_level.load(std::memory_order_acquire);
+    if (!initialized.load(std::memory_order_acquire) || level == LogLevel::Off) {
         return;
     }
 
-    if (!track_vulkan_calls && current_level < LogLevel::Verbose) {
+    if (!track_vulkan_calls.load(std::memory_order_relaxed) && level < LogLevel::Verbose) {
         return;
     }
 
@@ -523,24 +568,28 @@ GPUStateSnapshot GPULogger::GetCurrentSnapshot() {
     GPUStateSnapshot snapshot;
     snapshot.timestamp = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch());
-    snapshot.driver_type = detected_driver;
+    snapshot.driver_type = detected_driver.load(std::memory_order_acquire);
 
     // Capture recent Vulkan calls
     {
         std::lock_guard lock(ring_buffer_mutex);
-        snapshot.recent_calls.reserve(ring_buffer_size);
+        const size_t capacity = call_ring_buffer.size();
+        snapshot.recent_calls.reserve(capacity);
+        if (capacity > 0) {
+            const size_t start = ring_buffer_index < capacity ? ring_buffer_index : 0;
 
-        // Copy from current position to end
-        for (size_t i = ring_buffer_index; i < ring_buffer_size; ++i) {
-            if (!call_ring_buffer[i].call_name.empty()) {
-                snapshot.recent_calls.push_back(call_ring_buffer[i]);
+            // Copy from current position to end
+            for (size_t i = start; i < capacity; ++i) {
+                if (!call_ring_buffer[i].call_name.empty()) {
+                    snapshot.recent_calls.push_back(call_ring_buffer[i]);
+                }
             }
-        }
 
-        // Copy from beginning to current position
-        for (size_t i = 0; i < ring_buffer_index; ++i) {
-            if (!call_ring_buffer[i].call_name.empty()) {
-                snapshot.recent_calls.push_back(call_ring_buffer[i]);
+            // Copy from beginning to current position
+            for (size_t i = 0; i < start; ++i) {
+                if (!call_ring_buffer[i].call_name.empty()) {
+                    snapshot.recent_calls.push_back(call_ring_buffer[i]);
+                }
             }
         }
     }
@@ -553,8 +602,10 @@ GPUStateSnapshot GPULogger::GetCurrentSnapshot() {
             "Current Usage: {}\n"
             "Peak Usage: {}\n"
             "Active Allocations: {}\n",
-            total_allocations, FormatMemorySize(current_allocated_bytes),
-            FormatMemorySize(peak_allocated_bytes), memory_allocations.size());
+            total_allocations.load(std::memory_order_relaxed),
+            FormatMemorySize(current_allocated_bytes.load(std::memory_order_relaxed)),
+            FormatMemorySize(peak_allocated_bytes.load(std::memory_order_relaxed)),
+            memory_allocations.size());
     }
 
     // Capture stored pipeline and driver debug info
@@ -648,34 +699,34 @@ void GPULogger::DumpStateToFile(const std::string& crash_reason) {
 }
 
 void GPULogger::SetLogLevel(LogLevel level) {
-    current_level = level;
+    current_level.store(level, std::memory_order_release);
 }
 
 void GPULogger::EnableVulkanCallTracking(bool enabled) {
-    track_vulkan_calls = enabled;
+    track_vulkan_calls.store(enabled, std::memory_order_relaxed);
 }
 
 void GPULogger::EnableMemoryTracking(bool enabled) {
-    track_memory = enabled;
+    track_memory.store(enabled, std::memory_order_relaxed);
 }
 
 void GPULogger::EnableDriverDebugInfo(bool enabled) {
-    capture_driver_debug = enabled;
+    capture_driver_debug.store(enabled, std::memory_order_relaxed);
 }
 
 void GPULogger::SetRingBufferSize(size_t entries) {
     std::lock_guard lock(ring_buffer_mutex);
-    ring_buffer_size = entries;
-    call_ring_buffer.resize(entries);
+    ring_buffer_size = (std::max)(entries, size_t{1});
+    call_ring_buffer.assign(ring_buffer_size, VulkanCallEntry{});
     ring_buffer_index = 0;
 }
 
 LogLevel GPULogger::GetLogLevel() const {
-    return current_level;
+    return current_level.load(std::memory_order_acquire);
 }
 
 DriverType GPULogger::GetDriverType() const {
-    return detected_driver;
+    return detected_driver.load(std::memory_order_acquire);
 }
 
 std::string GPULogger::GetStatistics() const {
@@ -683,25 +734,31 @@ std::string GPULogger::GetStatistics() const {
     return fmt::format(
         "Vulkan Calls: {}, Allocations: {}, Deallocations: {}, "
         "Current Memory: {}, Peak Memory: {}",
-        total_vulkan_calls, total_allocations, total_deallocations,
-        FormatMemorySize(current_allocated_bytes), FormatMemorySize(peak_allocated_bytes));
+        total_vulkan_calls.load(std::memory_order_relaxed),
+        total_allocations.load(std::memory_order_relaxed),
+        total_deallocations.load(std::memory_order_relaxed),
+        FormatMemorySize(current_allocated_bytes.load(std::memory_order_relaxed)),
+        FormatMemorySize(peak_allocated_bytes.load(std::memory_order_relaxed)));
 }
 
 bool GPULogger::IsInitialized() const {
-    return initialized;
+    return initialized.load(std::memory_order_acquire);
 }
 
 void GPULogger::WriteToLog(const std::string& message) {
+    std::lock_guard lock(file_mutex);
     if (!gpu_log_file || !gpu_log_file->IsOpen()) {
         return;
     }
 
-    std::lock_guard lock(file_mutex);
-    bytes_written += gpu_log_file->WriteString(message);
+    const u64 prev_written = bytes_written.load(std::memory_order_relaxed);
+    const u64 wrote = static_cast<u64>(gpu_log_file->WriteString(message));
+    const u64 new_written = prev_written + wrote;
+    bytes_written.store(new_written, std::memory_order_relaxed);
 
     // Flush on errors or if we've written a lot
     using namespace Common::Literals;
-    if (bytes_written % (1_MiB) == 0) {
+    if (new_written / 1_MiB > prev_written / 1_MiB) {
         gpu_log_file->Flush();
     }
 }

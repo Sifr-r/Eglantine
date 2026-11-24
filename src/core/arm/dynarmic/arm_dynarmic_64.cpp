@@ -7,10 +7,12 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
 #include <thread>
+#include <utility>
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
 #endif
@@ -19,8 +21,10 @@
 #include "core/arm/dynarmic/arm_dynarmic.h"
 #include "core/arm/dynarmic/arm_dynarmic_64.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
+#include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/kernel.h"
 #include "dynarmic/interface/A64/config.h"
 #include "dynarmic/interface/jit_stats.h"
 #include "video_core/nx2_spikes.h"
@@ -65,9 +69,11 @@ std::optional<u32> DynarmicCallbacks64::MemoryReadCode(u64 vaddr) {
     if (!m_memory.IsValidVirtualAddressRange(vaddr, sizeof(u32)))
         return std::nullopt;
     auto const aligned_vaddr = vaddr & ~Core::Memory::YUZU_PAGEMASK;
-    if (last_code_addr != aligned_vaddr) {
+    const u32 generation = code_generation.load(std::memory_order_acquire);
+    if (last_code_addr != aligned_vaddr || cached_code_generation != generation) {
         m_memory.ReadBlock(aligned_vaddr, &cached_code_page, sizeof(cached_code_page));
         last_code_addr = aligned_vaddr;
+        cached_code_generation = generation;
     }
     return cached_code_page.inst[(vaddr & Core::Memory::YUZU_PAGEMASK) / sizeof(u32)];
 }
@@ -166,7 +172,8 @@ void DynarmicCallbacks64::AddTicks(u64 ticks) {
     // if not all cores are doing a similar amount of work. Instead of doing this, we should
     // device a way so that timing is consistent across all cores without increasing the ticks 4
     // times.
-    u64 amortized_ticks = ticks / Core::Hardware::NUM_CPU_CORES;
+    const u64 active_cores = std::max<u64>(m_parent.m_system.Kernel().ActiveCoreCount(), 1);
+    u64 amortized_ticks = ticks / active_cores;
     // Always execute at least one tick.
     amortized_ticks = std::max<u64>(amortized_ticks, 1);
     m_parent.m_system.CoreTiming().AddTicks(amortized_ticks);
@@ -466,7 +473,7 @@ void ArmDynarmic64::RewindBreakpointInstruction() {
 
 ArmDynarmic64::ArmDynarmic64(System& system, bool uses_wall_clock, Kernel::KProcess* process, DynarmicExclusiveMonitor& exclusive_monitor, std::size_t core_index)
     : ArmInterface{uses_wall_clock}, m_system{system}, m_exclusive_monitor{exclusive_monitor}
-    , m_cb(std::make_optional<DynarmicCallbacks64>(*this, process))
+    , m_cb(std::in_place, *this, process)
     , m_core_index{core_index}
 {
     auto& page_table = process->GetPageTable().GetBasePageTable();
@@ -533,7 +540,7 @@ void ArmDynarmic64::SignalInterrupt(Kernel::KThread* thread) {
 }
 
 void ArmDynarmic64::ClearInstructionCache() {
-    m_cb->last_code_addr = u64(-1);
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->ClearCache();
     VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::JitClear);
 }
@@ -542,7 +549,7 @@ void ArmDynarmic64::InvalidateCacheRange(u64 addr, std::size_t size) {
     // Drop the cached code page too: blocks recompiled after the invalidation would
     // otherwise still decode the old instructions (e.g. a gdbstub breakpoint written
     // into or removed from that page).
-    m_cb->last_code_addr = u64(-1);
+    m_cb->code_generation.fetch_add(1, std::memory_order_release);
     m_jit->InvalidateCacheRange(addr, size);
     VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::JitInvalidate, {}, size);
 }

@@ -34,6 +34,9 @@ std::vector<T> Enumerate(Query&& query) {
     for (int attempt = 0; attempt < MAX_ATTEMPTS && result == VK_INCOMPLETE; ++attempt) {
         u32 num{};
         result = query(&num, nullptr);
+        if (result == VK_SUCCESS && num == 0) {
+            return {};
+        }
         if (result == VK_SUCCESS || result == VK_INCOMPLETE) {
             out.resize(num);
             result = query(&num, out.data());
@@ -175,6 +178,7 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdSetConservativeRasterizationModeEXT);
     X(vkCmdSetLineRasterizationModeEXT);
     X(vkCmdSetLineStippleEnableEXT);
+    X(vkCmdSetLineStippleEXT);
     X(vkCmdSetDepthBiasEnableEXT);
     X(vkCmdSetLogicOpEnableEXT);
     X(vkCmdSetDepthClampEnableEXT);
@@ -303,6 +307,27 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     if (!dld.vkCreateRenderPass2) {
         Proc(dld.vkCreateRenderPass2, dld, "vkCreateRenderPass2KHR", device);
     }
+
+    // Line stipple is core in Vulkan 1.4, or provided by VK_KHR_line_rasterization / VK_EXT_line_rasterization
+    if (!dld.vkCmdSetLineStippleEXT) {
+        Proc(dld.vkCmdSetLineStippleEXT, dld, "vkCmdSetLineStippleKHR", device);
+    }
+    if (!dld.vkCmdSetLineStippleEXT) {
+        Proc(dld.vkCmdSetLineStippleEXT, dld, "vkCmdSetLineStipple", device);
+    }
+
+    // Optional VK_KHR_video_queue / VK_KHR_video_decode_queue entrypoints
+    X(vkCreateVideoSessionKHR);
+    X(vkDestroyVideoSessionKHR);
+    X(vkGetVideoSessionMemoryRequirementsKHR);
+    X(vkBindVideoSessionMemoryKHR);
+    X(vkCreateVideoSessionParametersKHR);
+    X(vkUpdateVideoSessionParametersKHR);
+    X(vkDestroyVideoSessionParametersKHR);
+    X(vkCmdBeginVideoCodingKHR);
+    X(vkCmdEndVideoCodingKHR);
+    X(vkCmdControlVideoCodingKHR);
+    X(vkCmdDecodeVideoKHR);
 #undef X
 }
 
@@ -348,6 +373,12 @@ bool Load(VkInstance instance, InstanceDispatch& dld) noexcept {
     X(vkGetPhysicalDeviceSurfacePresentModesKHR);
     X(vkGetPhysicalDeviceSurfaceSupportKHR);
     X(vkGetPhysicalDeviceToolProperties);
+    if (!dld.vkGetPhysicalDeviceToolProperties) {
+        Proc(dld.vkGetPhysicalDeviceToolProperties, dld,
+             "vkGetPhysicalDeviceToolPropertiesEXT", instance);
+    }
+    X(vkGetPhysicalDeviceVideoCapabilitiesKHR);
+    X(vkGetPhysicalDeviceVideoFormatPropertiesKHR);
     X(vkGetSwapchainImagesKHR);
     X(vkQueuePresentKHR);
 
@@ -520,10 +551,9 @@ Instance Instance::Create(u32 version, Span<const char*> layers, Span<const char
 }
 
 std::vector<VkPhysicalDevice> Instance::EnumeratePhysicalDevices() const {
-    u32 num;
-    Check(dld->vkEnumeratePhysicalDevices(handle, &num, nullptr));
-    std::vector<VkPhysicalDevice> physical_devices(num);
-    Check(dld->vkEnumeratePhysicalDevices(handle, &num, physical_devices.data()));
+    auto physical_devices = Enumerate<VkPhysicalDevice>([this](u32* num, VkPhysicalDevice* data) {
+        return dld->vkEnumeratePhysicalDevices(handle, num, data);
+    });
     SortPhysicalDevices(physical_devices, *dld);
     return physical_devices;
 }
@@ -553,7 +583,7 @@ void Image::Release() const noexcept {
 }
 
 Image::MemoryBlock Image::GetMemoryBlock() const noexcept {
-    if (allocation == nullptr) {
+    if (!handle || allocation == nullptr || allocator == nullptr) {
         return {};
     }
     VmaAllocationInfo2 info{};
@@ -566,12 +596,18 @@ Image::MemoryBlock Image::GetMemoryBlock() const noexcept {
 }
 
 void Buffer::Flush() const {
+    if (!handle || allocation == nullptr || allocator == nullptr) {
+        return;
+    }
     if (!is_coherent) {
         vmaFlushAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
     }
 }
 
 void Buffer::Invalidate() const {
+    if (!handle || allocation == nullptr || allocator == nullptr) {
+        return;
+    }
     if (!is_coherent) {
         vmaInvalidateAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);
     }
@@ -1002,11 +1038,9 @@ VkFormatProperties3 PhysicalDevice::GetFormatProperties3(VkFormat format) const 
 }
 
 std::vector<VkExtensionProperties> PhysicalDevice::EnumerateDeviceExtensionProperties() const {
-    u32 num;
-    dld->vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &num, nullptr);
-    std::vector<VkExtensionProperties> properties(num);
-    dld->vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &num, properties.data());
-    return properties;
+    return Enumerate<VkExtensionProperties>([this](u32* num, VkExtensionProperties* properties) {
+        return dld->vkEnumerateDeviceExtensionProperties(physical_device, nullptr, num, properties);
+    });
 }
 
 std::vector<VkQueueFamilyProperties> PhysicalDevice::GetQueueFamilyProperties() const {
@@ -1019,14 +1053,37 @@ std::vector<VkQueueFamilyProperties> PhysicalDevice::GetQueueFamilyProperties() 
 
 std::vector<VkPhysicalDeviceToolProperties> PhysicalDevice::GetPhysicalDeviceToolProperties()
     const {
-    u32 num = 0;
     if (!dld->vkGetPhysicalDeviceToolProperties) {
         return {};
     }
-    dld->vkGetPhysicalDeviceToolProperties(physical_device, &num, nullptr);
-    std::vector<VkPhysicalDeviceToolProperties> properties(num);
-    dld->vkGetPhysicalDeviceToolProperties(physical_device, &num, properties.data());
-    return properties;
+    static constexpr int MAX_ATTEMPTS = 8;
+    std::vector<VkPhysicalDeviceToolProperties> properties;
+    VkResult result = VK_INCOMPLETE;
+    u32 num = 0;
+    for (int attempt = 0; attempt < MAX_ATTEMPTS && result == VK_INCOMPLETE; ++attempt) {
+        num = 0;
+        result = dld->vkGetPhysicalDeviceToolProperties(physical_device, &num, nullptr);
+        if (result == VK_SUCCESS && num == 0) {
+            return {};
+        }
+        if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+            return {};
+        }
+        properties.assign(num, VkPhysicalDeviceToolProperties{
+                                   .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TOOL_PROPERTIES,
+                                   .pNext = nullptr,
+                               });
+        result = dld->vkGetPhysicalDeviceToolProperties(physical_device, &num, properties.data());
+        if (result == VK_SUCCESS) {
+            properties.resize(num);
+            return properties;
+        }
+    }
+    if (result == VK_INCOMPLETE) {
+        properties.resize(num);
+        return properties;
+    }
+    return {};
 }
 
 std::vector<VkCooperativeMatrixPropertiesKHR> PhysicalDevice::GetCooperativeMatrixPropertiesKHR()
@@ -1046,6 +1103,46 @@ std::vector<VkCooperativeMatrixPropertiesKHR> PhysicalDevice::GetCooperativeMatr
              });
     if (dld->vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physical_device, &num,
                                                                properties.data()) != VK_SUCCESS) {
+        return {};
+    }
+    properties.resize(num);
+    return properties;
+}
+
+std::optional<VkVideoCapabilitiesKHR> PhysicalDevice::GetVideoCapabilitiesKHR(
+    const VkVideoProfileInfoKHR& profile, void* next_structures) const {
+    if (!dld->vkGetPhysicalDeviceVideoCapabilitiesKHR) {
+        return std::nullopt;
+    }
+    VkVideoCapabilitiesKHR capabilities{
+        .sType = VK_STRUCTURE_TYPE_VIDEO_CAPABILITIES_KHR,
+        .pNext = next_structures,
+    };
+    if (dld->vkGetPhysicalDeviceVideoCapabilitiesKHR(physical_device, &profile, &capabilities) !=
+        VK_SUCCESS) {
+        return std::nullopt;
+    }
+    return capabilities;
+}
+
+std::vector<VkVideoFormatPropertiesKHR> PhysicalDevice::GetVideoFormatPropertiesKHR(
+    const VkPhysicalDeviceVideoFormatInfoKHR& format_info) const {
+    if (!dld->vkGetPhysicalDeviceVideoFormatPropertiesKHR) {
+        return {};
+    }
+    u32 num = 0;
+    if (dld->vkGetPhysicalDeviceVideoFormatPropertiesKHR(physical_device, &format_info, &num,
+                                                         nullptr) != VK_SUCCESS ||
+        num == 0) {
+        return {};
+    }
+    std::vector<VkVideoFormatPropertiesKHR> properties(
+        num, VkVideoFormatPropertiesKHR{
+                 .sType = VK_STRUCTURE_TYPE_VIDEO_FORMAT_PROPERTIES_KHR,
+                 .pNext = nullptr,
+             });
+    if (dld->vkGetPhysicalDeviceVideoFormatPropertiesKHR(physical_device, &format_info, &num,
+                                                         properties.data()) != VK_SUCCESS) {
         return {};
     }
     properties.resize(num);

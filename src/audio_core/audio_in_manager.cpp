@@ -36,6 +36,10 @@ Result Manager::AcquireSessionId(size_t& session_id) {
 
 void Manager::ReleaseSessionId(const size_t session_id) {
     std::scoped_lock l{mutex};
+    ReleaseSessionIdLocked(session_id);
+}
+
+void Manager::ReleaseSessionIdLocked(const size_t session_id) {
     LOG_DEBUG(Service_Audio, "Freeing AudioIn session {}", session_id);
     session_ids[free_session_id] = session_id;
     num_free_sessions++;
@@ -51,7 +55,6 @@ Manager::~Manager() {
 }
 
 Result Manager::LinkToManager() {
-    std::scoped_lock l{mutex};
     if (!linked_to_manager) {
         system.AudioCore().GetAudioManager().SetInManager(std::bind(&Manager::BufferReleaseAndRegister, this));
         linked_to_manager = true;
@@ -61,14 +64,14 @@ Result Manager::LinkToManager() {
 }
 
 void Manager::Start() {
+    std::scoped_lock l{mutex};
     if (sessions_started) {
         return;
     }
 
-    std::scoped_lock l{mutex};
     for (auto& session : sessions) {
         if (session) {
-            session->StartSession();
+            session->StartSessionLocked();
         }
     }
 
@@ -79,7 +82,7 @@ void Manager::BufferReleaseAndRegister() {
     std::scoped_lock l{mutex};
     for (auto& session : sessions) {
         if (session != nullptr) {
-            session->ReleaseAndRegisterBuffers();
+            session->ReleaseAndRegisterBuffersLocked();
         }
     }
 }

@@ -9,6 +9,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <span>
 #include "core/core.h"
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/service/ipc_helpers.h"
@@ -273,10 +274,10 @@ public:
 
     ~IScanRequest() override {
         state.store(State::Idle);
-        svc_ctx.CloseEvent(evt_scan_complete);
-        svc_ctx.CloseEvent(evt_processing);
         if (worker.joinable())
             worker.join();
+        svc_ctx.CloseEvent(evt_scan_complete);
+        svc_ctx.CloseEvent(evt_processing);
     }
 
 private:
@@ -446,7 +447,7 @@ private:
         LOG_WARNING(Service_NIFM, "(STUBBED) called, ssid_length={}", ssid_length);
 
         IPC::ResponseBuilder rb{ctx, 2};
-        rb.Push(1);
+        rb.Push(ResultSuccess);
     }
 
     void GetResult(HLERequestContext& ctx) {
@@ -756,7 +757,7 @@ void IGeneralService::GetNetworkProfile(HLERequestContext& ctx) {
 
     ctx.WriteBuffer(profile);
 
-    IPC::ResponseBuilder rb{ctx, 2};
+    IPC::ResponseBuilder rb{ctx, 2, 0, 1};
     rb.Push(ResultSuccess);
     rb.PushIpcInterface<INetworkProfile>(ctx, system);
 }
@@ -764,19 +765,22 @@ void IGeneralService::GetNetworkProfile(HLERequestContext& ctx) {
 void IGeneralService::SetNetworkProfile(HLERequestContext& ctx) {
     LOG_DEBUG(Service_NIFM, "SetNetworkProfile called");
 
-    if (!ctx.CanReadBuffer(0) || ctx.GetReadBufferSize() < sizeof(NifmNetworkProfileData)) {
+    NifmNetworkProfileData profile{};
+    if (!ctx.ReadBufferInto(std::as_writable_bytes(std::span{&profile, 1}))) {
         IPC::ResponseBuilder{ctx, 2}.Push(ResultInvalidInput);
         return;
     }
 
-    const auto data = ctx.ReadBufferCopy(0);
-    const auto* np = reinterpret_cast<const NifmNetworkProfileData*>(data.data());
-
+    const auto& wireless = profile.wireless_setting_data;
+    if (wireless.ssid_length > std::size(wireless.ssid) - 1) {
+        LOG_ERROR(Service_NIFM, "Invalid SSID length: {}", wireless.ssid_length);
+        IPC::ResponseBuilder{ctx, 2}.Push(ResultInvalidInput);
+        return;
+    }
     PendingProfile prof{};
-    prof.ssid_len = np->wireless_setting_data.ssid_length;
-    std::memcpy(prof.ssid.data(), np->wireless_setting_data.ssid.data(), prof.ssid_len);
-    std::memcpy(prof.passphrase.data(), np->wireless_setting_data.passphrase.data(),
-                sizeof(prof.passphrase));
+    prof.ssid_len = wireless.ssid_length;
+    std::memcpy(prof.ssid.data(), wireless.ssid.data(), prof.ssid_len);
+    prof.passphrase = wireless.passphrase;
 
     {
         std::scoped_lock lk{g_profile_mtx};
@@ -901,10 +905,14 @@ void IGeneralService::GetCurrentIpAddress(HLERequestContext& ctx) {
 void IGeneralService::CreateTemporaryNetworkProfile(HLERequestContext& ctx) {
     LOG_DEBUG(Service_NIFM, "called");
 
-    ASSERT_MSG(ctx.GetReadBufferSize() == 0x17c, "SfNetworkProfileData is not the correct size");
+    SfNetworkProfileData profile{};
+    if (!ctx.ReadBufferInto(std::as_writable_bytes(std::span{&profile, 1}))) {
+        IPC::ResponseBuilder{ctx, 2}.Push(ResultInvalidInput);
+        return;
+    }
+
     u128 uuid{};
-    auto buffer = ctx.ReadBuffer();
-    std::memcpy(&uuid, buffer.data() + 8, sizeof(u128));
+    std::memcpy(&uuid, &profile.uuid, sizeof(uuid));
 
     IPC::ResponseBuilder rb{ctx, 6, 0, 1};
 

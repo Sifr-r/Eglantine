@@ -26,9 +26,10 @@ Usage:
 option(EGLANTINE_RUST_OFFLINE "Pass --offline --frozen to Cargo invocations" OFF)
 
 function(add_rust_static_library)
-    set(options OFFLINE)
+    set(options OFFLINE NO_DEFAULT_FEATURES)
     set(oneValueArgs TARGET MANIFEST LIB_NAME PACKAGE INCLUDE_DIR TARGET_DIR)
-    cmake_parse_arguments(RUST "${options}" "${oneValueArgs}" "" ${ARGN})
+    set(multiValueArgs FEATURES)
+    cmake_parse_arguments(RUST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     if(NOT RUST_TARGET)
         message(FATAL_ERROR "add_rust_static_library: TARGET is required")
@@ -57,20 +58,56 @@ function(add_rust_static_library)
         set(_lib_filename "lib${RUST_LIB_NAME}.a")
     endif()
 
+    if(NOT DEFINED EGLANTINE_RUST_TARGET)
+        set(EGLANTINE_RUST_TARGET "" CACHE STRING "Explicit Cargo --target triple override")
+    endif()
+
     set(_cargo_triple "")
-    if(DEFINED EGLANTINE_RUST_TARGET AND NOT "${EGLANTINE_RUST_TARGET}" STREQUAL "")
+    if(NOT "${EGLANTINE_RUST_TARGET}" STREQUAL "")
         set(_cargo_triple "${EGLANTINE_RUST_TARGET}")
     elseif(MINGW)
-        if(ARCHITECTURE_x86_64)
-            set(_cargo_triple "x86_64-pc-windows-gnu")
-        elseif(ARCHITECTURE_arm64)
-            set(_cargo_triple "aarch64-pc-windows-gnullvm")
+        set(_use_default_mingw_triple TRUE)
+        if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+            get_filename_component(_cargo_dir "${CARGO_EXECUTABLE}" DIRECTORY)
+            find_program(RUSTC_EXECUTABLE rustc HINTS "${_cargo_dir}")
+            if(RUSTC_EXECUTABLE)
+                execute_process(
+                    COMMAND "${RUSTC_EXECUTABLE}" -vV
+                    OUTPUT_VARIABLE _rustc_vv
+                    ERROR_QUIET
+                    RESULT_VARIABLE _rustc_rc
+                )
+                if(_rustc_rc EQUAL 0 AND _rustc_vv MATCHES "host: ([^\r\n]+)")
+                    string(STRIP "${CMAKE_MATCH_1}" _rustc_host)
+                    # Native MSYS2 UCRT64/CLANG64 rustc targets MinGW directly without --target.
+                    if(ARCHITECTURE_x86_64 AND _rustc_host MATCHES "^x86_64-pc-windows-(gnu|gnullvm)$")
+                        set(_use_default_mingw_triple FALSE)
+                    elseif(ARCHITECTURE_arm64 AND _rustc_host MATCHES "^aarch64-pc-windows-(gnu|gnullvm)$")
+                        set(_use_default_mingw_triple FALSE)
+                    endif()
+                endif()
+            endif()
+        endif()
+        if(_use_default_mingw_triple)
+            if(ARCHITECTURE_x86_64)
+                set(_cargo_triple "x86_64-pc-windows-gnu")
+            elseif(ARCHITECTURE_arm64)
+                set(_cargo_triple "aarch64-pc-windows-gnullvm")
+            endif()
         endif()
     elseif(APPLE)
         if(ARCHITECTURE_arm64)
             set(_cargo_triple "aarch64-apple-darwin")
         elseif(ARCHITECTURE_x86_64)
             set(_cargo_triple "x86_64-apple-darwin")
+        endif()
+    elseif(ANDROID)
+        if(CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a" OR ARCHITECTURE_arm64)
+            set(_cargo_triple "aarch64-linux-android")
+        elseif(CMAKE_ANDROID_ARCH_ABI STREQUAL "x86_64" OR ARCHITECTURE_x86_64)
+            set(_cargo_triple "x86_64-linux-android")
+        elseif(CMAKE_ANDROID_ARCH_ABI STREQUAL "armeabi-v7a")
+            set(_cargo_triple "armv7-linux-androideabi")
         endif()
     endif()
 
@@ -89,15 +126,81 @@ function(add_rust_static_library)
     if(RUST_PACKAGE)
         list(APPEND _cargo_args -p "${RUST_PACKAGE}")
     endif()
+    if(RUST_NO_DEFAULT_FEATURES)
+        list(APPEND _cargo_args --no-default-features)
+    endif()
+    if(RUST_FEATURES)
+        string(JOIN "," _features_csv ${RUST_FEATURES})
+        list(APPEND _cargo_args --features "${_features_csv}")
+    endif()
     if(RUST_OFFLINE OR EGLANTINE_RUST_OFFLINE)
         list(APPEND _cargo_args --offline --frozen)
     endif()
     if(_triple_args)
         list(APPEND _cargo_args ${_triple_args})
     endif()
-    list(APPEND _cargo_args "$<$<NOT:$<CONFIG:Debug>>:--release>")
+
+    get_property(_is_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+    if(_is_multi_config)
+        list(APPEND _cargo_args "$<$<NOT:$<CONFIG:Debug>>:--release>")
+        set(_stamp_file "${_cargo_target_dir}/${RUST_TARGET}_$<CONFIG>.stamp")
+        set(_byproduct_libs "$<$<CONFIG:Debug>:${_lib_debug}>$<$<NOT:$<CONFIG:Debug>>:${_lib_release}>")
+        set(_comment_config "$<CONFIG>")
+        set(_default_location "${_lib_release}")
+    else()
+        string(TOUPPER "${CMAKE_BUILD_TYPE}" _build_type_upper)
+        if(_build_type_upper STREQUAL "DEBUG")
+            set(_default_location "${_lib_debug}")
+            set(_stamp_config "Debug")
+        else()
+            list(APPEND _cargo_args --release)
+            set(_default_location "${_lib_release}")
+            if(CMAKE_BUILD_TYPE)
+                set(_stamp_config "${CMAKE_BUILD_TYPE}")
+            else()
+                set(_stamp_config "Release")
+            endif()
+        endif()
+        set(_stamp_file "${_cargo_target_dir}/${RUST_TARGET}_${_stamp_config}.stamp")
+        set(_byproduct_libs "${_default_location}")
+        set(_comment_config "${_stamp_config}")
+    endif()
 
     set(_env_args "CARGO_TARGET_DIR=${_cargo_target_dir}")
+    if(ANDROID AND _cargo_triple)
+        string(TOUPPER "${_cargo_triple}" _env_triple)
+        string(REPLACE "-" "_" _env_triple "${_env_triple}")
+        set(_ndk_clang "")
+        if(CMAKE_C_COMPILER)
+            get_filename_component(_ndk_bin_dir "${CMAKE_C_COMPILER}" DIRECTORY)
+            set(_ndk_api "${CMAKE_SYSTEM_VERSION}")
+            if(NOT _ndk_api AND ANDROID_NATIVE_API_LEVEL)
+                set(_ndk_api "${ANDROID_NATIVE_API_LEVEL}")
+            endif()
+            if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
+                set(_ndk_clang_cand "${_ndk_bin_dir}/${_cargo_triple}${_ndk_api}-clang.cmd")
+            else()
+                set(_ndk_clang_cand "${_ndk_bin_dir}/${_cargo_triple}${_ndk_api}-clang")
+            endif()
+            if(EXISTS "${_ndk_clang_cand}")
+                set(_ndk_clang "${_ndk_clang_cand}")
+            else()
+                set(_ndk_clang "${CMAKE_C_COMPILER}")
+            endif()
+        endif()
+        if(_ndk_clang)
+            list(APPEND _env_args
+                "CARGO_TARGET_${_env_triple}_LINKER=${_ndk_clang}"
+                "CC_${_env_triple}=${_ndk_clang}"
+            )
+        endif()
+        if(CMAKE_AR)
+            list(APPEND _env_args
+                "CARGO_TARGET_${_env_triple}_AR=${CMAKE_AR}"
+                "AR_${_env_triple}=${CMAKE_AR}"
+            )
+        endif()
+    endif()
     if(MSVC)
         # Keep Rust CRT linkage aligned with CMake's CMAKE_MSVC_RUNTIME_LIBRARY (/MD vs /MT).
         set(_rustflags "$ENV{RUSTFLAGS}")
@@ -119,19 +222,17 @@ function(add_rust_static_library)
         "${_manifest_dir}/Cargo.lock"
         "${_manifest_dir}/src/*.rs"
         "${_manifest_dir}/crates/*/Cargo.toml"
-        "${_manifest_dir}/crates/*/src/*.rs"
+        "${_manifest_dir}/crates/**/*.rs"
     )
-
-    set(_stamp_file "${_cargo_target_dir}/${RUST_TARGET}_$<CONFIG>.stamp")
 
     add_custom_command(
         OUTPUT "${_stamp_file}"
-        BYPRODUCTS "${_lib_debug}" "${_lib_release}"
+        BYPRODUCTS "${_byproduct_libs}"
         COMMAND "${CMAKE_COMMAND}" -E env ${_env_args} "${CARGO_EXECUTABLE}" ${_cargo_args}
         COMMAND "${CMAKE_COMMAND}" -E touch "${_stamp_file}"
         WORKING_DIRECTORY "${_manifest_dir}"
         DEPENDS ${_rust_sources}
-        COMMENT "Building Rust static library ${RUST_TARGET} ($<CONFIG>)"
+        COMMENT "Building Rust static library ${RUST_TARGET} (${_comment_config})"
         COMMAND_EXPAND_LISTS
         VERBATIM
     )
@@ -143,7 +244,7 @@ function(add_rust_static_library)
     add_dependencies("${RUST_TARGET}" "${_build_target}")
 
     set_target_properties("${RUST_TARGET}" PROPERTIES
-        IMPORTED_LOCATION "${_lib_release}"
+        IMPORTED_LOCATION "${_default_location}"
         IMPORTED_LOCATION_RELEASE "${_lib_release}"
         IMPORTED_LOCATION_RELWITHDEBINFO "${_lib_release}"
         IMPORTED_LOCATION_MINSIZEREL "${_lib_release}"
@@ -161,6 +262,8 @@ function(add_rust_static_library)
         set(_native_libs kernel32 ntdll userenv ws2_32 dbghelp bcrypt advapi32)
     elseif(APPLE)
         set(_native_libs pthread dl m "-framework Security" "-framework CoreFoundation")
+    elseif(ANDROID)
+        set(_native_libs dl m log)
     else()
         set(_native_libs pthread dl m)
     endif()

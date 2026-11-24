@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/core.h"
+#include "core/hle/service/psc/time/clocks/context_writers.h"
 #include "core/hle/service/psc/time/common.h"
 
 namespace Service::PSC::Time {
@@ -13,6 +14,9 @@ OperationEvent::OperationEvent(Core::System& system)
                                                 m_ctx.CreateEvent("Time:OperationEvent:Event")} {}
 
 OperationEvent::~OperationEvent() {
+    if (m_owner != nullptr) {
+        m_owner->Unlink(*this);
+    }
     m_ctx.CloseEvent(m_event);
 }
 

@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cstring>
+#include <limits>
+#include <new>
 #include <span>
 #include <vector>
 
@@ -75,15 +77,19 @@ FileType AppLoader_NSO::IdentifyType(const FileSys::VirtualFile& in_file) {
 }
 
 std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::System& system, const FileSys::VfsFile& nso_file, VAddr load_base, bool should_pass_arguments, bool load_into_process, std::optional<FileSys::PatchManager> pm, std::vector<Core::NCE::Patcher>* patches, s32 patch_index) {
-    if (nso_file.GetSize() < sizeof(NSOHeader))
+    const size_t file_size = nso_file.GetSize();
+    if (file_size < sizeof(NSOHeader))
         return std::nullopt;
     NSOHeader nso_header{};
     if (sizeof(NSOHeader) != nso_file.ReadObject(&nso_header))
         return std::nullopt;
     if (nso_header.magic != Common::MakeMagic('N', 'S', 'O', '0'))
         return std::nullopt;
-    if (nso_header.segments.empty())
+#ifdef HAS_NCE
+    if (patches && (patch_index < 0 || static_cast<size_t>(patch_index) >= patches->size())) {
         return std::nullopt;
+    }
+#endif
 
     // Allocate some space at the beginning if we are patching in PreText mode.
     const size_t module_start = [&]() -> size_t {
@@ -100,72 +106,101 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
         return 0;
     }();
 
-    auto const last_segment_it = &nso_header.segments[nso_header.segments.size() - 1];
-    // Build program image directly in codeset memory :)
-    Kernel::CodeSet codeset;
-    codeset.memory.resize(module_start + last_segment_it->location + last_segment_it->size);
-    {
-        std::vector<u8> compressed_data(*std::ranges::max_element(nso_header.segments_compressed_size));
-        std::vector<u8> decompressed_size(std::ranges::max_element(nso_header.segments, [](auto const& a, auto const& b) {
-            return a.size < b.size;
-        })->size);
-        for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
-            nso_file.Read(compressed_data.data(), nso_header.segments_compressed_size[i], nso_header.segments[i].offset);
-            if (nso_header.IsSegmentCompressed(i)) {
-                if (nso_header.IsZBICCompressed()) {
-                    // ZBIC compression
-                    const int r = Common::Compression::DecompressDataZBIC(
-                        std::span<u8>{decompressed_size}.first(nso_header.segments[i].size),
-                        std::span<const u8>{compressed_data}.first(nso_header.segments_compressed_size[i])
-                    );
-                    ASSERT(r > 0);
-                } else {
-                    // LZ4 compression
-                    int r = Common::Compression::DecompressDataLZ4(
-                        decompressed_size.data(),
-                        nso_header.segments[i].size,
-                        compressed_data.data(),
-                        nso_header.segments_compressed_size[i]
-                    );
-                    ASSERT(r == int(nso_header.segments[i].size));
-                }
+    const auto args = should_pass_arguments ? Settings::values.program_args.GetValue() : std::string{};
+    if (args.size() > NSO_ARGUMENT_DATA_ALLOCATION_SIZE - sizeof(NSOArgumentHeader)) {
+        return std::nullopt;
+    }
 
-                std::memcpy(
-                    codeset.memory.data() + module_start + nso_header.segments[i].location,
-                    decompressed_size.data(),
-                    nso_header.segments[i].size
-                );
-            } else {
-                // Not compressed
-                std::memcpy(
-                    codeset.memory.data() + module_start + nso_header.segments[i].location,
-                    compressed_data.data(),
-                    nso_header.segments[i].size
-                );
+    const auto& data_segment = nso_header.segments.back();
+    constexpr u64 max_image_size = (std::numeric_limits<u32>::max)() & ~Core::Memory::YUZU_PAGEMASK;
+#ifdef HAS_NCE
+    if (module_start > max_image_size) {
+        return std::nullopt;
+    }
+#endif
+    const u64 data_end = module_start + u64{data_segment.location} + data_segment.size;
+    const u64 argument_size = args.empty() ? 0 : NSO_ARGUMENT_DATA_ALLOCATION_SIZE;
+    const u64 unaligned_image_size = data_end + argument_size + data_segment.bss_size;
+    if (unaligned_image_size == 0 || unaligned_image_size > max_image_size) {
+        return std::nullopt;
+    }
+
+    u32 image_size = PageAlignSize(static_cast<u32>(unaligned_image_size));
+    Kernel::CodeSet codeset;
+    if (static_cast<size_t>(image_size) > codeset.memory.max_size()) {
+        return std::nullopt;
+    }
+
+    std::array<size_t, 3> segment_file_sizes{};
+    size_t max_compressed_size = 0;
+    for (size_t i = 0; i < nso_header.segments.size(); ++i) {
+        const auto& segment = nso_header.segments[i];
+        const bool compressed = nso_header.IsSegmentCompressed(i);
+        const u32 stored_size = compressed ? nso_header.segments_compressed_size[i] : segment.size;
+        const u64 offset = module_start + u64{segment.location};
+        const u64 segment_size = u64{segment.size} +
+                                 (i == nso_header.segments.size() - 1
+                                      ? argument_size + data_segment.bss_size
+                                      : 0);
+        if (segment.offset > file_size || stored_size > file_size - segment.offset ||
+            offset + segment.size > data_end || segment_size > max_image_size ||
+            offset + PageAlignSize(static_cast<u32>(segment_size)) > image_size) {
+            return std::nullopt;
+        }
+        if (compressed) {
+            constexpr auto max_codec_size = static_cast<u32>((std::numeric_limits<int>::max)());
+            if (stored_size == 0 || stored_size > max_codec_size || segment.size > max_codec_size) {
+                return std::nullopt;
             }
-            codeset.segments[i].addr = module_start + nso_header.segments[i].location;
-            codeset.segments[i].offset = module_start + nso_header.segments[i].location;
-            codeset.segments[i].size = nso_header.segments[i].size;
+            max_compressed_size = (std::max)(max_compressed_size, static_cast<size_t>(stored_size));
+        }
+        segment_file_sizes[i] = stored_size;
+        auto& mapped_segment = codeset.segments[i];
+        mapped_segment.addr = offset;
+        mapped_segment.offset = static_cast<size_t>(offset);
+        mapped_segment.size = PageAlignSize(static_cast<u32>(segment_size));
+    }
+
+    {
+        std::vector<u8> compressed_data;
+        try {
+            codeset.memory.resize(image_size);
+            compressed_data.resize(max_compressed_size);
+        } catch (const std::bad_alloc&) {
+            return std::nullopt;
+        }
+        for (size_t i = 0; i < nso_header.segments.size(); ++i) {
+            const size_t stored_size = segment_file_sizes[i];
+            if (stored_size == 0) {
+                continue;
+            }
+            const auto& segment = nso_header.segments[i];
+            auto destination =
+                std::span{codeset.memory}.subspan(codeset.segments[i].offset, segment.size);
+            const bool compressed = nso_header.IsSegmentCompressed(i);
+            auto* source = compressed ? compressed_data.data() : destination.data();
+            if (nso_file.Read(source, stored_size, segment.offset) != stored_size) {
+                return std::nullopt;
+            }
+            if (compressed) {
+                const int decompressed_size = nso_header.IsZBICCompressed()
+                    ? Common::Compression::DecompressDataZBIC(destination, {source, stored_size})
+                    : Common::Compression::DecompressDataLZ4(destination.data(), destination.size(),
+                                                             source, stored_size);
+                if (decompressed_size < 0 ||
+                    static_cast<size_t>(decompressed_size) != destination.size()) {
+                    return std::nullopt;
+                }
+            }
         }
     }
 
-    if (should_pass_arguments && !Settings::values.program_args.GetValue().empty()) {
-        const auto arg_data{Settings::values.program_args.GetValue()};
-
-        codeset.DataSegment().size += NSO_ARGUMENT_DATA_ALLOCATION_SIZE;
-        NSOArgumentHeader args_header{NSO_ARGUMENT_DATA_ALLOCATION_SIZE, static_cast<u32_le>(arg_data.size()), {}};
-        const auto end_offset = codeset.memory.size();
-        codeset.memory.resize(u32(codeset.memory.size()) + NSO_ARGUMENT_DATA_ALLOCATION_SIZE);
-        std::memcpy(codeset.memory.data() + end_offset, &args_header, sizeof(NSOArgumentHeader));
-        std::memcpy(codeset.memory.data() + end_offset + sizeof(NSOArgumentHeader), arg_data.data(), arg_data.size());
-    }
-
-    codeset.DataSegment().size += nso_header.segments[2].bss_size;
-    u32 image_size = PageAlignSize(u32(codeset.memory.size()) + nso_header.segments[2].bss_size);
-    codeset.memory.resize(image_size);
-
-    for (std::size_t i = 0; i < nso_header.segments.size(); ++i) {
-        codeset.segments[i].size = PageAlignSize(codeset.segments[i].size);
+    if (!args.empty()) {
+        const NSOArgumentHeader args_header{NSO_ARGUMENT_DATA_ALLOCATION_SIZE,
+                                            static_cast<u32>(args.size()), {}};
+        auto* const args_destination = codeset.memory.data() + data_end;
+        std::memcpy(args_destination, &args_header, sizeof(args_header));
+        std::memcpy(args_destination + sizeof(args_header), args.data(), args.size());
     }
 
     // Apply patches if necessary
@@ -178,6 +213,10 @@ std::optional<VAddr> AppLoader_NSO::LoadModule(Kernel::KProcess& process, Core::
                     patchable_section.size());
 
         pi_header = pm->PatchNSO(pi_header, name);
+        if (pi_header.size() < sizeof(NSOHeader) ||
+            pi_header.size() - sizeof(NSOHeader) > patchable_section.size()) {
+            return std::nullopt;
+        }
 
         std::copy(pi_header.begin() + sizeof(NSOHeader), pi_header.end(), patchable_section.data());
     }

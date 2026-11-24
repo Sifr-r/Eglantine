@@ -11,6 +11,7 @@
 
 #include <QCloseEvent>
 #include <QMessageBox>
+#include <QPointer>
 #include <QStringListModel>
 
 #include "common/logging.h"
@@ -91,7 +92,9 @@ ConfigureMotionTouch::ConfigureMotionTouch(QWidget* parent,
     ConnectEvents();
 }
 
-ConfigureMotionTouch::~ConfigureMotionTouch() = default;
+ConfigureMotionTouch::~ConfigureMotionTouch() {
+    udp_test_job.reset();
+}
 
 void ConfigureMotionTouch::SetConfiguration() {
     const Common::ParamPackage touch_param(Settings::values.touch_device.GetValue());
@@ -204,15 +207,27 @@ void ConfigureMotionTouch::OnCemuhookUDPTest() {
     ui->udp_test->setEnabled(false);
     ui->udp_test->setText(tr("Testing"));
     udp_test_in_progress = true;
-    InputCommon::CemuhookUDP::TestCommunication(
+    udp_test_job.reset();
+    QPointer<ConfigureMotionTouch> self(this);
+    udp_test_job = std::make_unique<InputCommon::CemuhookUDP::CommunicationTestJob>(
         ui->udp_server->text().toStdString(), static_cast<u16>(ui->udp_port->text().toInt()),
-        [this] {
-            LOG_INFO(Frontend, "UDP input test success");
-            QMetaObject::invokeMethod(this, [this] { ShowUDPTestResult(true); });
-        },
-        [this] {
-            LOG_ERROR(Frontend, "UDP input test failed");
-            QMetaObject::invokeMethod(this, [this] { ShowUDPTestResult(false); });
+        [self](bool result) {
+            if (result) {
+                LOG_INFO(Frontend, "UDP input test success");
+            } else {
+                LOG_ERROR(Frontend, "UDP input test failed");
+            }
+            if (!self) {
+                return;
+            }
+            QMetaObject::invokeMethod(
+                self,
+                [self, result] {
+                    if (self) {
+                        self->ShowUDPTestResult(result);
+                    }
+                },
+                Qt::QueuedConnection);
         });
 }
 
@@ -243,6 +258,12 @@ void ConfigureMotionTouch::closeEvent(QCloseEvent* event) {
         event->accept();
     } else {
         event->ignore();
+    }
+}
+
+void ConfigureMotionTouch::reject() {
+    if (CanCloseDialog()) {
+        QDialog::reject();
     }
 }
 

@@ -12,10 +12,10 @@ import android.os.Handler
 import android.os.Looper
 import android.view.KeyEvent
 import android.view.View
-import android.view.WindowInsets
 import android.view.inputmethod.InputMethodManager
 import androidx.annotation.Keep
 import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import java.io.Serializable
 import org.yuzu.yuzu_emu.NativeLibrary
 import org.yuzu.yuzu_emu.R
@@ -23,20 +23,52 @@ import org.yuzu.yuzu_emu.applets.keyboard.ui.KeyboardDialogFragment
 
 @Keep
 object SoftwareKeyboard {
-    lateinit var data: KeyboardData
+    var data: KeyboardData = KeyboardData(SwkbdResult.Cancel.ordinal, "")
     val dataLock = Object()
+    private var isDataReady = false
+
+    fun notifyNormalCompleted() {
+        synchronized(dataLock) {
+            isDataReady = true
+            dataLock.notifyAll()
+        }
+    }
 
     private fun executeNormalImpl(config: KeyboardConfig) {
         val emulationActivity = NativeLibrary.sEmulationActivity.get()
-        data = KeyboardData(SwkbdResult.Cancel.ordinal, "")
-        val fragment = KeyboardDialogFragment.newInstance(config)
-        fragment.show(emulationActivity!!.supportFragmentManager, KeyboardDialogFragment.TAG)
+        if (emulationActivity == null ||
+            emulationActivity.isFinishing ||
+            emulationActivity.isDestroyed
+        ) {
+            notifyNormalCompleted()
+            return
+        }
+
+        val fragmentManager = emulationActivity.supportFragmentManager
+        if (fragmentManager.isStateSaved) {
+            notifyNormalCompleted()
+            return
+        }
+
+        try {
+            val fragment = KeyboardDialogFragment.newInstance(config)
+            fragment.show(fragmentManager, KeyboardDialogFragment.TAG)
+        } catch (_: IllegalStateException) {
+            notifyNormalCompleted()
+        }
     }
 
     private fun executeInlineImpl(config: KeyboardConfig) {
         val emulationActivity = NativeLibrary.sEmulationActivity.get()
+        if (emulationActivity == null ||
+            emulationActivity.isFinishing ||
+            emulationActivity.isDestroyed
+        ) {
+            return
+        }
 
-        val overlayView = emulationActivity!!.findViewById<View>(R.id.surface_input_overlay)
+        val overlayView =
+            emulationActivity.findViewById<View>(R.id.surface_input_overlay) ?: return
         overlayView.requestFocus()
         val im =
             overlayView.context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
@@ -44,15 +76,18 @@ object SoftwareKeyboard {
         im.showSoftInput(overlayView, InputMethodManager.SHOW_FORCED)
 
         // There isn't a good way to know that the IMM is dismissed, so poll every 500ms to submit inline keyboard result.
-        val handler = Handler(Looper.myLooper()!!)
-        val delayMs = 500
+        val handler = Handler(Looper.getMainLooper())
+        val delayMs = 500L
         handler.postDelayed(
             object : Runnable {
                 override fun run() {
-                    val insets = ViewCompat.getRootWindowInsets(overlayView)
-                    val isKeyboardVisible = insets!!.isVisible(WindowInsets.Type.ime())
+                    if (!overlayView.isAttachedToWindow) {
+                        return
+                    }
+                    val insets = ViewCompat.getRootWindowInsets(overlayView) ?: return
+                    val isKeyboardVisible = insets.isVisible(WindowInsetsCompat.Type.ime())
                     if (isKeyboardVisible) {
-                        handler.postDelayed(this, delayMs.toLong())
+                        handler.postDelayed(this, delayMs)
                         return
                     }
 
@@ -60,22 +95,47 @@ object SoftwareKeyboard {
                     NativeLibrary.submitInlineKeyboardInput(KeyEvent.KEYCODE_ENTER)
                 }
             },
-            delayMs.toLong()
+            delayMs
         )
     }
 
     @JvmStatic
     fun executeNormal(config: KeyboardConfig): KeyboardData {
-        NativeLibrary.sEmulationActivity.get()!!.runOnUiThread { executeNormalImpl(config) }
-        synchronized(dataLock) {
-            dataLock.wait()
+        val emulationActivity = NativeLibrary.sEmulationActivity.get()
+        if (emulationActivity == null ||
+            emulationActivity.isFinishing ||
+            emulationActivity.isDestroyed
+        ) {
+            return KeyboardData(SwkbdResult.Cancel.ordinal, "")
         }
-        return data
+
+        synchronized(dataLock) {
+            data = KeyboardData(SwkbdResult.Cancel.ordinal, "")
+            isDataReady = false
+        }
+
+        emulationActivity.runOnUiThread { executeNormalImpl(config) }
+
+        synchronized(dataLock) {
+            while (!isDataReady) {
+                try {
+                    dataLock.wait()
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    break
+                }
+            }
+            return data.copy()
+        }
     }
 
     @JvmStatic
     fun executeInline(config: KeyboardConfig) {
-        NativeLibrary.sEmulationActivity.get()!!.runOnUiThread { executeInlineImpl(config) }
+        val emulationActivity = NativeLibrary.sEmulationActivity.get() ?: return
+        if (emulationActivity.isFinishing || emulationActivity.isDestroyed) {
+            return
+        }
+        emulationActivity.runOnUiThread { executeInlineImpl(config) }
     }
 
     // Corresponds to Service::AM::Applets::SwkbdType

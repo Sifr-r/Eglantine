@@ -207,8 +207,8 @@ void Joycons::RegisterNewDevice(SDL_hid_device_info* device_info) {
             }},
         };
 
-        handle->InitializeDevice();
         handle->SetCallbacks(callbacks);
+        handle->InitializeDevice();
     }
 }
 

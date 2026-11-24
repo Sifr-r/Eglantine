@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <set>
 
 namespace Kernel {
@@ -26,14 +27,11 @@ public:
     ~VsyncManager();
 
     void SignalVsync(Kernel::KernelCore& kernel);
-    void LinkVsyncEvent(Event* event) {
-        m_vsync_events.insert(event);
-    }
-    void UnlinkVsyncEvent(Event* event) {
-        m_vsync_events.erase(event);
-    }
+    void LinkVsyncEvent(Event* event);
+    void UnlinkVsyncEvent(Event* event);
 
 private:
+    std::mutex m_lock;
     std::set<Event*> m_vsync_events;
 };
 

@@ -2,14 +2,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "core/hle/service/cmif_serialization.h"
+#include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/ns/async_result.h"
+#include "core/hle/service/os/event.h"
 
 #include <cstring>
+#include <utility>
 
 namespace Service::NS {
 
-IAsyncResult::IAsyncResult(Core::System& system_, Service::Event* event_)
-    : ServiceFramework{system_, "nn::ns::detail::IAsyncResult"}, event{event_} {
+IAsyncResult::IAsyncResult(Core::System& system_,
+                           std::shared_ptr<KernelHelpers::ServiceContext> service_context_,
+                           std::shared_ptr<Service::Event> event_)
+    : ServiceFramework{system_, "nn::ns::detail::IAsyncResult"},
+      service_context{std::move(service_context_)}, event{std::move(event_)} {
     // clang-format off
     static const FunctionInfo functions[] = {
         {0, nullptr, "Get"},

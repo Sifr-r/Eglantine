@@ -23,8 +23,6 @@ RyujinxDialog::~RyujinxDialog() {
 }
 
 void RyujinxDialog::fromEden() {
-    accept();
-
     // Workaround: Ryujinx deletes and re-creates its directory structure???
     // So we just copy Eden's data to Ryujinx and then link the other way
     namespace fs = std::filesystem;
@@ -32,14 +30,15 @@ void RyujinxDialog::fromEden() {
         fs::remove_all(m_ryu);
         fs::create_directories(m_ryu);
         fs::copy(m_eden, m_ryu, fs::copy_options::recursive);
-    } catch (std::exception& e) {
+    } catch (const std::exception& e) {
         QtCommon::Frontend::Critical(
             tr("Failed to link save data"),
             tr("OS returned error: %1").arg(QString::fromStdString(e.what())));
+        return;
     }
 
-    // ?ploo
     QtCommon::FS::LinkRyujinx(m_ryu, m_eden);
+    accept();
 }
 
 void RyujinxDialog::fromRyujinx() {

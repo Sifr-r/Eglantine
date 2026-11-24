@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstring>
+
 #include "audio_core/adsp/apps/audio_renderer/command_list_processor.h"
 #include "audio_core/renderer/command/effect/light_limiter.h"
 
@@ -31,8 +34,13 @@ static void InitializeLightLimiterEffect(const LightLimiterInfo::ParameterVersio
     state.samples_average.fill(0.0f);
     state.compression_gain.fill(1.0f);
     state.look_ahead_sample_offsets.fill(0);
+    if (!IsChannelCountValid(params.channel_count) || params.look_ahead_samples_max <= 0) {
+        return;
+    }
+
+    const auto max_samples{(std::min)(params.look_ahead_samples_max, 48000)};
     for (u32 i = 0; i < params.channel_count; i++) {
-        state.look_ahead_sample_buffers[i].resize(params.look_ahead_samples_max, 0.0f);
+        state.look_ahead_sample_buffers[i].resize(static_cast<size_t>(max_samples), 0.0f);
     }
 }
 
@@ -65,7 +73,26 @@ static void ApplyLightLimiterEffect(const LightLimiterInfo::ParameterVersion2& p
         return ((f64)s / 256.0);
     };
 
-    if (enabled) {
+    if (params.channel_count == 0 || !IsChannelCountValid(params.channel_count)) {
+        return;
+    }
+
+    bool can_apply{enabled && params.look_ahead_samples_min > 0};
+    if (can_apply) {
+        const auto required_samples{static_cast<size_t>(params.look_ahead_samples_min)};
+        for (u32 i = 0; i < params.channel_count; i++) {
+            if (state.look_ahead_sample_buffers[i].size() < required_samples) {
+                can_apply = false;
+                break;
+            }
+            if (state.look_ahead_sample_offsets[i] < 0 ||
+                state.look_ahead_sample_offsets[i] >= params.look_ahead_samples_min) {
+                state.look_ahead_sample_offsets[i] = 0;
+            }
+        }
+    }
+
+    if (can_apply) {
         if (statistics && params.statistics_reset_required) {
             for (u32 i = 0; i < params.channel_count; i++) {
                 statistics->channel_compression_gain_min[i] = 1.0f;
@@ -149,18 +176,38 @@ void LightLimiterVersion1Command::Dump(
     string += "\n";
 }
 
-void LightLimiterVersion1Command::Process(const AudioRenderer::CommandListProcessor& processor) {
+static void ProcessLightLimiterCommand(const AudioRenderer::CommandListProcessor& processor,
+                                       const LightLimiterInfo::ParameterVersion2& parameter,
+                                       const std::array<s16, MaxChannels>& inputs,
+                                       const std::array<s16, MaxChannels>& outputs,
+                                       const bool effect_enabled, const CpuAddr state,
+                                       const CpuAddr workbuffer,
+                                       LightLimiterInfo::StatisticsInternal* statistics) {
+    if (parameter.channel_count == 0 || !IsChannelCountValid(parameter.channel_count)) {
+        return;
+    }
+
+    auto state_{reinterpret_cast<LightLimiterInfo::State*>(state)};
+    if (state_ == nullptr) {
+        return;
+    }
+
     std::array<std::span<const s32>, MaxChannels> input_buffers{};
     std::array<std::span<s32>, MaxChannels> output_buffers{};
 
     for (u32 i = 0; i < parameter.channel_count; i++) {
+        if (inputs[i] < 0 || outputs[i] < 0 ||
+            static_cast<size_t>(inputs[i] + 1) * processor.sample_count >
+                processor.mix_buffers.size() ||
+            static_cast<size_t>(outputs[i] + 1) * processor.sample_count >
+                processor.mix_buffers.size()) {
+            return;
+        }
         input_buffers[i] = processor.mix_buffers.subspan(inputs[i] * processor.sample_count,
                                                          processor.sample_count);
         output_buffers[i] = processor.mix_buffers.subspan(outputs[i] * processor.sample_count,
                                                           processor.sample_count);
     }
-
-    auto state_{reinterpret_cast<LightLimiterInfo::State*>(state)};
 
     if (effect_enabled) {
         if (parameter.state == LightLimiterInfo::ParameterState::Updating) {
@@ -170,9 +217,13 @@ void LightLimiterVersion1Command::Process(const AudioRenderer::CommandListProces
         }
     }
 
-    LightLimiterInfo::StatisticsInternal* statistics{nullptr};
     ApplyLightLimiterEffect(parameter, *state_, effect_enabled, input_buffers, output_buffers,
                             processor.sample_count, statistics);
+}
+
+void LightLimiterVersion1Command::Process(const AudioRenderer::CommandListProcessor& processor) {
+    ProcessLightLimiterCommand(processor, parameter, inputs, outputs, effect_enabled, state,
+                               workbuffer, nullptr);
 }
 
 bool LightLimiterVersion1Command::Verify(const AudioRenderer::CommandListProcessor& processor) {
@@ -193,29 +244,9 @@ void LightLimiterVersion2Command::Dump(
 }
 
 void LightLimiterVersion2Command::Process(const AudioRenderer::CommandListProcessor& processor) {
-    std::array<std::span<const s32>, MaxChannels> input_buffers{};
-    std::array<std::span<s32>, MaxChannels> output_buffers{};
-
-    for (u32 i = 0; i < parameter.channel_count; i++) {
-        input_buffers[i] = processor.mix_buffers.subspan(inputs[i] * processor.sample_count,
-                                                         processor.sample_count);
-        output_buffers[i] = processor.mix_buffers.subspan(outputs[i] * processor.sample_count,
-                                                          processor.sample_count);
-    }
-
-    auto state_{reinterpret_cast<LightLimiterInfo::State*>(state)};
-
-    if (effect_enabled) {
-        if (parameter.state == LightLimiterInfo::ParameterState::Updating) {
-            UpdateLightLimiterEffectParameter(parameter, *state_);
-        } else if (parameter.state == LightLimiterInfo::ParameterState::Initialized) {
-            InitializeLightLimiterEffect(parameter, *state_, workbuffer);
-        }
-    }
-
     auto statistics{reinterpret_cast<LightLimiterInfo::StatisticsInternal*>(result_state)};
-    ApplyLightLimiterEffect(parameter, *state_, effect_enabled, input_buffers, output_buffers,
-                            processor.sample_count, statistics);
+    ProcessLightLimiterCommand(processor, parameter, inputs, outputs, effect_enabled, state,
+                               workbuffer, statistics);
 }
 
 bool LightLimiterVersion2Command::Verify(const AudioRenderer::CommandListProcessor& processor) {

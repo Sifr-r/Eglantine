@@ -331,9 +331,9 @@ HostLocInfo& RegAlloc::ValueInfo(const IR::Inst* value) {
     };
     if (const auto iter = std::find_if(gprs.begin(), gprs.end(), contains_value); iter != gprs.end()) {
         return *iter;
-    } else if (const auto iter = std::find_if(fprs.begin(), fprs.end(), contains_value); iter != gprs.end()) {
+    } else if (const auto iter = std::find_if(fprs.begin(), fprs.end(), contains_value); iter != fprs.end()) {
         return *iter;
-    } else if (const auto iter = std::find_if(spills.begin(), spills.end(), contains_value); iter != gprs.end()) {
+    } else if (const auto iter = std::find_if(spills.begin(), spills.end(), contains_value); iter != spills.end()) {
         return *iter;
     }
     UNREACHABLE();

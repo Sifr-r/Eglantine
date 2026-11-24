@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstring>
+#include <memory>
 #include <regex>
 #include <string>
 
@@ -32,27 +33,34 @@ static bool CalculateHMAC256(Destination* out, const SourceKey* key, std::size_t
                              const SourceData* data, std::size_t data_length) {
     size_t out_len = 0;
 
-    static EVP_MAC* mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
+    static EVP_MAC* const mac = EVP_MAC_fetch(nullptr, "HMAC", nullptr);
     if (!mac) return false;
 
-    static EVP_MAC_CTX* ctx = EVP_MAC_CTX_new(mac);
+    const std::unique_ptr<EVP_MAC_CTX, decltype(&EVP_MAC_CTX_free)> ctx{
+        EVP_MAC_CTX_new(mac), &EVP_MAC_CTX_free};
     if (!ctx) return false;
 
-    static OSSL_PARAM params[] = {
-        OSSL_PARAM_construct_utf8_string("digest", (char*)"SHA256", 0),
+    char digest_name[] = "SHA256";
+    const OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string("digest", digest_name, 0),
         OSSL_PARAM_construct_end()
     };
 
-    if (!EVP_MAC_init(ctx, reinterpret_cast<const unsigned char*>(key), key_length, params))
+    if (EVP_MAC_init(ctx.get(), reinterpret_cast<const unsigned char*>(key), key_length, params) != 1)
         return false;
 
-    return EVP_MAC_update(ctx, reinterpret_cast<const unsigned char*>(data), data_length) &&
-           EVP_MAC_final(ctx, reinterpret_cast<unsigned char*>(out), &out_len, 32);
+    return EVP_MAC_update(ctx.get(), reinterpret_cast<const unsigned char*>(data), data_length) == 1 &&
+           EVP_MAC_final(ctx.get(), reinterpret_cast<unsigned char*>(out), &out_len, 32) == 1 &&
+           out_len == 32;
 }
 
 NAX::NAX(VirtualFile file_)
     : header(std::make_unique<NAXHeader>()),
       file(std::move(file_)), keys{Core::Crypto::KeyManager::Instance()} {
+    if (file == nullptr) {
+        status = Loader::ResultStatus::ErrorNullFile;
+        return;
+    }
     std::string path = Common::FS::SanitizePath(file->GetFullPath());
     static const std::regex nax_path_regex("/registered/(000000[0-9A-F]{2})/([0-9A-F]{32})\\.nca",
                                            std::regex_constants::ECMAScript |
@@ -94,7 +102,9 @@ Loader::ResultStatus NAX::Parse(std::string_view path) {
     if (header->magic != Common::MakeMagic('N', 'A', 'X', '0')) {
         return Loader::ResultStatus::ErrorBadNAXHeader;
     }
-    if (file->GetSize() < NAX_HEADER_PADDING_SIZE + header->file_size) {
+    const u64 file_size = file->GetSize();
+    if (file_size < NAX_HEADER_PADDING_SIZE ||
+        header->file_size > file_size - NAX_HEADER_PADDING_SIZE) {
         return Loader::ResultStatus::ErrorIncorrectNAXFileSize;
     }
 

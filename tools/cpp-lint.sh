@@ -27,29 +27,34 @@ EOF
 }
 
 while :; do
-	case "$1" in
-	once)
+    case "${1:-}" in
+    once)
         find "$SRC_DIR" -type f -name "*.h" -exec grep -L "#pragma once" {} +
-		break
-		;;
-	osdef)
-		# not recommended macros
-		PATTERN="ANDROID\|_WIN64\|__linux\|__unix\|APPLE\|__APPLE"
-		strings=("ANDROID" "_WIN64" "__linux" "__unix" "APPLE" "__APPLE" "linux" "unix")
-		for item in "${strings[@]}"; do
-			PATTERN="$PATTERN\|ifdef $item\|($item)"
-		done
-		# if statements for macros that shouldn't be if
-		strings=("_WIN32" "_AIX" "__managarm__" "__unix__" "__linux__" "__FreeBSD__" "__NetBSD__" \
-			"__OpenBSD__" "__DragonFly__" "__redox__" "__HAIKU__" "__OHOS__" "__FIREOS__")
-		for item in "${strings[@]}"; do
-			PATTERN="$PATTERN\|if $item"
-		done
+        break
+        ;;
+    osdef)
+        # not recommended macros
+        PATTERN="ANDROID\|_WIN64\|__linux\|__unix\|APPLE\|__APPLE"
+        for item in ANDROID _WIN64 __linux __unix APPLE __APPLE linux unix; do
+            PATTERN="$PATTERN\|ifdef $item\|($item)"
+        done
+        # if statements for macros that shouldn't be if
+        for item in _WIN32 _AIX __managarm__ __unix__ __linux__ __FreeBSD__ __NetBSD__ \
+            __OpenBSD__ __DragonFly__ __redox__ __HAIKU__ __OHOS__ __FIREOS__; do
+            PATTERN="$PATTERN\|if $item"
+        done
         find "$SRC_DIR" -type f -name "*.h" -exec grep -nw "$PATTERN" {} + || echo
-		break
-		;;
-	*) usage ;;
-	esac
+        break
+        ;;
+    -h|--help)
+        usage
+        exit 0
+        ;;
+    *)
+        usage >&2
+        exit 1
+        ;;
+    esac
 
-	shift
+    shift
 done

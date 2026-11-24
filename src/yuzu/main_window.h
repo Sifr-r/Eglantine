@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <set>
@@ -19,6 +20,7 @@
 #include <QMainWindow>
 #include <QPointer>
 #include <QMessageBox>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QTimer>
 #include <QTranslator>
@@ -577,7 +579,7 @@ private:
     std::unique_ptr<QtConfig> config;
 
     // Whether emulation is currently running in yuzu.
-    bool emulation_running = false;
+    std::atomic<bool> emulation_running{false};
     bool boot_in_progress = false;
     bool close_pending = false;
 
@@ -659,7 +661,8 @@ private:
     QTranslator translator;
 
     // Install progress dialog
-    QProgressDialog* install_progress = nullptr;
+    QPointer<QProgressDialog> install_progress;
+    std::shared_ptr<std::atomic_bool> install_cancel;
     NupProgressDialog* nup_progress = nullptr;
     QFutureWatcher<FileSys::Nup::PackResult> nup_watcher;
     std::shared_ptr<std::atomic_bool> nup_cancel;

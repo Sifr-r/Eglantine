@@ -9,6 +9,7 @@
 #pragma once
 
 #include <functional>
+#include <mutex>
 #include <span>
 
 #include "input_common/helpers/joycon_protocol/joycon_types.h"
@@ -40,15 +41,21 @@ public:
     void UpdateCamera(const std::vector<u8>& camera_data, IrsResolution format);
 
 private:
-    void UpdateActiveLeftPadInput(const InputReportActive& input,
-                                  const MotionStatus& motion_status);
-    void UpdateActiveRightPadInput(const InputReportActive& input,
-                                   const MotionStatus& motion_status);
-    void UpdateActiveProPadInput(const InputReportActive& input, const MotionStatus& motion_status);
+    JoyconCallbacks GetCallbacksSnapshot() const;
 
-    void UpdatePassiveLeftPadInput(const InputReportPassive& buffer);
-    void UpdatePassiveRightPadInput(const InputReportPassive& buffer);
-    void UpdatePassiveProPadInput(const InputReportPassive& buffer);
+    void UpdateRingWithCallbacks(s16 value, const RingStatus& ring_status,
+                                 const JoyconCallbacks& cb);
+
+    void UpdateActiveLeftPadInput(const InputReportActive& input, const MotionStatus& motion_status,
+                                  const JoyconCallbacks& cb);
+    void UpdateActiveRightPadInput(const InputReportActive& input,
+                                   const MotionStatus& motion_status, const JoyconCallbacks& cb);
+    void UpdateActiveProPadInput(const InputReportActive& input, const MotionStatus& motion_status,
+                                 const JoyconCallbacks& cb);
+
+    void UpdatePassiveLeftPadInput(const InputReportPassive& buffer, const JoyconCallbacks& cb);
+    void UpdatePassiveRightPadInput(const InputReportPassive& buffer, const JoyconCallbacks& cb);
+    void UpdatePassiveProPadInput(const InputReportPassive& buffer, const JoyconCallbacks& cb);
 
     /// Returns a calibrated joystick axis from raw axis data
     f32 GetAxisValue(u16 raw_value, JoyStickAxisCalibration calibration) const;
@@ -78,6 +85,7 @@ private:
     JoyStickCalibration right_stick_calibration{};
     MotionCalibration motion_calibration{};
 
+    mutable std::mutex callback_mutex;
     JoyconCallbacks callbacks{};
 };
 

@@ -8,6 +8,8 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <mutex>
 #include <string>
 
 #ifdef HAS_OPENGL
@@ -679,17 +681,32 @@ void GRenderWindow::RequestCameraCapture() {
 void GRenderWindow::OnCameraCapture(int requestId, const QImage& img) {
 #if YUZU_USE_QT_MULTIMEDIA
     // TODO: Capture directly in the format and resolution needed
+    if (img.isNull()) {
+        return;
+    }
     const auto camera_width = input_subsystem->GetCamera()->getImageWidth();
     const auto camera_height = input_subsystem->GetCamera()->getImageHeight();
+    if (camera_width == 0 || camera_height == 0 ||
+        camera_width > static_cast<std::size_t>((std::numeric_limits<int>::max)()) ||
+        camera_height > static_cast<std::size_t>((std::numeric_limits<int>::max)()) ||
+        camera_width > (std::numeric_limits<std::size_t>::max)() / sizeof(u32) / camera_height) {
+        return;
+    }
     const auto converted =
         img.scaled(static_cast<int>(camera_width), static_cast<int>(camera_height),
                    Qt::AspectRatioMode::IgnoreAspectRatio,
                    Qt::TransformationMode::SmoothTransformation)
-            .mirrored(false, true);
-    if (camera_data.size() != camera_width * camera_height) {
-        camera_data.resize(camera_width * camera_height);
+            .mirrored(false, true)
+            .convertToFormat(QImage::Format_RGB32);
+    const std::size_t pixel_count = camera_width * camera_height;
+    const std::size_t expected_bytes = pixel_count * sizeof(u32);
+    if (converted.isNull() || converted.sizeInBytes() < static_cast<qsizetype>(expected_bytes)) {
+        return;
     }
-    std::memcpy(camera_data.data(), converted.bits(), camera_width * camera_height * sizeof(u32));
+    if (camera_data.size() != pixel_count) {
+        camera_data.resize(pixel_count);
+    }
+    std::memcpy(camera_data.data(), converted.constBits(), expected_bytes);
     input_subsystem->GetCamera()->SetCameraData(camera_width, camera_height, camera_data);
     pending_camera_snapshots = 0;
 #endif
@@ -798,14 +815,6 @@ void GRenderWindow::ReleaseRenderTarget() {
 }
 
 void GRenderWindow::CaptureScreenshot(const QString& screenshot_path) {
-    auto& renderer = QtCommon::system->Renderer();
-
-    if (renderer.IsScreenshotPending()) {
-        LOG_WARNING(Render,
-                    "A screenshot is already requested or in progress, ignoring the request");
-        return;
-    }
-
     const Layout::FramebufferLayout layout{[]() {
         u32 height = UISettings::values.screenshot_height.GetValue();
         if (height == 0) {
@@ -817,6 +826,20 @@ void GRenderWindow::CaptureScreenshot(const QString& screenshot_path) {
             UISettings::CalculateWidth(height, Settings::values.aspect_ratio.GetValue());
         return Layout::DefaultFrameLayout(width, height);
     }()};
+
+    std::scoped_lock lk{QtCommon::renderer_mutex};
+    if (!QtCommon::renderer_active.load(std::memory_order_acquire) || !QtCommon::system ||
+        !QtCommon::system->IsPoweredOn() || QtCommon::system->IsShuttingDown()) {
+        return;
+    }
+
+    auto& renderer = QtCommon::system->Renderer();
+
+    if (renderer.IsScreenshotPending()) {
+        LOG_WARNING(Render,
+                    "A screenshot is already requested or in progress, ignoring the request");
+        return;
+    }
 
     screenshot_image = QImage(QSize(layout.width, layout.height), QImage::Format_RGB32);
     renderer.RequestScreenshot(

@@ -63,7 +63,8 @@ void Ver3StoreData::BuildToStoreData(StoreData& out_store_data) const {
     out_store_data.SetEyebrowAspect(static_cast<u8>(appearance_bits5.eyebrow_aspect.Value()));
     out_store_data.SetEyebrowRotate(static_cast<u8>(appearance_bits5.eyebrow_rotate.Value()));
     out_store_data.SetEyebrowX(static_cast<u8>(appearance_bits5.eyebrow_x.Value()));
-    out_store_data.SetEyebrowY(static_cast<u8>(appearance_bits5.eyebrow_y.Value() - 3));
+    const u32 eyebrow_y = appearance_bits5.eyebrow_y.Value();
+    out_store_data.SetEyebrowY(static_cast<u8>(eyebrow_y >= 3 ? eyebrow_y - 3 : 0));
 
     out_store_data.SetNoseType(static_cast<NoseType>(appearance_bits6.nose_type.Value()));
     out_store_data.SetNoseScale(static_cast<u8>(appearance_bits6.nose_scale.Value()));
@@ -119,7 +120,7 @@ void Ver3StoreData::BuildFromStoreData(const StoreData& store_data) {
 
     appearance_bits4.eye_type.Assign(static_cast<u8>(store_data.GetEyeType()));
     appearance_bits4.eye_scale.Assign(store_data.GetEyeScale());
-    appearance_bits4.eye_aspect.Assign(store_data.GetEyebrowAspect());
+    appearance_bits4.eye_aspect.Assign(store_data.GetEyeAspect());
     appearance_bits4.eye_rotate.Assign(store_data.GetEyeRotate());
     appearance_bits4.eye_x.Assign(store_data.GetEyeX());
     appearance_bits4.eye_y.Assign(store_data.GetEyeY());

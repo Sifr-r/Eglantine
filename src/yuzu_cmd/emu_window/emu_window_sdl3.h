@@ -46,6 +46,9 @@ public:
     /// Whether the window is still open, and a close request hasn't yet been sent
     bool IsOpen() const;
 
+    bool HasInputFocus() const;
+    bool SetSessionVisible(bool visible);
+
     /// Sets the title the titlebar timer prepared; call from the main thread.
     void ApplyPendingTitle();
 

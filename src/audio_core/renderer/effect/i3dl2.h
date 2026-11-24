@@ -4,6 +4,8 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <memory>
 #include <vector>
 
 #include "audio_core/common/common.h"
@@ -129,25 +131,38 @@ public:
     };
 
     struct State {
-        f32 lowpass_0;
-        f32 lowpass_1;
-        f32 lowpass_2;
-        I3dl2DelayLine early_delay_line;
-        std::array<s32, MaxDelayTaps> early_tap_steps;
-        f32 early_gain;
-        f32 late_gain;
-        s32 early_to_late_taps;
-        std::array<I3dl2DelayLine, MaxDelayLines> fdn_delay_lines;
-        std::array<I3dl2DelayLine, MaxDelayLines> decay_delay_lines0;
-        std::array<I3dl2DelayLine, MaxDelayLines> decay_delay_lines1;
-        f32 last_reverb_echo;
-        I3dl2DelayLine center_delay_line;
-        std::array<std::array<f32, 3>, MaxDelayLines> lowpass_coeff;
-        std::array<f32, MaxDelayLines> shelf_filter;
-        f32 dry_gain;
+        f32 lowpass_0{};
+        f32 lowpass_1{};
+        f32 lowpass_2{};
+        I3dl2DelayLine early_delay_line{};
+        std::array<s32, MaxDelayTaps> early_tap_steps{};
+        f32 early_gain{};
+        f32 late_gain{};
+        s32 early_to_late_taps{};
+        std::array<I3dl2DelayLine, MaxDelayLines> fdn_delay_lines{};
+        std::array<I3dl2DelayLine, MaxDelayLines> decay_delay_lines0{};
+        std::array<I3dl2DelayLine, MaxDelayLines> decay_delay_lines1{};
+        f32 last_reverb_echo{};
+        I3dl2DelayLine center_delay_line{};
+        std::array<std::array<f32, 3>, MaxDelayLines> lowpass_coeff{};
+        std::array<f32, MaxDelayLines> shelf_filter{};
+        f32 dry_gain{};
     };
     static_assert(sizeof(State) <= sizeof(EffectInfoBase::State),
                   "I3dl2ReverbInfo::State is too large!");
+    static_assert(alignof(State) <= alignof(std::max_align_t),
+                  "I3dl2ReverbInfo::State alignment exceeds EffectInfoBase::state!");
+
+    I3dl2ReverbInfo() {
+        std::construct_at(reinterpret_cast<State*>(state.data()));
+    }
+
+    I3dl2ReverbInfo(const I3dl2ReverbInfo&) = delete;
+    I3dl2ReverbInfo& operator=(const I3dl2ReverbInfo&) = delete;
+
+    ~I3dl2ReverbInfo() override {
+        std::destroy_at(reinterpret_cast<State*>(state.data()));
+    }
 
     /**
      * Update the info with new parameters, version 1.

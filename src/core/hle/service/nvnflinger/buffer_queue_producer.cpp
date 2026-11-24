@@ -802,140 +802,185 @@ void BufferQueueProducer::Transact(u32 code, std::span<const u8> parcel_data,
     InputParcel parcel_in{parcel_data};
     OutputParcel parcel_out{};
 
-    switch (static_cast<TransactionId>(code)) {
-    case TransactionId::Connect: {
-        const auto enable_listener = parcel_in.Read<bool>();
-        const auto api = parcel_in.Read<NativeWindowApi>();
-        const auto producer_controlled_by_app = parcel_in.Read<bool>();
-
-        UNIMPLEMENTED_IF_MSG(enable_listener, "Listener is unimplemented!");
-
-        std::shared_ptr<IProducerListener> listener;
-        QueueBufferOutput output{};
-
-        status = Connect(listener, api, producer_controlled_by_app, &output);
-
-        parcel_out.Write(output);
-        break;
-    }
-    case TransactionId::SetPreallocatedBuffer: {
-        const auto slot = parcel_in.Read<s32>();
-        const auto buffer = parcel_in.ReadObject<NvGraphicBuffer>();
-
-        status = SetPreallocatedBuffer(slot, buffer);
-        break;
-    }
-    case TransactionId::DequeueBuffer: {
-        const auto is_async = parcel_in.Read<bool>();
-        const auto width = parcel_in.Read<u32>();
-        const auto height = parcel_in.Read<u32>();
-        const auto pixel_format = parcel_in.Read<PixelFormat>();
-        const auto usage = parcel_in.Read<u32>();
-
-        s32 slot{};
-        Fence fence{};
-
-        status = DequeueBuffer(&slot, &fence, is_async, width, height, pixel_format, usage);
-
-        parcel_out.Write(slot);
-        parcel_out.WriteFlattenedObject(&fence);
-        break;
-    }
-    case TransactionId::RequestBuffer: {
-        const auto slot = parcel_in.Read<s32>();
-
-        std::shared_ptr<GraphicBuffer> buf;
-
-        status = RequestBuffer(slot, &buf);
-
-        parcel_out.WriteFlattenedObject<NvGraphicBuffer>(buf.get());
-        break;
-    }
-    case TransactionId::QueueBuffer: {
-        const auto slot = parcel_in.Read<s32>();
-
-        QueueBufferInput input{parcel_in};
-        QueueBufferOutput output;
-
-        status = QueueBuffer(slot, input, &output);
-
-        parcel_out.Write(output);
-        break;
-    }
-    case TransactionId::Query: {
-        const auto what = parcel_in.Read<NativeWindow>();
-
-        s32 value{};
-
-        status = Query(what, &value);
-
-        parcel_out.Write(value);
-        break;
-    }
-    case TransactionId::CancelBuffer: {
-        const auto slot = parcel_in.Read<s32>();
-        const auto fence = parcel_in.ReadFlattened<Fence>();
-
-        CancelBuffer(slot, fence);
-        break;
-    }
-    case TransactionId::Disconnect: {
-        const auto api = parcel_in.Read<NativeWindowApi>();
-
-        status = Disconnect(api);
-        break;
-    }
-    case TransactionId::DetachBuffer: {
-        const auto slot = parcel_in.Read<s32>();
-
-        status = DetachBuffer(slot);
-        break;
-    }
-    case TransactionId::SetBufferCount: {
-        const auto buffer_count = parcel_in.Read<s32>();
-
-        status = SetBufferCount(buffer_count);
-        break;
-    }
-    case TransactionId::GetBufferHistory: {
-        if (!Settings::values.enable_buffer_history.GetValue()) {
-            LOG_DEBUG(Service_Nvnflinger, "(STUBBED) called");
-            break;
-        }
-
-        LOG_DEBUG(Service_Nvnflinger, "called, transaction=GetBufferHistory");
-
-        const s32 request = parcel_in.Read<s32>();
-        if (request <= 0) {
-            parcel_out.Write(Status::BadValue);
-            parcel_out.Write<s32>(0);
-            break;
-        }
-
-        std::vector<BufferHistoryInfo> snapshot;
-
-        {
-            std::scoped_lock lk(core->buffer_history_mutex);
-            for (auto& [frame, info] : core->buffer_history_map) {
-                snapshot.push_back(info);
+    if (!parcel_in.IsValid()) {
+        status = Status::BadValue;
+    } else {
+        switch (static_cast<TransactionId>(code)) {
+        case TransactionId::Connect: {
+            const auto enable_listener = parcel_in.Read<bool>();
+            const auto api = parcel_in.Read<NativeWindowApi>();
+            const auto producer_controlled_by_app = parcel_in.Read<bool>();
+            if (!parcel_in.IsValid()) {
+                status = Status::BadValue;
+                break;
             }
-        }
 
-        std::sort(snapshot.begin(), snapshot.end(), [](auto& a, auto& b){
-            return a.frame_number > b.frame_number;
-        });
+            UNIMPLEMENTED_IF_MSG(enable_listener, "Listener is unimplemented!");
 
-        const s32 limit = std::min(request, (s32)snapshot.size());
-        parcel_out.Write(Status::NoError);
-        parcel_out.Write<s32>(limit);
-        for (s32 i = 0; i < limit; ++i) {
-            parcel_out.Write(snapshot[i]);
+            std::shared_ptr<IProducerListener> listener;
+            QueueBufferOutput output{};
+
+            status = Connect(listener, api, producer_controlled_by_app, &output);
+
+            parcel_out.Write(output);
+            break;
         }
-        break;
-    }
-    default:
-        ASSERT_MSG(false, "Unimplemented TransactionId {}", code);
-        break;
+        case TransactionId::SetPreallocatedBuffer: {
+            const auto slot = parcel_in.Read<s32>();
+            const auto buffer = parcel_in.ReadObject<NvGraphicBuffer>();
+            if (!parcel_in.IsValid()) {
+                status = Status::BadValue;
+                break;
+            }
+
+            status = SetPreallocatedBuffer(slot, buffer);
+            break;
+        }
+        case TransactionId::DequeueBuffer: {
+            const auto is_async = parcel_in.Read<bool>();
+            const auto width = parcel_in.Read<u32>();
+            const auto height = parcel_in.Read<u32>();
+            const auto pixel_format = parcel_in.Read<PixelFormat>();
+            const auto usage = parcel_in.Read<u32>();
+            if (!parcel_in.IsValid()) {
+                status = Status::BadValue;
+                break;
+            }
+
+            s32 slot{};
+            Fence fence{};
+
+            status = DequeueBuffer(&slot, &fence, is_async, width, height, pixel_format, usage);
+
+            parcel_out.Write(slot);
+            parcel_out.WriteFlattenedObject(&fence);
+            break;
+        }
+        case TransactionId::RequestBuffer: {
+            const auto slot = parcel_in.Read<s32>();
+            if (!parcel_in.IsValid()) {
+                status = Status::BadValue;
+                break;
+            }
+
+            std::shared_ptr<GraphicBuffer> buf;
+
+            status = RequestBuffer(slot, &buf);
+
+            parcel_out.WriteFlattenedObject<NvGraphicBuffer>(buf.get());
+            break;
+        }
+        case TransactionId::QueueBuffer: {
+            const auto slot = parcel_in.Read<s32>();
+
+            QueueBufferInput input{parcel_in};
+            if (!parcel_in.IsValid()) {
+                status = Status::BadValue;
+                break;
+            }
+            QueueBufferOutput output;
+
+            status = QueueBuffer(slot, input, &output);
+
+            parcel_out.Write(output);
+            break;
+        }
+        case TransactionId::Query: {
+            const auto what = parcel_in.Read<NativeWindow>();
+            if (!parcel_in.IsValid()) {
+                status = Status::BadValue;
+                break;
+            }
+
+            s32 value{};
+
+            status = Query(what, &value);
+
+            parcel_out.Write(value);
+            break;
+        }
+        case TransactionId::CancelBuffer: {
+            const auto slot = parcel_in.Read<s32>();
+            const auto fence = parcel_in.ReadFlattened<Fence>();
+            if (!parcel_in.IsValid()) {
+                status = Status::BadValue;
+                break;
+            }
+
+            CancelBuffer(slot, fence);
+            break;
+        }
+        case TransactionId::Disconnect: {
+            const auto api = parcel_in.Read<NativeWindowApi>();
+            if (!parcel_in.IsValid()) {
+                status = Status::BadValue;
+                break;
+            }
+
+            status = Disconnect(api);
+            break;
+        }
+        case TransactionId::DetachBuffer: {
+            const auto slot = parcel_in.Read<s32>();
+            if (!parcel_in.IsValid()) {
+                status = Status::BadValue;
+                break;
+            }
+
+            status = DetachBuffer(slot);
+            break;
+        }
+        case TransactionId::SetBufferCount: {
+            const auto buffer_count = parcel_in.Read<s32>();
+            if (!parcel_in.IsValid()) {
+                status = Status::BadValue;
+                break;
+            }
+
+            status = SetBufferCount(buffer_count);
+            break;
+        }
+        case TransactionId::GetBufferHistory: {
+            if (!Settings::values.enable_buffer_history.GetValue()) {
+                LOG_DEBUG(Service_Nvnflinger, "(STUBBED) called");
+                break;
+            }
+
+            LOG_DEBUG(Service_Nvnflinger, "called, transaction=GetBufferHistory");
+
+            const s32 request = parcel_in.Read<s32>();
+            if (!parcel_in.IsValid() || request <= 0) {
+                status = Status::BadValue;
+                parcel_out.Write<s32>(0);
+                break;
+            }
+
+            std::vector<BufferHistoryInfo> snapshot;
+
+            {
+                std::scoped_lock lk(core->buffer_history_mutex);
+                for (auto& [frame, info] : core->buffer_history_map) {
+                    snapshot.push_back(info);
+                }
+            }
+
+            std::sort(snapshot.begin(), snapshot.end(), [](auto& a, auto& b){
+                return a.frame_number > b.frame_number;
+            });
+
+            const s32 limit =
+                static_cast<s32>((std::min)(static_cast<std::size_t>(request), snapshot.size()));
+            status = Status::NoError;
+            parcel_out.Write<s32>(limit);
+            for (s32 i = 0; i < limit; ++i) {
+                parcel_out.Write(snapshot[i]);
+            }
+            break;
+        }
+        default:
+            ASSERT_MSG(false, "Unimplemented TransactionId {}", code);
+            break;
+        }
     }
 
     parcel_out.Write(status);

@@ -409,8 +409,10 @@ Result KMemoryManager::AllocateForProcess(KPageGroup* out, size_t num_pages, u32
                     // Process part or all of the block.
                     const size_t cur_pages =
                         (std::min)(remaining_pages, manager.GetPageOffsetToEnd(cur_address));
-                    any_new = manager.ProcessOptimizedAllocation(m_system.Kernel(), cur_address,
-                                                                 cur_pages, fill_pattern);
+                    if (manager.ProcessOptimizedAllocation(m_system.Kernel(), cur_address,
+                                                           cur_pages, fill_pattern)) {
+                        any_new = true;
+                    }
 
                     // Advance.
                     cur_address += cur_pages * PageSize;

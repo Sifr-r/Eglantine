@@ -62,7 +62,7 @@ Result NpadAbstractSixAxisHandler::UpdateSixAxisState() {
     Core::HID::NpadIdType npad_id = properties_handler->GetNpadId();
     for (std::size_t i = 0; i < AruidIndexMax; i++) {
         auto* data = applet_resource_holder->applet_resource->GetAruidDataByIndex(i);
-        if (data == nullptr || !data->flag.is_assigned) {
+        if (data == nullptr || !data->flag.is_assigned || data->shared_memory_format == nullptr) {
             continue;
         }
         auto& npad_entry = data->shared_memory_format->npad.npad_entry[NpadIdTypeToIndex(npad_id)];
@@ -74,7 +74,7 @@ Result NpadAbstractSixAxisHandler::UpdateSixAxisState() {
 Result NpadAbstractSixAxisHandler::UpdateSixAxisState(u64 aruid) {
     Core::HID::NpadIdType npad_id = properties_handler->GetNpadId();
     auto* data = applet_resource_holder->applet_resource->GetAruidData(aruid);
-    if (data == nullptr) {
+    if (data == nullptr || !data->flag.is_assigned || data->shared_memory_format == nullptr) {
         return ResultSuccess;
     }
     auto& npad_entry = data->shared_memory_format->npad.npad_entry[NpadIdTypeToIndex(npad_id)];
@@ -85,7 +85,8 @@ Result NpadAbstractSixAxisHandler::UpdateSixAxisState(u64 aruid) {
 Result NpadAbstractSixAxisHandler::UpdateSixAxisState2(u64 aruid) {
     const auto npad_index = NpadIdTypeToIndex(properties_handler->GetNpadId());
     AruidData* aruid_data = applet_resource_holder->applet_resource->GetAruidData(aruid);
-    if (aruid_data == nullptr) {
+    if (aruid_data == nullptr || !aruid_data->flag.is_assigned ||
+        aruid_data->shared_memory_format == nullptr) {
         return ResultSuccess;
     }
     auto& npad_internal_state = aruid_data->shared_memory_format->npad.npad_entry[npad_index];

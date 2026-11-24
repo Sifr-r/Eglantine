@@ -7,6 +7,11 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <vector>
+
 #include "audio_core/common/feature_support.h"
 #include "audio_core/renderer/behavior/behavior_info.h"
 #include "audio_core/renderer/behavior/info_updater.h"
@@ -22,17 +27,67 @@
 #include "audio_core/renderer/voice/voice_context.h"
 
 namespace AudioCore::Renderer {
+namespace {
+constexpr u32 VoiceV2Stride = 0x188;
+constexpr u32 RendererInfoSize = 0x10;
+} // namespace
 
 InfoUpdater::InfoUpdater(std::span<const u8> input_, std::span<u8> output_,
                          Kernel::KProcess* process_handle_, BehaviorInfo& behaviour_)
-    : input{input_.data() + sizeof(UpdateDataHeader)},
-      input_origin{input_}, output{output_.data() + sizeof(UpdateDataHeader)},
-      output_origin{output_}, in_header{reinterpret_cast<const UpdateDataHeader*>(
-                                  input_origin.data())},
-      out_header{reinterpret_cast<UpdateDataHeader*>(output_origin.data())},
-      expected_input_size{input_.size()}, expected_output_size{output_.size()},
-      process_handle{process_handle_}, behaviour{behaviour_} {
+    : input_origin{input_}, output_origin{output_}, process_handle{process_handle_},
+      behaviour{behaviour_} {}
+
+Result InfoUpdater::BeginUpdate(u32 memory_pool_count, u32 voice_count, u32 effect_count,
+                                u32 sink_count) {
+    using Service::Audio::ResultInvalidUpdateInfo;
+    R_UNLESS(input_origin.size() >= sizeof(UpdateDataHeader) &&
+                 output_origin.size() >= sizeof(UpdateDataHeader),
+             ResultInvalidUpdateInfo);
+
+    in_header = reinterpret_cast<const UpdateDataHeader*>(input_origin.data());
+    const u64 voice_stride = behaviour.IsVoiceInParameterV2Supported()
+                                 ? VoiceV2Stride
+                                 : sizeof(VoiceInfo::InParameter);
+    const bool effect_v2 = behaviour.IsEffectInfoVersion2Supported();
+    const u64 effect_stride = effect_v2 ? sizeof(EffectInfoBase::InParameterVersion2)
+                                       : sizeof(EffectInfoBase::InParameterVersion1);
+    const u64 effect_status_stride = effect_v2 ? sizeof(EffectInfoBase::OutStatusVersion2)
+                                              : sizeof(EffectInfoBase::OutStatusVersion1);
+    R_UNLESS(in_header->behaviour_size == sizeof(BehaviorInfo::InParameter) &&
+                 in_header->memory_pool_size ==
+                     u64{memory_pool_count} * sizeof(MemoryPoolInfo::InParameter) &&
+                 in_header->voice_resources_size ==
+                     u64{voice_count} * sizeof(VoiceChannelResource::InParameter) &&
+                 in_header->voices_size == u64{voice_count} * voice_stride &&
+                 in_header->effects_size == u64{effect_count} * effect_stride &&
+                 in_header->sinks_size == u64{sink_count} * sizeof(SinkInfoBase::InParameter) &&
+                 in_header->performance_buffer_size == sizeof(PerformanceManager::InParameter) &&
+                 (behaviour.IsSplitterSupported() || in_header->splitter_size == 0),
+             ResultInvalidUpdateInfo);
+
+    const u64 input_size = sizeof(UpdateDataHeader) + u64{in_header->behaviour_size} +
+                           in_header->memory_pool_size + in_header->voice_resources_size +
+                           in_header->voices_size + in_header->effects_size +
+                           in_header->splitter_size + in_header->mix_size +
+                           in_header->sinks_size + in_header->performance_buffer_size;
+    const u64 output_size = sizeof(UpdateDataHeader) +
+                            u64{memory_pool_count} * sizeof(MemoryPoolInfo::OutStatus) +
+                            u64{voice_count} * sizeof(VoiceInfo::OutStatus) +
+                            u64{effect_count} * effect_status_stride +
+                            u64{sink_count} * sizeof(SinkInfoBase::OutStatus) +
+                            sizeof(PerformanceManager::OutStatus) + sizeof(BehaviorInfo::OutStatus) +
+                            (behaviour.IsElapsedFrameCountSupported() ? RendererInfoSize : 0);
+    R_UNLESS(input_size == input_origin.size() && output_size == output_origin.size() &&
+                 output_size <= (std::numeric_limits<u32>::max)() &&
+                 in_header->splitter_size % alignof(SinkInfoBase::InParameter) == 0,
+             ResultInvalidUpdateInfo);
+
+    std::ranges::fill(output_origin, u8{0});
+    input = input_origin.data() + sizeof(UpdateDataHeader);
+    output = output_origin.data() + sizeof(UpdateDataHeader);
+    out_header = reinterpret_cast<UpdateDataHeader*>(output_origin.data());
     std::construct_at<UpdateDataHeader>(out_header, behaviour.GetProcessRevision());
+    return ResultSuccess;
 }
 
 Result InfoUpdater::UpdateVoiceChannelResources(VoiceContext& voice_context) {
@@ -63,7 +118,8 @@ Result InfoUpdater::UpdateVoiceChannelResources(VoiceContext& voice_context) {
 
 Result InfoUpdater::UpdateVoices(VoiceContext& voice_context,
                                  std::span<MemoryPoolInfo> memory_pools,
-                                 const u32 memory_pool_count) {
+                                 const u32 memory_pool_count, s32 mix_count, u32 splitter_count) {
+    using Service::Audio::ResultInvalidUpdateInfo;
     const PoolMapper pool_mapper(process_handle, memory_pools, memory_pool_count,
                                  behaviour.IsMemoryForceMappingEnabled());
     const auto voice_count{voice_context.GetCount()};
@@ -79,7 +135,7 @@ Result InfoUpdater::UpdateVoices(VoiceContext& voice_context,
 
     // Two input formats exist: legacy (0x170) and v2 with float biquad (0x188).
     const bool use_v2 = behaviour.IsVoiceInParameterV2Supported();
-    const u32 in_stride = use_v2 ? 0x188u : static_cast<u32>(sizeof(VoiceInfo::InParameter));
+    const u32 in_stride = use_v2 ? VoiceV2Stride : sizeof(VoiceInfo::InParameter);
 
     for (u32 i = 0; i < voice_count; i++) {
         VoiceInfo::InParameter local_in{};
@@ -132,10 +188,14 @@ Result InfoUpdater::UpdateVoices(VoiceContext& voice_context,
                 u32 external_ctx_size;
                 u32 reserved3[2];
             };
-            static_assert(sizeof(VoiceInParameterV2) == 0x188);
+            static_assert(sizeof(VoiceInParameterV2) == VoiceV2Stride);
             static_assert(offsetof(VoiceInParameterV2, crossfade_curve) == 0x177);
             const auto* vin = reinterpret_cast<const VoiceInParameterV2*>(input + i * in_stride);
-            if (behaviour.GetUserRevisionNum() >= 16 && vin->in_use && vin->crossfade_curve != 0) {
+            if (!vin->in_use) {
+                continue;
+            }
+            R_UNLESS(vin->wave_buffer_index < MaxWaveBuffers, ResultInvalidUpdateInfo);
+            if (behaviour.GetUserRevisionNum() >= 16 && vin->crossfade_curve != 0) {
                 LOG_ERROR(Service_Audio, "Unsupported voice biquad crossfade curve {}",
                           vin->crossfade_curve);
                 return Service::Audio::ResultInvalidUpdateInfo;
@@ -157,6 +217,12 @@ Result InfoUpdater::UpdateVoices(VoiceContext& voice_context,
             for (size_t filter_idx = 0; filter_idx < MaxBiquadFilters; filter_idx++) {
                 const auto& src = vin->biquads[filter_idx];
                 auto& dst = local_in.biquads[filter_idx];
+                if (!src.enable) {
+                    continue;
+                }
+                R_UNLESS(std::ranges::all_of(src.b, [](f32 value) { return std::isfinite(value); }) &&
+                             std::ranges::all_of(src.a, [](f32 value) { return std::isfinite(value); }),
+                         ResultInvalidUpdateInfo);
                 dst.enabled = src.enable;
                 // Convert float coefficients to fixed-point Q2.14 for legacy path
                 dst.b[0] = static_cast<s16>(std::clamp(src.b[0] * 16384.0f, -32768.0f, 32767.0f));
@@ -190,9 +256,24 @@ Result InfoUpdater::UpdateVoices(VoiceContext& voice_context,
             continue;
         }
 
+        R_UNLESS(in_param.id < voice_count && in_param.channel_count > 0 &&
+                     in_param.channel_count <= MaxChannels &&
+                     in_param.wave_buffer_index < MaxWaveBuffers &&
+                     in_param.wave_buffer_count <= MaxWaveBuffers,
+                 ResultInvalidUpdateInfo);
+        R_UNLESS(in_param.mix_id == static_cast<u32>(UnusedMixId) ||
+                     in_param.mix_id < static_cast<u32>(mix_count),
+                 ResultInvalidUpdateInfo);
+        if (behaviour.IsSplitterSupported() && in_param.mix_id == static_cast<u32>(UnusedMixId)) {
+            R_UNLESS(in_param.splitter_id == static_cast<u32>(UnusedSplitterId) ||
+                         in_param.splitter_id < splitter_count,
+                     ResultInvalidUpdateInfo);
+        }
         auto& voice_info{voice_context.GetInfo(in_param.id)};
 
         for (u32 channel = 0; channel < in_param.channel_count; channel++) {
+            R_UNLESS(in_param.channel_resource_ids[channel] < voice_count,
+                     Service::Audio::ResultInvalidUpdateInfo);
             voice_states[channel] = &voice_context.GetState(in_param.channel_resource_ids[channel]);
         }
 
@@ -369,49 +450,56 @@ Result InfoUpdater::UpdateEffectsVersion2(EffectContext& effect_context, const b
 
 Result InfoUpdater::UpdateMixes(MixContext& mix_context, const u32 mix_buffer_count,
                                 EffectContext& effect_context, SplitterContext& splitter_context) {
-    s32 mix_count{0};
-    u32 consumed_input_size{0};
-    u32 input_mix_size{0};
-
-    if (behaviour.IsMixInParameterDirtyOnlyUpdateSupported()) {
-        auto in_dirty_params{reinterpret_cast<const MixInfo::InDirtyParameter*>(input)};
-        mix_count = in_dirty_params->count;
-
-        // Validate against expected header size to ensure structure is correct
-        if (mix_count < 0 || mix_count > 0x100) {
-            LOG_ERROR(
-                Service_Audio,
-                "Invalid mix count from dirty parameter: count={}, magic={:#x}, expected_size={}",
-                mix_count, in_dirty_params->magic, in_header->mix_size);
-            return Service::Audio::ResultInvalidUpdateInfo;
-        }
-
-        consumed_input_size += static_cast<u32>(sizeof(MixInfo::InDirtyParameter));
-        input += sizeof(MixInfo::InDirtyParameter);
-    } else {
-        mix_count = mix_context.GetCount();
+    using Service::Audio::ResultInvalidUpdateInfo;
+    const bool dirty_only = behaviour.IsMixInParameterDirtyOnlyUpdateSupported();
+    const s32 mix_capacity = mix_context.GetCount();
+    const size_t header_size = dirty_only ? sizeof(MixInfo::InDirtyParameter) : 0;
+    R_UNLESS(in_header->mix_size >= header_size && mix_buffer_count != 0, ResultInvalidUpdateInfo);
+    s32 mix_count = mix_capacity;
+    if (dirty_only) {
+        mix_count = reinterpret_cast<const MixInfo::InDirtyParameter*>(input)->count;
+        R_UNLESS(mix_count >= 0 && mix_count <= mix_capacity && mix_count <= 0x100,
+                 ResultInvalidUpdateInfo);
     }
-
-    input_mix_size = static_cast<u32>(mix_count * sizeof(MixInfo::InParameter));
-    consumed_input_size += input_mix_size;
-
-
-    if (mix_buffer_count == 0) {
-        return Service::Audio::ResultInvalidUpdateInfo;
-    }
+    R_UNLESS(header_size + u64{static_cast<u32>(mix_count)} * sizeof(MixInfo::InParameter) ==
+                 in_header->mix_size,
+             ResultInvalidUpdateInfo);
 
     std::span<const MixInfo::InParameter> in_params{
-        reinterpret_cast<const MixInfo::InParameter*>(input), static_cast<size_t>(mix_count)};
+        reinterpret_cast<const MixInfo::InParameter*>(input + header_size),
+        static_cast<size_t>(mix_count)};
 
-    u32 total_buffer_count{0};
-    for (s32 i = 0; i < mix_count; i++) {
-        const auto& params{in_params[i]};
-
+    std::vector<bool> dirty_mixes(dirty_only ? static_cast<size_t>(mix_capacity) : 0);
+    u64 total_buffer_count = 0;
+    for (const auto& params : in_params) {
+        if (dirty_only || params.in_use) {
+            R_UNLESS(params.mix_id >= 0 && params.mix_id < mix_capacity,
+                     ResultInvalidUpdateInfo);
+        }
+        if (dirty_only) {
+            R_UNLESS(!dirty_mixes[params.mix_id], ResultInvalidUpdateInfo);
+            dirty_mixes[params.mix_id] = true;
+        }
         if (params.in_use) {
+            R_UNLESS(params.buffer_count <= MaxMixBuffers, ResultInvalidUpdateInfo);
             total_buffer_count += params.buffer_count;
-            if (params.dest_mix_id > static_cast<s32>(mix_context.GetCount()) &&
-                params.dest_mix_id != UnusedMixId && params.mix_id != FinalMixId) {
-                return Service::Audio::ResultInvalidUpdateInfo;
+            R_UNLESS(params.dest_mix_id == UnusedMixId ||
+                         (params.dest_mix_id >= 0 && params.dest_mix_id < mix_capacity),
+                     ResultInvalidUpdateInfo);
+            if (behaviour.IsSplitterSupported()) {
+                R_UNLESS(params.dest_splitter_id == UnusedSplitterId ||
+                             (params.dest_splitter_id >= 0 &&
+                              static_cast<u32>(params.dest_splitter_id) <
+                                  splitter_context.GetInfoCount()),
+                         ResultInvalidUpdateInfo);
+            }
+        }
+    }
+    if (dirty_only) {
+        for (s32 i = 0; i < mix_capacity; ++i) {
+            const auto* mix_info = mix_context.GetInfo(i);
+            if (!dirty_mixes[i] && mix_info->in_use) {
+                total_buffer_count += mix_info->buffer_count;
             }
         }
     }
@@ -425,7 +513,7 @@ Result InfoUpdater::UpdateMixes(MixContext& mix_context, const u32 mix_buffer_co
         const auto& params{in_params[i]};
 
         s32 mix_id{i};
-        if (behaviour.IsMixInParameterDirtyOnlyUpdateSupported()) {
+        if (dirty_only) {
             mix_id = params.mix_id;
         }
 
@@ -454,13 +542,7 @@ Result InfoUpdater::UpdateMixes(MixContext& mix_context, const u32 mix_buffer_co
         }
     }
 
-    if (consumed_input_size != in_header->mix_size) {
-        LOG_ERROR(Service_Audio, "Consumed an incorrect mixes size, header size={}, consumed={}",
-                  in_header->mix_size, consumed_input_size);
-        return Service::Audio::ResultInvalidUpdateInfo;
-    }
-
-    input += mix_count * sizeof(MixInfo::InParameter);
+    input += in_header->mix_size;
 
     return ResultSuccess;
 }
@@ -470,12 +552,11 @@ Result InfoUpdater::UpdateSinks(SinkContext& sink_context, std::span<MemoryPoolI
     PoolMapper pool_mapper(process_handle, memory_pools, memory_pool_count,
                            behaviour.IsMemoryForceMappingEnabled());
 
-    std::span<const SinkInfoBase::InParameter> in_params{
-        reinterpret_cast<const SinkInfoBase::InParameter*>(input), memory_pool_count};
-    std::span<SinkInfoBase::OutStatus> out_params{
-        reinterpret_cast<SinkInfoBase::OutStatus*>(output), memory_pool_count};
-
     const auto sink_count{sink_context.GetCount()};
+    std::span<const SinkInfoBase::InParameter> in_params{
+        reinterpret_cast<const SinkInfoBase::InParameter*>(input), sink_count};
+    std::span<SinkInfoBase::OutStatus> out_params{
+        reinterpret_cast<SinkInfoBase::OutStatus*>(output), sink_count};
 
     for (u32 i = 0; i < sink_count; i++) {
         const auto& params{in_params[i]};
@@ -631,8 +712,8 @@ Result InfoUpdater::UpdateErrorInfo(const BehaviorInfo& behaviour_) {
     return ResultSuccess;
 }
 
-Result InfoUpdater::UpdateSplitterInfo(SplitterContext& splitter_context) {
-    if (!splitter_context.Update(input)) {
+Result InfoUpdater::UpdateSplitterInfo(SplitterContext& splitter_context, s32 mix_count) {
+    if (!splitter_context.Update({input, in_header->splitter_size}, mix_count)) {
         return Service::Audio::ResultInvalidUpdateInfo;
     }
 
@@ -646,7 +727,7 @@ Result InfoUpdater::UpdateRendererInfo(const u64 elapsed_frames) {
         /* 0x00 */ u64 frames_elapsed;
         /* 0x08 */ char unk08[0x8];
     };
-    static_assert(sizeof(RenderInfo) == 0x10, "RenderInfo has the wrong size!");
+    static_assert(sizeof(RenderInfo) == RendererInfoSize, "RenderInfo has the wrong size!");
 
     auto out_params{reinterpret_cast<RenderInfo*>(output)};
     out_params->frames_elapsed = elapsed_frames;
@@ -661,9 +742,9 @@ Result InfoUpdater::UpdateRendererInfo(const u64 elapsed_frames) {
 }
 
 Result InfoUpdater::CheckConsumedSize() {
-    if (CpuAddr(input) - CpuAddr(input_origin.data()) != expected_input_size) {
+    if (input != input_origin.data() + input_origin.size()) {
         return Service::Audio::ResultInvalidUpdateInfo;
-    } else if (CpuAddr(output) - CpuAddr(output_origin.data()) != expected_output_size) {
+    } else if (output != output_origin.data() + output_origin.size()) {
         return Service::Audio::ResultInvalidUpdateInfo;
     }
     return ResultSuccess;

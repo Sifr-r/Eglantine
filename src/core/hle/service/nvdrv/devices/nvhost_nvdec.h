@@ -13,6 +13,8 @@ namespace Service::Nvidia::Devices {
 
 class nvhost_nvdec final : public nvhost_nvdec_common {
 public:
+    static constexpr DeviceKind Kind = DeviceKind::NvHostNvdec;
+
     explicit nvhost_nvdec(Core::System& system_, NvCore::Container& core);
     ~nvhost_nvdec() override;
 

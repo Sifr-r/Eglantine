@@ -49,12 +49,9 @@ void AudioRenderer::Stop() {
         return;
     }
 
-    mailbox.Send(Direction::DSP, Message::Shutdown);
-    if (mailbox.Receive(Direction::Host) != Message::Shutdown) {
-        LOG_ERROR(Service_Audio, "Host Audio Renderer -- Failed to receive shutdown "
-                                 "message response from ADSP!");
-    }
+    // Request stop before joining so Main wakes even if blocked in WaitFreeSpace or Receive.
     main_thread.request_stop();
+    mailbox.Send(Direction::DSP, Message::Shutdown);
     main_thread.join();
 
     for (auto& stream : streams) {
@@ -140,8 +137,10 @@ void AudioRenderer::Main(std::stop_token stop_token) {
     // TODO: Create buffer map/unmap thread + mailbox
     // TODO: Create gMix devices, initialize them here
 
-    if (mailbox.Receive(Direction::DSP) != Message::InitializeOK) {
-        LOG_ERROR(Service_Audio, "ADSP Audio Renderer -- Failed to receive initialize message from host!");
+    if (mailbox.Receive(Direction::DSP, stop_token) != Message::InitializeOK) {
+        if (!stop_token.stop_requested()) {
+            LOG_ERROR(Service_Audio, "ADSP Audio Renderer -- Failed to receive initialize message from host!");
+        }
         return;
     }
 
@@ -151,7 +150,10 @@ void AudioRenderer::Main(std::stop_token stop_token) {
     constexpr u64 max_process_time{2'304'000ULL};
 
     while (!stop_token.stop_requested()) {
-        auto msg{mailbox.Receive(Direction::DSP)};
+        auto msg{mailbox.Receive(Direction::DSP, stop_token)};
+        if (stop_token.stop_requested()) {
+            break;
+        }
         switch (msg) {
         case Message::Shutdown:
             mailbox.Send(Direction::Host, Message::Shutdown);
@@ -200,6 +202,9 @@ void AudioRenderer::Main(std::stop_token stop_token) {
 
                     if (index == 0) {
                         streams[index]->WaitFreeSpace(stop_token);
+                        if (stop_token.stop_requested()) {
+                            return;
+                        }
                     }
 
                     // Process the command list

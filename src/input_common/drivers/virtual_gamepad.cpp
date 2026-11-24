@@ -13,7 +13,7 @@ VirtualGamepad::VirtualGamepad(std::string input_engine_) : InputEngine(std::mov
 }
 
 void VirtualGamepad::SetButtonState(std::size_t player_index, int button_id, bool value) {
-    if (player_index > PlayerIndexCount) {
+    if (player_index >= PlayerIndexCount) {
         return;
     }
     const auto identifier = GetIdentifier(player_index);
@@ -26,7 +26,7 @@ void VirtualGamepad::SetButtonState(std::size_t player_index, VirtualButton butt
 
 void VirtualGamepad::SetStickPosition(std::size_t player_index, int axis_id, float x_value,
                                       float y_value) {
-    if (player_index > PlayerIndexCount) {
+    if (player_index >= PlayerIndexCount) {
         return;
     }
     const auto identifier = GetIdentifier(player_index);
@@ -42,6 +42,9 @@ void VirtualGamepad::SetStickPosition(std::size_t player_index, VirtualStick axi
 void VirtualGamepad::SetMotionState(std::size_t player_index, u64 delta_timestamp, float gyro_x,
                                     float gyro_y, float gyro_z, float accel_x, float accel_y,
                                     float accel_z) {
+    if (player_index >= PlayerIndexCount) {
+        return;
+    }
     const auto identifier = GetIdentifier(player_index);
     const BasicMotion motion_data{
         .gyro_x = gyro_x,

@@ -26,6 +26,11 @@ size_t Event::GetManagerIndex(const Type type) const {
 }
 
 void Event::SetAudioEvent(const Type type, const bool signalled) {
+    std::scoped_lock l{event_lock};
+    SetAudioEventLocked(type, signalled);
+}
+
+void Event::SetAudioEventLocked(const Type type, const bool signalled) {
     events_signalled[GetManagerIndex(type)] = signalled;
     if (signalled) {
         manager_event.notify_one();
@@ -52,6 +57,13 @@ bool Event::Wait(std::unique_lock<std::mutex>& l, const std::chrono::seconds tim
         timed_out = true;
     }
     return timed_out;
+}
+
+bool Event::Wait(std::unique_lock<std::mutex>& l, std::stop_token stop_token,
+                 const std::chrono::seconds timeout) {
+    return !manager_event.wait_for(l, std::move(stop_token), timeout, [&]() {
+        return std::ranges::any_of(events_signalled, [](bool x) { return x; });
+    });
 }
 
 void Event::ClearEvents() {

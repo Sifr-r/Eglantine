@@ -835,11 +835,15 @@ class SettingsFragmentPresenter(
                 }
 
                 override fun setInt(value: Int) {
+                    if (value !in styleTags.indices) {
+                        return
+                    }
                     NativeInput.setStyleIndex(playerIndex, styleTags[value])
                     settingsViewModel.setReloadListAndNotifyDataset(true)
                 }
 
-                override val defaultValue = NpadStyleIndex.Fullkey.int
+                override val defaultValue =
+                    styleTags.indexOf(NpadStyleIndex.Fullkey).let { if (it >= 0) it else 0 }
                 override fun getValueAsString(needsGlobal: Boolean): String = getInt().toString()
                 override fun reset() = setInt(defaultValue)
                 override val pairedSettingKey: String = "connected"
@@ -1291,7 +1295,7 @@ class SettingsFragmentPresenter(
                 add(SliderSetting(stickRangeSetting, titleId = R.string.range, min = 25, max = 150))
                 add(SliderSetting(stickDeadzoneSetting, R.string.deadzone))
             } else {
-                add(ModifierInputSetting(playerIndex, NativeAnalog.LStick, R.string.modifier))
+                add(ModifierInputSetting(playerIndex, nativeAnalog, R.string.modifier))
                 add(SliderSetting(modifierRangeSetting, R.string.modifier_range))
             }
         }
@@ -1549,7 +1553,7 @@ class SettingsFragmentPresenter(
 
             if (!NativeConfig.isPerGameConfigLoaded()) {
                 add(HeaderSetting(R.string.gpu_logging_header))
-                add(ByteSetting.GPU_LOG_LEVEL.key)
+                add(IntSetting.GPU_LOG_LEVEL.key)
                 add(BooleanSetting.GPU_LOG_VULKAN_CALLS.key)
                 add(BooleanSetting.DUMP_GUEST_SHADERS.key)
                 add(BooleanSetting.GPU_LOG_SHADER_DUMPS.key)

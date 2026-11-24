@@ -13,12 +13,13 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.isVisible
 import androidx.core.view.updatePadding
 import androidx.fragment.app.activityViewModels
+import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.transition.MaterialSharedAxis
-import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -153,67 +154,74 @@ class DriverFetcherFragment : Fragment() {
         fetchDrivers()
     }
 
+    override fun onDestroyView() {
+        super.onDestroyView()
+        client.dispatcher.cancelAll()
+        _binding = null
+    }
+
     private fun fetchDrivers() {
         binding.loadingIndicator.isVisible = true
 
         val driverGroups = arrayListOf<DriverGroup>()
 
-        repoList.forEach { driver ->
-            val name = driver.name
-            val path = driver.path
-            val useTagName = driver.useTagName
-            val sortMode = driver.sortMode
-            val sort = driver.sort
+        viewLifecycleOwner.lifecycleScope.launch {
+            repoList.forEach { driver ->
+                launch {
+                    val request = Request.Builder()
+                        .url("https://api.github.com/repos/${driver.path}/releases")
+                        .build()
 
-            CoroutineScope(Dispatchers.Main).launch {
-                val request =
-                    Request.Builder().url("https://api.github.com/repos/$path/releases").build()
+                    var errorMessage: String? = null
+                    val releases = withContext(Dispatchers.IO) {
+                        try {
+                            client.newCall(request).execute().use { response ->
+                                if (!response.isSuccessful) {
+                                    throw IOException("HTTP ${response.code}")
+                                }
 
-                withContext(Dispatchers.IO) {
-                    var releases: ArrayList<Release>
-                    try {
-                        client.newCall(request).execute().use { response ->
-                            if (!response.isSuccessful) {
-                                throw IOException(response.body.toString())
+                                val body = response.body?.string()
+                                    ?: throw IOException("Empty response body")
+                                Release.fromJsonArray(body, driver.useTagName, driver.sortMode)
                             }
-
-                            val body = response.body?.string() ?: return@withContext
-                            releases = Release.fromJsonArray(body, useTagName, sortMode)
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            errorMessage = e.message
+                            ArrayList()
                         }
-                    } catch (e: Exception) {
-                        withContext(Dispatchers.Main) {
-                            MaterialAlertDialogBuilder(requireActivity()).setTitle(
-                                getString(R.string.error_during_fetch)
-                            )
-                                .setMessage(
-                                    "${getString(R.string.failed_to_fetch)} $name:\n${e.message}"
-                                )
-                                .setPositiveButton(getString(R.string.ok)) { dialog, _ -> dialog.cancel() }
-                                .show()
+                    }
 
-                            releases = ArrayList()
+                    if (_binding == null || !isAdded) {
+                        return@launch
+                    }
+
+                    if (errorMessage != null) {
+                        context?.let { ctx ->
+                            MaterialAlertDialogBuilder(ctx)
+                                .setTitle(getString(R.string.error_during_fetch))
+                                .setMessage(
+                                    "${getString(R.string.failed_to_fetch)} ${driver.name}:\n$errorMessage"
+                                )
+                                .setPositiveButton(getString(R.string.ok)) { dialog, _ ->
+                                    dialog.cancel()
+                                }
+                                .show()
                         }
                     }
 
                     val group = DriverGroup(
-                        name,
+                        driver.name,
                         releases,
-                        sort
+                        driver.sort
                     )
 
-                    synchronized(driverGroups) {
-                        driverGroups.add(group)
-                        driverGroups.sortBy {
-                            it.sort
-                        }
-                    }
+                    driverGroups.add(group)
+                    driverGroups.sortBy { it.sort }
+                    driverGroupAdapter.updateDriverGroups(driverGroups.toList())
 
-                    withContext(Dispatchers.Main) {
-                        driverGroupAdapter.updateDriverGroups(driverGroups)
-
-                        if (driverGroups.size >= repoList.size) {
-                            binding.loadingIndicator.isVisible = false
-                        }
+                    if (driverGroups.size >= repoList.size) {
+                        binding.loadingIndicator.isVisible = false
                     }
                 }
             }
@@ -223,6 +231,9 @@ class DriverFetcherFragment : Fragment() {
     private fun setInsets() = ViewCompat.setOnApplyWindowInsetsListener(
         binding.root
     ) { _: View, windowInsets: WindowInsetsCompat ->
+        if (_binding == null) {
+            return@setOnApplyWindowInsetsListener windowInsets
+        }
         val barInsets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
         val cutoutInsets = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
 

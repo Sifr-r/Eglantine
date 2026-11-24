@@ -7,35 +7,64 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <bit>
 #include <chrono>
 #include <thread>
+
+#include <boost/container/small_vector.hpp>
 
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_hardware_timer.h"
+#include "core/hle/kernel/k_light_lock.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_thread.h"
+#include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/svc.h"
 
 namespace Kernel::Svc {
 namespace {
 
-constexpr bool IsValidVirtualCoreId(int32_t core_id) {
-    return (0 <= core_id && core_id < static_cast<int32_t>(Core::Hardware::NUM_CPU_CORES));
+constexpr int32_t Switch2VirtualCoreCount = 8;
+
+bool IsValidVirtualCoreId(const KernelCore& kernel, int32_t core_id) {
+    return 0 <= core_id && core_id < static_cast<int32_t>(kernel.ActiveCoreCount());
 }
 
-// Switch 2 hardware has eight cores. Six are emulated (the most an application is given), so
-// fold any id past them back onto the low cores, both in core ids and in affinity masks.
-constexpr int32_t FoldExtraCoreId(int32_t core_id) {
-    constexpr auto num_cores = static_cast<int32_t>(Core::Hardware::NUM_CPU_CORES);
-    return core_id >= num_cores && core_id < 2 * num_cores ? core_id - num_cores : core_id;
+// Switch 2 hardware has eight cores (0..7). Six are emulated (the most an application is given),
+// so fold Switch 2 virtual cores 6..7 (or active_cores..7) back onto the active low cores.
+int32_t FoldExtraCoreId(const Core::System& system, const KernelCore& kernel, int32_t core_id) {
+    if (!system.Platform().IsSwitch2()) {
+        return core_id;
+    }
+    const auto num_cores = static_cast<int32_t>(kernel.ActiveCoreCount());
+    if (core_id >= num_cores && core_id < Switch2VirtualCoreCount) {
+        return core_id % num_cores;
+    }
+    return core_id;
 }
 
-constexpr u64 FoldExtraCoreMask(u64 mask) {
-    constexpr u64 low = (1ULL << Core::Hardware::NUM_CPU_CORES) - 1;
-    return (mask & low) | ((mask >> Core::Hardware::NUM_CPU_CORES) & low);
+u64 FoldExtraCoreMask(const Core::System& system, const KernelCore& kernel, u64 mask) {
+    if (!system.Platform().IsSwitch2()) {
+        return mask;
+    }
+    const auto num_cores = kernel.ActiveCoreCount();
+    const u64 low_mask = (1ULL << num_cores) - 1;
+    const u64 switch2_mask = (1ULL << Switch2VirtualCoreCount) - 1;
+    const u64 extra_mask = switch2_mask & ~low_mask;
+    const u64 high_mask = ~switch2_mask;
+
+    u64 folded = (mask & low_mask) | (mask & high_mask);
+    u64 extra = mask & extra_mask;
+    while (extra != 0) {
+        const u32 bit = static_cast<u32>(std::countr_zero(extra));
+        extra &= ~(1ULL << bit);
+        folded |= (1ULL << (bit % num_cores));
+    }
+    return folded;
 }
 
 } // Anonymous namespace
@@ -54,11 +83,16 @@ Result CreateThread(Core::System& system, Handle* out_handle, u64 entry_point, u
     if (core_id == IdealCoreUseProcessValue) {
         core_id = process.GetIdealCoreId();
     }
-    core_id = FoldExtraCoreId(core_id);
+
+    // Validate against the process core mask before folding Switch 2 virtual cores 6..7.
+    R_UNLESS(0 <= core_id && core_id < static_cast<s32>(Common::BitSize<u64>()),
+             ResultInvalidCoreId);
+    R_UNLESS(((1ULL << core_id) & process.GetCoreMask()) != 0, ResultInvalidCoreId);
+
+    core_id = FoldExtraCoreId(system, kernel, core_id);
 
     // Validate arguments.
-    R_UNLESS(IsValidVirtualCoreId(core_id), ResultInvalidCoreId);
-    R_UNLESS(((1ull << core_id) & process.GetCoreMask()) != 0, ResultInvalidCoreId);
+    R_UNLESS(IsValidVirtualCoreId(kernel, core_id), ResultInvalidCoreId);
 
     R_UNLESS(HighestThreadPriority <= priority && priority <= LowestThreadPriority,
              ResultInvalidPriority);
@@ -127,7 +161,7 @@ Result StartThread(Core::System& system, Handle thread_handle) {
             const s64 timeout = kernel.HardwareTimer().GetTick() + 100'000 + 2;
             static_cast<void>(GetCurrentThread(kernel).Sleep(kernel, timeout));
         }
-    } else if (core >= 0 && core < static_cast<s32>(Core::Hardware::NUM_CPU_CORES)) {
+    } else if (core >= 0 && core < static_cast<s32>(kernel.ActiveCoreCount())) {
         const KThread* const running = kernel.Scheduler(core).GetSchedulerCurrentThread();
         const bool preempts = running == nullptr || running == thread.GetPointerUnsafe() ||
                               running == kernel.Scheduler(core).GetIdleThread() ||
@@ -270,14 +304,26 @@ Result GetThreadList(Core::System& system, s32* out_num_threads, u64 out_thread_
         R_THROW(ResultInvalidCurrentMemory);
     }
 
-    auto& memory = GetCurrentMemory(system.Kernel());
-    const auto& thread_list = current_process->GetThreadList();
-    const auto num_threads = thread_list.size();
-    const auto copy_amount = (std::min)(static_cast<std::size_t>(out_thread_ids_size), num_threads);
+    std::size_t num_threads{};
+    boost::container::small_vector<u64, 32> thread_ids;
+    {
+        KScopedLightLock lk{current_process->GetListLock()};
+        const auto& thread_list = current_process->GetThreadList();
+        num_threads = thread_list.size();
+        const auto copy_amount =
+            (std::min)(static_cast<std::size_t>(out_thread_ids_size), num_threads);
+        thread_ids.reserve(copy_amount);
 
-    auto list_iter = thread_list.cbegin();
-    for (std::size_t i = 0; i < copy_amount; ++i, ++list_iter) {
-        memory.Write64(out_thread_ids, list_iter->GetThreadId());
+        auto list_iter = thread_list.cbegin();
+        for (std::size_t i = 0; i < copy_amount && list_iter != thread_list.cend();
+             ++i, ++list_iter) {
+            thread_ids.push_back(list_iter->GetThreadId());
+        }
+    }
+
+    auto& memory = GetCurrentMemory(system.Kernel());
+    for (const u64 thread_id : thread_ids) {
+        memory.Write64(out_thread_ids, thread_id);
         out_thread_ids += sizeof(u64);
     }
 
@@ -299,36 +345,52 @@ Result GetThreadCoreMask(Core::System& system, s32* out_core_id, u64* out_affini
 
 Result SetThreadCoreMask(Core::System& system, Handle thread_handle, s32 core_id,
                          u64 affinity_mask) {
-    // Determine the core id/affinity mask.
+    auto& kernel = system.Kernel();
+    auto& process = GetCurrentProcess(kernel);
+    const u64 process_core_mask = process.GetCoreMask();
+
+    // Determine the core id/affinity mask before folding Switch 2 virtual cores 6..7.
     if (core_id == IdealCoreUseProcessValue) {
-        core_id = GetCurrentProcess(system.Kernel()).GetIdealCoreId();
+        core_id = process.GetIdealCoreId();
+        R_UNLESS(0 <= core_id && core_id < static_cast<s32>(Common::BitSize<u64>()),
+                 ResultInvalidCoreId);
         affinity_mask = (1ULL << core_id);
+    }
+
+    // Validate the affinity mask and core id against the process core mask pre-fold.
+    R_UNLESS((affinity_mask | process_core_mask) == process_core_mask, ResultInvalidCoreId);
+    R_UNLESS(affinity_mask != 0, ResultInvalidCombination);
+    if (core_id >= 0) {
+        R_UNLESS(core_id < static_cast<s32>(Common::BitSize<u64>()), ResultInvalidCoreId);
+        R_UNLESS(((1ULL << core_id) & process_core_mask) != 0, ResultInvalidCoreId);
+    }
+
+    const s32 pre_fold_core_id = core_id;
+    const u64 pre_fold_affinity_mask = affinity_mask;
+
+    // Validated against the real mask above; fold Switch 2 cores 6..7 to the emulated cores.
+    affinity_mask = FoldExtraCoreMask(system, kernel, affinity_mask);
+    R_UNLESS(affinity_mask != 0, ResultInvalidCoreId);
+    core_id = FoldExtraCoreId(system, kernel, core_id);
+
+    const u64 active_core_mask = (1ULL << kernel.ActiveCoreCount()) - 1;
+    R_UNLESS((affinity_mask & active_core_mask) == affinity_mask, ResultInvalidCoreId);
+
+    // Validate the folded core id, and verify pre-fold core_id was in pre-fold affinity_mask.
+    if (IsValidVirtualCoreId(kernel, core_id)) {
+        R_UNLESS(pre_fold_core_id < 0 || ((1ULL << pre_fold_core_id) & pre_fold_affinity_mask) != 0,
+                 ResultInvalidCombination);
+        R_UNLESS(((1ULL << core_id) & affinity_mask) != 0, ResultInvalidCombination);
     } else {
-        // Validate the affinity mask.
-        const u64 process_core_mask = GetCurrentProcess(system.Kernel()).GetCoreMask();
-        R_UNLESS((affinity_mask | process_core_mask) == process_core_mask, ResultInvalidCoreId);
-        R_UNLESS(affinity_mask != 0, ResultInvalidCombination);
-
-        // Validated against the real mask above; fold to the emulated cores from here on.
-        affinity_mask = FoldExtraCoreMask(affinity_mask);
-        core_id = FoldExtraCoreId(core_id);
-
-        // Validate the core id.
-        if (IsValidVirtualCoreId(core_id)) {
-            R_UNLESS(((1ULL << core_id) & affinity_mask) != 0, ResultInvalidCombination);
-        } else {
-            R_UNLESS(core_id == IdealCoreNoUpdate || core_id == IdealCoreDontCare,
-                     ResultInvalidCoreId);
-        }
+        R_UNLESS(core_id == IdealCoreNoUpdate || core_id == IdealCoreDontCare, ResultInvalidCoreId);
     }
 
     // Get the thread from its handle.
-    KScopedAutoObject thread =
-        GetCurrentProcess(system.Kernel()).GetHandleTable().GetObject<KThread>(system.Kernel(), thread_handle);
+    KScopedAutoObject thread = process.GetHandleTable().GetObject<KThread>(kernel, thread_handle);
     R_UNLESS(thread.IsNotNull(), ResultInvalidHandle);
 
     // Set the core mask.
-    R_RETURN(thread->SetCoreMask(system.Kernel(), core_id, affinity_mask));
+    R_RETURN(thread->SetCoreMask(kernel, core_id, affinity_mask));
 }
 
 /// Get the ID for the specified thread.

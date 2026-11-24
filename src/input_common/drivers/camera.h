@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <span>
 
 #include "input_common/input_engine.h"
@@ -26,6 +27,10 @@ public:
                                                 Common::Input::CameraFormat camera_format) override;
 
 private:
+    static std::size_t GetImageWidth(Common::Input::CameraFormat format);
+    static std::size_t GetImageHeight(Common::Input::CameraFormat format);
+
+    mutable std::mutex status_mutex;
     Common::Input::CameraStatus status{};
 };
 

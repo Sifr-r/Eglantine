@@ -6,8 +6,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
-#include "common/assert.h"
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "core/core.h"
@@ -23,42 +23,9 @@
 
 namespace Service::Nvidia::Devices {
 
-namespace {
-// Copies count amount of type T from the input vector into the dst vector.
-// Returns the number of bytes written into dst.
-template <typename T>
-std::size_t SliceVectors(std::span<const u8> input, std::vector<T>& dst, std::size_t count,
-                         std::size_t offset) {
-    if (dst.empty()) {
-        return 0;
-    }
-    const size_t bytes_copied = count * sizeof(T);
-    if (input.size() < offset + bytes_copied) {
-        return 0;
-    }
-    std::memcpy(dst.data(), input.data() + offset, bytes_copied);
-    return bytes_copied;
-}
-
-// Writes the data in src to an offset into the dst vector. The offset is specified in bytes
-// Returns the number of bytes written into dst.
-template <typename T>
-std::size_t WriteVectors(std::span<u8> dst, const std::vector<T>& src, std::size_t offset) {
-    if (src.empty()) {
-        return 0;
-    }
-    const size_t bytes_copied = src.size() * sizeof(T);
-    if (dst.size() < offset + bytes_copied) {
-        return 0;
-    }
-    std::memcpy(dst.data() + offset, src.data(), bytes_copied);
-    return bytes_copied;
-}
-} // Anonymous namespace
-
 nvhost_nvdec_common::nvhost_nvdec_common(Core::System& system_, NvCore::Container& core_,
-                                         NvCore::ChannelType channel_type_)
-    : nvdevice{system_}, host1x{system_.Host1x()}, core{core_},
+                                         NvCore::ChannelType channel_type_, DeviceKind kind_)
+    : nvdevice{system_, kind_}, host1x{system_.Host1x()}, core{core_},
       syncpoint_manager{core.GetSyncpointManager()}, nvmap{core.GetNvMapFile()},
       channel_type{channel_type_} {
     auto& syncpts_accumulated = core.Host1xDeviceFile().syncpts_accumulated;
@@ -84,46 +51,98 @@ NvResult nvhost_nvdec_common::SetNVMAPfd(IoctlSetNvmapFD& params) {
 NvResult nvhost_nvdec_common::Submit(IoctlSubmit& params, std::span<u8> data, DeviceFD fd) {
     LOG_DEBUG(Service_NVDRV, "called NVDEC Submit, cmd_buffer_count={}", params.cmd_buffer_count);
 
-    // Instantiate param buffers
-    std::vector<CommandBuffer> command_buffers(params.cmd_buffer_count);
-    std::vector<Reloc> relocs(params.relocation_count);
-    std::vector<u32> reloc_shifts(params.relocation_count);
-    std::vector<SyncptIncr> syncpt_increments(params.syncpoint_count);
-    std::vector<u32> fence_thresholds(params.fence_count);
+    const size_t command_count = params.cmd_buffer_count;
+    const size_t relocation_count = params.relocation_count;
+    const size_t syncpoint_count = params.syncpoint_count;
+    const size_t fence_count = params.fence_count;
 
-    // Slice input into their respective buffers
-    std::size_t offset = 0;
-    offset += SliceVectors(data, command_buffers, params.cmd_buffer_count, offset);
-    offset += SliceVectors(data, relocs, params.relocation_count, offset);
-    offset += SliceVectors(data, reloc_shifts, params.relocation_count, offset);
-    offset += SliceVectors(data, syncpt_increments, params.syncpoint_count, offset);
-    offset += SliceVectors(data, fence_thresholds, params.fence_count, offset);
+    size_t offset = 0;
+    const auto take_array = [&](size_t count, size_t element_size) {
+        if (count > (data.size() - offset) / element_size) {
+            return false;
+        }
+        offset += count * element_size;
+        return true;
+    };
+    if (syncpoint_count > fence_count || !take_array(command_count, sizeof(CommandBuffer)) ||
+        !take_array(relocation_count, sizeof(Reloc) + sizeof(u32))) {
+        return NvResult::InvalidSize;
+    }
+    const size_t syncpoints_offset = offset;
+    if (!take_array(syncpoint_count, sizeof(SyncptIncr)) ||
+        !take_array(fence_count, sizeof(u32))) {
+        return NvResult::InvalidSize;
+    }
+    const size_t fences_offset = syncpoints_offset + syncpoint_count * sizeof(SyncptIncr);
 
-    auto* session = core.GetSession(sessions[fd]);
-
-    for (std::size_t i = 0; i < syncpt_increments.size(); i++) {
-        const SyncptIncr& syncpt_incr = syncpt_increments[i];
-        fence_thresholds[i] =
-            syncpoint_manager.IncrementSyncpointMaxExt(syncpt_incr.id, syncpt_incr.increments);
+    const auto session_it = sessions.find(fd);
+    if (session_it == sessions.end()) {
+        return NvResult::InvalidState;
+    }
+    Kernel::KScopedAutoObject<Kernel::KProcess> process{system.Kernel()};
+    if (!core.WithSession(session_it->second, [&](const NvCore::Session& session) {
+            process.Reset(session.process);
+        }) ||
+        process.IsNull()) {
+        return NvResult::InvalidState;
     }
 
-    for (const auto& cmd_buffer : command_buffers) {
+    std::vector<SyncptIncr> syncpt_increments(syncpoint_count);
+    if (!syncpt_increments.empty()) {
+        std::memcpy(syncpt_increments.data(), data.data() + syncpoints_offset,
+                    syncpoint_count * sizeof(SyncptIncr));
+    }
+    for (const auto& increment : syncpt_increments) {
+        if (!syncpoint_manager.IsSyncpointAllocated(increment.id)) {
+            return NvResult::BadParameter;
+        }
+    }
+
+    struct CommandRange {
+        VAddr address;
+        size_t word_count;
+    };
+    std::vector<CommandRange> command_ranges;
+    command_ranges.reserve(command_count);
+    for (size_t i = 0; i < command_count; ++i) {
+        CommandBuffer cmd_buffer;
+        std::memcpy(&cmd_buffer, data.data() + i * sizeof(CommandBuffer), sizeof(CommandBuffer));
         const auto object = nvmap.GetHandle(cmd_buffer.memory_id);
-        ASSERT_OR_EXECUTE(object, return NvResult::InvalidState;);
+        if (!object) {
+            return NvResult::InvalidState;
+        }
+        if (cmd_buffer.word_count < 0) {
+            return NvResult::BadParameter;
+        }
+        const size_t word_count = static_cast<size_t>(cmd_buffer.word_count);
+        std::scoped_lock object_lock{object->mutex};
+        if (cmd_buffer.offset > object->size ||
+            word_count > (object->size - cmd_buffer.offset) / sizeof(Tegra::ChCommandHeader) ||
+            object->address > std::numeric_limits<VAddr>::max() - cmd_buffer.offset) {
+            return NvResult::BadParameter;
+        }
+        const VAddr address = object->address + cmd_buffer.offset;
+        if (word_count != 0 &&
+            (object->address == 0 || !process->GetMemory().IsValidVirtualAddressRange(
+                                         address, word_count * sizeof(Tegra::ChCommandHeader)))) {
+            return NvResult::BadParameter;
+        }
+        command_ranges.push_back({address, word_count});
+    }
+
+    for (size_t i = 0; i < syncpt_increments.size(); ++i) {
+        const auto& increment = syncpt_increments[i];
+        const u32 threshold =
+            syncpoint_manager.IncrementSyncpointMaxExt(increment.id, increment.increments);
+        std::memcpy(data.data() + fences_offset + i * sizeof(u32), &threshold, sizeof(threshold));
+    }
+
+    for (const auto& command : command_ranges) {
         Core::Memory::CpuGuestMemory<Tegra::ChCommandHeader,
                                      Core::Memory::GuestMemoryFlags::SafeRead>
-            cmdlist(session->process->GetMemory(), object->address + cmd_buffer.offset,
-                    cmd_buffer.word_count);
+            cmdlist(process->GetMemory(), command.address, command.word_count);
         host1x.PushEntries(fd, std::move(cmdlist));
     }
-
-    // Some games expect command_buffers to be written back
-    offset = 0;
-    offset += WriteVectors(data, command_buffers, offset);
-    offset += WriteVectors(data, relocs, offset);
-    offset += WriteVectors(data, reloc_shifts, offset);
-    offset += WriteVectors(data, syncpt_increments, offset);
-    offset += WriteVectors(data, fence_thresholds, offset);
 
     return NvResult::Success;
 }

@@ -17,7 +17,7 @@ namespace {
 Result ValidateOffset(s64 offset, size_t size, size_t data_size) {
     R_UNLESS(offset >= 0, AM::ResultInvalidOffset);
 
-    const size_t begin = offset;
+    const size_t begin = static_cast<size_t>(offset);
     const size_t end = begin + size;
 
     R_UNLESS(begin <= end && end <= data_size, AM::ResultInvalidOffset);
@@ -75,7 +75,8 @@ public:
     }
 
     Result Read(s64 offset, void* buffer, size_t size) override {
-        R_TRY(ValidateOffset(offset, size, m_size));
+        R_UNLESS(m_size >= 0, AM::ResultInvalidOffset);
+        R_TRY(ValidateOffset(offset, size, static_cast<size_t>(m_size)));
 
         m_memory.ReadBlock(m_trmem->GetSourceAddress() + offset, buffer, size);
 
@@ -84,7 +85,8 @@ public:
 
     Result Write(s64 offset, const void* buffer, size_t size) override {
         R_UNLESS(m_is_writable, ResultUnknown);
-        R_TRY(ValidateOffset(offset, size, m_size));
+        R_UNLESS(m_size >= 0, AM::ResultInvalidOffset);
+        R_TRY(ValidateOffset(offset, size, static_cast<size_t>(m_size)));
 
         m_memory.WriteBlock(m_trmem->GetSourceAddress() + offset, buffer, size);
 
@@ -124,7 +126,11 @@ public:
 LibraryAppletStorage::~LibraryAppletStorage() = default;
 
 std::vector<u8> LibraryAppletStorage::GetData() {
-    std::vector<u8> data(this->GetSize());
+    const s64 size = this->GetSize();
+    if (size <= 0) {
+        return {};
+    }
+    std::vector<u8> data(static_cast<size_t>(size));
     this->Read(0, data.data(), data.size());
     return data;
 }

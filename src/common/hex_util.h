@@ -33,13 +33,14 @@ template <std::size_t Size, bool le = false>
     ASSERT_MSG(Size * 2 <= str.size(), "Invalid string size");
 
     std::array<u8, Size> out{};
-    if constexpr (le) {
-        for (std::size_t i = 2 * Size - 2; i <= 2 * Size; i -= 2) {
-            out[i / 2] = static_cast<u8>((ToHexNibble(str[i]) << 4) | ToHexNibble(str[i + 1]));
-        }
-    } else {
-        for (std::size_t i = 0; i < 2 * Size; i += 2) {
-            out[i / 2] = static_cast<u8>((ToHexNibble(str[i]) << 4) | ToHexNibble(str[i + 1]));
+    for (std::size_t idx = 0; idx < Size; ++idx) {
+        const std::size_t str_idx = idx * 2;
+        const u8 byte =
+            static_cast<u8>((ToHexNibble(str[str_idx]) << 4) | ToHexNibble(str[str_idx + 1]));
+        if constexpr (le) {
+            out[Size - 1 - idx] = byte;
+        } else {
+            out[idx] = byte;
         }
     }
     return out;

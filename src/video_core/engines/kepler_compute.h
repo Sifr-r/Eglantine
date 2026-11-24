@@ -81,6 +81,9 @@ public:
     void SetNativeDataRam(std::array<u32, 0xc00>* data_ram) {
         native_data_ram = data_ram;
     }
+    void SetNativeQmdTable(std::shared_ptr<NativeQmdStateTable> table) {
+        native_qmd.SetStateTable(std::move(table));
+    }
     void SetNativeMacroMode(MacroEngine* shared_macro, std::span<u32> positions,
                             NativeMacroContext* context = nullptr) {
         if (native_context != context)

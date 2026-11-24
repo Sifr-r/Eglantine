@@ -45,7 +45,14 @@ std::vector<Network::ScanData> ScanWifiNetworks(std::chrono::milliseconds deadli
         return out;
 
     PWLAN_INTERFACE_INFO_LIST ifs{};
-    if (WlanEnumInterfaces(hClient, nullptr, &ifs) != ERROR_SUCCESS || ifs->dwNumberOfItems == 0) {
+    if (WlanEnumInterfaces(hClient, nullptr, &ifs) != ERROR_SUCCESS) {
+        WlanCloseHandle(hClient, nullptr);
+        return out;
+    }
+    if (ifs == nullptr || ifs->dwNumberOfItems == 0) {
+        if (ifs != nullptr) {
+            WlanFreeMemory(ifs);
+        }
         WlanCloseHandle(hClient, nullptr);
         return out;
     }

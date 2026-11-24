@@ -13,6 +13,7 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -52,6 +53,7 @@
 #include "video_core/textures/texture.h"
 
 namespace Tegra {
+class MemoryManager;
 namespace Control {
 struct ChannelState;
 }
@@ -89,6 +91,7 @@ class TextureCacheChannelInfo : public ChannelInfo {
 public:
     TextureCacheChannelInfo() = delete;
     TextureCacheChannelInfo(Tegra::Control::ChannelState& state) noexcept;
+    explicit TextureCacheChannelInfo(const Tegra::Control::ChannelStateBridge& bridge);
     TextureCacheChannelInfo(const TextureCacheChannelInfo& state) = delete;
     TextureCacheChannelInfo& operator=(const TextureCacheChannelInfo&) = delete;
 
@@ -107,6 +110,8 @@ public:
 
 template <class P>
 class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelInfo> {
+    friend struct TextureCacheTestAccess;
+
     /// Address shift for caching images into a hash table
     static constexpr u64 YUZU_PAGEBITS = 20;
 
@@ -397,6 +402,9 @@ public:
     /// Whether CommitAsyncFlushes would commit anything (downloads or their buffers).
     [[nodiscard]] bool HasAsyncFlushWork() const noexcept;
 
+    /// Whether an uncommitted download copies an image into guest buffer memory (DMA).
+    [[nodiscard]] bool HasUncommittedBufferDownloads() const noexcept;
+
     /// Return true when the caller should wait for async downloads
     [[nodiscard]] bool ShouldWaitAsyncFlushes() const noexcept;
 
@@ -425,6 +433,9 @@ public:
 
     /// Create channel state.
     void CreateChannel(Tegra::Control::ChannelState& channel) final override;
+
+    /// Create channel state from a ChannelStateBridge.
+    void CreateChannelFromBridge(const Tegra::Control::ChannelStateBridge& bridge) final override;
 
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
@@ -476,6 +487,12 @@ private:
 
     /// Refresh the contents (pixel data) of an image
     [[nodiscard]] bool IsDownloadable(const ImageBase& image) const noexcept;
+
+    void HandleScratchAllocationFailure(const ImageBase& image);
+
+    std::shared_ptr<Tegra::MemoryManager> WriteBackMemory(const ImageBase& image);
+    bool WriteBackImage(const ImageBase& image, std::span<const BufferImageCopy> copies,
+                        std::span<const u8> data);
 
     void RefreshContents(Image& image, ImageId image_id);
 
@@ -588,6 +605,8 @@ private:
     /// Returns true if the current clear parameters clear the whole image of a given image view
     [[nodiscard]] bool IsFullClear(ImageViewId id);
 
+    [[nodiscard]] bool ClearCovers(u32 width, u32 height) const;
+
     [[nodiscard]] std::pair<u32, u32> PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
                                                       bool mark_as_modified);
 
@@ -652,8 +671,7 @@ private:
     u32 swizzle_slices_per_batch = 0;
 
     struct BufferDownload {
-        GPUVAddr address;
-        size_t size;
+        HostRuns destination;
     };
 
     using PendingDownload = PendingImageDownload<Image>;
@@ -712,6 +730,7 @@ private:
 
     Common::ScratchBuffer<u8> swizzle_data_buffer;
     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+    u64 scratch_retry_frame{};
 
     u64 modification_tick = 0;
     u64 frame_start_modification_tick = 0;

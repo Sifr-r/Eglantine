@@ -369,6 +369,9 @@ void Room::RoomImpl::StartLoop() {
 }
 
 void Room::RoomImpl::HandleJoinRequest(const ENetEvent* event) {
+    if (event->peer->state != ENET_PEER_STATE_CONNECTED) {
+        return;
+    }
     if (IsMember(event->peer)) {
         LOG_WARNING(Network,
                     "Received a duplicate join request from an existing member. Ignoring it.");
@@ -382,6 +385,7 @@ void Room::RoomImpl::HandleJoinRequest(const ENetEvent* event) {
         std::lock_guard lock(member_mutex);
         if (members.size() >= member_slots) {
             SendRoomIsFull(event->peer);
+            enet_peer_disconnect_later(event->peer, 0);
             return;
         }
     }
@@ -410,11 +414,13 @@ void Room::RoomImpl::HandleJoinRequest(const ENetEvent* event) {
 
     if (pass != password) {
         SendWrongPassword(event->peer);
+        enet_peer_disconnect_later(event->peer, 0);
         return;
     }
 
     if (!IsValidNickname(nickname)) {
         SendNameCollision(event->peer);
+        enet_peer_disconnect_later(event->peer, 0);
         return;
     }
 
@@ -422,6 +428,7 @@ void Room::RoomImpl::HandleJoinRequest(const ENetEvent* event) {
         // Verify if the preferred fake ip is available
         if (!IsValidFakeIPAddress(preferred_fake_ip)) {
             SendIPCollision(event->peer);
+            enet_peer_disconnect_later(event->peer, 0);
             return;
         }
     } else {
@@ -431,6 +438,7 @@ void Room::RoomImpl::HandleJoinRequest(const ENetEvent* event) {
 
     if (client_version != network_version) {
         SendVersionMismatch(event->peer);
+        enet_peer_disconnect_later(event->peer, 0);
         return;
     }
 
@@ -467,6 +475,7 @@ void Room::RoomImpl::HandleJoinRequest(const ENetEvent* event) {
                       member.user_data.username) != username_ban_list.end()) {
 
             SendUserBanned(event->peer);
+            enet_peer_disconnect_later(event->peer, 0);
             return;
         }
 
@@ -477,6 +486,7 @@ void Room::RoomImpl::HandleJoinRequest(const ENetEvent* event) {
 
         if (std::find(ip_ban_list.begin(), ip_ban_list.end(), ip) != ip_ban_list.end()) {
             SendUserBanned(event->peer);
+            enet_peer_disconnect_later(event->peer, 0);
             return;
         }
     }
@@ -933,7 +943,18 @@ void Room::RoomImpl::BroadcastRoomInformation() {
 
     ENetPacket* enet_packet =
         enet_packet_create(packet.GetData(), packet.GetDataSize(), ENET_PACKET_FLAG_RELIABLE);
-    enet_host_broadcast(server, 0, enet_packet);
+    if (!enet_packet) {
+        return;
+    }
+    {
+        std::lock_guard lock(member_mutex);
+        for (const auto& member : members) {
+            enet_peer_send(member.peer, 0, enet_packet);
+        }
+    }
+    if (enet_packet->referenceCount == 0) {
+        enet_packet_destroy(enet_packet);
+    }
     enet_host_flush(server);
 }
 
@@ -1315,7 +1336,10 @@ bool Room::Create(const std::string& name, const std::string& description,
     ENetAddress address;
     address.host = ENET_HOST_ANY;
     if (!server_address.empty()) {
-        enet_address_set_host(&address, server_address.c_str());
+        if (enet_address_set_host(&address, server_address.c_str()) != 0) {
+            LOG_ERROR(Network, "Failed to resolve room bind address '{}'", server_address);
+            return false;
+        }
     }
     address.port = server_port;
 

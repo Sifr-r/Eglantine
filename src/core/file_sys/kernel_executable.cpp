@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <limits>
+#include <new>
 
 #include "common/string_util.h"
 #include "core/file_sys/kernel_executable.h"
@@ -29,13 +31,28 @@ bool DecompressBLZ(std::vector<u8>& data) {
     std::memcpy(&init_index, data.data() + data_size + 0x4, sizeof(u32));
     std::memcpy(&additional_size, data.data() + data_size + 0x8, sizeof(u32));
 
-    const auto start_offset = data.size() - compressed_size;
-    data.resize(compressed_size + additional_size + start_offset);
+    if (compressed_size < 0xC || compressed_size > data.size() || init_index > compressed_size) {
+        return false;
+    }
+
+    const std::size_t start_offset = data.size() - compressed_size;
+    const u64 decompressed_tail = static_cast<u64>(compressed_size) + additional_size;
+    if (decompressed_tail > data.max_size() - start_offset) {
+        return false;
+    }
+    try {
+        data.resize(start_offset + static_cast<std::size_t>(decompressed_tail));
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
 
     std::size_t index = compressed_size - init_index;
-    std::size_t out_index = compressed_size + additional_size;
+    std::size_t out_index = static_cast<std::size_t>(decompressed_tail);
 
     while (out_index > 0) {
+        if (index == 0) {
+            return false;
+        }
         --index;
         auto control = data[index + start_offset];
         for (size_t i = 0; i < 8; ++i) {
@@ -67,11 +84,14 @@ bool DecompressBLZ(std::vector<u8>& data) {
                         data[out_index + j + segment_offset + start_offset];
                 }
             } else {
-                if (out_index < 1) {
+                if (out_index < 1 || index < 1) {
                     return false;
                 }
                 --out_index;
                 --index;
+                if (out_index + start_offset >= data.size()) {
+                    return false;
+                }
                 data[out_index + start_offset] = data[index + start_offset];
             }
 
@@ -103,6 +123,10 @@ KIP::KIP(const VirtualFile& file) : status(Loader::ResultStatus::Success) {
     u64 offset = sizeof(KIPHeader);
     for (std::size_t i = 0; i < header.sections.size(); ++i) {
         auto compressed = file->ReadBytes(header.sections[i].compressed_size, offset);
+        if (compressed.size() != header.sections[i].compressed_size) {
+            status = Loader::ResultStatus::ErrorBadKIPHeader;
+            return;
+        }
         offset += header.sections[i].compressed_size;
 
         if (header.sections[i].compressed_size == 0 && header.sections[i].decompressed_size != 0) {
@@ -117,10 +141,15 @@ KIP::KIP(const VirtualFile& file) : status(Loader::ResultStatus::Success) {
             }
         }
     }
+    size = offset;
 }
 
 Loader::ResultStatus KIP::GetStatus() const {
     return status;
+}
+
+u64 KIP::GetSize() const {
+    return size;
 }
 
 std::string KIP::GetName() const {
@@ -196,7 +225,13 @@ u32 KIP::GetBSSOffset() const {
 }
 
 INI::INI(const VirtualFile& file) : status(Loader::ResultStatus::Success) {
-    if (file->GetSize() < sizeof(INIHeader) || file->ReadObject(&header) != sizeof(INIHeader)) {
+    if (file == nullptr) {
+        status = Loader::ResultStatus::ErrorNullFile;
+        return;
+    }
+
+    const u64 file_size = file->GetSize();
+    if (file_size < sizeof(INIHeader) || file->ReadObject(&header) != sizeof(INIHeader)) {
         status = Loader::ResultStatus::ErrorBadINIHeader;
         return;
     }
@@ -213,12 +248,21 @@ INI::INI(const VirtualFile& file) : status(Loader::ResultStatus::Success) {
 
     u64 offset = sizeof(INIHeader);
     for (std::size_t i = 0; i < header.kip_count; ++i) {
-        const auto kip_file =
-            std::make_shared<OffsetVfsFile>(file, file->GetSize() - offset, offset);
-        KIP kip(kip_file);
-        if (kip.GetStatus() == Loader::ResultStatus::Success) {
-            kips.push_back(std::move(kip));
+        if (offset >= file_size) {
+            status = Loader::ResultStatus::ErrorBadKIPHeader;
+            return;
         }
+
+        const auto kip_file = std::make_shared<OffsetVfsFile>(
+            file, static_cast<std::size_t>(file_size - offset), static_cast<std::size_t>(offset));
+        KIP kip(kip_file);
+        if (kip.GetStatus() != Loader::ResultStatus::Success) {
+            status = kip.GetStatus();
+            return;
+        }
+
+        offset += kip.GetSize();
+        kips.push_back(std::move(kip));
     }
 }
 

@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstring>
+
 #include "common/input.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
@@ -19,21 +22,84 @@
 #include "input_common/helpers/joycon_protocol/rumble.h"
 
 namespace InputCommon::Joycon {
+namespace {
+void CopySerialNumber(const wchar_t* src, SerialNumber& dst) {
+    dst.fill(0);
+    if (src == nullptr) {
+        return;
+    }
+    constexpr std::size_t max_wchars =
+        (sizeof(SerialNumber) + sizeof(wchar_t) - 1) / sizeof(wchar_t);
+    std::size_t wchar_len = 0;
+    while (wchar_len < max_wchars && src[wchar_len] != L'\0') {
+        ++wchar_len;
+    }
+    const std::size_t bytes_to_copy = (std::min)(wchar_len * sizeof(wchar_t), dst.size());
+    if (bytes_to_copy > 0) {
+        std::memcpy(dst.data(), src, bytes_to_copy);
+    }
+}
+
+class ScopedPauseInput {
+public:
+    explicit ScopedPauseInput(std::atomic<bool>& flag_, std::mutex& io_mutex_)
+        : flag{flag_}, prev_state{flag_.exchange(true)}, io_lock{io_mutex_} {}
+    ~ScopedPauseInput() {
+        io_lock.unlock();
+        flag.store(prev_state);
+    }
+    ScopedPauseInput(const ScopedPauseInput&) = delete;
+    ScopedPauseInput& operator=(const ScopedPauseInput&) = delete;
+
+private:
+    std::atomic<bool>& flag;
+    bool prev_state;
+    std::unique_lock<std::mutex> io_lock;
+};
+} // namespace
+
 JoyconDriver::JoyconDriver(std::size_t port_) : port{port_} {
     hidapi_handle = std::make_shared<JoyconHandle>();
 }
 
 JoyconDriver::~JoyconDriver() {
     Stop();
+    std::scoped_lock lock{mutex};
+    if (hidapi_handle && hidapi_handle->handle != nullptr) {
+        SDL_hid_close(hidapi_handle->handle);
+        hidapi_handle->handle = nullptr;
+    }
+}
+
+void JoyconDriver::StopInputThreadLocked() {
+    is_connected.store(false);
+    if (input_thread.joinable()) {
+        input_thread.request_stop();
+        input_thread.join();
+    }
+    input_thread = std::jthread{};
+    input_thread_running.store(false);
 }
 
 void JoyconDriver::Stop() {
-    is_connected = false;
-    input_thread = {};
+    std::scoped_lock lifecycle_lock{lifecycle_mutex};
+    StopInputThreadLocked();
+
+    std::scoped_lock lock{mutex};
+    if (hidapi_handle && hidapi_handle->handle != nullptr) {
+        SDL_hid_close(hidapi_handle->handle);
+        hidapi_handle->handle = nullptr;
+    }
 }
 
 Common::Input::DriverResult JoyconDriver::RequestDeviceAccess(SDL_hid_device_info* device_info) {
+    std::scoped_lock lifecycle_lock{lifecycle_mutex};
+    StopInputThreadLocked();
+
     std::scoped_lock lock{mutex};
+    if (device_info == nullptr) {
+        return Common::Input::DriverResult::InvalidParameters;
+    }
 
     handle_device_type = ControllerType::None;
     GetDeviceType(device_info, handle_device_type);
@@ -41,9 +107,18 @@ Common::Input::DriverResult JoyconDriver::RequestDeviceAccess(SDL_hid_device_inf
         return Common::Input::DriverResult::UnsupportedControllerType;
     }
 
+    if (hidapi_handle->handle != nullptr) {
+        SDL_hid_close(hidapi_handle->handle);
+        hidapi_handle->handle = nullptr;
+    }
+
     hidapi_handle->handle =
         SDL_hid_open(device_info->vendor_id, device_info->product_id, device_info->serial_number);
-    std::memcpy(&handle_serial_number, device_info->serial_number, 15);
+    if (device_info->serial_number != nullptr) {
+        CopySerialNumber(device_info->serial_number, handle_serial_number);
+    } else {
+        handle_serial_number.fill(0);
+    }
     if (!hidapi_handle->handle) {
         LOG_ERROR(Input, "Yuzu can't gain access to this device: ID {:04X}:{:04X}.",
                   device_info->vendor_id, device_info->product_id);
@@ -54,11 +129,14 @@ Common::Input::DriverResult JoyconDriver::RequestDeviceAccess(SDL_hid_device_inf
 }
 
 Common::Input::DriverResult JoyconDriver::InitializeDevice() {
+    std::scoped_lock lifecycle_lock{lifecycle_mutex};
+    StopInputThreadLocked();
+
+    std::scoped_lock lock{mutex};
     if (!hidapi_handle->handle) {
         return Common::Input::DriverResult::InvalidHandle;
     }
-    std::scoped_lock lock{mutex};
-    disable_input_thread = true;
+    disable_input_thread.store(true);
 
     // Reset Counters
     error_counter = 0;
@@ -121,67 +199,75 @@ Common::Input::DriverResult JoyconDriver::InitializeDevice() {
     // Apply HW configuration
     SetPollingMode();
 
-    // Initialize joycon poller
+    // Initialize joycon poller with registered callbacks before starting input_thread
     joycon_poller = std::make_unique<JoyconPoller>(device_type, left_stick_calibration,
                                                    right_stick_calibration, motion_calibration);
+    joycon_poller->SetCallbacks(registered_callbacks);
+
+    vibration_queue.Clear();
+    last_vibration_result.store(Common::Input::DriverResult::Success);
 
     // Start polling for data
-    is_connected = true;
-    if (!input_thread_running) {
-        input_thread =
-            std::jthread([this](std::stop_token stop_token) { InputThread(stop_token); });
-    }
-
-    disable_input_thread = false;
+    disable_input_thread.store(false);
+    is_connected.store(true);
+    input_thread =
+        std::jthread([this](std::stop_token stop_token) { InputThread(stop_token); });
     return Common::Input::DriverResult::Success;
 }
 
 void JoyconDriver::InputThread(std::stop_token stop_token) {
     LOG_INFO(Input, "Joycon Adapter input thread started");
     Common::SetCurrentThreadName("JoyconInput");
-    input_thread_running = true;
+    input_thread_running.store(true);
 
     // Max update rate is 5ms, ensure we are always able to read a bit faster
     constexpr int ThreadDelay = 3;
     std::vector<u8> buffer(MaxBufferSize);
 
     while (!stop_token.stop_requested()) {
-        int status = 0;
-
         if (!IsInputThreadValid()) {
-            input_thread.request_stop();
-            continue;
+            break;
         }
 
         // By disabling the input thread we can ensure custom commands will succeed as no package is
         // skipped
-        if (!disable_input_thread) {
-            status = SDL_hid_read_timeout(hidapi_handle->handle, buffer.data(), buffer.size(),
-                                          ThreadDelay);
-        } else {
+        if (disable_input_thread.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(ThreadDelay));
+            continue;
         }
 
-        if (IsPayloadCorrect(status, buffer)) {
-            OnNewData(buffer);
-        }
+        {
+            std::scoped_lock io_lock{io_mutex};
+            if (stop_token.stop_requested() || !IsInputThreadValid()) {
+                break;
+            }
+            if (disable_input_thread.load()) {
+                continue;
+            }
+            const int status = SDL_hid_read_timeout(hidapi_handle->handle, buffer.data(),
+                                                    buffer.size(), ThreadDelay);
 
-        if (!vibration_queue.Empty()) {
-            VibrationValue vibration_value;
-            vibration_queue.Pop(vibration_value);
-            last_vibration_result = rumble_protocol->SendVibration(vibration_value);
-        }
+            if (IsPayloadCorrect(status, buffer)) {
+                OnNewData(buffer);
+            }
 
-        // We can't keep up with vibrations. Start skipping.
-        while (vibration_queue.Size() > 6) {
-            vibration_queue.Pop();
+            if (!vibration_queue.Empty()) {
+                VibrationValue vibration_value;
+                vibration_queue.Pop(vibration_value);
+                last_vibration_result.store(rumble_protocol->SendVibration(vibration_value));
+            }
+
+            // We can't keep up with vibrations. Start skipping.
+            while (vibration_queue.Size() > 6) {
+                vibration_queue.Pop();
+            }
         }
 
         std::this_thread::yield();
     }
 
-    is_connected = false;
-    input_thread_running = false;
+    is_connected.store(false);
+    input_thread_running.store(false);
     LOG_INFO(Input, "Joycon Adapter input thread stopped");
 }
 
@@ -271,10 +357,11 @@ void JoyconDriver::OnNewData(std::span<u8> buffer) {
 }
 
 Common::Input::DriverResult JoyconDriver::SetPollingMode() {
-    SCOPE_EXIT {
-        disable_input_thread = false;
-    };
-    disable_input_thread = true;
+    if (!hidapi_handle->handle || !generic_protocol || !rumble_protocol || !irs_protocol ||
+        !nfc_protocol || !ring_protocol) {
+        return Common::Input::DriverResult::InvalidHandle;
+    }
+    ScopedPauseInput pause{disable_input_thread, io_mutex};
 
     rumble_protocol->EnableRumble(vibration_enabled && supported_features.vibration);
 
@@ -415,16 +502,16 @@ bool JoyconDriver::IsPayloadCorrect(int status, std::span<const u8> buffer) {
 
 Common::Input::DriverResult JoyconDriver::SetVibration(const VibrationValue& vibration) {
     std::scoped_lock lock{mutex};
-    if (disable_input_thread) {
+    if (!is_connected.load() || disable_input_thread.load()) {
         return Common::Input::DriverResult::HandleInUse;
     }
     vibration_queue.Push(vibration);
-    return last_vibration_result;
+    return last_vibration_result.load();
 }
 
 Common::Input::DriverResult JoyconDriver::SetLedConfig(u8 led_pattern) {
     std::scoped_lock lock{mutex};
-    if (disable_input_thread) {
+    if (!is_connected.load() || disable_input_thread.load() || !generic_protocol) {
         return Common::Input::DriverResult::HandleInUse;
     }
     return generic_protocol->SetLedPattern(led_pattern);
@@ -432,13 +519,11 @@ Common::Input::DriverResult JoyconDriver::SetLedConfig(u8 led_pattern) {
 
 Common::Input::DriverResult JoyconDriver::SetIrsConfig(IrsMode mode_, IrsResolution format_) {
     std::scoped_lock lock{mutex};
-    if (disable_input_thread) {
+    if (!is_connected.load() || disable_input_thread.load() || !irs_protocol) {
         return Common::Input::DriverResult::HandleInUse;
     }
-    disable_input_thread = true;
-    const auto result = irs_protocol->SetIrsConfig(mode_, format_);
-    disable_input_thread = false;
-    return result;
+    ScopedPauseInput pause{disable_input_thread, io_mutex};
+    return irs_protocol->SetIrsConfig(mode_, format_);
 }
 
 Common::Input::DriverResult JoyconDriver::SetPassiveMode() {
@@ -452,13 +537,19 @@ Common::Input::DriverResult JoyconDriver::SetPassiveMode() {
 }
 
 Common::Input::DriverResult JoyconDriver::SetActiveMode() {
+    std::unique_lock lock{mutex};
     if (is_ring_disabled_by_irs) {
         is_ring_disabled_by_irs = false;
-        SetActiveMode();
+        motion_enabled = true;
+        hidbus_enabled = false;
+        nfc_enabled = false;
+        passive_enabled = false;
+        irs_enabled = false;
+        SetPollingMode();
+        lock.unlock();
         return SetRingConMode();
     }
 
-    std::scoped_lock lock{mutex};
     motion_enabled = true;
     hidbus_enabled = false;
     nfc_enabled = false;
@@ -529,15 +620,12 @@ Common::Input::DriverResult JoyconDriver::StartNfcPolling() {
     if (!supported_features.nfc) {
         return Common::Input::DriverResult::NotSupported;
     }
-    if (!nfc_protocol->IsEnabled()) {
+    if (!nfc_protocol || !nfc_protocol->IsEnabled()) {
         return Common::Input::DriverResult::Disabled;
     }
 
-    disable_input_thread = true;
-    const auto result = nfc_protocol->StartNFCPollingMode();
-    disable_input_thread = false;
-
-    return result;
+    ScopedPauseInput pause{disable_input_thread, io_mutex};
+    return nfc_protocol->StartNFCPollingMode();
 }
 
 Common::Input::DriverResult JoyconDriver::StopNfcPolling() {
@@ -546,17 +634,21 @@ Common::Input::DriverResult JoyconDriver::StopNfcPolling() {
     if (!supported_features.nfc) {
         return Common::Input::DriverResult::NotSupported;
     }
-    if (!nfc_protocol->IsEnabled()) {
+    if (!nfc_protocol || !nfc_protocol->IsEnabled()) {
         return Common::Input::DriverResult::Disabled;
     }
 
-    disable_input_thread = true;
-    const auto result = nfc_protocol->StopNFCPollingMode();
-    disable_input_thread = false;
+    Common::Input::DriverResult result{};
+    {
+        ScopedPauseInput pause{disable_input_thread, io_mutex};
+        result = nfc_protocol->StopNFCPollingMode();
+    }
 
     if (amiibo_detected) {
         amiibo_detected = false;
-        joycon_poller->UpdateAmiibo({});
+        if (joycon_poller) {
+            joycon_poller->UpdateAmiibo({});
+        }
     }
 
     return result;
@@ -568,7 +660,7 @@ Common::Input::DriverResult JoyconDriver::ReadAmiiboData(std::vector<u8>& out_da
     if (!supported_features.nfc) {
         return Common::Input::DriverResult::NotSupported;
     }
-    if (!nfc_protocol->IsEnabled()) {
+    if (!nfc_protocol || !nfc_protocol->IsEnabled()) {
         return Common::Input::DriverResult::Disabled;
     }
     if (!amiibo_detected) {
@@ -576,11 +668,8 @@ Common::Input::DriverResult JoyconDriver::ReadAmiiboData(std::vector<u8>& out_da
     }
 
     out_data.resize(0x21C);
-    disable_input_thread = true;
-    const auto result = nfc_protocol->ReadAmiibo(out_data);
-    disable_input_thread = false;
-
-    return result;
+    ScopedPauseInput pause{disable_input_thread, io_mutex};
+    return nfc_protocol->ReadAmiibo(out_data);
 }
 
 Common::Input::DriverResult JoyconDriver::WriteNfcData(std::span<const u8> data) {
@@ -589,18 +678,15 @@ Common::Input::DriverResult JoyconDriver::WriteNfcData(std::span<const u8> data)
     if (!supported_features.nfc) {
         return Common::Input::DriverResult::NotSupported;
     }
-    if (!nfc_protocol->IsEnabled()) {
+    if (!nfc_protocol || !nfc_protocol->IsEnabled()) {
         return Common::Input::DriverResult::Disabled;
     }
     if (!amiibo_detected) {
         return Common::Input::DriverResult::ErrorWritingData;
     }
 
-    disable_input_thread = true;
-    const auto result = nfc_protocol->WriteAmiibo(data);
-    disable_input_thread = false;
-
-    return result;
+    ScopedPauseInput pause{disable_input_thread, io_mutex};
+    return nfc_protocol->WriteAmiibo(data);
 }
 
 Common::Input::DriverResult JoyconDriver::ReadMifareData(std::span<const MifareReadChunk> data,
@@ -610,18 +696,15 @@ Common::Input::DriverResult JoyconDriver::ReadMifareData(std::span<const MifareR
     if (!supported_features.nfc) {
         return Common::Input::DriverResult::NotSupported;
     }
-    if (!nfc_protocol->IsEnabled()) {
+    if (!nfc_protocol || !nfc_protocol->IsEnabled()) {
         return Common::Input::DriverResult::Disabled;
     }
     if (!amiibo_detected) {
         return Common::Input::DriverResult::ErrorWritingData;
     }
 
-    disable_input_thread = true;
-    const auto result = nfc_protocol->ReadMifare(data, out_data);
-    disable_input_thread = false;
-
-    return result;
+    ScopedPauseInput pause{disable_input_thread, io_mutex};
+    return nfc_protocol->ReadMifare(data, out_data);
 }
 
 Common::Input::DriverResult JoyconDriver::WriteMifareData(std::span<const MifareWriteChunk> data) {
@@ -630,18 +713,15 @@ Common::Input::DriverResult JoyconDriver::WriteMifareData(std::span<const Mifare
     if (!supported_features.nfc) {
         return Common::Input::DriverResult::NotSupported;
     }
-    if (!nfc_protocol->IsEnabled()) {
+    if (!nfc_protocol || !nfc_protocol->IsEnabled()) {
         return Common::Input::DriverResult::Disabled;
     }
     if (!amiibo_detected) {
         return Common::Input::DriverResult::ErrorWritingData;
     }
 
-    disable_input_thread = true;
-    const auto result = nfc_protocol->WriteMifare(data);
-    disable_input_thread = false;
-
-    return result;
+    ScopedPauseInput pause{disable_input_thread, io_mutex};
+    return nfc_protocol->WriteMifare(data);
 }
 
 bool JoyconDriver::IsConnected() const {
@@ -690,7 +770,11 @@ SerialNumber JoyconDriver::GetHandleSerialNumber() const {
 }
 
 void JoyconDriver::SetCallbacks(const JoyconCallbacks& callbacks) {
-    joycon_poller->SetCallbacks(callbacks);
+    std::scoped_lock lock{mutex};
+    registered_callbacks = callbacks;
+    if (joycon_poller) {
+        joycon_poller->SetCallbacks(registered_callbacks);
+    }
 }
 
 Common::Input::DriverResult JoyconDriver::GetDeviceType(SDL_hid_device_info* device_info,
@@ -703,7 +787,7 @@ Common::Input::DriverResult JoyconDriver::GetDeviceType(SDL_hid_device_info* dev
     constexpr u16 nintendo_vendor_id = 0x057e;
 
     controller_type = ControllerType::None;
-    if (device_info->vendor_id != nintendo_vendor_id) {
+    if (device_info == nullptr || device_info->vendor_id != nintendo_vendor_id) {
         return Common::Input::DriverResult::UnsupportedControllerType;
     }
 
@@ -718,10 +802,10 @@ Common::Input::DriverResult JoyconDriver::GetDeviceType(SDL_hid_device_info* dev
 
 Common::Input::DriverResult JoyconDriver::GetSerialNumber(SDL_hid_device_info* device_info,
                                                           SerialNumber& serial_number) {
-    if (device_info->serial_number == nullptr) {
+    if (device_info == nullptr || device_info->serial_number == nullptr) {
         return Common::Input::DriverResult::Unknown;
     }
-    std::memcpy(&serial_number, device_info->serial_number, 15);
+    CopySerialNumber(device_info->serial_number, serial_number);
     return Common::Input::DriverResult::Success;
 }
 

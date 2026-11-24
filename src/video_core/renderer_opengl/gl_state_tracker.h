@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2025 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -11,6 +14,7 @@
 #include <glad/glad.h>
 
 #include "common/common_types.h"
+#include "video_core/control/channel_state_bridge.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -213,20 +217,38 @@ public:
     }
 
     void NotifyRange(u8 start, u8 end) {
-        for (auto flag = start; flag <= end; flag++) {
+        if (start > end) {
+            return;
+        }
+        for (std::size_t flag = start; flag <= static_cast<std::size_t>(end); ++flag) {
             (*flags)[flag] = true;
         }
     }
 
+    void SetupTables(const Tegra::Control::ChannelStateBridge& bridge);
+
     void SetupTables(Tegra::Control::ChannelState& channel_state);
 
+    void ChangeChannel(const Tegra::Control::ChannelStateBridge& bridge);
+
     void ChangeChannel(Tegra::Control::ChannelState& channel_state);
+
+    /// Stops using the bound channel's flags, for when it goes away.
+    void ClearChannel() {
+        flags = &default_flags;
+        channel_bridge = Tegra::Control::ChannelStateBridge::FromDirtyFlags(default_flags);
+    }
+
+    [[nodiscard]] const Tegra::Control::ChannelStateBridge& ChannelBridge() const noexcept {
+        return channel_bridge;
+    }
 
     void InvalidateState();
 
 private:
     Tegra::Engines::Maxwell3D::DirtyState::Flags* flags;
     Tegra::Engines::Maxwell3D::DirtyState::Flags default_flags{};
+    Tegra::Control::ChannelStateBridge channel_bridge;
 
     GLuint framebuffer = 0;
     GLuint index_buffer = 0;

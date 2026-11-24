@@ -66,17 +66,35 @@ void ShaderCache::SyncGuestHost() {
 
 void ShaderCache::RefreshDebugRejections(bool unrejected) {
     std::vector<std::pair<VAddr, VAddr>> ranges;
+    std::vector<u64> dropped_hashes;
     {
         std::scoped_lock lock{lookup_mutex};
         for (const auto& [addr, entry] : lookup_cache) {
             const ShaderInfo* const info = entry->data;
-            if (info->lowered_native &&
-                (VideoCore::Nx2Debug::IsRejected(info->unique_hash) ||
-                 VideoCore::Nx2Debug::IsRejected(info->lowered_native->native_program_key))) {
+            if (!info->lowered_native) {
+                continue;
+            }
+            const auto& native = *info->lowered_native;
+            const u64 lowered_hash =
+                native.HasLoweredCode() ? NativeShaderHash(native.LoweredWords()) : 0;
+            if (native.HasFailedLowering() || VideoCore::Nx2Debug::IsRejected(info->unique_hash) ||
+                VideoCore::Nx2Debug::IsRejected(native.native_program_key) ||
+                VideoCore::Nx2Debug::IsRejected(native.native_hash) ||
+                (lowered_hash != 0 && VideoCore::Nx2Debug::IsRejected(lowered_hash))) {
                 ranges.emplace_back(entry->addr_start, entry->addr_end);
+                for (const u64 h :
+                     {info->unique_hash, native.native_program_key, native.native_hash,
+                      lowered_hash}) {
+                    if (h != 0) {
+                        dropped_hashes.push_back(h);
+                    }
+                }
             }
         }
     }
+    std::ranges::sort(dropped_hashes);
+    dropped_hashes.erase(std::unique(dropped_hashes.begin(), dropped_hashes.end()),
+                         dropped_hashes.end());
     {
         std::scoped_lock lock{invalidation_mutex};
         for (const auto& [start, end] : ranges) {
@@ -88,12 +106,109 @@ void ShaderCache::RefreshDebugRejections(bool unrejected) {
         std::scoped_lock lock{rejected_mutex};
         rejected_native.clear();
     }
+    shader_infos.fill(nullptr);
+    last_shaders_valid = false;
+    for (auto& slot : resolved_shader_cache) {
+        slot.info = nullptr;
+    }
     // shader_infos may point at removed programs: every channel must refresh its stages.
     for (const size_t id : active_channel_ids) {
-        channel_storage[id].maxwell3d.dirty.flags[VideoCommon::Dirty::Shaders] = true;
+        if (id < channel_storage.size() && channel_storage[id].has_value()) {
+            channel_storage[id]->maxwell3d.dirty.flags[VideoCommon::Dirty::Shaders] = true;
+        }
     }
+    OnDebugRejectionsRefreshed(unrejected, dropped_hashes);
     LOG_INFO(HW_GPU, "Debug server rejections applied: {} cached programs dropped{}", ranges.size(),
              unrejected ? ", earlier rejections forgotten" : "");
+}
+
+bool ShaderCache::EvictFailedLazyShader(const ShaderInfo* target) {
+    if (!target || !target->lowered_native || !target->lowered_native->HasFailedLowering()) {
+        return false;
+    }
+    bool cleared_refs = false;
+    for (const ShaderInfo*& bound : shader_infos) {
+        if (bound == target) {
+            bound = nullptr;
+            last_shaders_valid = false;
+            cleared_refs = true;
+        }
+    }
+    for (auto& slot : resolved_shader_cache) {
+        if (slot.info == target) {
+            slot.info = nullptr;
+            cleared_refs = true;
+        }
+    }
+    std::vector<std::pair<VAddr, VAddr>> ranges;
+    {
+        std::scoped_lock lock{lookup_mutex};
+        for (const auto& [addr, entry] : lookup_cache) {
+            if (entry->data == target) {
+                ranges.emplace_back(entry->addr_start, entry->addr_end);
+            }
+        }
+    }
+    if (!ranges.empty()) {
+        std::scoped_lock lock{invalidation_mutex};
+        for (const auto& [start, end] : ranges) {
+            InvalidatePagesInRegion(start, end - start);
+        }
+        RemovePendingShaders();
+    }
+    if (cleared_refs || !ranges.empty()) {
+        for (const size_t id : active_channel_ids) {
+            if (id < channel_storage.size() && channel_storage[id].has_value()) {
+                channel_storage[id]->maxwell3d.dirty.flags[VideoCommon::Dirty::Shaders] = true;
+            }
+        }
+    }
+    return !ranges.empty();
+}
+
+size_t ShaderCache::EvictFailedLazyShaders() {
+    std::vector<std::pair<VAddr, VAddr>> ranges;
+    std::vector<const ShaderInfo*> failed_infos;
+    {
+        std::scoped_lock lock{lookup_mutex};
+        for (const auto& [addr, entry] : lookup_cache) {
+            const ShaderInfo* const info = entry->data;
+            if (info->lowered_native && info->lowered_native->HasFailedLowering()) {
+                ranges.emplace_back(entry->addr_start, entry->addr_end);
+                failed_infos.push_back(info);
+            }
+        }
+    }
+    bool cleared_refs = false;
+    for (const ShaderInfo*& bound : shader_infos) {
+        if (bound && bound->lowered_native && bound->lowered_native->HasFailedLowering()) {
+            bound = nullptr;
+            last_shaders_valid = false;
+            cleared_refs = true;
+        }
+    }
+    for (auto& slot : resolved_shader_cache) {
+        if (slot.info && slot.info->lowered_native &&
+            slot.info->lowered_native->HasFailedLowering()) {
+            slot.info = nullptr;
+            cleared_refs = true;
+        }
+    }
+    if (!ranges.empty()) {
+        std::scoped_lock lock{invalidation_mutex};
+        for (const auto& [start, end] : ranges) {
+            InvalidatePagesInRegion(start, end - start);
+        }
+        RemovePendingShaders();
+    }
+    if (cleared_refs || !ranges.empty()) {
+        for (const size_t id : active_channel_ids) {
+            if (id < channel_storage.size() && channel_storage[id].has_value()) {
+                channel_storage[id]->maxwell3d.dirty.flags[VideoCommon::Dirty::Shaders] = true;
+            }
+        }
+    }
+    return ranges.size();
 }
 
 std::array<u64, 6> ShaderCache::GraphicsNativeKeys(
@@ -190,13 +305,14 @@ bool ShaderCache::RefreshStages(std::array<u64, 6>& unique_hashes) try {
         }
         if (!shader_info) {
             const u32 start_address{native ? 0 : shader_config.offset};
+            const u64 resolved_inv_serial = invalidation_serial.load(std::memory_order_acquire);
             try {
-                // Native programs are lowered while the environment is built (once: the
-                // ShaderInfo keeps the result for the pipeline's environments).
+                // Native programs capture SM86 instructions once while the environment is built;
+                // ShaderInfo retains that snapshot and lazily runs LowerToMaxwell only on fallback.
                 RethrowIfRejected(*cpu_shader_addr);
                 GraphicsEnvironment env{*maxwell3d, *gpu_memory, program, native ? shader_addr : base_addr, start_address};
                 shader_info = MakeShaderInfo(env, *cpu_shader_addr);
-                CacheResolved(shader_addr, memory_id, map_serial, inv_serial, shader_info);
+                CacheResolved(shader_addr, memory_id, map_serial, resolved_inv_serial, shader_info);
             } catch (const Shader::Exception&) {
                 RememberRejection(*cpu_shader_addr);
                 // Once per program: which stage slot it is bound to, its header and the slot's
@@ -281,10 +397,11 @@ const ShaderInfo* ShaderCache::ComputeShader() {
         return nullptr;
     }
     RethrowIfRejected(*cpu_shader_addr);
+    const u64 resolved_inv_serial = invalidation_serial.load(std::memory_order_acquire);
     try {
         ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base, qmd.program_start};
         const ShaderInfo* const shader = MakeShaderInfo(env, *cpu_shader_addr);
-        CacheResolved(shader_addr, memory_id, map_serial, inv_serial, shader);
+        CacheResolved(shader_addr, memory_id, map_serial, resolved_inv_serial, shader);
         return shader;
     } catch (const Shader::Exception&) {
         RememberRejection(*cpu_shader_addr);
@@ -357,7 +474,16 @@ const ShaderInfo* ShaderCache::TryGetResolved(GPUVAddr shader_addr, size_t memor
     if (entry.shader_addr == shader_addr && entry.memory_id == memory_id &&
         entry.map_serial == map_serial && entry.invalidation_serial == inv_serial &&
         entry.info != nullptr) {
-        return entry.info;
+        if (!entry.info->lowered_native || !entry.info->lowered_native->HasFailedLowering()) {
+            return entry.info;
+        }
+        const ShaderInfo* const failed_info = entry.info;
+        entry.info = nullptr;
+        EvictFailedLazyShader(failed_info);
+    }
+    if (!gpu_memory) {
+        out_cpu_addr.reset();
+        return nullptr;
     }
     out_cpu_addr = gpu_memory->GpuToCpuAddress(shader_addr);
     if (!out_cpu_addr) {
@@ -365,6 +491,11 @@ const ShaderInfo* ShaderCache::TryGetResolved(GPUVAddr shader_addr, size_t memor
     }
     const ShaderInfo* const info = TryGet(*out_cpu_addr);
     if (info != nullptr) {
+        if (info->lowered_native && info->lowered_native->HasFailedLowering()) {
+            entry.info = nullptr;
+            EvictFailedLazyShader(info);
+            return nullptr;
+        }
         entry.shader_addr = shader_addr;
         entry.memory_id = memory_id;
         entry.map_serial = map_serial;

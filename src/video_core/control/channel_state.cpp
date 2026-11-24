@@ -8,6 +8,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "common/assert.h"
+#include "core/core.h"
+#include "core/platform_profile.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dma_pusher.h"
 #include "video_core/engines/fermi_2d.h"
@@ -16,6 +18,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/engines/puller.h"
+#include "video_core/gpu.h"
 #include "video_core/macro.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -29,17 +32,6 @@ constexpr u32 NvkComputeSubchannel = 1;
 constexpr u32 NvkM2mfSubchannel = 2;
 constexpr u32 Nvk2DSubchannel = 3;
 constexpr u32 NvkCopySubchannel = 4;
-
-// Switch 2 channels of a process share one TSG, whose graphics context holds the macro RAM.
-std::shared_ptr<NativeMacroContext> Nx2MacroContext() {
-    static const auto context = [] {
-        auto created = std::make_shared<NativeMacroContext>();
-        created->engine.native_turing = true;
-        created->compute_engine.native_turing = true;
-        return created;
-    }();
-    return context;
-}
 
 void BindNvkDefaultSubchannels(ChannelState::Payload& payload) {
     auto& dma_pusher = payload.dma_pusher;
@@ -71,21 +63,36 @@ ChannelState::ChannelState(s32 bind_id_)
     : bind_id{bind_id_}
 {}
 
-void ChannelState::Init(Core::System& system, u64 program_id_) {
+void ChannelState::Init(Core::System& system, u64 program_id_,
+                        std::shared_ptr<NativeMacroContext> native_macro_context,
+                        std::shared_ptr<NativeQmdStateTable> native_qmd_table) {
     ASSERT(memory_manager);
     program_id = program_id_;
     payload.emplace(system, *memory_manager, *this);
     BindNvkDefaultSubchannels(*payload);
-    if (g_nx2_ampere) {
+    const bool use_ampere = native_macro_context != nullptr ||
+                            g_nx2_ampere.load(std::memory_order_relaxed) ||
+                            system.Platform().IsSwitch2();
+    if (use_ampere) {
         // Switch 2 command streams use Ampere classes with Turing+ (MME64) macros, and its
         // block-linear surfaces the console's GOB swizzle.
+        const bool had_explicit_macro_ctx = native_macro_context != nullptr;
+        if (!native_macro_context) {
+            native_macro_context = system.GPU().GetOrCreateNativeMacroContext();
+        }
+        if (!native_qmd_table && !had_explicit_macro_ctx) {
+            native_qmd_table = system.GPU().GetOrCreateNativeQmdTable();
+        }
         memory_manager->EnableNativeTiling();
-        const auto macros = Nx2MacroContext();
-        payload->maxwell_3d.SetNativeMacroContext(macros);
+        payload->maxwell_3d.SetNativeMacroContext(native_macro_context);
         payload->maxwell_3d.SetNativeTuringMacroMode(true);
-        payload->kepler_compute.SetNativeMacroMode(&macros->engine, macros->positions,
-                                                   macros.get());
+        payload->kepler_compute.SetNativeMacroMode(&native_macro_context->engine,
+                                                   native_macro_context->positions,
+                                                   native_macro_context.get());
         payload->kepler_compute.SetNativeDataRam(&payload->maxwell_3d.GetNativeDataRam());
+        if (native_qmd_table) {
+            payload->kepler_compute.SetNativeQmdTable(std::move(native_qmd_table));
+        }
     }
     initialized = true;
 }

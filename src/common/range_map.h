@@ -30,7 +30,6 @@ public:
     ~RangeMap() = default;
 
     void Map(KeyTBase address, KeyTBase address_end, ValueT value) {
-        cached_begin = cached_end = 0;
         KeyT new_address = static_cast<KeyT>(address);
         KeyT new_address_end = static_cast<KeyT>(address_end);
         if (new_address < 0) {
@@ -39,6 +38,10 @@ public:
         if (new_address_end < 0) {
             new_address_end = 0;
         }
+        if (new_address >= new_address_end) {
+            return;
+        }
+        cached_begin = cached_end = 0;
         InternalMap(new_address, new_address_end, value);
     }
 

@@ -6,6 +6,9 @@
 
 #pragma once
 
+#include <algorithm>
+#include <string_view>
+
 #include "common/bit_field.h"
 #include "common/common_types.h"
 
@@ -24,8 +27,9 @@ static_assert(sizeof(MessageFlags) == 0x8, "MessageFlags has incorrect size");
 struct SourceName {
     char name[0x16];
 
-    const char* GetString() const {
-        return name;
+    std::string_view GetString() const {
+        const auto* end = std::find(name, name + sizeof(name), '\0');
+        return {name, static_cast<std::size_t>(end - name)};
     }
 };
 ;

@@ -7,6 +7,8 @@
 #include <memory>
 #include <type_traits>
 
+#include "common/assert.h"
+
 namespace Kernel {
 
 template <typename T>
@@ -20,7 +22,7 @@ template <typename T>
     requires KLockable<T>
 class KScopedLock {
 public:
-    explicit KScopedLock(T* l) : m_lock(*l) {}
+    explicit KScopedLock(T* l) : KScopedLock(DerefLock(l)) {}
     explicit KScopedLock(T& l) : m_lock(l) {
         m_lock.Lock();
     }
@@ -36,6 +38,11 @@ public:
     KScopedLock& operator=(KScopedLock&&) = delete;
 
 private:
+    static T& DerefLock(T* ptr) {
+        ASSERT(ptr != nullptr);
+        return *ptr;
+    }
+
     T& m_lock;
 };
 

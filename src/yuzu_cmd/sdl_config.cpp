@@ -56,9 +56,14 @@ SdlConfig::SdlConfig(const std::optional<std::string> config_path) {
 }
 
 SdlConfig::~SdlConfig() {
-    if (global) {
+    if (global && save_on_destroy) {
         SdlConfig::SaveAllValues();
     }
+}
+
+bool SdlConfig::ReadToolValues(const std::string& path) {
+    SdlConfig config;
+    return config.InitializeReadOnly(path);
 }
 
 void SdlConfig::ReloadAllValues() {

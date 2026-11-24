@@ -6,7 +6,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 
 #include "common/alignment.h"
 #include "common/common_types.h"
@@ -156,16 +160,26 @@ public:
 
     // Random generation.
     void GenerateRandomBytes(void* dst, std::size_t size) {
+        if (dst == nullptr || size == 0) {
+            return;
+        }
+
         const uintptr_t start = reinterpret_cast<uintptr_t>(dst);
         const uintptr_t end = start + size;
         const uintptr_t aligned_start = Common::AlignUp(start, 4);
-        const uintptr_t aligned_end = Common::AlignDown(end, 4);
 
         // Make sure we're aligned.
         if (start < aligned_start) {
+            const std::size_t head_size =
+                (std::min)(static_cast<std::size_t>(aligned_start - start), size);
             const u32 rnd = this->GenerateRandomU32();
-            std::memcpy(dst, &rnd, aligned_start - start);
+            std::memcpy(dst, &rnd, head_size);
+            if (head_size == size) {
+                return;
+            }
         }
+
+        const uintptr_t aligned_end = Common::AlignDown(end, 4);
 
         // Write as many aligned u32s as we can.
         {

@@ -283,7 +283,8 @@ void WindowSystem::OnHomeButtonPressed(ButtonPressDuration type) {
 
 void WindowSystem::PruneTerminatedAppletsLocked() {
     for (auto it = m_applets.begin(); it != m_applets.end(); /* ... */) {
-        const auto& [aruid, applet] = *it;
+        const u64 aruid = it->first;
+        std::shared_ptr<Applet> applet = it->second;
 
         std::scoped_lock lk{applet->lock};
 

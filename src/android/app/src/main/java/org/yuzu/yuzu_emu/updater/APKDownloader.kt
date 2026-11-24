@@ -25,35 +25,44 @@ class APKDownloader(private val url: String, private val outputFile: File) {
             }
 
             override fun onResponse(call: Call, response: Response) {
-                if (response.isSuccessful) {
-                    response.body?.let { body ->
-                        val contentLength = body.contentLength()
-                        try {
-                            val inputStream = body.byteStream()
-                            val outputStream = FileOutputStream(outputFile)
-                            val buffer = ByteArray(4096)
-                            var bytesRead: Int
-                            var totalBytesRead: Long = 0
+                response.use { resp ->
+                    if (!resp.isSuccessful) {
+                        onComplete(false)
+                        return
+                    }
 
-                            while (inputStream.read(buffer).also { bytesRead = it } != -1) {
-                                outputStream.write(buffer, 0, bytesRead)
-                                totalBytesRead += bytesRead
-                                val progress = (totalBytesRead * 100 / contentLength).toInt()
-                                onProgress(progress)
+                    val body = resp.body
+                    if (body == null) {
+                        onComplete(false)
+                        return
+                    }
+
+                    val contentLength = body.contentLength()
+                    try {
+                        body.byteStream().use { inputStream ->
+                            FileOutputStream(outputFile).use { outputStream ->
+                                val buffer = ByteArray(4096)
+                                var bytesRead: Int
+                                var totalBytesRead: Long = 0
+
+                                while (inputStream.read(buffer).also { bytesRead = it } != -1) {
+                                    outputStream.write(buffer, 0, bytesRead)
+                                    totalBytesRead += bytesRead
+                                    if (contentLength > 0) {
+                                        val progress =
+                                            ((totalBytesRead * 100) / contentLength).toInt()
+                                                .coerceIn(0, 100)
+                                        onProgress(progress)
+                                    }
+                                }
+                                outputStream.flush()
                             }
-                            outputStream.flush()
-                            outputStream.close()
-                            inputStream.close()
-                            onComplete(true)
-                        } catch (e: IOException) {
-                            e.printStackTrace()
-                            onComplete(false)
                         }
-                    } ?: run {
+                        onComplete(true)
+                    } catch (e: IOException) {
+                        e.printStackTrace()
                         onComplete(false)
                     }
-                } else {
-                    onComplete(false)
                 }
             }
         })

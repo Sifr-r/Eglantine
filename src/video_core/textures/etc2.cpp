@@ -8,13 +8,19 @@
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <span>
+#include <vector>
 
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "common/logging.h"
 #include "video_core/textures/etc2.h"
+
+#ifdef EGLANTINE_ENABLE_ISPC
+#include "simd_kernels/tex_etc2_ispc.h"
+#endif
 
 namespace Tegra::Texture::ETC2 {
 namespace {
@@ -430,7 +436,64 @@ void DecodeBlock(Format format, std::span<const u8> block,
     }
 }
 
+#ifdef EGLANTINE_ENABLE_ISPC
+bool IspcEnvEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_ISPC");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+bool IspcVerifyEnabled() noexcept {
+    static const bool verify = [] {
+        const char* value = std::getenv("EDEN_NX2_ISPC_VERIFY");
+        return value != nullptr && value[0] == '1';
+    }();
+    return verify;
+}
+#endif
+
+void DecompressScalar(std::span<const u8> data, Format format, u32 width, u32 height, u32 depth,
+                      u32 stride, u32 block_bytes, u32 columns, u32 rows, std::span<u8> output) {
+    size_t input_offset = 0;
+    std::array<u8, BLOCK_PIXELS * 4> texels;
+    for (u32 z = 0; z < depth; ++z) {
+        const size_t slice_offset = static_cast<size_t>(z) * width * height * stride;
+        for (u32 by = 0; by < rows; ++by) {
+            const u32 y0 = by * BLOCK_HEIGHT;
+            const u32 block_height = (std::min)(BLOCK_HEIGHT, height - y0);
+            for (u32 bx = 0; bx < columns; ++bx) {
+                const u32 x0 = bx * BLOCK_WIDTH;
+                const u32 block_width = (std::min)(BLOCK_WIDTH, width - x0);
+
+                DecodeBlock(format, data.subspan(input_offset, block_bytes), texels);
+                input_offset += block_bytes;
+
+                // Only the texels inside the image are written, the padding of the last block
+                // row and column is dropped.
+                for (u32 y = 0; y < block_height; ++y) {
+                    for (u32 x = 0; x < block_width; ++x) {
+                        const size_t destination =
+                            slice_offset + (static_cast<size_t>(y0 + y) * width + x0 + x) * stride;
+                        std::memcpy(output.data() + destination,
+                                    &texels[(y * BLOCK_WIDTH + x) * stride], stride);
+                    }
+                }
+            }
+        }
+    }
+}
+
 } // Anonymous namespace
+
+bool IsIspcEnabled() noexcept {
+#ifdef EGLANTINE_ENABLE_ISPC
+    return IspcEnvEnabled();
+#else
+    return false;
+#endif
+}
 
 u32 BytesPerTexel(Format format) {
     switch (format) {
@@ -470,33 +533,33 @@ void Decompress(std::span<const u8> data, Format format, u32 width, u32 height, 
         return;
     }
 
-    size_t input_offset = 0;
-    std::array<u8, BLOCK_PIXELS * 4> texels;
-    for (u32 z = 0; z < depth; ++z) {
-        const size_t slice_offset = static_cast<size_t>(z) * width * height * stride;
-        for (u32 by = 0; by < rows; ++by) {
-            const u32 y0 = by * BLOCK_HEIGHT;
-            const u32 block_height = (std::min)(BLOCK_HEIGHT, height - y0);
-            for (u32 bx = 0; bx < columns; ++bx) {
-                const u32 x0 = bx * BLOCK_WIDTH;
-                const u32 block_width = (std::min)(BLOCK_WIDTH, width - x0);
-
-                DecodeBlock(format, data.subspan(input_offset, block_bytes), texels);
-                input_offset += block_bytes;
-
-                // Only the texels inside the image are written, the padding of the last block
-                // row and column is dropped.
-                for (u32 y = 0; y < block_height; ++y) {
-                    for (u32 x = 0; x < block_width; ++x) {
-                        const size_t destination =
-                            slice_offset + (static_cast<size_t>(y0 + y) * width + x0 + x) * stride;
-                        std::memcpy(output.data() + destination,
-                                    &texels[(y * BLOCK_WIDTH + x) * stride], stride);
-                    }
-                }
-            }
-        }
+    if (required_input == 0 || required_output == 0) {
+        return;
     }
+
+#ifdef EGLANTINE_ENABLE_ISPC
+    if (IspcEnvEnabled()) {
+        if (IspcVerifyEnabled()) {
+            std::vector<u8> scalar_out(required_output);
+            DecompressScalar(data, format, width, height, depth, stride, block_bytes, columns, rows,
+                             scalar_out);
+            ispc::etc2_decompress(data.data(), static_cast<s32>(format), width, height, depth,
+                                  output.data());
+            if (std::memcmp(output.data(), scalar_out.data(), required_output) != 0) {
+                LOG_ERROR(HW_GPU, "EDEN_NX2_ISPC_VERIFY: ETC2 mismatch (format={}, {}x{}x{})",
+                          static_cast<u32>(format), width, height, depth);
+                std::memcpy(output.data(), scalar_out.data(), required_output);
+            }
+            return;
+        }
+        ispc::etc2_decompress(data.data(), static_cast<s32>(format), width, height, depth,
+                              output.data());
+        return;
+    }
+#endif
+
+    DecompressScalar(data, format, width, height, depth, stride, block_bytes, columns, rows,
+                     output);
 }
 
 } // namespace Tegra::Texture::ETC2

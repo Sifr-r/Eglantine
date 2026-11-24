@@ -22,15 +22,19 @@ u64 EstimateRDTSCFrequency() {
     FencedRDTSC();
 
     // Get the current time.
-    const auto start_time = RealTimeClock::Now();
+    const auto start_time = SteadyClock::Now();
     const u64 tsc_start = FencedRDTSC();
     // Wait for 100 milliseconds.
     std::this_thread::sleep_for(std::chrono::milliseconds{100});
-    const auto end_time = RealTimeClock::Now();
+    const auto end_time = SteadyClock::Now();
     const u64 tsc_end = FencedRDTSC();
     // Calculate differences.
-    const u64 timer_diff = static_cast<u64>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count());
+    const s64 elapsed_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+    if (elapsed_ns <= 0 || tsc_end <= tsc_start) {
+        return 0;
+    }
+    const u64 timer_diff = static_cast<u64>(elapsed_ns);
     const u64 tsc_diff = tsc_end - tsc_start;
     const u64 tsc_freq = MultiplyAndDivide64(tsc_diff, 1000000000ULL, timer_diff);
     return RoundToNearest<100'000>(tsc_freq);

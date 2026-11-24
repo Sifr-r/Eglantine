@@ -53,6 +53,8 @@ public:
     ResultStatus ReadTitle(std::string& title) override;
     ResultStatus ReadControlData(FileSys::NACP& control) override;
     ResultStatus ReadNSOModules(Modules& modules) override;
+    ResultStatus ReadProgramMetadata(Core::System& system,
+                                     FileSys::ProgramMetadata& out_metadata) override;
 
 private:
     std::unique_ptr<FileSys::NupContainer> nup;

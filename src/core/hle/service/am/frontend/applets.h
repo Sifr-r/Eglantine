@@ -74,7 +74,7 @@ protected:
     std::shared_ptr<IStorage> PopInteractiveInData();
     void PushOutData(std::shared_ptr<IStorage> storage);
     void PushInteractiveOutData(std::shared_ptr<IStorage> storage);
-    void Exit();
+    void Exit(Result result = ResultSuccess);
 
 protected:
     Core::System& system;

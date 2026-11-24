@@ -10,6 +10,7 @@
 add_executable(tests
     core/nx2_frame_interval.cpp
     core/save_data_lifecycle.cpp
+    video_core/astc.cpp
     video_core/etc2.cpp
     video_core/upload_batch.cpp
     video_core/texture_swizzle.cpp
@@ -43,13 +44,16 @@ add_executable(tests
     common/ring_buffer.cpp
     common/scratch_buffer.cpp
     common/slot_vector.cpp
-    common/undefined_fix.cpp
     common/unique_function.cpp
     common/zstd_compression.cpp
+    core/cmif_out_buffer.cpp
+    core/content_provider_init.cpp
     core/core_timing.cpp
+    core/kernel_finish_termination.cpp
     core/key_code_map.cpp
     core/launch_params.cpp
     core/ldn.cpp
+    core/loader_file_formats.cpp
     core/memory_range.cpp
     core/internal_network/socket_proxy.cpp
     core/nup_writer.cpp
@@ -58,6 +62,9 @@ add_executable(tests
     core/nx2_gpu_memory_registry.cpp
     core/nx2_gsv_bounds.cpp
     core/nx2_guest_ranges.cpp
+    core/nx2_session_state.cpp
+    core/platform_profile.cpp
+    core/platform_sizing.cpp
     core/priority_queue.cpp
     core/process_load.cpp
     core/shutdown_ordering.cpp
@@ -74,6 +81,8 @@ add_executable(tests
     video_core/memory_manager_runs.cpp
     video_core/memory_manager_page_table.cpp
     video_core/nx2_concurrency.cpp
+    video_core/nx2_macro_context.cpp
+    video_core/buffer_download_policy.cpp
     video_core/nx2_sparse_residency.cpp
     video_core/spirv_storage_alignment.cpp
     video_core/pipeline_cache_dir.cpp
@@ -90,7 +99,11 @@ add_executable(tests
     video_core/draw_skip_policy.cpp
     video_core/virtual_range_cache.cpp
     video_core/query_copy.cpp
+    video_core/ampere_direct_spirv.cpp
+    video_core/ampere_lazy_lowering.cpp
+    video_core/channel_bridge_parity.cpp
     video_core/ampere_lowering.cpp
+    video_core/ampere_rust_parity.cpp
     video_core/spirv_software_matrix.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_i2f.cpp
@@ -116,6 +129,17 @@ add_executable(tests
     video_core/shader_attributes.cpp
     video_core/indirect_reset.cpp
     video_core/ocarina_upscale.cpp
+    video_core/pending_download.cpp
+    video_core/shader_ir_edges.cpp
+    video_core/syncpoint_manager.cpp
+    video_core/texture_cache_lifetime.cpp
+    video_core/texture_clear_covers.cpp
+    video_core/vulkan_device_version.cpp
+    video_core/vulkan_static_cache.cpp
+    audio_core/sink_stream_silent.cpp
+    core/memory_span.cpp
+    frontend_common/config_persistence.cpp
+    frontend_common/play_time.cpp
     input_common/calibration_configuration_job.cpp
     network/packet_bounds.cpp
     network/room_information.cpp
@@ -132,16 +156,22 @@ create_target_directory_groups(tests)
 if (ENABLE_UPDATE_CHECKER)
     target_sources(tests PRIVATE
         common/update_checker.cpp
-        common/update_installer.cpp
-        ../frontend_common/update_checker.cpp
-        ../frontend_common/update_installer.cpp)
+        common/update_installer.cpp)
 endif()
 
-target_link_libraries(tests PRIVATE common core input_common video_core)
+target_link_libraries(tests PRIVATE audio_core common core frontend_common input_common video_core)
+if (TARGET eglantine_rs)
+    target_link_libraries(tests PRIVATE eglantine_rs)
+endif()
 
 if (ENABLE_MCP_SERVER)
     target_sources(tests PRIVATE mcp/protocol.cpp)
     target_link_libraries(tests PRIVATE mcp)
+endif()
+if (ENABLE_QT)
+    target_sources(tests PRIVATE qt_common/qt_config_ban_list.cpp)
+    target_link_libraries(tests PRIVATE qt_common Qt6::Core SimpleIni::SimpleIni)
+    add_test(NAME qt_config_ban_list COMMAND tests "[qt_config]")
 endif()
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 

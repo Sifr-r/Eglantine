@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 #include "core/file_sys/vfs/vfs_offset.h"
@@ -23,6 +24,10 @@ std::size_t OffsetVfsFile::GetSize() const {
 }
 
 bool OffsetVfsFile::Resize(std::size_t new_size) {
+    if (new_size > (std::numeric_limits<std::size_t>::max)() - offset) {
+        return false;
+    }
+
     if (offset + new_size < file->GetSize()) {
         size = new_size;
     } else {
@@ -48,15 +53,25 @@ bool OffsetVfsFile::IsReadable() const {
 }
 
 std::size_t OffsetVfsFile::Read(u8* data, std::size_t length, std::size_t r_offset) const {
-    return file->Read(data, TrimToFit(length, r_offset), offset + r_offset);
+    const auto trimmed = TrimToFit(length, r_offset);
+    if (trimmed == 0 || r_offset > (std::numeric_limits<std::size_t>::max)() - offset) {
+        return 0;
+    }
+
+    return file->Read(data, trimmed, offset + r_offset);
 }
 
 std::size_t OffsetVfsFile::Write(const u8* data, std::size_t length, std::size_t r_offset) {
-    return file->Write(data, TrimToFit(length, r_offset), offset + r_offset);
+    const auto trimmed = TrimToFit(length, r_offset);
+    if (trimmed == 0 || r_offset > (std::numeric_limits<std::size_t>::max)() - offset) {
+        return 0;
+    }
+
+    return file->Write(data, trimmed, offset + r_offset);
 }
 
 std::optional<u8> OffsetVfsFile::ReadByte(std::size_t r_offset) const {
-    if (r_offset >= size) {
+    if (r_offset >= size || r_offset > (std::numeric_limits<std::size_t>::max)() - offset) {
         return std::nullopt;
     }
 
@@ -64,7 +79,12 @@ std::optional<u8> OffsetVfsFile::ReadByte(std::size_t r_offset) const {
 }
 
 std::vector<u8> OffsetVfsFile::ReadBytes(std::size_t r_size, std::size_t r_offset) const {
-    return file->ReadBytes(TrimToFit(r_size, r_offset), offset + r_offset);
+    const auto trimmed = TrimToFit(r_size, r_offset);
+    if (trimmed == 0 || r_offset > (std::numeric_limits<std::size_t>::max)() - offset) {
+        return {};
+    }
+
+    return file->ReadBytes(trimmed, offset + r_offset);
 }
 
 std::vector<u8> OffsetVfsFile::ReadAllBytes() const {
@@ -72,14 +92,19 @@ std::vector<u8> OffsetVfsFile::ReadAllBytes() const {
 }
 
 bool OffsetVfsFile::WriteByte(u8 data, std::size_t r_offset) {
-    if (r_offset < size)
+    if (r_offset < size && r_offset <= (std::numeric_limits<std::size_t>::max)() - offset)
         return file->WriteByte(data, offset + r_offset);
 
     return false;
 }
 
 std::size_t OffsetVfsFile::WriteBytes(const std::vector<u8>& data, std::size_t r_offset) {
-    return file->Write(data.data(), TrimToFit(data.size(), r_offset), offset + r_offset);
+    const auto trimmed = TrimToFit(data.size(), r_offset);
+    if (trimmed == 0 || r_offset > (std::numeric_limits<std::size_t>::max)() - offset) {
+        return 0;
+    }
+
+    return file->Write(data.data(), trimmed, offset + r_offset);
 }
 
 bool OffsetVfsFile::Rename(std::string_view new_name) {
@@ -91,6 +116,9 @@ std::size_t OffsetVfsFile::GetOffset() const {
 }
 
 std::size_t OffsetVfsFile::TrimToFit(std::size_t r_size, std::size_t r_offset) const {
+    if (r_offset >= size) {
+        return 0;
+    }
     return std::clamp(r_size, std::size_t{0}, size - r_offset);
 }
 

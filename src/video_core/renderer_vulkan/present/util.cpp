@@ -49,13 +49,49 @@ vk::Image CreateWrappedImage(MemoryAllocator& allocator, VkExtent2D dimensions, 
 
 void TransitionImageLayout(vk::CommandBuffer& cmdbuf, VkImage image, VkImageLayout target_layout,
                            VkImageLayout source_layout) {
-    constexpr VkFlags flags{VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
+    const VkPipelineStageFlags src_stage = [source_layout] {
+        switch (source_layout) {
+        case VK_IMAGE_LAYOUT_UNDEFINED:
+            return VkPipelineStageFlags{VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT};
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            return VkPipelineStageFlags{VK_PIPELINE_STAGE_TRANSFER_BIT};
+        default:
+            return vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER;
+        }
+    }();
+    const VkAccessFlags src_access = [source_layout] {
+        switch (source_layout) {
+        case VK_IMAGE_LAYOUT_UNDEFINED:
+            return VkAccessFlags{0};
+        case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+            return VkAccessFlags{VK_ACCESS_TRANSFER_WRITE_BIT};
+        default:
+            return VkAccessFlags{VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                 VK_ACCESS_SHADER_READ_BIT |
+                                 VK_ACCESS_SHADER_WRITE_BIT |
+                                 VK_ACCESS_TRANSFER_READ_BIT |
+                                 VK_ACCESS_TRANSFER_WRITE_BIT};
+        }
+    }();
+    const VkPipelineStageFlags dst_stage =
+        target_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+            ? VkPipelineStageFlags{VK_PIPELINE_STAGE_TRANSFER_BIT}
+            : vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER;
+    const VkAccessFlags dst_access =
+        target_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+            ? VkAccessFlags{VK_ACCESS_TRANSFER_WRITE_BIT}
+            : VkAccessFlags{VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                            VK_ACCESS_SHADER_READ_BIT |
+                            VK_ACCESS_SHADER_WRITE_BIT |
+                            VK_ACCESS_TRANSFER_READ_BIT |
+                            VK_ACCESS_TRANSFER_WRITE_BIT};
     const VkImageMemoryBarrier barrier{
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         .pNext = nullptr,
-        .srcAccessMask = flags,
-        .dstAccessMask = flags,
+        .srcAccessMask = src_access,
+        .dstAccessMask = dst_access,
         .oldLayout = source_layout,
         .newLayout = target_layout,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -69,8 +105,7 @@ void TransitionImageLayout(vk::CommandBuffer& cmdbuf, VkImage image, VkImageLayo
             .layerCount = 1,
         },
     };
-    cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
-                           0, barrier);
+    cmdbuf.PipelineBarrier(src_stage, dst_stage, 0, barrier);
 }
 
 void UploadImage(const Device& device, MemoryAllocator& allocator, Scheduler& scheduler,

@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <cmath>
 #include <filesystem>
+#include <string_view>
 #include "data_manager.h"
 #include "common/assert.h"
 #include "common/fs/path_util.h"
@@ -54,12 +58,18 @@ u64 ClearDir(DataDir dir, const std::string &user_id)
 }
 
 std::string ReadableBytesSize(u64 size) noexcept {
-    std::array<std::string_view, 6> const units{"B", "KB", "MB", "GB", "TB", "PB"};
-    u64 const base = 1000;
+    static constexpr std::array<std::string_view, 7> units{"B", "KB", "MB", "GB", "TB", "PB", "EB"};
+    constexpr u64 base = 1000;
     if (size == 0)
         return "0 B";
-    auto const digit_groups = std::min<u64>(u64(std::log10(size) / std::log10(base)), u64(units.size()));
-    return fmt::format("{:.1f} {}", size / std::pow(base, digit_groups), units[digit_groups]);
+    const auto digit_groups = (std::min)(
+        static_cast<u64>(std::log10(static_cast<double>(size)) /
+                         std::log10(static_cast<double>(base))),
+        static_cast<u64>(units.size() - 1));
+    return fmt::format("{:.1f} {}",
+                       static_cast<double>(size) /
+                           std::pow(static_cast<double>(base), static_cast<double>(digit_groups)),
+                       units[digit_groups]);
 }
 
 u64 DataDirSize(DataDir dir)

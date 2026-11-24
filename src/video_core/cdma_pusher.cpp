@@ -96,7 +96,17 @@ CDmaPusher::CDmaPusher(Host1x::Host1x& host1x_, s32 id)
     });
 }
 
-CDmaPusher::~CDmaPusher() = default;
+CDmaPusher::~CDmaPusher() {
+    Stop();
+}
+
+void CDmaPusher::Stop() {
+    if (thread.joinable()) {
+        thread.request_stop();
+        command_cv.notify_all();
+        thread.join();
+    }
+}
 
 void CDmaPusher::ExecuteCommand(u32 method, u32 arg) {
     switch (current_class) {
@@ -105,6 +115,11 @@ void CDmaPusher::ExecuteCommand(u32 method, u32 arg) {
         host_processor.ProcessMethod(host1x, Host1x::Control::Method(method), arg);
         break;
     default:
+        if (method >= ThiRegisters::NUM_REGS) {
+            LOG_ERROR(Service_NVDRV, "Class {} method {:#x} out of range", u32(current_class),
+                      method);
+            return;
+        }
         thi_regs.reg_array[method] = arg;
         switch (static_cast<ThiMethod>(method)) {
         case ThiMethod::IncSyncpt: {

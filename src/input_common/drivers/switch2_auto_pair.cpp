@@ -349,6 +349,10 @@ std::string SlotIdentity(const Settings::PlayerInput& player, std::size_t slot,
         }
     }
 
+    if (!Switch2AutoPair::IsSwitch2Player(player)) {
+        return {};
+    }
+
     // Then the identity the slot had in an earlier pass.
     for (const auto& entry : device_players) {
         if (entry.second == slot) {

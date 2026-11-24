@@ -36,7 +36,7 @@ Tegra::BlendMode ConvertBlending(Service::Nvnflinger::LayerBlending blending) {
 } // namespace
 
 nvdisp_disp0::nvdisp_disp0(Core::System& system_, NvCore::Container& core)
-    : nvdevice{system_}, container{core}, nvmap{core.GetNvMapFile()} {}
+    : nvdevice{system_, Kind}, container{core}, nvmap{core.GetNvMapFile()} {}
 nvdisp_disp0::~nvdisp_disp0() = default;
 
 NvResult nvdisp_disp0::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> input,

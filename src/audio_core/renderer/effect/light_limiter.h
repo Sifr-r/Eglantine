@@ -4,6 +4,8 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <memory>
 #include <vector>
 
 #include "audio_core/common/common.h"
@@ -71,13 +73,27 @@ public:
                   "LightLimiterInfo::ParameterVersion2 has the wrong size!");
 
     struct State {
-        std::array<Common::FixedPoint<49, 15>, MaxChannels> samples_average;
-        std::array<Common::FixedPoint<49, 15>, MaxChannels> compression_gain;
-        std::array<s32, MaxChannels> look_ahead_sample_offsets;
-        std::array<std::vector<Common::FixedPoint<49, 15>>, MaxChannels> look_ahead_sample_buffers;
+        std::array<Common::FixedPoint<49, 15>, MaxChannels> samples_average{};
+        std::array<Common::FixedPoint<49, 15>, MaxChannels> compression_gain{};
+        std::array<s32, MaxChannels> look_ahead_sample_offsets{};
+        std::array<std::vector<Common::FixedPoint<49, 15>>, MaxChannels>
+            look_ahead_sample_buffers{};
     };
     static_assert(sizeof(State) <= sizeof(EffectInfoBase::State),
                   "LightLimiterInfo::State has the wrong size!");
+    static_assert(alignof(State) <= alignof(std::max_align_t),
+                  "LightLimiterInfo::State alignment exceeds EffectInfoBase::state!");
+
+    LightLimiterInfo() {
+        std::construct_at(reinterpret_cast<State*>(state.data()));
+    }
+
+    LightLimiterInfo(const LightLimiterInfo&) = delete;
+    LightLimiterInfo& operator=(const LightLimiterInfo&) = delete;
+
+    ~LightLimiterInfo() override {
+        std::destroy_at(reinterpret_cast<State*>(state.data()));
+    }
 
     struct StatisticsInternal {
         /* 0x00 */ std::array<f32, MaxChannels> channel_max_sample;

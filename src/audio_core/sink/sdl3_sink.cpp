@@ -4,7 +4,11 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <mutex>
 #include <span>
+#include <stop_token>
+#include <thread>
 #include <vector>
 
 #include <SDL3/SDL.h>
@@ -84,44 +88,34 @@ public:
      */
     SDLSinkStream(u32 device_channels_, u32 system_channels_, const std::string& output_device,
                   const std::string& input_device, StreamType type_, Core::System& system_)
-        : SinkStream{system_, type_} {
+        : SinkStream{system_, type_},
+          configured_device{type_ == StreamType::In ? input_device : output_device},
+          default_device{type_ == StreamType::In ? SDL_AUDIO_DEVICE_DEFAULT_RECORDING
+                                                 : SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK} {
         system_channels = system_channels_;
         device_channels = device_channels_;
-
-        SDL_AudioSpec spec{};
-        spec.freq = TargetSampleRate;
-        spec.channels = static_cast<u8>(device_channels);
-        spec.format = SDL_AUDIO_S16;
-
-        std::string device_name{output_device};
-        bool capture{false};
-        if (type == StreamType::In) {
-            device_name = input_device;
-            capture = true;
+        OpenBackend(DesiredDevice());
+        watching = SDL_AddEventWatch(&SDLSinkStream::OnDeviceEvent, this);
+        if (watching) {
+            recovery = std::jthread([this](std::stop_token stop) {
+                const std::stop_callback wake_on_stop{stop, [this] { RequestReopen(); }};
+                while (!stop.stop_requested()) {
+                    reopen.wait(false);
+                    if (stop.stop_requested()) {
+                        break;
+                    }
+                    reopen = false;
+                    std::scoped_lock lock{backend_mutex};
+                    if (!finalized) {
+                        const auto desired = DesiredDevice();
+                        if (force_reopen.exchange(false) || !stream ||
+                            desired != bound_device.load()) {
+                            OpenBackend(desired);
+                        }
+                    }
+                }
+            });
         }
-
-        const SDL_AudioDeviceID audio_device =
-            device_name.empty() ? (capture ? SDL_AUDIO_DEVICE_DEFAULT_RECORDING
-                                           : SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK)
-                                : FindAudioDeviceByName(device_name, capture);
-
-        stream = SDL_OpenAudioDeviceStream(audio_device, &spec, &SDLSinkStream::DataCallback,
-                                           this);
-
-        if (stream == nullptr) {
-            LOG_CRITICAL(Audio_Sink, "Error opening SDL audio device: {}", SDL_GetError());
-            return;
-        }
-
-        SDL_AudioSpec stream_in{};
-        SDL_AudioSpec stream_out{};
-        static_cast<void>(SDL_GetAudioStreamFormat(stream, &stream_in, &stream_out));
-
-        LOG_INFO(Service_Audio,
-                 "Opening SDL stream {} with: rate {} channels {} (system channels {}) "
-                 " format {}",
-                 static_cast<const void*>(stream), stream_out.freq, stream_out.channels,
-                 system_channels, static_cast<int>(stream_out.format));
     }
 
     /**
@@ -129,6 +123,11 @@ public:
      */
     ~SDLSinkStream() override {
         LOG_DEBUG(Service_Audio, "Destructing SDL stream {}", name);
+        if (watching) {
+            SDL_RemoveEventWatch(&SDLSinkStream::OnDeviceEvent, this);
+            recovery.request_stop();
+            recovery.join();
+        }
         Finalize();
     }
 
@@ -136,14 +135,11 @@ public:
      * Finalize the sink stream.
      */
     void Finalize() override {
-        if (stream == nullptr) {
-            return;
-        }
-
-        Stop();
-        SDL_ClearAudioStream(stream);
-        SDL_DestroyAudioStream(stream);
-        stream = nullptr;
+        std::scoped_lock lock{backend_mutex};
+        finalized = true;
+        SignalPause();
+        CloseBackend();
+        StopSilentDevice();
     }
 
     /**
@@ -153,26 +149,100 @@ public:
      *                 Default false.
      */
     void Start(bool resume = false) override {
-        if (stream == nullptr || !paused) {
+        std::scoped_lock lock{backend_mutex};
+        if (finalized || !paused) {
             return;
         }
-
         paused = false;
-        static_cast<void>(SDL_ResumeAudioStreamDevice(stream));
+        if (stream && !SDL_ResumeAudioStreamDevice(stream)) {
+            force_reopen = true;
+            RequestReopen();
+        }
     }
 
     /**
      * Stop the sink stream.
      */
     void Stop() override {
-        if (stream == nullptr || paused) {
+        std::scoped_lock lock{backend_mutex};
+        if (paused) {
             return;
         }
         SignalPause();
-        static_cast<void>(SDL_PauseAudioStreamDevice(stream));
+        if (stream) {
+            static_cast<void>(SDL_PauseAudioStreamDevice(stream));
+        }
     }
 
 private:
+    void RequestReopen() {
+        reopen = true;
+        reopen.notify_one();
+    }
+
+    static bool SDLCALL OnDeviceEvent(void* user, SDL_Event* event) {
+        if (event->type != SDL_EVENT_AUDIO_DEVICE_ADDED &&
+            event->type != SDL_EVENT_AUDIO_DEVICE_REMOVED) {
+            return true;
+        }
+        auto& self = *static_cast<SDLSinkStream*>(user);
+        if (event->adevice.recording != (self.type == StreamType::In)) {
+            return true;
+        }
+        const auto bound = self.bound_device.load();
+        if (event->type == SDL_EVENT_AUDIO_DEVICE_REMOVED) {
+            if (bound != self.default_device && bound == event->adevice.which) {
+                self.force_reopen = true;
+                self.RequestReopen();
+            }
+        } else if (bound == 0u ||
+                   (bound == self.default_device && !self.configured_device.empty())) {
+            self.RequestReopen();
+        }
+        return true;
+    }
+
+    void CloseBackend() {
+        if (stream) {
+            SDL_DestroyAudioStream(stream);
+            stream = nullptr;
+        }
+    }
+
+    SDL_AudioDeviceID DesiredDevice() const {
+        return configured_device.empty()
+                   ? default_device
+                   : FindAudioDeviceByName(configured_device, type == StreamType::In);
+    }
+
+    void OpenBackend(SDL_AudioDeviceID requested) {
+        CloseBackend();
+        StopSilentDevice();
+        const SDL_AudioSpec spec{SDL_AUDIO_S16, static_cast<int>(device_channels),
+                                 static_cast<int>(TargetSampleRate)};
+        for (const auto candidate : {requested, default_device}) {
+            bound_device = candidate;
+            stream = SDL_OpenAudioDeviceStream(candidate, &spec, &SDLSinkStream::DataCallback, this);
+            if (stream && (paused || SDL_ResumeAudioStreamDevice(stream))) {
+                SDL_AudioSpec stream_out{};
+                static_cast<void>(SDL_GetAudioStreamFormat(stream, nullptr, &stream_out));
+                LOG_INFO(Service_Audio,
+                         "Opening SDL stream {} with: rate {} channels {} (system channels {}) "
+                         " format {}",
+                         static_cast<const void*>(stream), stream_out.freq, stream_out.channels,
+                         system_channels, static_cast<int>(stream_out.format));
+                return;
+            }
+            CloseBackend();
+            if (candidate == default_device) {
+                break;
+            }
+        }
+        bound_device = 0;
+        LOG_WARNING(Audio_Sink, "Error opening SDL audio device: {}, playing silence instead",
+                    SDL_GetError());
+        StartSilentDevice();
+    }
     /**
      * Main callback from SDL. Either expects samples from us (audio render/audio out), or will
      * provide samples to be copied (audio in).
@@ -191,6 +261,10 @@ private:
 
         const std::size_t num_channels = impl->GetDeviceChannels();
         const std::size_t frame_size = num_channels;
+        if (frame_size == 0) {
+            return;
+        }
+        const std::size_t frame_size_bytes = frame_size * sizeof(s16);
 
         if (impl->type == StreamType::In) {
             const int bytes_available = SDL_GetAudioStreamAvailable(stream);
@@ -198,34 +272,54 @@ private:
                 return;
             }
 
-            std::vector<s16> input(bytes_available / static_cast<int>(sizeof(s16)));
-            const int bytes_read = SDL_GetAudioStreamData(stream, input.data(), bytes_available);
+            const std::size_t num_frames =
+                static_cast<std::size_t>(bytes_available) / frame_size_bytes;
+            if (num_frames == 0) {
+                return;
+            }
+            const int aligned_bytes = static_cast<int>(num_frames * frame_size_bytes);
+            std::vector<s16> input(num_frames * frame_size);
+            const int bytes_read = SDL_GetAudioStreamData(stream, input.data(), aligned_bytes);
             if (bytes_read <= 0) {
                 return;
             }
 
-            const std::size_t num_frames =
-                static_cast<std::size_t>(bytes_read) / sizeof(s16) / frame_size;
-            std::span<const s16> input_buffer{input.data(),
-                                              static_cast<std::size_t>(bytes_read) / sizeof(s16)};
-            impl->ProcessAudioIn(input_buffer, num_frames);
+            const std::size_t frames_read =
+                static_cast<std::size_t>(bytes_read) / frame_size_bytes;
+            if (frames_read == 0) {
+                return;
+            }
+            std::span<const s16> input_buffer{input.data(), frames_read * frame_size};
+            impl->ProcessAudioIn(input_buffer, frames_read);
         } else {
             if (additional_amount <= 0 && total_amount <= 0) {
                 return;
             }
 
             const int bytes_requested = additional_amount > 0 ? additional_amount : total_amount;
-            std::vector<s16> output(bytes_requested / static_cast<int>(sizeof(s16)));
             const std::size_t num_frames =
-                static_cast<std::size_t>(bytes_requested) / sizeof(s16) / frame_size;
+                static_cast<std::size_t>(bytes_requested) / frame_size_bytes;
+            if (num_frames == 0) {
+                return;
+            }
+            const int aligned_bytes = static_cast<int>(num_frames * frame_size_bytes);
+            std::vector<s16> output(num_frames * frame_size);
             std::span<s16> output_buffer{output.data(), output.size()};
             impl->ProcessAudioOutAndRender(output_buffer, num_frames);
-            static_cast<void>(SDL_PutAudioStreamData(stream, output.data(), bytes_requested));
+            static_cast<void>(SDL_PutAudioStreamData(stream, output.data(), aligned_bytes));
         }
     }
 
-    /// SDL stream attached to an opened input/output device
+    const std::string configured_device;
+    const SDL_AudioDeviceID default_device;
     SDL_AudioStream* stream{};
+    std::atomic<SDL_AudioDeviceID> bound_device{};
+    std::atomic<bool> reopen{};
+    std::atomic<bool> force_reopen{};
+    bool watching{};
+    bool finalized{};
+    std::mutex backend_mutex;
+    std::jthread recovery;
 };
 
 SDLSink::SDLSink(std::string_view target_device_name) {
@@ -243,6 +337,7 @@ SDLSink::~SDLSink() = default;
 
 SinkStream* SDLSink::AcquireSinkStream(Core::System& system, u32 system_channels_,
                                        const std::string&, StreamType type) {
+    std::scoped_lock lock{streams_mutex};
     system_channels = system_channels_;
     SinkStreamPtr& stream = sink_streams.emplace_back(std::make_unique<SDLSinkStream>(
         device_channels, system_channels, output_device, input_device, type, system));
@@ -251,6 +346,7 @@ SinkStream* SDLSink::AcquireSinkStream(Core::System& system, u32 system_channels
 }
 
 void SDLSink::CloseStream(SinkStream* stream) {
+    std::scoped_lock lock{streams_mutex};
     for (size_t i = 0; i < sink_streams.size(); i++) {
         if (sink_streams[i].get() == stream) {
             sink_streams[i].reset();
@@ -261,14 +357,17 @@ void SDLSink::CloseStream(SinkStream* stream) {
 }
 
 void SDLSink::CloseStreams() {
+    std::scoped_lock lock{streams_mutex};
     sink_streams.clear();
 }
 
 f32 SDLSink::GetDeviceVolume() const {
+    std::scoped_lock lock{streams_mutex};
     return device_volume;
 }
 
 void SDLSink::SetDeviceVolume(f32 volume) {
+    std::scoped_lock lock{streams_mutex};
     device_volume = volume;
     for (auto& stream : sink_streams) {
         stream->SetDeviceVolume(volume);
@@ -276,6 +375,7 @@ void SDLSink::SetDeviceVolume(f32 volume) {
 }
 
 void SDLSink::SetSystemVolume(f32 volume) {
+    std::scoped_lock lock{streams_mutex};
     for (auto& stream : sink_streams) {
         stream->SetSystemVolume(volume);
     }

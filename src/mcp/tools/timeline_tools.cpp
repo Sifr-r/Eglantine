@@ -300,14 +300,20 @@ ToolResult CompareRuns(ToolContext&, const json& args) {
 /// firmware_status: whether firmware is installed and, if its version can be read, the version
 /// and display strings.
 ToolResult FirmwareStatus(ToolContext& ctx, const json&) {
+    if (ctx.system == nullptr) {
+        return ToolResult::Error("no system is available");
+    }
     const bool present = FirmwareManager::CheckFirmwarePresence(*ctx.system);
     json out{{"installed", present}};
     if (present) {
         const auto [version, result] = FirmwareManager::GetFirmwareVersion(*ctx.system);
         if (result.IsSuccess()) {
+            const auto bounded_string = [](const auto& buf) {
+                return std::string(buf.begin(), std::find(buf.begin(), buf.end(), '\0'));
+            };
             out["version"] = fmt::format("{}.{}.{}", version.major, version.minor, version.micro);
-            out["display_version"] = std::string{version.display_version.data()};
-            out["display_title"] = std::string{version.display_title.data()};
+            out["display_version"] = bounded_string(version.display_version);
+            out["display_title"] = bounded_string(version.display_title);
         }
     }
     return ToolResult::Structured(std::move(out));

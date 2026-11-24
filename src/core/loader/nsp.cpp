@@ -37,6 +37,12 @@ AppLoader_NSP::AppLoader_NSP(FileSys::VirtualFile file_,
     if (nsp->IsExtractedType()) {
         secondary_loader = std::make_unique<AppLoader_DeconstructedRomDirectory>(nsp->GetExeFS(), false);
     } else {
+        const auto program_nca_file =
+            nsp->GetNCAFile(nsp->GetProgramTitleID(), FileSys::ContentRecordType::Program);
+        if (program_nca_file != nullptr) {
+            secondary_loader = std::make_unique<AppLoader_NCA>(program_nca_file);
+        }
+
         const auto control_nca =
             nsp->GetNCA(FileSys::GetBaseTitleID(nsp->GetProgramTitleID()), FileSys::ContentRecordType::Control);
         if (control_nca == nullptr || control_nca->GetStatus() != ResultStatus::Success) {
@@ -47,9 +53,6 @@ AppLoader_NSP::AppLoader_NSP(FileSys::VirtualFile file_,
             const FileSys::PatchManager pm{FileSys::GetBaseTitleID(nsp->GetProgramTitleID()), fsc, content_provider};
             return pm.ParseControlNCA(*control_nca);
         }();
-
-        secondary_loader = std::make_unique<AppLoader_NCA>(
-            nsp->GetNCAFile(nsp->GetProgramTitleID(), FileSys::ContentRecordType::Program));
     }
 }
 
@@ -130,6 +133,10 @@ AppLoader_NSP::LoadResult AppLoader_NSP::Load(Kernel::KProcess& process, Core::S
         return {ResultStatus::ErrorNSPMissingProgramNCA, {}};
     }
 
+    if (secondary_loader == nullptr) {
+        return {ResultStatus::ErrorNotInitialized, {}};
+    }
+
     const auto result = secondary_loader->Load(process, system);
     if (result.first != ResultStatus::Success) {
         return result;
@@ -189,6 +196,10 @@ ResultStatus AppLoader_NSP::VerifyIntegrity(std::function<bool(size_t, size_t)> 
 }
 
 ResultStatus AppLoader_NSP::ReadRomFS(FileSys::VirtualFile& out_file) {
+    if (secondary_loader == nullptr) {
+        return ResultStatus::ErrorNotInitialized;
+    }
+
     return secondary_loader->ReadRomFS(out_file);
 }
 
@@ -265,15 +276,57 @@ ResultStatus AppLoader_NSP::ReadManualRomFS(FileSys::VirtualFile& out_file) {
 }
 
 ResultStatus AppLoader_NSP::ReadBanner(std::vector<u8>& buffer) {
+    if (secondary_loader == nullptr) {
+        return ResultStatus::ErrorNotInitialized;
+    }
+
     return secondary_loader->ReadBanner(buffer);
 }
 
 ResultStatus AppLoader_NSP::ReadLogo(std::vector<u8>& buffer) {
+    if (secondary_loader == nullptr) {
+        return ResultStatus::ErrorNotInitialized;
+    }
+
     return secondary_loader->ReadLogo(buffer);
 }
 
 ResultStatus AppLoader_NSP::ReadNSOModules(Modules& modules) {
+    if (secondary_loader == nullptr) {
+        return ResultStatus::ErrorNotInitialized;
+    }
+
     return secondary_loader->ReadNSOModules(modules);
+}
+
+ResultStatus AppLoader_NSP::ReadProgramMetadata(Core::System& system,
+                                                FileSys::ProgramMetadata& out_metadata) {
+    const auto title_id = nsp->GetProgramTitleID();
+    if (!nsp->IsExtractedType() && title_id == 0) {
+        return ResultStatus::ErrorNSPMissingProgramNCA;
+    }
+
+    const auto nsp_status = nsp->GetStatus();
+    if (nsp_status != ResultStatus::Success) {
+        return nsp_status;
+    }
+
+    const auto nsp_program_status = nsp->GetProgramStatus();
+    if (nsp_program_status != ResultStatus::Success) {
+        return nsp_program_status;
+    }
+
+    if (secondary_loader == nullptr) {
+        if (!nsp->IsExtractedType() &&
+            nsp->GetNCA(title_id, FileSys::ContentRecordType::Program) == nullptr) {
+            return Core::Crypto::KeyManager::KeyFileExists(false)
+                       ? ResultStatus::ErrorNSPMissingProgramNCA
+                       : ResultStatus::ErrorMissingProductionKeyFile;
+        }
+        return ResultStatus::ErrorNotInitialized;
+    }
+
+    return secondary_loader->ReadProgramMetadata(system, out_metadata);
 }
 
 } // namespace Loader

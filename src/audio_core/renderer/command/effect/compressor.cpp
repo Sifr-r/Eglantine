@@ -13,7 +13,7 @@ namespace AudioCore::Renderer {
 
 static void SetCompressorEffectParameter(const CompressorInfo::ParameterVersion2& params,
                                          CompressorInfo::State& state) {
-    const auto ratio{1.0f / params.compressor_ratio};
+    const auto ratio{params.compressor_ratio != 0.0f ? 1.0f / params.compressor_ratio : 0.0f};
     auto makeup_gain{0.0f};
     if (params.makeup_gain_enabled) {
         makeup_gain = (params.threshold * 0.5f) * (ratio - 1.0f) - 3.0f;
@@ -69,9 +69,10 @@ static void ApplyCompressorEffect(const CompressorInfo::ParameterVersion2& param
             }
 
             if (b >= state.unk_10) {
+                const auto inv_ratio{params.compressor_ratio != 0.0f ? 1.0f / params.compressor_ratio
+                                                                     : 0.0f};
                 const auto d{b >= state.unk_14
-                                 ? ((1.0f / params.compressor_ratio) - 1.0f) *
-                                       (b - params.threshold)
+                                 ? (inv_ratio - 1.0f) * (b - params.threshold)
                                  : (b - state.unk_10) * (b - state.unk_10) * -state.unk_0C};
                 const auto e{d / 20.0f * 3.3219f};
                 const auto f{(e - std::trunc(e)) * 0.69315f};
@@ -112,18 +113,32 @@ static void ApplyCompressorEffect(const CompressorInfo::ParameterVersion2& param
 
 void CompressorCommand::Dump([[maybe_unused]] const AudioRenderer::CommandListProcessor& processor,
                              std::string& string) {
+    const auto channel_count =
+        parameter.channel_count > 0
+            ? (std::min<s16>)(parameter.channel_count, static_cast<s16>(MaxChannels))
+            : s16{0};
     string += fmt::format("CompressorCommand\n\tenabled {} \n\tinputs: ", effect_enabled);
-    for (s16 i = 0; i < parameter.channel_count; i++) {
+    for (s16 i = 0; i < channel_count; i++) {
         string += fmt::format("{:02X}, ", inputs[i]);
     }
     string += "\n\toutputs: ";
-    for (s16 i = 0; i < parameter.channel_count; i++) {
+    for (s16 i = 0; i < channel_count; i++) {
         string += fmt::format("{:02X}, ", outputs[i]);
     }
     string += "\n";
 }
 
 void CompressorCommand::Process(const AudioRenderer::CommandListProcessor& processor) {
+    if (parameter.channel_count <= 0 ||
+        !IsChannelCountValid(static_cast<u16>(parameter.channel_count))) {
+        return;
+    }
+
+    auto state_{reinterpret_cast<CompressorInfo::State*>(state)};
+    if (state_ == nullptr) {
+        return;
+    }
+
     std::array<std::span<const s32>, MaxChannels> input_buffers{};
     std::array<std::span<s32>, MaxChannels> output_buffers{};
 
@@ -133,8 +148,6 @@ void CompressorCommand::Process(const AudioRenderer::CommandListProcessor& proce
         output_buffers[i] = processor.mix_buffers.subspan(outputs[i] * processor.sample_count,
                                                           processor.sample_count);
     }
-
-    auto state_{reinterpret_cast<CompressorInfo::State*>(state)};
 
     if (effect_enabled) {
         if (parameter.state == CompressorInfo::ParameterState::Updating) {

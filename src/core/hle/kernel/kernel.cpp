@@ -7,6 +7,7 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bitset>
@@ -60,9 +61,20 @@ struct ThreadLocalData {
     std::optional<KThread> raw_thread;
     KThread* current_thread = nullptr;
     KThread* thread = nullptr;
+    u64 kernel_instance_id = 0;
     u8 host_thread_id = UINT8_MAX;
     bool is_phantom_mode_for_singlecore = false;
     bool lock = false;
+
+    void Reset() {
+        current_thread = nullptr;
+        thread = nullptr;
+        raw_thread.reset();
+        kernel_instance_id = 0;
+        host_thread_id = UINT8_MAX;
+        is_phantom_mode_for_singlecore = false;
+        lock = false;
+    }
 };
 
 struct KernelCore::Impl {
@@ -85,14 +97,51 @@ struct KernelCore::Impl {
     static thread_local ThreadLocalData tls_data;
 
     explicit Impl(Core::System& system_, KernelCore& kernel_) : system{system_} {
-        tls_data.lock = true;
+        EnsureCurrentTls(tls_data);
+    }
+
+    ~Impl() {
+        ResetOwnedTls(tls_data);
+    }
+
+    void EnsureCurrentTls(ThreadLocalData& t) const {
+        const u64 current_id = instance_id.load(std::memory_order_acquire);
+        if (t.kernel_instance_id != current_id) {
+            t.Reset();
+            t.kernel_instance_id = current_id;
+            t.lock = true;
+        }
+    }
+
+    void ResetOwnedTls(ThreadLocalData& t) const {
+        if (t.kernel_instance_id == instance_id.load(std::memory_order_acquire)) {
+            t.Reset();
+        }
     }
 
     void SetMulticore(bool is_multi) {
         is_multicore = is_multi;
     }
 
+    void SetActiveCoreCount(u32 core_count) {
+        const u32 clamped = std::clamp<u32>(core_count, 1U, Core::Hardware::NUM_CPU_CORES);
+        const bool has_active_cores =
+            is_initialized.load(std::memory_order_acquire) ||
+            std::ranges::any_of(schedulers, [](const auto& s) { return s.has_value(); }) ||
+            std::ranges::any_of(cores, [](const auto& c) { return c.has_value(); });
+        if (has_active_cores) {
+            if (clamped != active_core_count) {
+                LOG_ERROR(Kernel,
+                          "Ignoring SetActiveCoreCount({}) after kernel initialization (active={})",
+                          clamped, active_core_count);
+            }
+            return;
+        }
+        active_core_count = clamped;
+    }
+
     void Initialize(KernelCore& kernel) {
+        is_shutting_down.store(false, std::memory_order_relaxed);
         hardware_timer.emplace(kernel);
         hardware_timer->Initialize();
 
@@ -120,7 +169,9 @@ struct KernelCore::Impl {
         }
 
         InitializeHackSharedMemory(kernel);
+        EnsureCurrentTls(tls_data);
         RegisterHostThread(nullptr);
+        is_initialized.store(true, std::memory_order_release);
     }
 
     void TerminateAllProcesses() {
@@ -140,6 +191,7 @@ struct KernelCore::Impl {
         };
 
         CloseServices();
+        DestroyServices();
 
         if (application_process) {
             // A process still referenced here is never finalized, so its memory stays mapped in
@@ -167,7 +219,7 @@ struct KernelCore::Impl {
         preemption_event = nullptr;
 
         // Cleanup persistent kernel objects
-        auto CleanupObject = [&kernel](KAutoObject* obj) {
+        auto CleanupObject = [&kernel](auto*& obj) {
             if (obj) {
                 obj->Close(kernel);
                 obj = nullptr;
@@ -186,6 +238,7 @@ struct KernelCore::Impl {
             }
 
             schedulers[core_id].reset();
+            cores[core_id].reset();
         }
 
         // Next host thead ID to use, IDs below NUM_CPU_CORES represent core threads, the rest others
@@ -227,16 +280,46 @@ struct KernelCore::Impl {
             hardware_timer->Finalize();
             hardware_timer.reset();
         }
+
+        ResetOwnedTls(tls_data);
+        instance_id.store(next_instance_id.fetch_add(1, std::memory_order_relaxed),
+                          std::memory_order_release);
+
+        is_initialized.store(false, std::memory_order_release);
     }
 
     void CloseServices() {
-        // Ensures all servers gracefully shutdown.
-        std::scoped_lock lk{server_lock};
-        server_managers.clear();
+        // Ensures all servers stop without holding server_lock while server threads may still be
+        // registering in RunServer, and without destroying ServerManagers while in-flight services
+        // may still hold references to them prior to core/thread shutdown.
+        std::vector<Service::ServerManager*> managers;
+        {
+            std::scoped_lock lk{server_lock};
+            is_shutting_down.store(true, std::memory_order_release);
+            managers.reserve(server_managers.size());
+            for (const auto& manager : server_managers) {
+                managers.push_back(manager.get());
+            }
+        }
+        for (auto* manager : managers) {
+            manager->RequestStop();
+        }
+        for (auto* manager : managers) {
+            manager->WaitStopped();
+        }
+    }
+
+    void DestroyServices() {
+        std::vector<std::unique_ptr<Service::ServerManager>> managers;
+        {
+            std::scoped_lock lk{server_lock};
+            managers.swap(server_managers);
+        }
+        managers.clear();
     }
 
     void InitializePhysicalCores() {
-        for (u32 i = 0; i < Core::Hardware::NUM_CPU_CORES; i++) {
+        for (u32 i = 0; i < active_core_count; i++) {
             auto const core = s32(i);
             schedulers[i].emplace(system.Kernel());
             cores[i].emplace(system.Kernel(), i);
@@ -362,7 +445,7 @@ struct KernelCore::Impl {
     }
 
     void InitializeShutdownThreads() {
-        for (u32 core_id = 0; core_id < Core::Hardware::NUM_CPU_CORES; core_id++) {
+        for (u32 core_id = 0; core_id < active_core_count; core_id++) {
             shutdown_threads[core_id] = KThread::Create(system.Kernel());
             ASSERT(KThread::InitializeHighPriorityThread(system, shutdown_threads[core_id], {}, {}, core_id)
                 .IsSuccess());
@@ -390,29 +473,34 @@ struct KernelCore::Impl {
 
     /// Sets the host thread ID for the caller.
     u32 SetHostThreadId(std::size_t core_id) {
+        EnsureCurrentTls(tls_data);
+
         // This should only be called during core init.
         ASSERT(tls_data.host_thread_id == UINT8_MAX);
 
-        // The first four slots are reserved for CPU core threads
-        ASSERT(core_id < Core::Hardware::NUM_CPU_CORES);
+        // The active core slots are reserved for CPU core threads
+        ASSERT(core_id < active_core_count);
         tls_data.host_thread_id = u8(core_id);
         return tls_data.host_thread_id;
     }
 
     /// Gets the host thread ID for the caller
     u32 GetHostThreadId() const {
+        EnsureCurrentTls(tls_data);
         return tls_data.host_thread_id;
     }
 
     // Gets the dummy KThread for the caller, allocating a new one if this is the first time
     KThread* GetHostDummyThread(ThreadLocalData& t, KThread* existing_thread) {
+        EnsureCurrentTls(t);
         if (t.thread == nullptr) {
-            auto const initialize = [this](KThread* thread) {
-                ASSERT(KThread::InitializeDummyThread(system, thread, nullptr).IsSuccess());
-                return thread;
-            };
-            t.raw_thread.emplace(system.Kernel());
-            t.thread = existing_thread ? existing_thread : initialize(&*t.raw_thread);
+            if (existing_thread != nullptr) {
+                t.thread = existing_thread;
+            } else {
+                t.raw_thread.emplace(system.Kernel());
+                ASSERT(KThread::InitializeDummyThread(system, &*t.raw_thread, nullptr).IsSuccess());
+                t.thread = &*t.raw_thread;
+            }
             ASSERT(t.thread != nullptr);
         }
         return t.thread;
@@ -420,7 +508,7 @@ struct KernelCore::Impl {
 
     /// Registers a CPU core thread by allocating a host thread ID for it
     void RegisterCoreThread(std::size_t core_id) {
-        ASSERT(core_id < Core::Hardware::NUM_CPU_CORES);
+        ASSERT(core_id < active_core_count);
         const auto this_id = SetHostThreadId(core_id);
         if (!is_multicore)
             single_core_thread_id = this_id;
@@ -440,10 +528,12 @@ struct KernelCore::Impl {
 
     // Forces singlecore
     bool IsPhantomModeForSingleCore() const {
+        EnsureCurrentTls(tls_data);
         return tls_data.is_phantom_mode_for_singlecore;
     }
     void SetIsPhantomModeForSingleCore(bool value) {
         ASSERT(!is_multicore);
+        EnsureCurrentTls(tls_data);
         tls_data.is_phantom_mode_for_singlecore = value;
     }
 
@@ -452,10 +542,12 @@ struct KernelCore::Impl {
     }
 
     KThread* GetCurrentEmuThread(ThreadLocalData& t) {
+        EnsureCurrentTls(t);
         return t.current_thread ? t.current_thread : (t.current_thread = GetHostDummyThread(t, nullptr));
     }
 
     void SetCurrentEmuThread(KThread* thread) {
+        EnsureCurrentTls(tls_data);
         tls_data.current_thread = thread;
     }
 
@@ -507,7 +599,7 @@ struct KernelCore::Impl {
         size_t misc_region_needed_size;
         {
             // Each core has a one page stack for all three stack types (Main, Idle, Exception).
-            misc_region_needed_size = Core::Hardware::NUM_CPU_CORES * (3 * (PageSize + PageSize));
+            misc_region_needed_size = active_core_count * (3 * (PageSize + PageSize));
 
             // Account for each auto-map device.
             for (const auto& region : memory_layout->GetPhysicalMemoryRegionTree()) {
@@ -859,13 +951,18 @@ struct KernelCore::Impl {
     std::array<KThread*, Core::Hardware::NUM_CPU_CORES> shutdown_threads{};
     std::array<std::optional<Kernel::KScheduler>, Core::Hardware::NUM_CPU_CORES> schedulers{};
 
+    u32 active_core_count{4};
     bool is_multicore{};
+    std::atomic_bool is_initialized{false};
     std::atomic_bool is_shutting_down{};
     u32 single_core_thread_id{};
 
     std::array<u64, Core::Hardware::NUM_CPU_CORES> svc_ticks{};
 
     KWorkerTaskManager worker_task_manager;
+
+    inline static std::atomic<u64> next_instance_id{1};
+    std::atomic<u64> instance_id{next_instance_id.fetch_add(1, std::memory_order_relaxed)};
 
     // System context
     Core::System& system;
@@ -880,6 +977,18 @@ void KernelCore::SetMulticore(bool is_multicore) {
     impl->SetMulticore(is_multicore);
 }
 
+void KernelCore::SetActiveCoreCount(u32 core_count) {
+    impl->SetActiveCoreCount(core_count);
+}
+
+u32 KernelCore::ActiveCoreCount() const {
+    return impl->active_core_count;
+}
+
+bool KernelCore::IsInitialized() const {
+    return impl->is_initialized.load(std::memory_order_acquire);
+}
+
 void KernelCore::Initialize() {
     slab_heap_container = std::make_unique<SlabHeapContainer>();
     impl->Initialize(*this);
@@ -891,6 +1000,10 @@ void KernelCore::Shutdown() {
 
 void KernelCore::CloseServices() {
     impl->CloseServices();
+}
+
+void KernelCore::DestroyServices() {
+    impl->DestroyServices();
 }
 
 const KResourceLimit* KernelCore::GetSystemResourceLimit() const {
@@ -952,25 +1065,29 @@ const Kernel::GlobalSchedulerContext& KernelCore::GlobalSchedulerContext() const
 }
 
 Kernel::KScheduler& KernelCore::Scheduler(std::size_t id) {
+    ASSERT(id < impl->active_core_count && impl->schedulers[id].has_value());
     return *impl->schedulers[id];
 }
 
 const Kernel::KScheduler& KernelCore::Scheduler(std::size_t id) const {
+    ASSERT(id < impl->active_core_count && impl->schedulers[id].has_value());
     return *impl->schedulers[id];
 }
 
 Kernel::PhysicalCore& KernelCore::PhysicalCore(std::size_t id) {
+    ASSERT(id < impl->active_core_count && impl->cores[id].has_value());
     return *impl->cores[id];
 }
 
 const Kernel::PhysicalCore& KernelCore::PhysicalCore(std::size_t id) const {
+    ASSERT(id < impl->active_core_count && impl->cores[id].has_value());
     return *impl->cores[id];
 }
 
 size_t KernelCore::CurrentPhysicalCoreIndex() const {
     const u32 core_id = impl->GetCurrentHostThreadID();
-    if (core_id >= Core::Hardware::NUM_CPU_CORES) {
-        return Core::Hardware::NUM_CPU_CORES - 1;
+    if (core_id >= impl->active_core_count) {
+        return impl->active_core_count - 1;
     }
     return core_id;
 }
@@ -984,7 +1101,7 @@ const Kernel::PhysicalCore& KernelCore::CurrentPhysicalCore() const {
 }
 
 Kernel::KScheduler* KernelCore::CurrentScheduler() {
-    if (auto const core_id = impl->GetCurrentHostThreadID(); core_id < Core::Hardware::NUM_CPU_CORES)
+    if (auto const core_id = impl->GetCurrentHostThreadID(); core_id < impl->active_core_count)
         return std::addressof(*impl->schedulers[core_id]);
     return {}; // This is expected when called from not a guest thread
 }
@@ -1035,8 +1152,11 @@ void KernelCore::RunServer(std::unique_ptr<Service::ServerManager>&& server_mana
     auto* manager = server_manager.get();
 
     {
-        std::scoped_lock lk{impl->server_lock};
+        std::unique_lock lk{impl->server_lock};
         if (impl->is_shutting_down) {
+            lk.unlock();
+            manager->CancelBeforeRun();
+            server_manager.reset();
             return;
         }
 
@@ -1267,10 +1387,15 @@ void KernelCore::SuspendEmulation(bool suspended) {
     const auto TryWait = [&]() {
         KScopedSchedulerLock sl{*this};
 
+        const auto active_cores = static_cast<s32>(impl->active_core_count);
         for (auto& process : processes) {
-            for (auto i = 0; i < static_cast<s32>(Core::Hardware::NUM_CPU_CORES); ++i) {
-                if (Scheduler(i).GetSchedulerCurrentThread()->GetOwnerProcess() ==
-                    process.GetPointerUnsafe()) {
+            for (s32 i = 0; i < active_cores; ++i) {
+                if (!impl->schedulers[i].has_value()) {
+                    continue;
+                }
+                const auto* current_thread = Scheduler(i).GetSchedulerCurrentThread();
+                if (current_thread != nullptr &&
+                    current_thread->GetOwnerProcess() == process.GetPointerUnsafe()) {
                     // A thread has not finished running yet.
                     // Continue waiting.
                     return false;
@@ -1289,8 +1414,11 @@ void KernelCore::SuspendEmulation(bool suspended) {
 void KernelCore::ShutdownCores() {
     impl->TerminateAllProcesses();
     KScopedSchedulerLock lk{*this};
-    for (auto* thread : impl->shutdown_threads)
-        void(thread->Run(*this));
+    for (u32 core_id = 0; core_id < impl->active_core_count; ++core_id) {
+        if (impl->shutdown_threads[core_id] != nullptr) {
+            void(impl->shutdown_threads[core_id]->Run(*this));
+        }
+    }
 }
 
 bool KernelCore::IsMulticore() const {

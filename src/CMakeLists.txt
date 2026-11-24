@@ -282,6 +282,11 @@ if(YUZU_STATIC_ROOM)
     return()
 endif()
 
+if(ENABLE_ISPC_KERNELS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/simd_kernels/CMakeLists.txt")
+    include(AddIspcKernel)
+    add_subdirectory(simd_kernels)
+endif()
+
 add_subdirectory(core)
 add_subdirectory(audio_core)
 add_subdirectory(video_core)

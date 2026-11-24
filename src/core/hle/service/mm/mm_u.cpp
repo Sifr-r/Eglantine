@@ -127,7 +127,7 @@ private:
 
         for (const auto& session : sessions) {
             if (session.module == module) {
-                IPC::ResponseBuilder rb{ctx, 2};
+                IPC::ResponseBuilder rb{ctx, 3};
                 rb.Push(ResultSuccess);
                 rb.Push(session.min);
                 return;

@@ -16,6 +16,7 @@
 #include "common/fs/path_util.h"
 #include "common/settings.h"
 #include "frontend_common/config.h"
+#include "frontend_common/sentry_crash_reporter.h"
 #include "startup_checks.h"
 #include "yuzu/nx2_switches.h"
 
@@ -38,6 +39,7 @@
 #endif
 
 #include "main_window.h"
+#include "qt_common/qt_common.h"
 #include "user_data_migration.h"
 
 #ifdef YUZU_CRASH_DUMPS
@@ -201,8 +203,12 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    Frontend::SentryCrashReporter crash_reporter;
+    crash_reporter.Start(Frontend::SentryFrontend::Qt);
 #ifdef YUZU_CRASH_DUMPS
-    Breakpad::InstallCrashHandler();
+    if (!crash_reporter.IsActive()) {
+        Breakpad::InstallCrashHandler();
+    }
 #endif
 
     // Init settings params
@@ -302,10 +308,15 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    MainWindow main_window{has_broken_vulkan};
-    // After settings have been loaded by GMainWindow, apply the filter
-    main_window.show();
+    int exit_code = 0;
+    {
+        MainWindow main_window{has_broken_vulkan};
+        // After settings have been loaded by GMainWindow, apply the filter
+        main_window.show();
 
-    app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window, &MainWindow::OnAppFocusStateChanged);
-    return app.exec();
+        app.connect(&app, &QGuiApplication::applicationStateChanged, &main_window, &MainWindow::OnAppFocusStateChanged);
+        exit_code = app.exec();
+    }
+    QtCommon::Shutdown();
+    return exit_code;
 }

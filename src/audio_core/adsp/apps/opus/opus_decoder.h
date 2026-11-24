@@ -7,6 +7,7 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <thread>
 
 #include "audio_core/adsp/apps/opus/shared_memory.h"
@@ -63,8 +64,12 @@ public:
     void Send(Direction dir, u32 message);
     u32 Receive(Direction dir, std::stop_token stop_token = {});
 
-    void SetSharedMemory(SharedMemory& shared_memory_) {
-        shared_memory = &shared_memory_;
+    SharedMemory& GetSharedMemory() noexcept {
+        return shared_memory;
+    }
+
+    std::mutex& GetHostMutex() noexcept {
+        return host_mutex;
     }
 
 private:
@@ -89,7 +94,9 @@ private:
     bool running{};
     /// Structure shared with the host, input data set by the host before sending a mailbox message,
     /// and the responses are written back by the OpusDecoder.
-    SharedMemory* shared_memory{};
+    SharedMemory shared_memory{};
+    /// Serializes host mailbox and shared-memory transactions across HardwareOpus instances.
+    std::mutex host_mutex{};
 };
 
 } // namespace AudioCore::ADSP::OpusDecoder

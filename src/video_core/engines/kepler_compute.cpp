@@ -24,6 +24,7 @@
 #include "common/settings.h"
 #include "shader_recompiler/exception.h"
 #include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "video_core/gpu_split.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_diag.h"
@@ -136,14 +137,29 @@ void KeplerCompute::ProcessNativeReportSemaphore(u32 argument) {
     }
     if ((argument >> 3) & 1) {
         const u32 reduction = (argument >> 9) & 7;
-        rasterizer->SignalFence([this, address, payload, reduction] {
-            const u32 value = ReduceSemaphore(reduction, false,
-                                              memory_manager.Read<u32>(address), payload);
-            memory_manager.Write<u32>(address, value);
-            if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
-            }
-        });
+        const auto mm_weak = memory_manager.weak_from_this();
+        const bool mm_managed = !mm_weak.expired();
+        rasterizer->SignalFence(
+            [mm_ptr = &memory_manager, mm_weak, mm_managed,
+             nx2_weak = std::weak_ptr<Core::Nx2SessionState>(memory_manager.System().Nx2Session()),
+             address, payload, reduction] {
+                std::shared_ptr<MemoryManager> mm_pin;
+                if (mm_managed) {
+                    mm_pin = mm_weak.lock();
+                    if (!mm_pin) {
+                        return;
+                    }
+                }
+                const u32 value =
+                    ReduceSemaphore(reduction, false, mm_ptr->Read<u32>(address), payload);
+                mm_ptr->Write<u32>(address, value);
+                if (const auto device = mm_ptr->GpuToCpuAddress(address)) {
+                    if (const auto nx2_session = nx2_weak.lock();
+                        nx2_session && !nx2_session->IsRetired()) {
+                        nx2_session->SemaphoreWaiters().OnWrite(*device, value);
+                    }
+                }
+            });
         return;
     }
     rasterizer->Query(address, VideoCommon::QueryType::Payload,
@@ -400,13 +416,28 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                 const bool four_words = (flags >> 30) == 0;
                 if (!memory_manager.IsFullyMappedRange(address, four_words ? 16 : sizeof(payload))) return false;
                 if (flags & (1U << 26)) {
-                    rasterizer->SignalFence([this, address, payload, flags] {
-                        const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
-                                                          memory_manager.Read<u32>(address), payload);
-                        memory_manager.Write<u32>(address, value);
-                        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
-                        }
+                    const auto mm_weak = memory_manager.weak_from_this();
+                    const bool mm_managed = !mm_weak.expired();
+                    rasterizer->SignalFence(
+                        [mm_ptr = &memory_manager, mm_weak, mm_managed,
+                         nx2_weak = std::weak_ptr<Core::Nx2SessionState>(system.Nx2Session()),
+                         address, payload, flags] {
+                            std::shared_ptr<MemoryManager> mm_pin;
+                            if (mm_managed) {
+                                mm_pin = mm_weak.lock();
+                                if (!mm_pin) {
+                                    return;
+                                }
+                            }
+                            const u32 value = ReduceSemaphore((flags >> 20) & 7, (flags >> 24) & 1,
+                                                              mm_ptr->Read<u32>(address), payload);
+                            mm_ptr->Write<u32>(address, value);
+                            if (const auto device = mm_ptr->GpuToCpuAddress(address)) {
+                                if (const auto nx2_session = nx2_weak.lock();
+                                    nx2_session && !nx2_session->IsRetired()) {
+                                    nx2_session->SemaphoreWaiters().OnWrite(*device, value);
+                                }
+                            }
                         static const u64 watch = [] {
                             const char* text = std::getenv("EDEN_NX2_SEM_WATCH");
                             return text ? u64{std::strtoull(text, nullptr, 16)} : u64{};
@@ -416,8 +447,8 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         }
                         if (!VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::QueryDiagnostics) ||
                             VideoCommon::NativeQueryTraceEnabled()) {
-                            VideoCommon::TraceNativeQuery(1, memory_manager.GetID(), address,
-                                memory_manager.GpuToCpuAddress(address).value_or(0), 0, value, 1U << 26);
+                            VideoCommon::TraceNativeQuery(1, mm_ptr->GetID(), address,
+                                mm_ptr->GpuToCpuAddress(address).value_or(0), 0, value, 1U << 26);
                         }
                     });
                 } else if (four_words) {
@@ -428,13 +459,28 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                     // NVN2 tracks QMD completion with a max release (bit 19) into a word other
                     // releases also advance: a plain write would move it backwards and leave
                     // GEQ acquires waiting forever.
-                    rasterizer->SignalFence([this, address, payload] {
-                        const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
-                        memory_manager.Write<u32>(address, value);
-                        if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
-                        }
-                    });
+                    const auto mm_weak = memory_manager.weak_from_this();
+                    const bool mm_managed = !mm_weak.expired();
+                    rasterizer->SignalFence(
+                        [mm_ptr = &memory_manager, mm_weak, mm_managed,
+                         nx2_weak = std::weak_ptr<Core::Nx2SessionState>(system.Nx2Session()),
+                         address, payload] {
+                            std::shared_ptr<MemoryManager> mm_pin;
+                            if (mm_managed) {
+                                mm_pin = mm_weak.lock();
+                                if (!mm_pin) {
+                                    return;
+                                }
+                            }
+                            const u32 value = (std::max)(mm_ptr->Read<u32>(address), payload);
+                            mm_ptr->Write<u32>(address, value);
+                            if (const auto device = mm_ptr->GpuToCpuAddress(address)) {
+                                if (const auto nx2_session = nx2_weak.lock();
+                                    nx2_session && !nx2_session->IsRetired()) {
+                                    nx2_session->SemaphoreWaiters().OnWrite(*device, value);
+                                }
+                            }
+                        });
                 } else {
                     static const u64 watch = [] {
                         const char* text = std::getenv("EDEN_NX2_SEM_WATCH");

@@ -18,15 +18,25 @@
 #endif
 
 namespace Core {
+namespace {
+
+std::unique_ptr<AnnounceMultiplayerRoom::Backend> CreateBackend(
+    [[maybe_unused]] const std::string& host, [[maybe_unused]] const std::string& username,
+    [[maybe_unused]] const std::string& token) {
+#ifdef ENABLE_WEB_SERVICE
+    return std::make_unique<WebService::RoomJson>(host, username, token);
+#else
+    return std::make_unique<AnnounceMultiplayerRoom::NullBackend>();
+#endif
+}
+
+} // Anonymous namespace
 
 AnnounceMultiplayerSession::AnnounceMultiplayerSession() {
-#ifdef ENABLE_WEB_SERVICE
-    backend = std::make_unique<WebService::RoomJson>(Settings::values.web_api_url.GetValue(),
-                                                     Settings::values.eden_username.GetValue(),
-                                                     Settings::values.eden_token.GetValue());
-#else
-    backend = std::make_unique<AnnounceMultiplayerRoom::NullBackend>();
-#endif
+    web_api_url = Settings::values.web_api_url.GetValue();
+    username = Settings::values.eden_username.GetValue();
+    token = Settings::values.eden_token.GetValue();
+    backend = CreateBackend(web_api_url, username, token);
 }
 
 WebService::WebResult AnnounceMultiplayerSession::Register() {
@@ -38,8 +48,12 @@ WebService::WebResult AnnounceMultiplayerSession::Register() {
     if (room->GetState() != Network::Room::State::Open) {
         return WebService::WebResult{WebService::WebResult::Code::LibError, "Room is not open", ""};
     }
-    UpdateBackendData(room);
-    WebService::WebResult result = backend->Register();
+    WebService::WebResult result;
+    {
+        std::lock_guard lock(backend_mutex);
+        UpdateBackendData(room);
+        result = backend->Register();
+    }
     if (result.result_code != WebService::WebResult::Code::Success) {
         return result;
     }
@@ -53,6 +67,7 @@ void AnnounceMultiplayerSession::Start() {
     if (announce_multiplayer_thread.has_value()) {
         Stop();
     }
+    shutdown_event.Reset();
     announce_multiplayer_thread.emplace([&](std::stop_token stoken) {
         // Invokes all current bound error callbacks.
         const auto ErrorCallback = [this](WebService::WebResult result) {
@@ -73,7 +88,7 @@ void AnnounceMultiplayerSession::Start() {
         std::chrono::seconds const announce_timeslice(15);
         auto update_time = std::chrono::steady_clock::now();
         std::future<WebService::WebResult> future;
-        while (!shutdown_event.WaitUntil(update_time)) {
+        while (!stoken.stop_requested() && !shutdown_event.WaitUntil(update_time)) {
             update_time = std::chrono::steady_clock::now() + announce_timeslice;
             auto room = Network::GetRoom().lock();
             if (!room) {
@@ -82,8 +97,12 @@ void AnnounceMultiplayerSession::Start() {
             if (room->GetState() != Network::Room::State::Open) {
                 break;
             }
-            UpdateBackendData(room);
-            WebService::WebResult result = backend->Update();
+            WebService::WebResult result;
+            {
+                std::lock_guard lock(backend_mutex);
+                UpdateBackendData(room);
+                result = backend->Update();
+            }
             if (result.result_code != WebService::WebResult::Code::Success) {
                 ErrorCallback(result);
             }
@@ -103,6 +122,7 @@ void AnnounceMultiplayerSession::Stop() {
     if (announce_multiplayer_thread.has_value()) {
         shutdown_event.Set();
         announce_multiplayer_thread.reset();
+        std::lock_guard lock(backend_mutex);
         backend->Delete();
         registered = false;
     }
@@ -139,18 +159,21 @@ void AnnounceMultiplayerSession::UpdateBackendData(std::shared_ptr<Network::Room
 }
 
 AnnounceMultiplayerRoom::RoomList AnnounceMultiplayerSession::GetRoomList() {
-    return backend->GetRoomList();
+    std::unique_ptr<AnnounceMultiplayerRoom::Backend> list_backend;
+    {
+        std::lock_guard lock(backend_mutex);
+        list_backend = CreateBackend(web_api_url, username, token);
+    }
+    return list_backend->GetRoomList();
 }
 
 void AnnounceMultiplayerSession::UpdateCredentials() {
     ASSERT_MSG(!IsRunning(), "Credentials can only be updated when session is not running");
-#ifdef ENABLE_WEB_SERVICE
-    backend = std::make_unique<WebService::RoomJson>(Settings::values.web_api_url.GetValue(),
-                                                     Settings::values.eden_username.GetValue(),
-                                                     Settings::values.eden_token.GetValue());
-#else
-    backend = std::make_unique<AnnounceMultiplayerRoom::NullBackend>();
-#endif
+    std::lock_guard lock(backend_mutex);
+    web_api_url = Settings::values.web_api_url.GetValue();
+    username = Settings::values.eden_username.GetValue();
+    token = Settings::values.eden_token.GetValue();
+    backend = CreateBackend(web_api_url, username, token);
 }
 
 } // namespace Core

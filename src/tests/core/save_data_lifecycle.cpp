@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <memory>
@@ -167,9 +168,10 @@ public:
 
     LoadResult Load(Kernel::KProcess& process, Core::System& system) override {
         const auto metadata = FileSys::ProgramMetadata::GetDefault();
-        REQUIRE(process.LoadFromMetadata(system.Kernel(), metadata, Kernel::PageSize, {}, 0)
-                    .IsSuccess());
-        REQUIRE(process.IsInitialized());
+        if (process.LoadFromMetadata(system.Kernel(), metadata, Kernel::PageSize, {}, 0).IsError() ||
+            !process.IsInitialized()) {
+            return {Loader::ResultStatus::ErrorNotInitialized, {}};
+        }
         return {Loader::ResultStatus::Success, LoadParameters{0x2c, 0x100000}};
     }
 };
@@ -219,6 +221,25 @@ private:
     const std::filesystem::path previous_dump =
         Common::FS::GetEdenPath(Common::FS::EdenPath::DumpDir);
     std::filesystem::path directory;
+};
+
+struct WorkerAbort final {};
+
+struct WorkerChecks {
+    std::vector<std::string> failures;
+
+    void Check(bool ok, const char* expr, int line) {
+        if (!ok) {
+            failures.push_back("line " + std::to_string(line) + ": " + expr);
+        }
+    }
+
+    void Require(bool ok, const char* expr, int line) {
+        if (!ok) {
+            failures.push_back("line " + std::to_string(line) + ": " + expr);
+            throw WorkerAbort{};
+        }
+    }
 };
 
 struct DomainIpcResult {
@@ -299,10 +320,11 @@ DomainIpcResult SendDomainCommand(
 
     Service::HLERequestContext ctx{system.Kernel(), memory, server_session, guest_thread};
     ctx.SetSessionRequestManager(session_manager);
-    REQUIRE(ctx.PopulateFromIncomingCommandBuffer(reinterpret_cast<u32_le*>(cmd_buf.data())) ==
-            ResultSuccess);
-    REQUIRE(session_manager->CompleteSyncRequest(server_session, ctx) == ResultSuccess);
-    REQUIRE(ctx.WriteToOutgoingCommandBuffer() == ResultSuccess);
+    if (ctx.PopulateFromIncomingCommandBuffer(cmd_buf) != ResultSuccess ||
+        session_manager->CompleteSyncRequest(server_session, ctx) != ResultSuccess ||
+        ctx.WriteToOutgoingCommandBuffer() != ResultSuccess) {
+        return DomainIpcResult{ResultUnknown, 0};
+    }
 
     DomainIpcResult out{};
     const u32* resp = ctx.CommandBuffer();
@@ -580,429 +602,464 @@ TEST_CASE("FSP_SRV cmd 68 uses space_id before filter and cmd 28 does not wildca
         server_thread.join();
     };
 
+    WorkerChecks checks;
+#define WORKER_CHECK(...) checks.Check(static_cast<bool>(__VA_ARGS__), #__VA_ARGS__, __LINE__)
+#define WORKER_REQUIRE(...) checks.Require(static_cast<bool>(__VA_ARGS__), #__VA_ARGS__, __LINE__)
+
     auto worker = system.Kernel().RunOnHostCoreProcess("fsp-srv-save-test", [&] {
-        Service::Process process{system};
-        SaveProcessTestLoader loader;
-        Loader::ResultStatus load_status = Loader::ResultStatus::Success;
-        REQUIRE(process.Initialize(loader, load_status));
-        REQUIRE(load_status == Loader::ResultStatus::Success);
-        SCOPE_EXIT {
-            process.Finalize();
-        };
+        try {
+            Service::Process process{system};
+            SaveProcessTestLoader loader;
+            Loader::ResultStatus load_status = Loader::ResultStatus::Success;
+            WORKER_REQUIRE(process.Initialize(loader, load_status));
+            WORKER_REQUIRE(load_status == Loader::ResultStatus::Success);
+            SCOPE_EXIT {
+                process.Finalize();
+            };
 
-        auto* guest_process = process.GetHandle();
-        auto& memory = guest_process->GetMemory();
-        memory.SetCurrentPageTable(*guest_process);
-        system.Kernel().SetApplicationProcess(guest_process);
-        SCOPE_EXIT {
-            system.Kernel().SetApplicationProcess(nullptr);
-        };
+            auto* guest_process = process.GetHandle();
+            auto& memory = guest_process->GetMemory();
+            memory.SetCurrentPageTable(*guest_process);
+            system.Kernel().SetApplicationProcess(guest_process);
+            SCOPE_EXIT {
+                system.Kernel().SetApplicationProcess(nullptr);
+            };
 
-        constexpr size_t StackPages = 16;
-        Kernel::KScopedResourceReservation mem_res(
-            system.Kernel(), guest_process, Kernel::Svc::LimitableResource::PhysicalMemoryMax,
-            StackPages * Kernel::PageSize);
-        REQUIRE(mem_res.Succeeded());
-        Kernel::KProcessAddress stack_bottom{};
-        REQUIRE(guest_process->GetPageTable().MapPages(
-                    &stack_bottom, StackPages, Kernel::KMemoryState::Stack,
-                    Kernel::KMemoryPermission::UserReadWrite) == ResultSuccess);
-        mem_res.Commit();
+            constexpr size_t StackPages = 16;
+            Kernel::KScopedResourceReservation mem_res(
+                system.Kernel(), guest_process, Kernel::Svc::LimitableResource::PhysicalMemoryMax,
+                StackPages * Kernel::PageSize);
+            WORKER_REQUIRE(mem_res.Succeeded());
+            Kernel::KProcessAddress stack_bottom{};
+            WORKER_REQUIRE(guest_process->GetPageTable().MapPages(
+                               &stack_bottom, StackPages, Kernel::KMemoryState::Stack,
+                               Kernel::KMemoryPermission::UserReadWrite) == ResultSuccess);
+            mem_res.Commit();
 
-        Kernel::KScopedResourceReservation thread_res(
-            system.Kernel(), guest_process, Kernel::Svc::LimitableResource::ThreadCountMax);
-        REQUIRE(thread_res.Succeeded());
-        auto* guest_thread = Kernel::KThread::Create(system.Kernel());
-        REQUIRE(guest_thread != nullptr);
-        REQUIRE(Kernel::KThread::InitializeUserThread(
-                    system, guest_thread, Kernel::KProcessAddress{}, 0,
-                    stack_bottom + StackPages * Kernel::PageSize, 0x2c, 0,
-                    guest_process) == ResultSuccess);
-        Kernel::KThread::Register(system.Kernel(), guest_thread);
-        thread_res.Commit();
-        SCOPE_EXIT {
-            guest_thread->Close(system.Kernel());
-        };
+            Kernel::KScopedResourceReservation thread_res(
+                system.Kernel(), guest_process, Kernel::Svc::LimitableResource::ThreadCountMax);
+            WORKER_REQUIRE(thread_res.Succeeded());
+            auto* guest_thread = Kernel::KThread::Create(system.Kernel());
+            WORKER_REQUIRE(guest_thread != nullptr);
+            WORKER_REQUIRE(Kernel::KThread::InitializeUserThread(
+                               system, guest_thread, Kernel::KProcessAddress{}, 0,
+                               stack_bottom + StackPages * Kernel::PageSize, 0x2c, 0,
+                               guest_process) == ResultSuccess);
+            Kernel::KThread::Register(system.Kernel(), guest_thread);
+            thread_res.Commit();
+            SCOPE_EXIT {
+                guest_thread->Close(system.Kernel());
+            };
 
-        auto* session = Kernel::KSession::Create(system.Kernel());
-        REQUIRE(session != nullptr);
-        session->Initialize(system.Kernel(), nullptr, 0);
-        Kernel::KSession::Register(system.Kernel(), session);
-        SCOPE_EXIT {
-            session->GetClientSession().Close(system.Kernel());
-            session->GetServerSession().Close(system.Kernel());
-        };
-        auto* server_session = &session->GetServerSession();
+            auto* session = Kernel::KSession::Create(system.Kernel());
+            WORKER_REQUIRE(session != nullptr);
+            session->Initialize(system.Kernel(), nullptr, 0);
+            Kernel::KSession::Register(system.Kernel(), session);
+            SCOPE_EXIT {
+                session->GetClientSession().Close(system.Kernel());
+                session->GetServerSession().Close(system.Kernel());
+            };
+            auto* server_session = &session->GetServerSession();
 
-        auto& fsc = system.GetFileSystemController();
-        REQUIRE(fsc.RegisterProcess(process.GetProcessId(), TitleId, nullptr) == ResultSuccess);
+            auto& fsc = system.GetFileSystemController();
+            WORKER_REQUIRE(fsc.RegisterProcess(process.GetProcessId(), TitleId, nullptr) ==
+                           ResultSuccess);
 
-        auto fsp_srv = std::make_shared<Service::FileSystem::FSP_SRV>(system);
-        auto session_manager = std::make_shared<Service::SessionRequestManager>(
-            system.Kernel(), *server_manager_ptr);
-        session_manager->SetSessionHandler(fsp_srv);
-        session_manager->ConvertToDomain();
+            auto fsp_srv = std::make_shared<Service::FileSystem::FSP_SRV>(system);
+            auto session_manager = std::make_shared<Service::SessionRequestManager>(
+                system.Kernel(), *server_manager_ptr);
+            session_manager->SetSessionHandler(fsp_srv);
+            session_manager->ConvertToDomain();
 
-        // cmd 1: SetCurrentProcess
-        const auto set_pid_res = SendDomainCommand(system, memory, session_manager, server_session,
-                                                   guest_thread, 1, 1, {}, true);
-        REQUIRE(set_pid_res.result == ResultSuccess);
+            // cmd 1: SetCurrentProcess
+            const auto set_pid_res = SendDomainCommand(system, memory, session_manager,
+                                                       server_session, guest_thread, 1, 1, {}, true);
+            WORKER_REQUIRE(set_pid_res.result == ResultSuccess);
 
-        // Create saves for two different titles and a temporary save for the current title.
-        auto controller = fsc.OpenSaveDataController();
-        const auto other_account =
-            SaveDataAttribute::Make(OtherTitleId, SaveDataType::Account, TestUserId, 0);
-        FileSys::VirtualDir dir{};
-        REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User, AccountAttribute) ==
-                ResultSuccess);
-        REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User, other_account) ==
-                ResultSuccess);
-        REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::Temporary, TemporaryAttribute) ==
-                ResultSuccess);
-        REQUIRE(dir != nullptr);
-        const auto temp_file = dir->CreateFile("payload.bin");
-        REQUIRE(temp_file != nullptr);
-        REQUIRE(temp_file->Resize(0x20));
+            // Create saves for two different titles and a temporary save for the current title.
+            auto controller = fsc.OpenSaveDataController();
+            const auto other_account =
+                SaveDataAttribute::Make(OtherTitleId, SaveDataType::Account, TestUserId, 0);
+            FileSys::VirtualDir dir{};
+            WORKER_REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User,
+                                                      AccountAttribute) == ResultSuccess);
+            WORKER_REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User, other_account) ==
+                           ResultSuccess);
+            WORKER_REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::Temporary,
+                                                      TemporaryAttribute) == ResultSuccess);
+            WORKER_REQUIRE(dir != nullptr);
+            const auto temp_file = dir->CreateFile("payload.bin");
+            WORKER_REQUIRE(temp_file != nullptr);
+            WORKER_REQUIRE(temp_file->Resize(0x20));
 
-        // cmd 68: OpenSaveDataInfoReaderBySaveDataFilter(space_id, filter)
-        constexpr std::size_t FilterOffset =
-            Common::AlignUp(sizeof(SaveDataSpaceId), alignof(SaveDataFilter));
-        static_assert(FilterOffset == 8);
+            // cmd 68: OpenSaveDataInfoReaderBySaveDataFilter(space_id, filter)
+            constexpr std::size_t FilterOffset =
+                Common::AlignUp(sizeof(SaveDataSpaceId), alignof(SaveDataFilter));
+            static_assert(FilterOffset == 8);
 
-        const auto open_reader = [&](SaveDataSpaceId space_id, const SaveDataFilter& filter) {
-            std::array<u8, FilterOffset + sizeof(SaveDataFilter)> payload{};
-            std::memcpy(payload.data(), &space_id, sizeof(space_id));
-            std::memcpy(payload.data() + FilterOffset, &filter, sizeof(filter));
-            return SendDomainCommand(system, memory, session_manager, server_session, guest_thread,
-                                     1, 68, payload);
-        };
+            const auto open_reader = [&](SaveDataSpaceId space_id, const SaveDataFilter& filter) {
+                std::array<u8, FilterOffset + sizeof(SaveDataFilter)> payload{};
+                std::memcpy(payload.data(), &space_id, sizeof(space_id));
+                std::memcpy(payload.data() + FilterOffset, &filter, sizeof(filter));
+                return SendDomainCommand(system, memory, session_manager, server_session,
+                                         guest_thread, 1, 68, payload);
+            };
 
-        SaveDataFilter user_filter{};
-        user_filter.use_program_id = true;
-        user_filter.attribute.program_id = OtherTitleId;
+            SaveDataFilter user_filter{};
+            user_filter.use_program_id = true;
+            user_filter.attribute.program_id = OtherTitleId;
 
-        // Invalid space_id must be rejected.
-        CHECK(open_reader(SaveDataSpaceId::ProperSystem, user_filter).result ==
-              FileSys::ResultInvalidArgument);
+            // Invalid space_id must be rejected.
+            WORKER_CHECK(open_reader(SaveDataSpaceId::ProperSystem, user_filter).result ==
+                         FileSys::ResultInvalidArgument);
 
-        // User space + filter on OtherTitleId returns only OtherTitleId's save.
-        REQUIRE(open_reader(SaveDataSpaceId::User, user_filter).result == ResultSuccess);
-        const u32 user_reader_id = static_cast<u32>(session_manager->DomainHandlerCount());
-        REQUIRE(user_reader_id >= 2);
+            // User space + filter on OtherTitleId returns only OtherTitleId's save.
+            WORKER_REQUIRE(open_reader(SaveDataSpaceId::User, user_filter).result == ResultSuccess);
+            const u32 user_reader_id = static_cast<u32>(session_manager->DomainHandlerCount());
+            WORKER_REQUIRE(user_reader_id >= 2);
 
-        const VAddr info_buf_addr = stack_bottom.GetValue() + 0x1000;
-        std::array<Service::FileSystem::ISaveDataInfoReader::SaveDataInfo, 4> info_entries{};
-        const auto read_user =
-            SendDomainCommand(system, memory, session_manager, server_session, guest_thread,
-                              user_reader_id, 0, {}, false, info_buf_addr, sizeof(info_entries));
-        REQUIRE(read_user.result == ResultSuccess);
-        REQUIRE(read_user.out_word == 1);
-        memory.ReadBlock(info_buf_addr, info_entries.data(), sizeof(info_entries));
-        CHECK(info_entries[0].space == SaveDataSpaceId::User);
-        CHECK(info_entries[0].type == SaveDataType::Account);
-        CHECK(info_entries[0].title_id == OtherTitleId);
+            const VAddr info_buf_addr = stack_bottom.GetValue() + 0x1000;
+            std::array<Service::FileSystem::ISaveDataInfoReader::SaveDataInfo, 4> info_entries{};
+            const auto read_user = SendDomainCommand(system, memory, session_manager,
+                                                     server_session, guest_thread, user_reader_id,
+                                                     0, {}, false, info_buf_addr,
+                                                     sizeof(info_entries));
+            WORKER_REQUIRE(read_user.result == ResultSuccess);
+            WORKER_REQUIRE(read_user.out_word == 1);
+            memory.ReadBlock(info_buf_addr, info_entries.data(), sizeof(info_entries));
+            WORKER_CHECK(info_entries[0].space == SaveDataSpaceId::User);
+            WORKER_CHECK(info_entries[0].type == SaveDataType::Account);
+            WORKER_CHECK(info_entries[0].title_id == OtherTitleId);
 
-        // Temporary space + filter on SaveDataType::Temporary returns the temporary save.
-        SaveDataFilter temp_filter{};
-        temp_filter.use_save_data_type = true;
-        temp_filter.attribute.type = SaveDataType::Temporary;
-        REQUIRE(open_reader(SaveDataSpaceId::Temporary, temp_filter).result == ResultSuccess);
-        const u32 temp_reader_id = static_cast<u32>(session_manager->DomainHandlerCount());
-        REQUIRE(temp_reader_id > user_reader_id);
+            // Temporary space + filter on SaveDataType::Temporary returns the temporary save.
+            SaveDataFilter temp_filter{};
+            temp_filter.use_save_data_type = true;
+            temp_filter.attribute.type = SaveDataType::Temporary;
+            WORKER_REQUIRE(open_reader(SaveDataSpaceId::Temporary, temp_filter).result ==
+                           ResultSuccess);
+            const u32 temp_reader_id = static_cast<u32>(session_manager->DomainHandlerCount());
+            WORKER_REQUIRE(temp_reader_id > user_reader_id);
 
-        info_entries = {};
-        const auto read_temp =
-            SendDomainCommand(system, memory, session_manager, server_session, guest_thread,
-                              temp_reader_id, 0, {}, false, info_buf_addr, sizeof(info_entries));
-        REQUIRE(read_temp.result == ResultSuccess);
-        REQUIRE(read_temp.out_word == 1);
-        memory.ReadBlock(info_buf_addr, info_entries.data(), sizeof(info_entries));
-        CHECK(info_entries[0].space == SaveDataSpaceId::Temporary);
-        CHECK(info_entries[0].type == SaveDataType::Temporary);
-        CHECK(info_entries[0].title_id == TitleId);
+            info_entries = {};
+            const auto read_temp = SendDomainCommand(system, memory, session_manager,
+                                                     server_session, guest_thread, temp_reader_id,
+                                                     0, {}, false, info_buf_addr,
+                                                     sizeof(info_entries));
+            WORKER_REQUIRE(read_temp.result == ResultSuccess);
+            WORKER_REQUIRE(read_temp.out_word == 1);
+            memory.ReadBlock(info_buf_addr, info_entries.data(), sizeof(info_entries));
+            WORKER_CHECK(info_entries[0].space == SaveDataSpaceId::Temporary);
+            WORKER_CHECK(info_entries[0].type == SaveDataType::Temporary);
+            WORKER_CHECK(info_entries[0].title_id == TitleId);
 
-        // cmd 28: DeleteSaveDataFileSystemBySaveDataAttribute(space_id, attribute)
-        // program_id == 0 must resolve to TitleId and delete ONLY TitleId's save.
-        constexpr std::size_t AttrOffset =
-            Common::AlignUp(sizeof(SaveDataSpaceId), alignof(SaveDataAttribute));
-        static_assert(AttrOffset == 8);
+            // cmd 28: DeleteSaveDataFileSystemBySaveDataAttribute(space_id, attribute)
+            // program_id == 0 must resolve to TitleId and delete ONLY TitleId's save.
+            constexpr std::size_t AttrOffset =
+                Common::AlignUp(sizeof(SaveDataSpaceId), alignof(SaveDataAttribute));
+            static_assert(AttrOffset == 8);
 
-        const auto delete_by_attr = [&](SaveDataSpaceId space_id,
-                                        const SaveDataAttribute& attribute) {
-            std::array<u8, AttrOffset + sizeof(SaveDataAttribute)> payload{};
-            std::memcpy(payload.data(), &space_id, sizeof(space_id));
-            std::memcpy(payload.data() + AttrOffset, &attribute, sizeof(attribute));
-            return SendDomainCommand(system, memory, session_manager, server_session, guest_thread,
-                                     1, 28, payload);
-        };
+            const auto delete_by_attr = [&](SaveDataSpaceId space_id,
+                                            const SaveDataAttribute& attribute) {
+                std::array<u8, AttrOffset + sizeof(SaveDataAttribute)> payload{};
+                std::memcpy(payload.data(), &space_id, sizeof(space_id));
+                std::memcpy(payload.data() + AttrOffset, &attribute, sizeof(attribute));
+                return SendDomainCommand(system, memory, session_manager, server_session,
+                                         guest_thread, 1, 28, payload);
+            };
 
-        const auto current_title_attr =
-            SaveDataAttribute::Make(0, SaveDataType::Account, TestUserId, 0);
-        REQUIRE(delete_by_attr(SaveDataSpaceId::User, current_title_attr).result == ResultSuccess);
+            const auto current_title_attr =
+                SaveDataAttribute::Make(0, SaveDataType::Account, TestUserId, 0);
+            WORKER_REQUIRE(delete_by_attr(SaveDataSpaceId::User, current_title_attr).result ==
+                           ResultSuccess);
 
-        const auto remaining = controller->EnumerateSaveData(SaveDataSpaceId::User);
-        REQUIRE(remaining.size() == 1);
-        CHECK(remaining[0].title_id == OtherTitleId);
+            const auto remaining = controller->EnumerateSaveData(SaveDataSpaceId::User);
+            WORKER_REQUIRE(remaining.size() == 1);
+            WORKER_CHECK(remaining[0].title_id == OtherTitleId);
 
-        // Second delete targets only the already-deleted TitleId save and leaves OtherTitleId intact.
-        CHECK(delete_by_attr(SaveDataSpaceId::User, current_title_attr).result ==
-              FileSys::ResultTargetNotFound);
-        CHECK(controller->EnumerateSaveData(SaveDataSpaceId::User).size() == 1);
+            // Second delete targets only the already-deleted TitleId save and leaves OtherTitleId intact.
+            WORKER_CHECK(delete_by_attr(SaveDataSpaceId::User, current_title_attr).result ==
+                         FileSys::ResultTargetNotFound);
+            WORKER_CHECK(controller->EnumerateSaveData(SaveDataSpaceId::User).size() == 1);
 
-        // ISaveDataInfoReader enumerates Cache storages (including indexed cache saves).
-        const auto default_cache =
-            SaveDataAttribute::Make(TitleId, SaveDataType::Cache, InvalidUserId, 0, 0);
-        const auto indexed_cache =
-            SaveDataAttribute::Make(TitleId, SaveDataType::Cache, InvalidUserId, 0, 3);
-        REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User, default_cache) ==
-                ResultSuccess);
-        REQUIRE(dir != nullptr);
-        const auto cache0_file = dir->CreateFile("cache0.bin");
-        REQUIRE(cache0_file != nullptr);
-        REQUIRE(cache0_file->Resize(0x40));
+            // ISaveDataInfoReader enumerates Cache storages (including indexed cache saves).
+            const auto default_cache =
+                SaveDataAttribute::Make(TitleId, SaveDataType::Cache, InvalidUserId, 0, 0);
+            const auto indexed_cache =
+                SaveDataAttribute::Make(TitleId, SaveDataType::Cache, InvalidUserId, 0, 3);
+            WORKER_REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User, default_cache) ==
+                           ResultSuccess);
+            WORKER_REQUIRE(dir != nullptr);
+            const auto cache0_file = dir->CreateFile("cache0.bin");
+            WORKER_REQUIRE(cache0_file != nullptr);
+            WORKER_REQUIRE(cache0_file->Resize(0x40));
 
-        REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User, indexed_cache) ==
-                ResultSuccess);
-        REQUIRE(dir != nullptr);
-        auto cache3_file = dir->CreateFile("cache3.bin");
-        REQUIRE(cache3_file != nullptr);
-        REQUIRE(cache3_file->Resize(0x80));
+            WORKER_REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User, indexed_cache) ==
+                           ResultSuccess);
+            WORKER_REQUIRE(dir != nullptr);
+            auto cache3_file = dir->CreateFile("cache3.bin");
+            WORKER_REQUIRE(cache3_file != nullptr);
+            WORKER_REQUIRE(cache3_file->Resize(0x80));
 
-        SaveDataFilter cache_filter{};
-        cache_filter.use_save_data_type = true;
-        cache_filter.attribute.type = SaveDataType::Cache;
-        REQUIRE(open_reader(SaveDataSpaceId::User, cache_filter).result == ResultSuccess);
-        const u32 cache_reader_id = static_cast<u32>(session_manager->DomainHandlerCount());
-        REQUIRE(cache_reader_id > temp_reader_id);
+            SaveDataFilter cache_filter{};
+            cache_filter.use_save_data_type = true;
+            cache_filter.attribute.type = SaveDataType::Cache;
+            WORKER_REQUIRE(open_reader(SaveDataSpaceId::User, cache_filter).result ==
+                           ResultSuccess);
+            const u32 cache_reader_id = static_cast<u32>(session_manager->DomainHandlerCount());
+            WORKER_REQUIRE(cache_reader_id > temp_reader_id);
 
-        info_entries = {};
-        const auto read_cache =
-            SendDomainCommand(system, memory, session_manager, server_session, guest_thread,
-                              cache_reader_id, 0, {}, false, info_buf_addr, sizeof(info_entries));
-        REQUIRE(read_cache.result == ResultSuccess);
-        REQUIRE(read_cache.out_word == 2);
-        memory.ReadBlock(info_buf_addr, info_entries.data(), sizeof(info_entries));
-        CHECK(info_entries[0].type == SaveDataType::Cache);
-        CHECK(info_entries[0].save_id_unknown != TitleId);
-        CHECK(info_entries[0].title_id == TitleId);
-        CHECK(info_entries[0].index == 0);
-        CHECK(info_entries[0].save_image_size == 0x40);
-        CHECK(info_entries[1].type == SaveDataType::Cache);
-        CHECK(info_entries[1].save_id_unknown != info_entries[0].save_id_unknown);
-        CHECK(info_entries[1].title_id == TitleId);
-        CHECK(info_entries[1].index == 3);
-        CHECK(info_entries[1].save_image_size == 0x80);
+            info_entries = {};
+            const auto read_cache = SendDomainCommand(system, memory, session_manager,
+                                                      server_session, guest_thread, cache_reader_id,
+                                                      0, {}, false, info_buf_addr,
+                                                      sizeof(info_entries));
+            WORKER_REQUIRE(read_cache.result == ResultSuccess);
+            WORKER_REQUIRE(read_cache.out_word == 2);
+            memory.ReadBlock(info_buf_addr, info_entries.data(), sizeof(info_entries));
+            WORKER_CHECK(info_entries[0].type == SaveDataType::Cache);
+            WORKER_CHECK(info_entries[0].save_id_unknown != TitleId);
+            WORKER_CHECK(info_entries[0].title_id == TitleId);
+            WORKER_CHECK(info_entries[0].index == 0);
+            WORKER_CHECK(info_entries[0].save_image_size == 0x40);
+            WORKER_CHECK(info_entries[1].type == SaveDataType::Cache);
+            WORKER_CHECK(info_entries[1].save_id_unknown != info_entries[0].save_id_unknown);
+            WORKER_CHECK(info_entries[1].title_id == TitleId);
+            WORKER_CHECK(info_entries[1].index == 3);
+            WORKER_CHECK(info_entries[1].save_image_size == 0x80);
 
-        // [C-1] Reject save_data_id == 0 / system_save_data_id == 0 in cmds 21, 25, 28 without
-        // wiping save/0000000000000000/<user_id>.
-        const auto zero_sys_attr =
-            SaveDataAttribute::Make(0, SaveDataType::System, TestUserId, 0);
-        CHECK(delete_by_attr(SaveDataSpaceId::User, zero_sys_attr).result ==
-              FileSys::ResultInvalidArgument);
+            // [C-1] Reject save_data_id == 0 / system_save_data_id == 0 in cmds 21, 25, 28 without
+            // wiping save/0000000000000000/<user_id>.
+            const auto zero_sys_attr =
+                SaveDataAttribute::Make(0, SaveDataType::System, TestUserId, 0);
+            WORKER_CHECK(delete_by_attr(SaveDataSpaceId::User, zero_sys_attr).result ==
+                         FileSys::ResultInvalidArgument);
 
-        const u64 zero_id = 0;
-        std::array<u8, sizeof(u64)> zero_id_payload{};
-        std::memcpy(zero_id_payload.data(), &zero_id, sizeof(zero_id));
-        CHECK(SendDomainCommand(system, memory, session_manager, server_session, guest_thread, 1,
-                                21, zero_id_payload)
-                  .result == FileSys::ResultInvalidArgument);
+            const u64 zero_id = 0;
+            std::array<u8, sizeof(u64)> zero_id_payload{};
+            std::memcpy(zero_id_payload.data(), &zero_id, sizeof(zero_id));
+            WORKER_CHECK(SendDomainCommand(system, memory, session_manager, server_session,
+                                           guest_thread, 1, 21, zero_id_payload)
+                             .result == FileSys::ResultInvalidArgument);
 
-        constexpr std::size_t SpaceIdPlusU64Offset =
-            Common::AlignUp(sizeof(SaveDataSpaceId), alignof(u64));
-        std::array<u8, SpaceIdPlusU64Offset + sizeof(u64)> cmd25_zero_payload{};
-        const auto user_space = SaveDataSpaceId::User;
-        std::memcpy(cmd25_zero_payload.data(), &user_space, sizeof(user_space));
-        std::memcpy(cmd25_zero_payload.data() + SpaceIdPlusU64Offset, &zero_id, sizeof(zero_id));
-        CHECK(SendDomainCommand(system, memory, session_manager, server_session, guest_thread, 1,
-                                25, cmd25_zero_payload)
-                  .result == FileSys::ResultInvalidArgument);
+            constexpr std::size_t SpaceIdPlusU64Offset =
+                Common::AlignUp(sizeof(SaveDataSpaceId), alignof(u64));
+            std::array<u8, SpaceIdPlusU64Offset + sizeof(u64)> cmd25_zero_payload{};
+            const auto user_space = SaveDataSpaceId::User;
+            std::memcpy(cmd25_zero_payload.data(), &user_space, sizeof(user_space));
+            std::memcpy(cmd25_zero_payload.data() + SpaceIdPlusU64Offset, &zero_id,
+                        sizeof(zero_id));
+            WORKER_CHECK(SendDomainCommand(system, memory, session_manager, server_session,
+                                           guest_thread, 1, 25, cmd25_zero_payload)
+                             .result == FileSys::ResultInvalidArgument);
 
-        // [H-3] Cross-user isolation on cmd 21: active default user != TestUserId, so deleting
-        // OtherTitleId by ID must not delete TestUserId's Account save.
-        std::array<u8, sizeof(u64)> other_title_id_payload{};
-        std::memcpy(other_title_id_payload.data(), &OtherTitleId, sizeof(OtherTitleId));
-        CHECK(SendDomainCommand(system, memory, session_manager, server_session, guest_thread, 1,
-                                21, other_title_id_payload)
-                  .result == FileSys::ResultTargetNotFound);
+            // [H-3] Cross-user isolation on cmd 21: active default user != TestUserId, so deleting
+            // OtherTitleId by ID must not delete TestUserId's Account save.
+            std::array<u8, sizeof(u64)> other_title_id_payload{};
+            std::memcpy(other_title_id_payload.data(), &OtherTitleId, sizeof(OtherTitleId));
+            WORKER_CHECK(SendDomainCommand(system, memory, session_manager, server_session,
+                                           guest_thread, 1, 21, other_title_id_payload)
+                             .result == FileSys::ResultTargetNotFound);
 
-        // [H-2] cmd 80: OpenSaveDataMetaFile wire layout (space_id @ 0x00, u32 meta_type @ 0x04,
-        // SaveDataAttribute @ 0x08) and SaveDataMetaType::None rejection.
-        REQUIRE(controller->OpenSaveData(&dir, SaveDataSpaceId::User, other_account) ==
-                ResultSuccess);
-        REQUIRE(dir != nullptr);
-        const auto thumb_file = dir->CreateFile("meta");
-        REQUIRE(thumb_file != nullptr);
-        REQUIRE(thumb_file->Resize(0x10));
+            // [H-2] cmd 80: OpenSaveDataMetaFile wire layout (space_id @ 0x00, u32 meta_type @ 0x04,
+            // SaveDataAttribute @ 0x08) and SaveDataMetaType::None rejection.
+            WORKER_REQUIRE(controller->OpenSaveData(&dir, SaveDataSpaceId::User, other_account) ==
+                           ResultSuccess);
+            WORKER_REQUIRE(dir != nullptr);
+            const auto thumb_file = dir->CreateFile("meta");
+            WORKER_REQUIRE(thumb_file != nullptr);
+            WORKER_REQUIRE(thumb_file->Resize(0x10));
 
-        const auto open_meta_file = [&](SaveDataSpaceId space_id, u32 meta_type_raw,
-                                        const SaveDataAttribute& attribute) {
-            std::array<u8, 8 + sizeof(SaveDataAttribute)> payload{};
-            std::memcpy(payload.data(), &space_id, sizeof(space_id));
-            std::memcpy(payload.data() + 4, &meta_type_raw, sizeof(meta_type_raw));
-            std::memcpy(payload.data() + 8, &attribute, sizeof(attribute));
-            return SendDomainCommand(system, memory, session_manager, server_session, guest_thread,
-                                     1, 80, payload);
-        };
+            const auto open_meta_file = [&](SaveDataSpaceId space_id, u32 meta_type_raw,
+                                            const SaveDataAttribute& attribute) {
+                std::array<u8, 8 + sizeof(SaveDataAttribute)> payload{};
+                std::memcpy(payload.data(), &space_id, sizeof(space_id));
+                std::memcpy(payload.data() + 4, &meta_type_raw, sizeof(meta_type_raw));
+                std::memcpy(payload.data() + 8, &attribute, sizeof(attribute));
+                return SendDomainCommand(system, memory, session_manager, server_session,
+                                         guest_thread, 1, 80, payload);
+            };
 
-        CHECK(open_meta_file(SaveDataSpaceId::User,
-                             static_cast<u32>(SaveDataMetaType::None), other_account)
-                  .result == FileSys::ResultInvalidArgument);
-        CHECK(open_meta_file(SaveDataSpaceId::User, 99u, other_account).result ==
-              FileSys::ResultInvalidArgument);
-        const auto prev_domain_count = session_manager->DomainHandlerCount();
-        REQUIRE(open_meta_file(SaveDataSpaceId::User,
-                               static_cast<u32>(SaveDataMetaType::Thumbnail), other_account)
+            WORKER_CHECK(open_meta_file(SaveDataSpaceId::User,
+                                        static_cast<u32>(SaveDataMetaType::None), other_account)
+                             .result == FileSys::ResultInvalidArgument);
+            WORKER_CHECK(open_meta_file(SaveDataSpaceId::User, 99u, other_account).result ==
+                         FileSys::ResultInvalidArgument);
+            const auto prev_domain_count = session_manager->DomainHandlerCount();
+            WORKER_REQUIRE(
+                open_meta_file(SaveDataSpaceId::User, static_cast<u32>(SaveDataMetaType::Thumbnail),
+                               other_account)
                     .result == ResultSuccess);
-        CHECK(session_manager->DomainHandlerCount() == prev_domain_count + 1);
+            WORKER_CHECK(session_manager->DomainHandlerCount() == prev_domain_count + 1);
 
-        // cmd 24: RegisterSaveDataFileSystemAtomicDeletion validates buffer alignment, preserves
-        // all targets if any ID fails resolution, and deletes all save_data_ids when all resolve.
-        const VAddr in_buf_addr = stack_bottom.GetValue() + 0x2000;
-        constexpr u64 SecondSystemSaveId = 0x0000000000005678;
-        const auto sys_save_1 =
-            SaveDataAttribute::Make(TitleId, SaveDataType::System, InvalidUserId, TestSystemSaveDataId);
-        const auto sys_save_2 =
-            SaveDataAttribute::Make(TitleId, SaveDataType::System, InvalidUserId, SecondSystemSaveId);
-        REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User, sys_save_1) ==
-                ResultSuccess);
-        REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User, sys_save_2) ==
-                ResultSuccess);
+            // cmd 24: RegisterSaveDataFileSystemAtomicDeletion validates buffer alignment, preserves
+            // all targets if any ID fails resolution, and deletes all save_data_ids when all resolve.
+            const VAddr in_buf_addr = stack_bottom.GetValue() + 0x2000;
+            constexpr u64 SecondSystemSaveId = 0x0000000000005678;
+            const auto sys_save_1 = SaveDataAttribute::Make(TitleId, SaveDataType::System,
+                                                            InvalidUserId, TestSystemSaveDataId);
+            const auto sys_save_2 = SaveDataAttribute::Make(TitleId, SaveDataType::System,
+                                                            InvalidUserId, SecondSystemSaveId);
+            WORKER_REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User, sys_save_1) ==
+                           ResultSuccess);
+            WORKER_REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User, sys_save_2) ==
+                           ResultSuccess);
 
-        std::array<u8, 12> unaligned_ids{};
-        memory.WriteBlock(in_buf_addr, unaligned_ids.data(), unaligned_ids.size());
-        CHECK(SendDomainCommand(system, memory, session_manager, server_session, guest_thread, 1,
-                                24, {}, false, 0, 0, in_buf_addr, 4)
-                  .result == FileSys::ResultInvalidArgument);
-        CHECK(SendDomainCommand(system, memory, session_manager, server_session, guest_thread, 1,
-                                24, {}, false, 0, 0, in_buf_addr, 12)
-                  .result == FileSys::ResultInvalidArgument);
+            std::array<u8, 12> unaligned_ids{};
+            memory.WriteBlock(in_buf_addr, unaligned_ids.data(), unaligned_ids.size());
+            WORKER_CHECK(SendDomainCommand(system, memory, session_manager, server_session,
+                                           guest_thread, 1, 24, {}, false, 0, 0, in_buf_addr, 4)
+                             .result == FileSys::ResultInvalidArgument);
+            WORKER_CHECK(SendDomainCommand(system, memory, session_manager, server_session,
+                                           guest_thread, 1, 24, {}, false, 0, 0, in_buf_addr, 12)
+                             .result == FileSys::ResultInvalidArgument);
 
-        // Atomicity check: if the 2nd ID does not exist, the 1st ID must not be deleted.
-        const std::array<u64, 2> partial_invalid_ids{TestSystemSaveDataId, UnknownSaveDataId};
-        memory.WriteBlock(in_buf_addr, partial_invalid_ids.data(), sizeof(partial_invalid_ids));
-        CHECK(SendDomainCommand(system, memory, session_manager, server_session, guest_thread, 1,
-                                24, {}, false, 0, 0, in_buf_addr, sizeof(partial_invalid_ids))
-                  .result == FileSys::ResultTargetNotFound);
-        CHECK(controller->OpenSaveData(&dir, SaveDataSpaceId::User, sys_save_1) == ResultSuccess);
+            // Atomicity check: if the 2nd ID does not exist, the 1st ID must not be deleted.
+            const std::array<u64, 2> partial_invalid_ids{TestSystemSaveDataId, UnknownSaveDataId};
+            memory.WriteBlock(in_buf_addr, partial_invalid_ids.data(), sizeof(partial_invalid_ids));
+            WORKER_CHECK(SendDomainCommand(system, memory, session_manager, server_session,
+                                           guest_thread, 1, 24, {}, false, 0, 0, in_buf_addr,
+                                           sizeof(partial_invalid_ids))
+                             .result == FileSys::ResultTargetNotFound);
+            WORKER_CHECK(controller->OpenSaveData(&dir, SaveDataSpaceId::User, sys_save_1) ==
+                         ResultSuccess);
 
-        const std::array<u64, 2> atomic_ids{TestSystemSaveDataId, SecondSystemSaveId};
-        memory.WriteBlock(in_buf_addr, atomic_ids.data(), sizeof(atomic_ids));
-        REQUIRE(SendDomainCommand(system, memory, session_manager, server_session, guest_thread, 1,
-                                  24, {}, false, 0, 0, in_buf_addr, sizeof(atomic_ids))
-                    .result == ResultSuccess);
+            const std::array<u64, 2> atomic_ids{TestSystemSaveDataId, SecondSystemSaveId};
+            memory.WriteBlock(in_buf_addr, atomic_ids.data(), sizeof(atomic_ids));
+            WORKER_REQUIRE(SendDomainCommand(system, memory, session_manager, server_session,
+                                             guest_thread, 1, 24, {}, false, 0, 0, in_buf_addr,
+                                             sizeof(atomic_ids))
+                               .result == ResultSuccess);
 
-        for (const auto& entry : controller->EnumerateSaveData(SaveDataSpaceId::User)) {
-            CHECK(entry.system_save_data_id != TestSystemSaveDataId);
-            CHECK(entry.system_save_data_id != SecondSystemSaveId);
+            for (const auto& entry : controller->EnumerateSaveData(SaveDataSpaceId::User)) {
+                WORKER_CHECK(entry.system_save_data_id != TestSystemSaveDataId);
+                WORKER_CHECK(entry.system_save_data_id != SecondSystemSaveId);
+            }
+
+            // cmds 601, 615, 1001 reject negative sizes.
+            struct SizePair {
+                s64 data_size;
+                s64 journal_size;
+            };
+            const auto send_sizes = [&](u32 cmd_id, s64 data_size, s64 journal_size) {
+                const SizePair sizes{data_size, journal_size};
+                std::array<u8, sizeof(SizePair)> payload{};
+                std::memcpy(payload.data(), &sizes, sizeof(sizes));
+                return SendDomainCommand(system, memory, session_manager, server_session,
+                                         guest_thread, 1, cmd_id, payload);
+            };
+
+            WORKER_CHECK(send_sizes(1001, -1, 0).result == FileSys::ResultInvalidArgument);
+            WORKER_CHECK(send_sizes(1001, 0, -1).result == FileSys::ResultInvalidArgument);
+            WORKER_CHECK(send_sizes(601, -1, 0).result == FileSys::ResultInvalidArgument);
+            WORKER_CHECK(send_sizes(615, 0, -1).result == FileSys::ResultInvalidArgument);
+
+            // [M-2c] cmds 601 and 615 compute aligned total size + 0x40000 overhead for positive sizes
+            // and reject signed overflow.
+            const auto total_601 = send_sizes(601, 0x1000, 0x2000);
+            WORKER_REQUIRE(total_601.result == ResultSuccess);
+            WORKER_CHECK(total_601.out_word == (0x4000 + 0x4000 + 0x40000));
+
+            const auto total_615 = send_sizes(615, 0x5000, 0x1000);
+            WORKER_REQUIRE(total_615.result == ResultSuccess);
+            WORKER_CHECK(total_615.out_word == (0x8000 + 0x4000 + 0x40000));
+
+            WORKER_CHECK(send_sizes(601, std::numeric_limits<s64>::max(), 0).result ==
+                         FileSys::ResultInvalidArgument);
+            WORKER_CHECK(send_sizes(615, 0, std::numeric_limits<s64>::max()).result ==
+                         FileSys::ResultInvalidArgument);
+
+            // [M-2a] cmd 68 resolves filter.use_program_id && filter.attribute.program_id == 0 to the
+            // calling process's program_id (TitleId).
+            SaveDataFilter current_prog_filter{};
+            current_prog_filter.use_program_id = true;
+            current_prog_filter.attribute.program_id = 0;
+            WORKER_REQUIRE(open_reader(SaveDataSpaceId::User, current_prog_filter).result ==
+                           ResultSuccess);
+            const u32 current_prog_reader_id =
+                static_cast<u32>(session_manager->DomainHandlerCount());
+            info_entries = {};
+            const auto read_current_prog = SendDomainCommand(
+                system, memory, session_manager, server_session, guest_thread,
+                current_prog_reader_id, 0, {}, false, info_buf_addr, sizeof(info_entries));
+            WORKER_REQUIRE(read_current_prog.result == ResultSuccess);
+            WORKER_REQUIRE(read_current_prog.out_word == 2);
+            memory.ReadBlock(info_buf_addr, info_entries.data(), sizeof(info_entries));
+            WORKER_CHECK(info_entries[0].title_id == TitleId);
+            WORKER_CHECK(info_entries[1].title_id == TitleId);
+
+            // [M-2b] cmd 62 (OpenSaveDataInfoReaderOnlyCacheStorage) opens User space filtered to Cache.
+            WORKER_REQUIRE(SendDomainCommand(system, memory, session_manager, server_session,
+                                             guest_thread, 1, 62, {})
+                               .result == ResultSuccess);
+            const u32 only_cache_reader_id =
+                static_cast<u32>(session_manager->DomainHandlerCount());
+            WORKER_REQUIRE(only_cache_reader_id > current_prog_reader_id);
+            info_entries = {};
+            const auto read_only_cache = SendDomainCommand(
+                system, memory, session_manager, server_session, guest_thread, only_cache_reader_id,
+                0, {}, false, info_buf_addr, sizeof(info_entries));
+            WORKER_REQUIRE(read_only_cache.result == ResultSuccess);
+            WORKER_REQUIRE(read_only_cache.out_word == 2);
+            memory.ReadBlock(info_buf_addr, info_entries.data(), sizeof(info_entries));
+            WORKER_CHECK(info_entries[0].space == SaveDataSpaceId::User);
+            WORKER_CHECK(info_entries[0].type == SaveDataType::Cache);
+            WORKER_CHECK(info_entries[1].space == SaveDataSpaceId::User);
+            WORKER_CHECK(info_entries[1].type == SaveDataType::Cache);
+
+            const u64 default_cache_id = info_entries[0].save_id_unknown;
+            const u64 cache_id = info_entries[1].save_id_unknown;
+            WORKER_CHECK(controller->GetCommitId(SaveDataSpaceId::User, default_cache_id) == 1);
+            WORKER_CHECK(controller->GetCommitId(SaveDataSpaceId::User, cache_id) == 1);
+            WORKER_REQUIRE(cache3_file->Resize(0x100));
+            WORKER_CHECK(controller->GetCommitId(SaveDataSpaceId::User, cache_id) == 2);
+            WORKER_CHECK(controller->GetCommitId(SaveDataSpaceId::User, default_cache_id) == 1);
+            cache3_file.reset();
+
+            const auto active_user =
+                system.GetProfileManager().GetUser(Settings::values.current_user.GetValue());
+            WORKER_REQUIRE(active_user.has_value());
+            const auto active_account =
+                SaveDataAttribute::Make(TitleId, SaveDataType::Account, active_user->AsU128(), 0);
+            WORKER_REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User,
+                                                      active_account) == ResultSuccess);
+
+            std::array<u8, sizeof(TitleId)> ambiguous_id_payload{};
+            std::memcpy(ambiguous_id_payload.data(), &TitleId, sizeof(TitleId));
+            WORKER_CHECK(SendDomainCommand(system, memory, session_manager, server_session,
+                                           guest_thread, 1, 21, ambiguous_id_payload)
+                             .result == FileSys::ResultTargetNotFound);
+
+            // Deleting an enumerated cache ID must leave the account save and other indices intact.
+            std::array<u8, sizeof(cache_id)> cache_id_payload{};
+            std::memcpy(cache_id_payload.data(), &cache_id, sizeof(cache_id));
+            WORKER_REQUIRE(SendDomainCommand(system, memory, session_manager, server_session,
+                                             guest_thread, 1, 21, cache_id_payload)
+                               .result == ResultSuccess);
+            controller->SetAutoCreate(false);
+            WORKER_CHECK(controller->OpenSaveData(&dir, SaveDataSpaceId::User, indexed_cache) ==
+                         FileSys::ResultTargetNotFound);
+            WORKER_CHECK(controller->OpenSaveData(&dir, SaveDataSpaceId::User, default_cache) ==
+                         ResultSuccess);
+            WORKER_CHECK(controller->OpenSaveData(&dir, SaveDataSpaceId::User, active_account) ==
+                         ResultSuccess);
+            WORKER_CHECK(SendDomainCommand(system, memory, session_manager, server_session,
+                                           guest_thread, 1, 21, cache_id_payload)
+                             .result == FileSys::ResultTargetNotFound);
+        } catch (const WorkerAbort&) {
+        } catch (const std::exception& ex) {
+            checks.failures.push_back(std::string("unexpected exception: ") + ex.what());
+        } catch (...) {
+            checks.failures.push_back("unexpected unknown exception");
         }
-
-        // cmds 601, 615, 1001 reject negative sizes.
-        struct SizePair {
-            s64 data_size;
-            s64 journal_size;
-        };
-        const auto send_sizes = [&](u32 cmd_id, s64 data_size, s64 journal_size) {
-            const SizePair sizes{data_size, journal_size};
-            std::array<u8, sizeof(SizePair)> payload{};
-            std::memcpy(payload.data(), &sizes, sizeof(sizes));
-            return SendDomainCommand(system, memory, session_manager, server_session, guest_thread,
-                                     1, cmd_id, payload);
-        };
-
-        CHECK(send_sizes(1001, -1, 0).result == FileSys::ResultInvalidArgument);
-        CHECK(send_sizes(1001, 0, -1).result == FileSys::ResultInvalidArgument);
-        CHECK(send_sizes(601, -1, 0).result == FileSys::ResultInvalidArgument);
-        CHECK(send_sizes(615, 0, -1).result == FileSys::ResultInvalidArgument);
-
-        // [M-2c] cmds 601 and 615 compute aligned total size + 0x40000 overhead for positive sizes
-        // and reject signed overflow.
-        const auto total_601 = send_sizes(601, 0x1000, 0x2000);
-        REQUIRE(total_601.result == ResultSuccess);
-        CHECK(total_601.out_word == (0x4000 + 0x4000 + 0x40000));
-
-        const auto total_615 = send_sizes(615, 0x5000, 0x1000);
-        REQUIRE(total_615.result == ResultSuccess);
-        CHECK(total_615.out_word == (0x8000 + 0x4000 + 0x40000));
-
-        CHECK(send_sizes(601, std::numeric_limits<s64>::max(), 0).result ==
-              FileSys::ResultInvalidArgument);
-        CHECK(send_sizes(615, 0, std::numeric_limits<s64>::max()).result ==
-              FileSys::ResultInvalidArgument);
-
-        // [M-2a] cmd 68 resolves filter.use_program_id && filter.attribute.program_id == 0 to the
-        // calling process's program_id (TitleId).
-        SaveDataFilter current_prog_filter{};
-        current_prog_filter.use_program_id = true;
-        current_prog_filter.attribute.program_id = 0;
-        REQUIRE(open_reader(SaveDataSpaceId::User, current_prog_filter).result == ResultSuccess);
-        const u32 current_prog_reader_id = static_cast<u32>(session_manager->DomainHandlerCount());
-        info_entries = {};
-        const auto read_current_prog = SendDomainCommand(
-            system, memory, session_manager, server_session, guest_thread, current_prog_reader_id,
-            0, {}, false, info_buf_addr, sizeof(info_entries));
-        REQUIRE(read_current_prog.result == ResultSuccess);
-        REQUIRE(read_current_prog.out_word == 2);
-        memory.ReadBlock(info_buf_addr, info_entries.data(), sizeof(info_entries));
-        CHECK(info_entries[0].title_id == TitleId);
-        CHECK(info_entries[1].title_id == TitleId);
-
-        // [M-2b] cmd 62 (OpenSaveDataInfoReaderOnlyCacheStorage) opens User space filtered to Cache.
-        REQUIRE(SendDomainCommand(system, memory, session_manager, server_session, guest_thread, 1,
-                                  62, {})
-                    .result == ResultSuccess);
-        const u32 only_cache_reader_id = static_cast<u32>(session_manager->DomainHandlerCount());
-        REQUIRE(only_cache_reader_id > current_prog_reader_id);
-        info_entries = {};
-        const auto read_only_cache = SendDomainCommand(
-            system, memory, session_manager, server_session, guest_thread, only_cache_reader_id, 0,
-            {}, false, info_buf_addr, sizeof(info_entries));
-        REQUIRE(read_only_cache.result == ResultSuccess);
-        REQUIRE(read_only_cache.out_word == 2);
-        memory.ReadBlock(info_buf_addr, info_entries.data(), sizeof(info_entries));
-        CHECK(info_entries[0].space == SaveDataSpaceId::User);
-        CHECK(info_entries[0].type == SaveDataType::Cache);
-        CHECK(info_entries[1].space == SaveDataSpaceId::User);
-        CHECK(info_entries[1].type == SaveDataType::Cache);
-
-        const u64 default_cache_id = info_entries[0].save_id_unknown;
-        const u64 cache_id = info_entries[1].save_id_unknown;
-        CHECK(controller->GetCommitId(SaveDataSpaceId::User, default_cache_id) == 1);
-        CHECK(controller->GetCommitId(SaveDataSpaceId::User, cache_id) == 1);
-        REQUIRE(cache3_file->Resize(0x100));
-        CHECK(controller->GetCommitId(SaveDataSpaceId::User, cache_id) == 2);
-        CHECK(controller->GetCommitId(SaveDataSpaceId::User, default_cache_id) == 1);
-        cache3_file.reset();
-
-        const auto active_user =
-            system.GetProfileManager().GetUser(Settings::values.current_user.GetValue());
-        REQUIRE(active_user.has_value());
-        const auto active_account =
-            SaveDataAttribute::Make(TitleId, SaveDataType::Account, active_user->AsU128(), 0);
-        REQUIRE(controller->CreateSaveData(&dir, SaveDataSpaceId::User, active_account) ==
-                ResultSuccess);
-
-        std::array<u8, sizeof(TitleId)> ambiguous_id_payload{};
-        std::memcpy(ambiguous_id_payload.data(), &TitleId, sizeof(TitleId));
-        CHECK(SendDomainCommand(system, memory, session_manager, server_session, guest_thread,
-                                1, 21, ambiguous_id_payload)
-                  .result == FileSys::ResultTargetNotFound);
-
-        // Deleting an enumerated cache ID must leave the account save and other indices intact.
-        std::array<u8, sizeof(cache_id)> cache_id_payload{};
-        std::memcpy(cache_id_payload.data(), &cache_id, sizeof(cache_id));
-        REQUIRE(SendDomainCommand(system, memory, session_manager, server_session, guest_thread,
-                                  1, 21, cache_id_payload)
-                    .result == ResultSuccess);
-        controller->SetAutoCreate(false);
-        CHECK(controller->OpenSaveData(&dir, SaveDataSpaceId::User, indexed_cache) ==
-              FileSys::ResultTargetNotFound);
-        CHECK(controller->OpenSaveData(&dir, SaveDataSpaceId::User, default_cache) == ResultSuccess);
-        CHECK(controller->OpenSaveData(&dir, SaveDataSpaceId::User, active_account) == ResultSuccess);
-        CHECK(SendDomainCommand(system, memory, session_manager, server_session, guest_thread,
-                                1, 21, cache_id_payload)
-                  .result == FileSys::ResultTargetNotFound);
     });
     worker.join();
+#undef WORKER_REQUIRE
+#undef WORKER_CHECK
+
+    for (const auto& failure : checks.failures) {
+        FAIL_CHECK(failure);
+    }
+    REQUIRE(checks.failures.empty());
 }
 
 TEST_CASE("Guest IDirectory hides save metadata sidecar files", "[core][save-data]") {

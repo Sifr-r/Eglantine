@@ -64,6 +64,12 @@ class SettingsDialogFragment : DialogFragment(), DialogInterface.OnClickListener
     }
 
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
+        val clickedItem = settingsViewModel.clickedItem
+        if (clickedItem == null) {
+            dismissAllowingStateLoss()
+            return super.onCreateDialog(savedInstanceState)
+        }
+
         return when (type) {
             TYPE_RESET_SETTING -> {
                 MaterialAlertDialogBuilder(requireContext())
@@ -112,6 +118,10 @@ class SettingsDialogFragment : DialogFragment(), DialogInterface.OnClickListener
                             else -> {
                                 item.setting.reset()
                                 settingsViewModel.setAdapterItemChanged(position)
+                                if (item.setting.key == IntSetting.APP_LANGUAGE.key) {
+                                    settingsViewModel.setShouldRecreateForLanguageChange(true)
+                                    requireActivity().recreate()
+                                }
                             }
                         }
                     }
@@ -125,7 +135,10 @@ class SettingsDialogFragment : DialogFragment(), DialogInterface.OnClickListener
             }
 
             SettingsItem.TYPE_SINGLE_CHOICE -> {
-                val item = settingsViewModel.clickedItem as SingleChoiceSetting
+                val item = clickedItem as? SingleChoiceSetting ?: run {
+                    dismissAllowingStateLoss()
+                    return super.onCreateDialog(savedInstanceState)
+                }
                 val value = getSelectionForSingleChoiceValue(item)
 
                 MaterialAlertDialogBuilder(requireContext())
@@ -135,8 +148,11 @@ class SettingsDialogFragment : DialogFragment(), DialogInterface.OnClickListener
             }
 
             SettingsItem.TYPE_SLIDER -> {
+                val item = clickedItem as? SliderSetting ?: run {
+                    dismissAllowingStateLoss()
+                    return super.onCreateDialog(savedInstanceState)
+                }
                 sliderBinding = DialogSliderBinding.inflate(layoutInflater)
-                val item = settingsViewModel.clickedItem as SliderSetting
 
                 settingsViewModel.setSliderTextValue(item.getSelectedValue().toFloat(), item.units)
                 sliderBinding.slider.apply {
@@ -158,8 +174,11 @@ class SettingsDialogFragment : DialogFragment(), DialogInterface.OnClickListener
             }
 
             SettingsItem.TYPE_SPINBOX -> {
+                val item = clickedItem as? SpinBoxSetting ?: run {
+                    dismissAllowingStateLoss()
+                    return super.onCreateDialog(savedInstanceState)
+                }
                 spinboxBinding = DialogSpinboxBinding.inflate(layoutInflater)
-                val item = settingsViewModel.clickedItem as SpinBoxSetting
 
                 val currentValue = item.getSelectedValue()
                 spinboxBinding.editValue.setText(currentValue.toString())
@@ -262,8 +281,11 @@ class SettingsDialogFragment : DialogFragment(), DialogInterface.OnClickListener
             }
 
             SettingsItem.TYPE_STRING_INPUT -> {
+                val item = clickedItem as? StringInputSetting ?: run {
+                    dismissAllowingStateLoss()
+                    return super.onCreateDialog(savedInstanceState)
+                }
                 stringInputBinding = DialogEditTextBinding.inflate(layoutInflater)
-                val item = settingsViewModel.clickedItem as StringInputSetting
                 stringInputBinding.editText.setText(item.getSelectedValue())
 
                 val onGenerate = item.onGenerate
@@ -321,7 +343,10 @@ class SettingsDialogFragment : DialogFragment(), DialogInterface.OnClickListener
             }
 
             SettingsItem.TYPE_STRING_SINGLE_CHOICE -> {
-                val item = settingsViewModel.clickedItem as StringSingleChoiceSetting
+                val item = clickedItem as? StringSingleChoiceSetting ?: run {
+                    dismissAllowingStateLoss()
+                    return super.onCreateDialog(savedInstanceState)
+                }
                 MaterialAlertDialogBuilder(requireContext())
                     .setTitle(item.title)
                     .setSingleChoiceItems(item.choices, item.selectedValueIndex, this)
@@ -329,7 +354,10 @@ class SettingsDialogFragment : DialogFragment(), DialogInterface.OnClickListener
             }
 
             SettingsItem.TYPE_INT_SINGLE_CHOICE -> {
-                val item = settingsViewModel.clickedItem as IntSingleChoiceSetting
+                val item = clickedItem as? IntSingleChoiceSetting ?: run {
+                    dismissAllowingStateLoss()
+                    return super.onCreateDialog(savedInstanceState)
+                }
                 MaterialAlertDialogBuilder(requireContext())
                     .setTitle(item.title)
                     .setSingleChoiceItems(item.choices, item.selectedValueIndex, this)
@@ -346,8 +374,14 @@ class SettingsDialogFragment : DialogFragment(), DialogInterface.OnClickListener
         savedInstanceState: Bundle?
     ): View? {
         return when (type) {
-            SettingsItem.TYPE_SLIDER -> sliderBinding.root
-            SettingsItem.TYPE_STRING_INPUT -> stringInputBinding.root
+            SettingsItem.TYPE_SLIDER -> {
+                if (::sliderBinding.isInitialized) sliderBinding.root
+                else super.onCreateView(inflater, container, savedInstanceState)
+            }
+            SettingsItem.TYPE_STRING_INPUT -> {
+                if (::stringInputBinding.isInitialized) stringInputBinding.root
+                else super.onCreateView(inflater, container, savedInstanceState)
+            }
             else -> super.onCreateView(inflater, container, savedInstanceState)
         }
     }
@@ -356,6 +390,9 @@ class SettingsDialogFragment : DialogFragment(), DialogInterface.OnClickListener
         super.onViewCreated(view, savedInstanceState)
         when (type) {
             SettingsItem.TYPE_SLIDER -> {
+                if (!::sliderBinding.isInitialized) {
+                    return
+                }
                 settingsViewModel.sliderTextValue.collect(viewLifecycleOwner) {
                     sliderBinding.textValue.text = it
                 }
@@ -367,28 +404,27 @@ class SettingsDialogFragment : DialogFragment(), DialogInterface.OnClickListener
     }
 
     override fun onClick(dialog: DialogInterface, which: Int) {
-        when (settingsViewModel.clickedItem) {
+        when (val clickedItem = settingsViewModel.clickedItem) {
             is SingleChoiceSetting -> {
-                val scSetting = settingsViewModel.clickedItem as SingleChoiceSetting
-                val value = getValueForSingleChoiceSelection(scSetting, which)
+                val value = getValueForSingleChoiceSelection(clickedItem, which)
 
-                if (value in scSetting.warnChoices) {
+                if (value in clickedItem.warnChoices) {
                     MaterialAlertDialogBuilder(requireContext())
                         .setTitle(R.string.warning)
-                        .setMessage(scSetting.warningMessage)
+                        .setMessage(clickedItem.warningMessage)
                         .setPositiveButton(R.string.ok, null)
                         .create()
                         .show()
                 }
-                scSetting.setSelectedValue(value)
+                clickedItem.setSelectedValue(value)
 
-                if (scSetting.setting.key == IntSetting.RENDERER_SCALING_FILTER.key ||
-                    scSetting.setting.key == IntSetting.RENDERER_FRAME_GEN_TARGET_RATE.key
+                if (clickedItem.setting.key == IntSetting.RENDERER_SCALING_FILTER.key ||
+                    clickedItem.setting.key == IntSetting.RENDERER_FRAME_GEN_TARGET_RATE.key
                 ) {
                     settingsViewModel.setShouldReloadSettingsList(true)
                 }
 
-                if (scSetting.setting.key == "app_language") {
+                if (clickedItem.setting.key == "app_language") {
                     settingsViewModel.setShouldRecreateForLanguageChange(true)
                     // recreate page apply language change instantly
                     requireActivity().recreate()
@@ -396,33 +432,28 @@ class SettingsDialogFragment : DialogFragment(), DialogInterface.OnClickListener
             }
 
             is StringSingleChoiceSetting -> {
-                val scSetting = settingsViewModel.clickedItem as StringSingleChoiceSetting
-                val value = scSetting.getValueAt(which)
-                scSetting.setSelectedValue(value)
+                val value = clickedItem.getValueAt(which)
+                clickedItem.setSelectedValue(value)
             }
 
             is IntSingleChoiceSetting -> {
-                val scSetting = settingsViewModel.clickedItem as IntSingleChoiceSetting
-                val value = scSetting.getValueAt(which)
-                scSetting.setSelectedValue(value)
+                val value = clickedItem.getValueAt(which)
+                clickedItem.setSelectedValue(value)
             }
 
             is SliderSetting -> {
-                val sliderSetting = settingsViewModel.clickedItem as SliderSetting
-                sliderSetting.setSelectedValue(settingsViewModel.sliderProgress.value)
+                clickedItem.setSelectedValue(settingsViewModel.sliderProgress.value)
             }
 
             is SpinBoxSetting -> {
-                val spinBoxSetting = settingsViewModel.clickedItem as SpinBoxSetting
                 val value = spinboxBinding.editValue.text.toString().toIntOrNull()
-                if (value != null && value in spinBoxSetting.min..spinBoxSetting.max) {
-                    spinBoxSetting.setSelectedValue(value)
+                if (value != null && value in clickedItem.min..clickedItem.max) {
+                    clickedItem.setSelectedValue(value)
                 }
             }
 
             is StringInputSetting -> {
-                val stringInputSetting = settingsViewModel.clickedItem as StringInputSetting
-                stringInputSetting.setSelectedValue(
+                clickedItem.setSelectedValue(
                     (stringInputBinding.editText.text ?: "").toString()
                 )
             }

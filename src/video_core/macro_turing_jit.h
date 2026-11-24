@@ -14,7 +14,12 @@
 #include <vector>
 
 // Eden's Xbyak configuration (its hash maps): every translation unit must see the same one.
+#if defined(ARCHITECTURE_x86_64)
 #include "common/x64/xbyak.h"
+#elif defined(ARCHITECTURE_arm64)
+#include <oaknut/code_block.hpp>
+#include <oaknut/oaknut.hpp>
+#endif
 
 #include "video_core/macro_turing.h"
 
@@ -215,6 +220,7 @@ private:
         }
     };
 
+#if defined(ARCHITECTURE_x86_64)
     struct Program : Xbyak::CodeGenerator {
         explicit Program(std::span<const Word> code, bool batch_emits_)
             : Xbyak::CodeGenerator(1 << 20, Xbyak::AutoGrow), batch_emits{batch_emits_} {
@@ -751,6 +757,602 @@ private:
         Xbyak::Label fail_underflow, fail_source, fail_destination, fail_extended, fail_merge,
             fail_loop, fail_dread, fail_dwrite, fail_output, fail_emit, fail_outside, fail_steps;
     };
+#elif defined(ARCHITECTURE_arm64)
+    struct Program {
+        explicit Program(std::span<const Word> code_words, bool batch_emits_)
+            : mem{1 << 20}, code{mem.ptr(), mem.ptr()}, batch_emits{batch_emits_} {
+            mem.unprotect();
+            entry = code.xptr<Word (*)(State*)>();
+            Generate(code_words);
+            mem.protect();
+            mem.invalidate_all();
+        }
+
+        Word (*entry)(State*) = nullptr;
+
+    private:
+        using Decoded = TuringMacroInterpreter::Decoded;
+        static constexpr oaknut::XReg st{19};
+        static constexpr oaknut::WReg load0{20};
+        static constexpr oaknut::WReg load1{21};
+        static constexpr oaknut::WReg res0{22};
+        static constexpr oaknut::WReg res1{23};
+
+        static constexpr std::size_t RegOffset(Word reg) {
+            return offsetof(State, regs) + reg * sizeof(Word);
+        }
+
+        void CmpImm32(oaknut::WReg lhs, Word imm) {
+            using namespace oaknut::util;
+            if (imm <= 4095) {
+                code.CMP(lhs, imm);
+            } else {
+                code.MOV(W5, imm);
+                code.CMP(lhs, W5);
+            }
+        }
+
+        void Generate(std::span<const Word> code_words) {
+            using namespace oaknut::util;
+            const Word count = static_cast<Word>(code_words.size() / 3);
+            labels.resize(count);
+            std::vector<Decoded> decoded(count);
+            for (Word pc = 0; pc < count; ++pc) {
+                decoded[pc] = TuringMacroInterpreter::Decode(
+                    {code_words[pc * 3 + 2], code_words[pc * 3 + 1], code_words[pc * 3]});
+            }
+            Analyze(decoded);
+
+            code.STP(X29, X30, SP, PRE_INDEXED, -64);
+            code.STP(X19, X20, SP, 16);
+            code.STP(X21, X22, SP, 32);
+            code.STP(X23, X24, SP, 48);
+            code.MOV(X29, SP);
+            code.MOV(st, X0);
+            code.LDR(W0, st, offsetof(State, start));
+            CmpImm32(W0, count);
+            code.B(CS, fail_outside);
+            code.ADR(X3, table);
+            code.LSL(X4, X0, 2);
+            code.ADD(X3, X3, X4);
+            code.BR(X3);
+
+            for (Word pc = 0; pc < count; ++pc) {
+                code.l(labels[pc]);
+                Instruction(pc, count, decoded[pc]);
+            }
+
+            // Dispatch on w0 (the next pc). Every backward edge comes through here, so the
+            // instruction limit is counted here.
+            code.l(dispatch);
+            code.LDR(W3, st, offsetof(State, steps));
+            code.SUBS(W3, W3, 1);
+            code.STR(W3, st, offsetof(State, steps));
+            code.B(EQ, fail_steps);
+            CmpImm32(W0, count);
+            code.B(CS, fail_outside);
+            code.ADR(X3, table);
+            code.LSL(X4, X0, 2);
+            code.ADD(X3, X3, X4);
+            code.BR(X3);
+
+            code.l(success);
+            code.MOV(W0, 0);
+            code.l(leave);
+            code.LDP(X23, X24, SP, 48);
+            code.LDP(X21, X22, SP, 32);
+            code.LDP(X19, X20, SP, 16);
+            code.LDP(X29, X30, SP, POST_INDEXED, 64);
+            code.RET();
+
+            const auto fail_with = [&](oaknut::Label& label, Word error) {
+                code.l(label);
+                code.MOV(W0, error);
+                code.B(leave);
+            };
+            fail_with(fail_underflow, FifoUnderflow);
+            fail_with(fail_source, InvalidSource);
+            fail_with(fail_destination, InvalidDestination);
+            fail_with(fail_extended, UnsupportedExtended);
+            fail_with(fail_merge, InvalidMerge);
+            fail_with(fail_loop, InvalidLoop);
+            fail_with(fail_dread, DataRamReadOutOfBounds);
+            fail_with(fail_dwrite, DataRamWriteOutOfBounds);
+            fail_with(fail_output, InvalidOutput);
+            fail_with(fail_emit, UnsupportedEmit);
+            fail_with(fail_outside, OutsideCode);
+            fail_with(fail_steps, StepLimit);
+
+            code.align(4);
+            code.l(table);
+            for (Word pc = 0; pc < count; ++pc) {
+                code.B(labels[pc]);
+            }
+        }
+
+        // Loads MME register `reg` (as an operand of `lane`) into `dst`.
+        void Get(oaknut::WReg dst, const Decoded& d, Word reg, Word lane) {
+            if (reg < 24) {
+                code.LDR(dst, st, RegOffset(reg));
+                return;
+            }
+            switch (reg) {
+            case 24: code.MOV(dst, 0); return;
+            case 25: code.MOV(dst, Word(std::int32_t(std::int16_t(d.imm[lane])))); return;
+            case 26: code.MOV(dst, Word(std::int32_t(std::int16_t(d.imm[1 - lane])))); return;
+            case 27: code.MOV(dst, (d.imm[0] << 16) | d.imm[1]); return;
+            case 28: code.MOV(dst, load0); return;
+            case 29: code.MOV(dst, load1); return;
+            default: code.B(fail_source); return;
+            }
+        }
+
+        static bool IsFlow(Word op) {
+            return op >= 23 && op <= 29;
+        }
+
+        void Analyze(const std::vector<Decoded>& decoded) {
+            const Word count = static_cast<Word>(decoded.size());
+            loop_end.assign(count, false);
+            after_end.assign(count, false);
+            const auto mark = [&](std::vector<bool>& set, std::int64_t pc) {
+                if (pc >= 0 && pc < count) set[static_cast<std::size_t>(pc)] = true;
+            };
+            for (Word pc = 0; pc < count; ++pc) {
+                for (Word lane = 0; lane < 2; ++lane) {
+                    const Decoded& d = decoded[pc];
+                    if (d.op[lane] == 23 && d.imm[lane] >= 2 && pc + d.imm[lane] - 1 < count) {
+                        loop_end[pc + d.imm[lane] - 1] = true;
+                    }
+                }
+            }
+            for (Word pc = 0; pc < count; ++pc) {
+                const Decoded& d = decoded[pc];
+                if (!d.end) continue;
+                mark(after_end, std::int64_t{pc} + 1);
+                for (Word lane = 0; lane < 2; ++lane) {
+                    const Word imm = d.imm[lane];
+                    switch (d.op[lane]) {
+                    case 23: mark(after_end, std::int64_t{pc} + imm); break;
+                    case 24: mark(after_end, std::int64_t{pc} + (imm & 0x7fff)); break;
+                    case 25: case 26: case 27: case 28: case 29:
+                        mark(after_end, std::int64_t{pc} + (std::int32_t(imm << 19) >> 19));
+                        break;
+                    default: break;
+                    }
+                }
+            }
+            for (Word pc = 0; pc < count; ++pc) {
+                for (Word lane = 0; lane < 2; ++lane) {
+                    const Decoded& d = decoded[pc];
+                    if (d.op[lane] == 23 && d.imm[lane] >= 2) {
+                        const Word end = pc + d.imm[lane] - 1;
+                        if (end < count && decoded[end].end) mark(after_end, std::int64_t{pc} + 1);
+                    }
+                }
+            }
+        }
+
+        void Instruction(Word pc, Word count, const Decoded& d) {
+            using namespace oaknut::util;
+            for (Word i = 0; i < 2; ++i) {
+                const oaknut::WReg load = i == 0 ? load0 : load1;
+                if (!d.load[i]) {
+                    code.MOV(load, 0);
+                    continue;
+                }
+                code.LDR(W0, st, offsetof(State, consumed));
+                code.LDR(W3, st, offsetof(State, params_size));
+                code.CMP(W0, W3);
+                code.B(CS, fail_underflow);
+                code.LDR(X4, st, offsetof(State, params));
+                code.LSL(X5, X0, 2);
+                code.ADD(X4, X4, X5);
+                code.LDR(load, X4);
+                code.ADD(W0, W0, 1);
+                code.STR(W0, st, offsetof(State, consumed));
+            }
+            if (!d.pred_mode) {
+                Body(pc, count, d, 15);
+                return;
+            }
+            oaknut::Label when_false;
+            Get(W0, d, d.pred_reg, 0);
+            code.CBZ(W0, when_false);
+            Body(pc, count, d, d.mask_true);
+            code.l(when_false);
+            Body(pc, count, d, d.mask_false);
+        }
+
+        void Body(Word pc, Word count, const Decoded& d, Word mask) {
+            using namespace oaknut::util;
+            for (Word lane = 0; lane < 2; ++lane) {
+                if ((mask & (1U << lane)) != 0) continue;
+                bool selected = false;
+                for (Word out = 0; out < 2; ++out) {
+                    if ((mask & (4U << out)) == 0) continue;
+                    selected |= d.out_method[out] == lane + 1 || d.out_emit[out] == lane + 1;
+                }
+                if (selected) {
+                    code.MOV(lane == 0 ? res0 : res1, 0);
+                }
+            }
+            const bool flow =
+                (((mask & 1) != 0) && IsFlow(d.op[0])) || (((mask & 2) != 0) && IsFlow(d.op[1]));
+            if (flow) {
+                code.MOV(W3, pc + 1);
+                code.STR(W3, st, offsetof(State, next_pc));
+                code.STRB(WZR, st, offsetof(State, cancel_end));
+            }
+            const bool lane0_active = (mask & 1) != 0;
+            const bool early_operands =
+                ((mask & 2) != 0) && lane0_active &&
+                (d.op[0] == 22 || (d.dst[0] < 24 && (d.dst[0] == d.src_a[1] || d.dst[0] == d.src_b[1])));
+            if (early_operands) {
+                Get(W0, d, d.src_a[1], 1);
+                code.STR(W0, st, offsetof(State, scratch_x));
+                Get(W0, d, d.src_b[1], 1);
+                code.STR(W0, st, offsetof(State, scratch_y));
+            }
+            for (Word lane = 0; lane < 2; ++lane) {
+                if ((mask & (1U << lane)) == 0) {
+                    continue;
+                }
+                if (lane == 1 && early_operands) {
+                    code.LDR(W1, st, offsetof(State, scratch_x));
+                    code.LDR(W2, st, offsetof(State, scratch_y));
+                } else {
+                    Get(W1, d, d.src_a[lane], lane);
+                    Get(W2, d, d.src_b[lane], lane);
+                }
+                Lane(pc, d, lane);
+                // w0 holds the lane's value.
+                code.MOV(lane == 0 ? res0 : res1, W0);
+                if (d.dst[lane] < 24) {
+                    code.STR(W0, st, RegOffset(d.dst[lane]));
+                } else if (d.dst[lane] != 24) {
+                    code.B(fail_destination);
+                }
+            }
+            for (Word lane = 0; lane < 2; ++lane) {
+                if ((mask & (4U << lane)) == 0) {
+                    continue;
+                }
+                if (d.out_method[lane]) {
+                    Output(W0, d, d.out_method[lane]);
+                    code.AND(W1, W0, 0xfff);
+                    code.STR(W1, st, offsetof(State, method));
+                    code.LSR(W0, W0, 12);
+                    code.AND(W0, W0, 15);
+                    code.STR(W0, st, offsetof(State, increment));
+                }
+                if (d.out_emit[lane]) {
+                    Output(W0, d, d.out_emit[lane]);
+                    oaknut::Label call_emit, emitted;
+                    if (batch_emits) {
+                        code.LDR(W1, st, offsetof(State, method));
+                        code.LDR(W2, st, offsetof(State, emit_count));
+                        code.LDR(W3, st, offsetof(State, emit_capacity));
+                        code.CMP(W2, W3);
+                        code.B(CS, call_emit);
+                        code.CMP(W1, 0xe00);
+                        code.B(CS, call_emit);
+                        code.SUB(W3, W1, 0x157);
+                        code.CMP(W3, 1);
+                        code.B(LS, call_emit);
+                        code.MOV(W2, W2);
+                        code.ADD(X4, st, offsetof(State, emit_buffer));
+                        code.LSL(X3, X2, 3);
+                        code.ADD(X4, X4, X3);
+                        code.STR(W1, X4, 0);
+                        code.STR(W0, X4, 4);
+                        code.ADD(W2, W2, 1);
+                        code.STR(W2, st, offsetof(State, emit_count));
+                        code.B(emitted);
+                        code.l(call_emit);
+                    }
+                    code.MOV(W2, W0);
+                    code.LDR(W1, st, offsetof(State, method));
+                    code.MOV(X0, st);
+                    code.LDR(X3, st, offsetof(State, emit));
+                    code.BLR(X3);
+                    code.TST(W0, 0xff);
+                    code.B(EQ, fail_emit);
+                    if (batch_emits) {
+                        code.l(emitted);
+                    }
+                    code.LDR(W0, st, offsetof(State, increment));
+                    code.LDR(W1, st, offsetof(State, method));
+                    code.ADD(W1, W1, W0);
+                    code.STR(W1, st, offsetof(State, method));
+                }
+            }
+            if (after_end[pc]) {
+                code.LDRB(W3, st, offsetof(State, end_next));
+                code.CBNZ(W3, success);
+            }
+            if (flow) {
+                code.LDRB(W3, st, offsetof(State, stopped));
+                code.CBNZ(W3, success);
+            }
+            if (d.end) {
+                if (flow) {
+                    code.LDRB(W0, st, offsetof(State, cancel_end));
+                    code.EOR(W0, W0, 1);
+                    code.STRB(W0, st, offsetof(State, end_next));
+                } else {
+                    code.MOV(W0, 1);
+                    code.STRB(W0, st, offsetof(State, end_next));
+                }
+            }
+            if (loop_end[pc]) {
+                oaknut::Label no_loop;
+                code.LDR(W0, st, offsetof(State, loop_count));
+                code.CBZ(W0, no_loop);
+                code.LDR(W3, st, offsetof(State, loop_end));
+                CmpImm32(W3, pc);
+                code.B(NE, no_loop);
+                code.SUB(W0, W0, 1);
+                code.STR(W0, st, offsetof(State, loop_count));
+                code.LDR(W0, st, offsetof(State, loop_start));
+                code.ADD(W0, W0, 1);
+                code.B(dispatch);
+                code.l(no_loop);
+            }
+            if (flow) {
+                code.LDR(W0, st, offsetof(State, next_pc));
+                if (pc + 1 < count) {
+                    CmpImm32(W0, pc + 1);
+                    code.B(NE, dispatch);
+                    code.B(labels[pc + 1]);
+                } else {
+                    code.B(dispatch);
+                }
+            } else if (pc + 1 < count) {
+                code.B(labels[pc + 1]);
+            } else {
+                code.B(fail_outside);
+            }
+        }
+
+        void Output(oaknut::WReg dst, const Decoded& d, Word selector) {
+            switch (selector) {
+            case 1: code.MOV(dst, res0); return;
+            case 2: code.MOV(dst, res1); return;
+            case 3: code.MOV(dst, load0); return;
+            case 4: code.MOV(dst, load1); return;
+            case 5: code.MOV(dst, d.imm[0]); return;
+            case 6: code.MOV(dst, d.imm[1]); return;
+            case 8: code.MOV(dst, d.imm[0] >> 12); return;
+            case 9: code.MOV(dst, d.imm[1] >> 12); return;
+            case 10: code.MOV(dst, (d.imm[0] << 16) | d.imm[1]); return;
+            default: code.B(fail_output); return;
+            }
+        }
+
+        // w1 = x, w2 = y; leaves the result (0 or 1) in w0.
+        void Compare(Word op) {
+            using namespace oaknut::util;
+            code.CMP(W1, W2);
+            switch (op) {
+            case 17: case 25: code.CSET(W0, LT); break;
+            case 18: case 26: code.CSET(W0, CC); break;
+            case 19: case 27: code.CSET(W0, LE); break;
+            case 20: case 28: code.CSET(W0, LS); break;
+            default: code.CSET(W0, EQ); break;
+            }
+        }
+
+        void Lane(Word pc, const Decoded& d, Word lane) {
+            using namespace oaknut::util;
+            const Word imm = d.imm[lane];
+            const Word op = d.op[lane];
+            switch (op) {
+            case 0:
+                code.ADDS(W0, W1, W2);
+                code.CSET(W3, CS);
+                code.STR(W3, st, offsetof(State, carry));
+                return;
+            case 1:
+                code.ADD(W0, W1, W2);
+                code.LDR(W3, st, offsetof(State, carry));
+                code.ADD(W0, W0, W3);
+                return;
+            case 2:
+                code.SUBS(W0, W1, W2);
+                // ARM64 C flag is inverted borrow (~CF): CC means borrow (x < y).
+                code.CSET(W3, CC);
+                code.STR(W3, st, offsetof(State, carry));
+                return;
+            case 3:
+                code.SUB(W0, W1, W2);
+                code.LDR(W3, st, offsetof(State, carry));
+                code.SUB(W0, W0, W3);
+                return;
+            case 4:
+                code.SXTW(X0, W1);
+                code.SXTW(X2, W2);
+                code.MUL(X0, X0, X2);
+                code.LSR(X3, X0, 32);
+                code.STR(W3, st, offsetof(State, carry));
+                return;
+            case 6:
+                code.MOV(W1, W1);
+                code.MOV(W2, W2);
+                code.MUL(X0, X1, X2);
+                code.LSR(X3, X0, 32);
+                code.STR(W3, st, offsetof(State, carry));
+                return;
+            case 5:
+                code.LDR(W0, st, offsetof(State, carry));
+                return;
+            case 7:
+                code.MOV(W3, 0x1000);
+                code.CMP(W1, W3);
+                code.B(NE, fail_extended);
+                code.MOV(W0, 0);
+                return;
+            case 8:
+                code.CLZ(W0, W1);
+                return;
+            case 9:
+                code.LSL(W0, W1, W2);
+                return;
+            case 10:
+                code.LSR(W0, W1, W2);
+                return;
+            case 11:
+                code.ASR(W0, W1, W2);
+                return;
+            case 12:
+                code.AND(W0, W1, W2);
+                return;
+            case 13:
+                code.AND(W0, W1, W2);
+                code.MVN(W0, W0);
+                return;
+            case 14:
+                code.ORR(W0, W1, W2);
+                return;
+            case 15:
+                code.EOR(W0, W1, W2);
+                return;
+            case 16: {
+                const Word dest = (imm >> 10) & 63, bit_count = (imm >> 5) & 31;
+                const Word source = imm & 31;
+                if (dest >= 32) {
+                    code.B(fail_merge);
+                    return;
+                }
+                code.MOV(W0, W1);
+                if (bit_count == 0) {
+                    return;
+                }
+                if (source > 0) {
+                    code.LSR(W2, W2, static_cast<int>(source));
+                }
+                if (dest + bit_count <= 32) {
+                    code.BFI(W0, W2, static_cast<int>(dest), static_cast<int>(bit_count));
+                } else {
+                    const Word bits_mask = (1U << bit_count) - 1;
+                    const Word clear_mask = ~(bits_mask << dest);
+                    code.MOV(W3, clear_mask);
+                    code.AND(W0, W0, W3);
+                    code.MOV(W3, bits_mask);
+                    code.AND(W2, W2, W3);
+                    code.LSL(W2, W2, static_cast<int>(dest));
+                    code.ORR(W0, W0, W2);
+                }
+                return;
+            }
+            case 17: case 18: case 19: case 20: case 21:
+                Compare(op);
+                code.NEG(W0, W0);
+                return;
+            case 22:
+                code.ADD(W3, W1, W2);
+                code.AND(W1, W3, 0xffff);
+                code.MOV(X0, st);
+                code.LDR(X3, st, offsetof(State, read));
+                code.BLR(X3);
+                return;
+            case 23: {
+                if (imm < 2) {
+                    code.B(fail_loop);
+                    return;
+                }
+                oaknut::Label skip, done;
+                code.LDR(W3, st, offsetof(State, loop_count));
+                code.CBNZ(W3, fail_loop);
+                code.CBZ(W1, skip);
+                code.SUB(W1, W1, 1);
+                code.STR(W1, st, offsetof(State, loop_count));
+                code.MOV(W3, pc);
+                code.STR(W3, st, offsetof(State, loop_start));
+                code.MOV(W3, pc + imm - 1);
+                code.STR(W3, st, offsetof(State, loop_end));
+                code.B(done);
+                code.l(skip);
+                code.MOV(W3, pc + imm);
+                code.STR(W3, st, offsetof(State, next_pc));
+                code.l(done);
+                code.MOV(W0, 0);
+                return;
+            }
+            case 24:
+                code.MOV(W3, pc + (imm & 0x7fff));
+                code.STR(W3, st, offsetof(State, next_pc));
+                code.MOV(W0, 0);
+                return;
+            case 25: case 26: case 27: case 28: case 29: {
+                oaknut::Label not_taken;
+                Compare(op);
+                if ((imm & 0x8000) != 0) {
+                    code.CBZ(W0, not_taken);
+                } else {
+                    code.CBNZ(W0, not_taken);
+                }
+                const auto offset = std::int32_t(imm << 19) >> 19;
+                if (offset == -4096) {
+                    code.MOV(W3, 1);
+                    code.STRB(W3, st, offsetof(State, stopped));
+                } else {
+                    code.MOV(W3, Word(std::int32_t(pc) + offset));
+                    code.STR(W3, st, offsetof(State, next_pc));
+                    if ((imm & 0x4000) != 0) {
+                        code.MOV(W3, 1);
+                        code.STRB(W3, st, offsetof(State, cancel_end));
+                    } else {
+                        code.STRB(WZR, st, offsetof(State, cancel_end));
+                    }
+                }
+                code.l(not_taken);
+                code.MOV(W0, 0);
+                return;
+            }
+            case 30:
+                code.CMP(W1, 0xc00);
+                code.B(CS, fail_dread);
+                code.LDR(X3, st, offsetof(State, dram));
+                code.MOV(W1, W1);
+                code.LSL(X4, X1, 2);
+                code.ADD(X3, X3, X4);
+                code.LDR(W0, X3);
+                return;
+            case 31:
+                code.CMP(W1, 0xc00);
+                code.B(CS, fail_dwrite);
+                code.LDR(X3, st, offsetof(State, dram));
+                code.MOV(W1, W1);
+                code.LSL(X4, X1, 2);
+                code.ADD(X3, X3, X4);
+                code.STR(W2, X3);
+                code.MOV(W0, 0);
+                return;
+            default:
+                code.MOV(W0, 0);
+                return;
+            }
+        }
+
+        oaknut::CodeBlock mem;
+        oaknut::CodeGenerator code;
+        bool batch_emits{};
+        std::vector<oaknut::Label> labels;
+        std::vector<bool> loop_end, after_end;
+        oaknut::Label table, dispatch, success, leave;
+        oaknut::Label fail_underflow, fail_source, fail_destination, fail_extended, fail_merge,
+            fail_loop, fail_dread, fail_dwrite, fail_output, fail_emit, fail_outside, fail_steps;
+    };
+#else
+    struct Program {
+        explicit Program(std::span<const Word>, bool) {}
+        static Word FallbackEntry(State*) {
+            return OutsideCode;
+        }
+        Word (*entry)(State*) = &FallbackEntry;
+    };
+#endif
 
     std::array<std::unique_ptr<Program>, 2> programs; ///< Plain, batching
     std::array<std::uint64_t, 2> compiled_generations{~std::uint64_t{0}, ~std::uint64_t{0}};

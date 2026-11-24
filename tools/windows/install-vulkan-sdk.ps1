@@ -15,12 +15,15 @@ try {
 }
 
 $VulkanSDKVer = "1.4.341.1"
-if ((Get-WmiObject -Class Win32_ComputerSystem).SystemType -match '(x64)' -eq "True") {
+$osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+if ($osArch -eq [System.Runtime.InteropServices.Architecture]::X64) {
     $VulkanSDKArch = "X64"
     $VulkanSDKOs = "windows"
-} else {
+} elseif ($osArch -eq [System.Runtime.InteropServices.Architecture]::Arm64) {
     $VulkanSDKArch = "ARM64"
     $VulkanSDKOs = "warm"
+} else {
+    throw "Unsupported OS architecture: $osArch"
 }
 $VULKAN_SDK = "C:/VulkanSDK/$VulkanSDKVer"
 $ExeFile = "vulkansdk-windows-$VulkanSDKArch-$VulkanSDKVer.exe"

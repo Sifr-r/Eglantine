@@ -97,7 +97,7 @@ union Opcode {
     BitField<27, 5, u32> bf_dst_bit;
 
     u32 GetBitfieldMask() const {
-        return (1 << bf_size) - 1;
+        return (u32{1} << bf_size) - 1U;
     }
 
     s32 GetBranchTarget() const {

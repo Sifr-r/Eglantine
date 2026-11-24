@@ -136,10 +136,12 @@ Result IAddOnContentManager::ListAddOnContent(Out<u32> out_count,
 
     R_UNLESS(out.size() >= offset, AM::ResultApplicationRecordNotFound);
 
-    *out_count = static_cast<u32>(std::min<size_t>(out.size() - offset, count));
-    std::rotate(out.begin(), out.begin() + offset, out.end());
-
-    std::memcpy(out_addons.data(), out.data(), *out_count * sizeof(u32));
+    const size_t copied_count =
+        std::min({out.size() - offset, static_cast<size_t>(count), out_addons.size() / sizeof(u32)});
+    if (copied_count != 0) {
+        std::memcpy(out_addons.data(), out.data() + offset, copied_count * sizeof(u32));
+    }
+    *out_count = static_cast<u32>(copied_count);
 
     R_SUCCEED();
 }

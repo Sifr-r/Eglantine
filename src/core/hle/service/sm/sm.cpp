@@ -82,6 +82,7 @@ Result ServiceManager::RegisterService(Kernel::KServerPort** out_server_port, st
 
     service_ports.emplace(name, std::addressof(port->GetClientPort()));
     registered_services.emplace(name, handler);
+    service_registered_cv.notify_all();
     if (deferral_event) {
         deferral_event->Signal(kernel);
     }
@@ -91,6 +92,16 @@ Result ServiceManager::RegisterService(Kernel::KServerPort** out_server_port, st
 
     // We succeeded.
     R_SUCCEED();
+}
+
+void ServiceManager::CancelBlockingGets() {
+    std::scoped_lock lk{lock};
+    is_shutting_down = true;
+    service_registered_cv.notify_all();
+}
+
+bool ServiceManager::IsGuestServiceThread() const {
+    return kernel.CurrentScheduler() != nullptr;
 }
 
 Result ServiceManager::UnregisterService(const std::string& name) {
@@ -104,7 +115,10 @@ Result ServiceManager::UnregisterService(const std::string& name) {
     }
 
     registered_services.erase(iter);
-    service_ports.erase(name);
+    if (const auto port_iter = service_ports.find(name); port_iter != service_ports.end()) {
+        port_iter->second->Close(kernel);
+        service_ports.erase(port_iter);
+    }
 
     return ResultSuccess;
 }

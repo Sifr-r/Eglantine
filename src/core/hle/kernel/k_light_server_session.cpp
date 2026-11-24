@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <utility>
+
 #include "core/hle/kernel/k_light_server_session.h"
 #include "core/hle/kernel/k_light_session.h"
 #include "core/hle/kernel/k_thread.h"
@@ -126,30 +128,34 @@ Result KLightServerSession::ReplyAndReceive(KernelCore& kernel, u32* data) {
 
     // Reply, if we need to.
     if (data[0] & KLightSession::ReplyFlag) {
-        KScopedSchedulerLock sl(kernel);
+        KThread* current_request = nullptr;
+        {
+            KScopedSchedulerLock sl(kernel);
 
-        // Check that we're open.
-        R_UNLESS(!m_parent->IsClientClosed(), ResultSessionClosed);
-        R_UNLESS(!m_parent->IsServerClosed(), ResultSessionClosed);
+            // Check that we're open.
+            R_UNLESS(!m_parent->IsClientClosed(), ResultSessionClosed);
+            R_UNLESS(!m_parent->IsServerClosed(), ResultSessionClosed);
 
-        // Check that we have a request to reply to.
-        R_UNLESS(m_current_request != nullptr, ResultInvalidState);
+            // Check that we have a request to reply to.
+            R_UNLESS(m_current_request != nullptr, ResultInvalidState);
 
-        // Check that the server thread id is correct.
-        R_UNLESS(m_server_thread_id == GetCurrentThread(kernel).GetId(), ResultInvalidState);
+            // Check that the server thread id is correct.
+            R_UNLESS(m_server_thread_id == GetCurrentThread(kernel).GetId(), ResultInvalidState);
 
-        // If we can reply, do so.
-        if (!m_current_request->IsTerminationRequested()) {
-            std::memcpy(m_current_request->GetLightSessionData(), GetCurrentThread(kernel).GetLightSessionData(), KLightSession::DataSize);
-            m_current_request->EndWait(kernel, ResultSuccess);
+            // If we can reply, do so.
+            if (!m_current_request->IsTerminationRequested()) {
+                std::memcpy(m_current_request->GetLightSessionData(), GetCurrentThread(kernel).GetLightSessionData(), KLightSession::DataSize);
+                m_current_request->EndWait(kernel, ResultSuccess);
+            }
+
+            // Clear our current request; close after releasing the scheduler lock.
+            current_request = std::exchange(m_current_request, nullptr);
+            m_server_thread_id = InvalidThreadId;
         }
 
-        // Close our current request.
-        m_current_request->Close(kernel);
-
-        // Clear our current request.
-        m_current_request = nullptr;
-        m_server_thread_id = InvalidThreadId;
+        if (current_request != nullptr) {
+            current_request->Close(kernel);
+        }
     }
 
     // Create the wait queue for our receive.
@@ -213,6 +219,7 @@ Result KLightServerSession::ReplyAndReceive(KernelCore& kernel, u32* data) {
 
 void KLightServerSession::CleanupRequests(KernelCore& kernel) {
     // Cleanup all pending requests.
+    KThread* current_request = nullptr;
     {
         KScopedSchedulerLock sl(kernel);
 
@@ -223,21 +230,28 @@ void KLightServerSession::CleanupRequests(KernelCore& kernel) {
                 m_current_request->EndWait(kernel, ResultSessionClosed);
             }
 
-            // Clear our current request.
-            m_current_request->Close(kernel);
-            m_current_request = nullptr;
+            // Clear our current request; close after releasing the scheduler lock.
+            current_request = std::exchange(m_current_request, nullptr);
             m_server_thread_id = InvalidThreadId;
         }
 
-        // Reply to all other requests.
-        for (auto& thread : m_request_list) {
-            thread.EndWait(kernel, ResultSessionClosed);
+        // Reply to all other requests (EndWait unlinks the front node from m_request_list).
+        while (!m_request_list.empty()) {
+            KThread* const next_front = std::addressof(m_request_list.front());
+            next_front->EndWait(kernel, ResultSessionClosed);
+            if (!m_request_list.empty() && std::addressof(m_request_list.front()) == next_front) {
+                m_request_list.pop_front();
+            }
         }
 
         // Wait up our server thread, if we have one.
         if (m_server_thread != nullptr) {
             m_server_thread->EndWait(kernel, ResultSessionClosed);
         }
+    }
+
+    if (current_request != nullptr) {
+        current_request->Close(kernel);
     }
 }
 

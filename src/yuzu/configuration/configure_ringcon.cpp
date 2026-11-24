@@ -135,8 +135,18 @@ ConfigureRingController::ConfigureRingController(QWidget* parent,
     emulated_controller->SaveCurrentConfig();
     emulated_controller->EnableConfiguration();
 
+    qRegisterMetaType<Core::HID::ControllerTriggerType>("Core::HID::ControllerTriggerType");
+    connect(this, &ConfigureRingController::ControllerUpdateRequested, this,
+            &ConfigureRingController::ControllerUpdate, Qt::QueuedConnection);
+
     Core::HID::ControllerUpdateCallback engine_callback{
-        .on_change = [this](Core::HID::ControllerTriggerType type) { ControllerUpdate(type); },
+        .on_change =
+            [this](Core::HID::ControllerTriggerType type) {
+                if (type == Core::HID::ControllerTriggerType::RingController &&
+                    is_ring_enabled.load(std::memory_order_acquire)) {
+                    emit ControllerUpdateRequested(type);
+                }
+            },
         .is_npad_service = false,
     };
     callback_key = emulated_controller->SetCallback(engine_callback);
@@ -169,8 +179,12 @@ ConfigureRingController::ConfigureRingController(QWidget* parent,
                     QMenu context_menu;
                     Common::ParamPackage param = emulated_controller->GetRingParam();
                     context_menu.addAction(tr("Clear"), [&] {
-                        emulated_controller->SetRingParam(param);
-                        analog_map_buttons[sub_button_id]->setText(tr("[not set]"));
+                        emulated_controller->SetRingParam(Common::ParamPackage{});
+                        for (auto* button : analog_map_buttons) {
+                            if (button != nullptr) {
+                                button->setText(tr("[not set]"));
+                            }
+                        }
                     });
                     context_menu.addAction(tr("Invert axis"), [&] {
                         const bool invert_value = param.Get("invert_x", "+") == "-";
@@ -217,6 +231,7 @@ ConfigureRingController::ConfigureRingController(QWidget* parent,
 }
 
 ConfigureRingController::~ConfigureRingController() {
+    is_ring_enabled.store(false, std::memory_order_release);
     emulated_controller->SetPollingMode(Core::HID::EmulatedDeviceIndex::RightIndex,
                                         Common::Input::PollingMode::Active);
     emulated_controller->DisableConfiguration();
@@ -281,7 +296,7 @@ void ConfigureRingController::RestoreDefaults() {
 void ConfigureRingController::EnableRingController() {
     const auto dialog_title = tr("Error enabling ring input");
 
-    is_ring_enabled = false;
+    is_ring_enabled.store(false, std::memory_order_release);
     ui->ring_controller_sensor_value->setText(tr("Not connected"));
 
     if (!Settings::values.enable_joycon_driver) {
@@ -298,7 +313,7 @@ void ConfigureRingController::EnableRingController() {
         Core::HID::EmulatedDeviceIndex::RightIndex, Common::Input::PollingMode::Ring);
     switch (result) {
     case Common::Input::DriverResult::Success:
-        is_ring_enabled = true;
+        is_ring_enabled.store(true, std::memory_order_release);
         break;
     case Common::Input::DriverResult::NotSupported:
         QMessageBox::warning(this, dialog_title,
@@ -321,7 +336,7 @@ void ConfigureRingController::EnableRingController() {
 }
 
 void ConfigureRingController::ControllerUpdate(Core::HID::ControllerTriggerType type) {
-    if (!is_ring_enabled) {
+    if (!is_ring_enabled.load(std::memory_order_acquire)) {
         return;
     }
     if (type != Core::HID::ControllerTriggerType::RingController) {

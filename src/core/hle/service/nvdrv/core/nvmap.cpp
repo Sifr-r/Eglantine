@@ -107,12 +107,12 @@ void NvMap::UnmapHandle(Handle& handle_description) {
         return;
     }
     const VAddr vaddress = handle_description.address;
-    auto* session = core.GetSession(handle_description.session_id);
-    if (session != nullptr && session->mapper != nullptr) {
-        session->mapper->Unmap(vaddress, map_size);
-    }
+    const NvCore::Container::HeapMapperId mapper_id = handle_description.heap_mapper_id;
+    core.WithSessionMapper(handle_description.session_id, mapper_id,
+                           [&](HeapMapper& mapper) { mapper.Unmap(vaddress, map_size); });
     handle_description.d_address = 0;
     handle_description.in_heap = false;
+    handle_description.heap_mapper_id = 0;
 }
 
 bool NvMap::TryRemoveHandle(const Handle& handle_description) {
@@ -164,13 +164,12 @@ DAddr NvMap::GetHandleAddress(Handle::Id handle) {
 
 DAddr NvMap::PinHandle(NvMap::Handle::Id handle, bool low_area_pin) {
     auto handle_description{GetHandle(handle)};
-    if (!handle_description) [[unlikely]] {
+    if (!handle_description) {
         return 0;
     }
 
     std::scoped_lock lock(handle_description->mutex);
-    auto* session = core.GetSession(handle_description->session_id);
-    if (session == nullptr) {
+    if (!core.WithSession(handle_description->session_id, [](const NvCore::Session&) {})) {
         LOG_ERROR(Service_NVDRV, "Cannot pin nvmap handle {} without an active session", handle);
         return 0;
     }
@@ -184,6 +183,7 @@ DAddr NvMap::PinHandle(NvMap::Handle::Id handle, bool low_area_pin) {
     if (!handle_description->pins) {
         // If we're in the unmap queue we can just remove ourselves and return since we're already
         // mapped
+        bool already_mapped = false;
         {
             // Lock now to prevent our queue entry from being removed for allocation in-between the
             // following check and erase
@@ -191,47 +191,87 @@ DAddr NvMap::PinHandle(NvMap::Handle::Id handle, bool low_area_pin) {
             if (handle_description->unmap_queue_entry) {
                 unmap_queue.erase(*handle_description->unmap_queue_entry);
                 handle_description->unmap_queue_entry.reset();
-
-                if (low_area_pin) {
-                    map_low_area();
-                    handle_description->pins++;
-                    return static_cast<DAddr>(handle_description->pin_virt_address);
-                }
-
-                handle_description->pins++;
-                return handle_description->d_address;
+                already_mapped = true;
+            } else if (handle_description->d_address != 0) {
+                already_mapped = true;
             }
         }
+        if (already_mapped) {
+            if (low_area_pin) {
+                map_low_area();
+                handle_description->pins++;
+                return static_cast<DAddr>(handle_description->pin_virt_address);
+            }
 
-        using namespace std::placeholders;
+            handle_description->pins++;
+            return handle_description->d_address;
+        }
+
         // If not then allocate some space and map it
-        DAddr address{};
         auto& smmu = host1x.MemoryManager();
         const VAddr vaddress = handle_description->address;
         const size_t map_size = handle_description->aligned_size;
-        if (session->has_preallocated_area && session->mapper != nullptr &&
-            session->mapper->IsInBounds(vaddress, map_size)) {
-            handle_description->d_address = session->mapper->Map(vaddress, map_size);
+        bool mapped_in_heap = false;
+        DAddr heap_address{};
+        NvCore::Container::HeapMapperId mapper_id{};
+        if (!core.WithSession(handle_description->session_id, [&](NvCore::Session& session) {
+                if (session.has_preallocated_area && session.mapper != nullptr &&
+                    session.mapper->IsInBounds(vaddress, map_size)) {
+                    heap_address = session.mapper->Map(vaddress, map_size);
+                    mapper_id = NvCore::Container::IdOf(session.mapper.get());
+                    mapped_in_heap = true;
+                }
+            })) {
+            LOG_ERROR(Service_NVDRV, "Cannot pin nvmap handle {} without an active session", handle);
+            return 0;
+        }
+
+        if (mapped_in_heap) {
+            handle_description->d_address = heap_address;
             handle_description->in_heap = true;
+            handle_description->heap_mapper_id = mapper_id;
         } else {
+            DAddr address{};
             size_t aligned_up = Common::AlignUp(map_size, BIG_PAGE_SIZE);
             while ((address = smmu.Allocate(aligned_up)) == 0) {
                 // Free handles until the allocation succeeds
-                std::scoped_lock queueLock(unmap_queue_lock);
-                if (auto freeHandleDesc{unmap_queue.front()}) {
-                    // Handles in the unmap queue are guaranteed not to be pinned so don't bother
-                    // checking if they are before unmapping
-                    std::scoped_lock freeLock(freeHandleDesc->mutex);
-                    if (handle_description->d_address)
-                        UnmapHandle(*freeHandleDesc);
-                } else {
-                    LOG_CRITICAL(Service_NVDRV, "Ran out of SMMU address space!");
+                std::shared_ptr<Handle> freeHandleDesc;
+                {
+                    std::scoped_lock queueLock(unmap_queue_lock);
+                    if (unmap_queue.empty()) {
+                        LOG_CRITICAL(Service_NVDRV, "Ran out of SMMU address space!");
+                        return 0;
+                    }
+                    freeHandleDesc = std::move(unmap_queue.front());
+                    unmap_queue.pop_front();
+                    if (freeHandleDesc) {
+                        freeHandleDesc->unmap_queue_entry.reset();
+                    }
+                }
+                if (!freeHandleDesc) {
+                    continue;
+                }
+                // Handles in the unmap queue are normally unpinned, but re-check after taking
+                // freeHandleDesc->mutex in case another thread re-pinned it before we acquired it.
+                std::scoped_lock freeLock(freeHandleDesc->mutex);
+                if (freeHandleDesc->pins == 0 && freeHandleDesc->d_address != 0) {
+                    std::scoped_lock queueLock(unmap_queue_lock);
+                    UnmapHandle(*freeHandleDesc);
                 }
             }
 
+            if (!core.WithSession(handle_description->session_id,
+                                  [&](const NvCore::Session& session) {
+                                      smmu.Map(address, vaddress, map_size, session.asid, true);
+                                  })) {
+                smmu.Free(address, aligned_up);
+                LOG_ERROR(Service_NVDRV, "Session closed while mapping nvmap handle {}", handle);
+                return 0;
+            }
+
             handle_description->d_address = address;
-            smmu.Map(address, vaddress, map_size, session->asid, true);
             handle_description->in_heap = false;
+            handle_description->heap_mapper_id = 0;
         }
     }
 
@@ -317,7 +357,8 @@ std::optional<NvMap::FreeInfo> NvMap::FreeHandle(Handle::Id handle, bool interna
             .address = handle_description->address,
             .size = handle_description->size,
             .was_uncached = handle_description->flags.map_uncached.Value() != 0,
-            .can_unlock = true,
+            .can_unlock = handle_description->allocated,
+            .session_id = handle_description->session_id,
         };
     } else {
         return std::nullopt;

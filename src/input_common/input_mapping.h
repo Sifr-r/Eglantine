@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <mutex>
+#include <queue>
+
 #include "common/param_package.h"
-#include "common/threadsafe_queue.h"
 
 namespace InputCommon::Polling {
 enum class InputType;
@@ -78,7 +80,8 @@ private:
      */
     bool IsDriverValid(const MappingData& data) const;
 
-    Common::SPSCQueue<Common::ParamPackage> input_queue;
+    std::mutex mutex;
+    std::queue<Common::ParamPackage> input_queue;
     Polling::InputType input_type{Polling::InputType::None};
     bool is_enabled{};
     int first_axis = -1;

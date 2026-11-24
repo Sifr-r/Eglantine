@@ -141,6 +141,7 @@ static void EmitFromFixed(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Ins
     const bool fpcr_controlled = args[3].GetImmediateU1();
     ASSERT(rounding_mode == ctx.FPCR(fpcr_controlled).RMode());
     RegAlloc::Realize(Qto, Qfrom);
+    ctx.fpsr.Load();
 
     MaybeStandardFPSCRValue(code, ctx, fpcr_controlled, [&] {
         if constexpr (size == 32) {
@@ -258,7 +259,8 @@ static void EmitTwoOpFallbackWithoutRegAlloc(oaknut::CodeGenerator& code, EmitCo
     const u32 fpcr = ctx.FPCR(fpcr_controlled).Value();
     constexpr u64 stack_size = sizeof(u64) * 4;  // sizeof(u128) * 2
 
-    ABI_PushRegisters(code, ABI_CALLER_SAVE & ~(1ull << Qresult.index()), stack_size);
+    const RegisterList saved_registers = ABI_CALLER_SAVE & ~ToRegList(Qresult);
+    ABI_PushRegisters(code, saved_registers, stack_size);
 
     code.MOV(Xscratch0, std::bit_cast<u64>(fn));
     code.ADD(X0, SP, 0 * 16);
@@ -269,7 +271,7 @@ static void EmitTwoOpFallbackWithoutRegAlloc(oaknut::CodeGenerator& code, EmitCo
     code.BLR(Xscratch0);
     code.LDR(Qresult, SP);
 
-    ABI_PopRegisters(code, ABI_CALLER_SAVE & ~(1ull << Qresult.index()), stack_size);
+    ABI_PopRegisters(code, saved_registers, stack_size);
 }
 
 template<std::size_t fpcr_controlled_arg_index = 1, typename Lambda>

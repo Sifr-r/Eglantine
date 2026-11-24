@@ -57,8 +57,8 @@ class SigHandler {
 
     ::Common::unordered_map<u64, CodeBlockInfo> code_block_infos;
     std::shared_mutex code_block_infos_mutex;
-    struct sigaction old_sa_segv;
-    struct sigaction old_sa_bus;
+    struct sigaction old_sa_segv{};
+    struct sigaction old_sa_bus{};
     std::unique_ptr<uint8_t[]> signal_stack_memory;
     bool supports_fast_mem = true;
 public:
@@ -113,11 +113,12 @@ public:
 };
 
 std::optional<SigHandler> sig_handler;
+std::once_flag sig_handler_once;
 
 void SigHandler::RegisterHandler() {
-    if (!sig_handler) {
+    std::call_once(sig_handler_once, [] {
         sig_handler.emplace();
-    }
+    });
 }
 
 void SigHandler::SigAction(int sig, siginfo_t* info, void* raw_context) {

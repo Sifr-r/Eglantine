@@ -84,6 +84,12 @@ cmake_dependent_option(YUZU_USE_BUNDLED_QT "Download bundled Qt binaries" "${MSV
 
 option(ENABLE_DEBUG_TOOLS "Enable debugging tools (maxwell disassembler, SPIRV translator, etc)" OFF)
 option(ENABLE_WERROR "Enable -Werror diagnostics" ON)
+option(ENABLE_RUST_AMPERE "Enable Rust Ampere shader lowering parity backend" ON)
+option(ENABLE_RUST_AMP_SPIRV "Enable Rust direct SM86-to-SPIR-V shader compiler" ON)
+option(ENABLE_RUST_NUP "Enable Rust NUP archive container and writer backend" ON)
+option(ENABLE_RUST_SWITCH2_IO "Enable Rust Switch 2 IO protocol codec" ON)
+cmake_dependent_option(ENABLE_ISPC_KERNELS "Enable ISPC multi-ISA SIMD kernels when ispc is available" ON "NOT ANDROID" OFF)
+cmake_dependent_option(ENABLE_INTEL_XESS "Enable Intel XeSS dynamic runtime upscaler" ON "NOT ANDROID AND ARCHITECTURE_x86_64" OFF)
 
 # Handle specific -Werror downgrades safely across platforms
 if(ENABLE_WERROR)
@@ -301,8 +307,31 @@ cmake_dependent_option(YUZU_ROOM "Enable dedicated room functionality" ON "NOT A
 cmake_dependent_option(YUZU_ROOM_STANDALONE "Enable standalone room executable" ON "YUZU_ROOM" OFF)
 
 cmake_dependent_option(YUZU_CMD "Compile the eden-cli executable" ON "NOT ANDROID" OFF)
+option(ENABLE_GPUI "Build the experimental Eglantine GPUI desktop shell" OFF)
 
 cmake_dependent_option(YUZU_CRASH_DUMPS "Compile crash dump (Minidump) support" OFF "WIN32 OR LINUX" OFF)
+option(ENABLE_SENTRY "Enable Sentry crash reporting in the desktop frontends" OFF)
+
+if (ENABLE_SENTRY)
+    if (ANDROID OR YUZU_STATIC_ROOM OR NOT (ENABLE_QT OR YUZU_CMD) OR
+        NOT (WIN32 OR LINUX OR CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
+        message(FATAL_ERROR "ENABLE_SENTRY requires a Qt or SDL frontend on Windows, Linux, or macOS.")
+    endif()
+
+    find_package(sentry 0.17.5 CONFIG QUIET)
+    if (NOT TARGET sentry::sentry)
+        message(FATAL_ERROR "ENABLE_SENTRY requires an installed Sentry Native 0.17.5-compatible SDK built with "
+            "SENTRY_BACKEND=inproc and SENTRY_BUILD_SHARED_LIBS=OFF. Set CMAKE_PREFIX_PATH to its install prefix.")
+    endif()
+    get_target_property(SENTRY_LIBRARY_TYPE sentry::sentry TYPE)
+    if (NOT SENTRY_LIBRARY_TYPE STREQUAL "STATIC_LIBRARY" OR NOT SENTRY_BACKEND STREQUAL "inproc")
+        message(FATAL_ERROR "ENABLE_SENTRY requires Sentry Native built with "
+            "SENTRY_BACKEND=inproc and SENTRY_BUILD_SHARED_LIBS=OFF.")
+    endif()
+    if (NOT SENTRY_TRANSPORT MATCHES "^(curl|winhttp)$")
+        message(FATAL_ERROR "ENABLE_SENTRY requires Sentry Native built with its curl or WinHTTP transport.")
+    endif()
+endif()
 
 option(YUZU_DOWNLOAD_TIME_ZONE_DATA "Always download time zone binaries" ON)
 set(YUZU_TZDB_PATH "" CACHE STRING "Path to a pre-downloaded timezone database")
@@ -747,7 +776,52 @@ if (MSVC AND CXX_CLANG)
     link_libraries(llvm-mingw-runtime)
 endif()
 
+if (NOT YUZU_STATIC_ROOM AND (ENABLE_RUST_AMPERE OR ENABLE_RUST_AMP_SPIRV OR ENABLE_RUST_NUP OR ENABLE_RUST_SWITCH2_IO))
+    include(AddRustCrate)
+    set(_eglantine_rust_features)
+    if (ENABLE_RUST_AMPERE)
+        list(APPEND _eglantine_rust_features ampere)
+    endif()
+    if (ENABLE_RUST_AMP_SPIRV)
+        list(APPEND _eglantine_rust_features ampere-spirv)
+    endif()
+    if (ENABLE_RUST_NUP)
+        list(APPEND _eglantine_rust_features nup)
+    endif()
+    if (ENABLE_RUST_SWITCH2_IO)
+        list(APPEND _eglantine_rust_features switch2-io)
+    endif()
+    add_rust_static_library(
+        TARGET eglantine_rs
+        MANIFEST "${CMAKE_SOURCE_DIR}/rust/Cargo.toml"
+        PACKAGE eglantine_ffi
+        LIB_NAME eglantine_rs
+        INCLUDE_DIR "${CMAKE_SOURCE_DIR}/rust/include"
+        NO_DEFAULT_FEATURES
+        FEATURES ${_eglantine_rust_features}
+    )
+endif()
+
 add_subdirectory(src)
+
+if (ENABLE_GPUI)
+    if (NOT WIN32 OR NOT TARGET yuzu-cmd)
+        message(FATAL_ERROR "The GPUI preview requires Windows and YUZU_CMD=ON")
+    endif()
+    find_program(CARGO_EXECUTABLE cargo REQUIRED)
+    set(gpui_manifest "${PROJECT_SOURCE_DIR}/rust/apps/eglantine_gpui/Cargo.toml")
+    set(gpui_target_dir "${PROJECT_BINARY_DIR}/gpui-cargo")
+    set(gpui_profile "$<IF:$<CONFIG:Debug>,debug,release>")
+    set(gpui_binary "${gpui_target_dir}/${gpui_profile}/eglantine-gpui${CMAKE_EXECUTABLE_SUFFIX}")
+    add_custom_target(eglantine-gpui ALL
+        COMMAND "${CARGO_EXECUTABLE}" build --locked --manifest-path "${gpui_manifest}"
+            --target-dir "${gpui_target_dir}" $<$<NOT:$<CONFIG:Debug>>:--release>
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${gpui_binary}" "$<TARGET_FILE_DIR:yuzu-cmd>/eglantine-gpui${CMAKE_EXECUTABLE_SUFFIX}"
+        DEPENDS yuzu-cmd
+        VERBATIM
+    )
+endif()
 
 if (ENABLE_DEBUG_TOOLS)
     add_subdirectory(tools/maxwell-disas)

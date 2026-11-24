@@ -55,6 +55,8 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
+#include "frontend_common/sentry_crash_reporter.h"
+#include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
 #include "input_common/drivers/keyboard.h"
 #include "input_common/drivers/switch2_auto_pair.h"
@@ -71,6 +73,9 @@
 #endif
 #include "yuzu_cmd/emu_window/emu_window_sdl3_null.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3_vk.h"
+#include "yuzu_cmd/gpui_content.h"
+#include "yuzu_cmd/gpui_library.h"
+#include "yuzu_cmd/gpui_session.h"
 #ifdef YUZU_ENABLE_MCP
 #include "mcp/server.h"
 #include "yuzu_cmd/mcp_host_cli.h"
@@ -261,11 +266,22 @@ static void OnStatusMessageReceived(const Network::StatusMessageEntry& msg) {
 }
 
 struct SdlState {
+    Frontend::SentryCrashReporter crash_reporter;
     Core::System system{};
     // Must outlive emu_window, which keeps a pointer to it.
     InputCommon::InputSubsystem input_subsystem{};
     std::unique_ptr<EmuWindow_SDL3> emu_window;
     bool network_initialized{};
+    std::unique_ptr<Gpui::Session> gpui_session;
+    SDL_Scancode gpui_home_key{SDL_SCANCODE_F10};
+    SDL_GamepadButton gpui_home_button{SDL_GAMEPAD_BUTTON_GUIDE};
+    bool gpui_key_held{};
+    std::optional<SDL_JoystickID> gpui_controller_held;
+    bool gpui_mapped_home_held{};
+    bool gpui_home_down{};
+    bool gpui_home_announced{};
+    bool gpui_start_error{};
+    std::atomic_bool gpui_game_exit{};
     // The configuration of this session. It is owned by the state because SDL_AppMain returns
     // before SDL_AppIterate runs, so a local would already be destroyed when the Switch 2
     // auto-pair pass saves the bindings it makes.
@@ -587,9 +603,54 @@ static bool BuildWarm(Core::System& system, int argc, char** argv, wchar_t** arg
     return result.ok;
 }
 
+enum class GpuiTool { None, Library, Content };
+
+static bool RunGpuiTool(GpuiTool tool, Gpui::Session& session, Core::System& system, int argc,
+                        char** argv, [[maybe_unused]] wchar_t** wide_argv) {
+    const char* config = SDL_GetEnvironmentVariable(SDL_GetEnvironment(), "EGLANTINE_GPUI_CONFIG");
+    if (config && *config && !SdlConfig::ReadToolValues(config)) {
+        session.Error("The GPUI emulator configuration could not be read");
+        return false;
+    }
+    const auto path_argument = [&](int index) {
+#ifdef _WIN32
+        if (wide_argv) {
+            return Common::UTF16ToUTF8(wide_argv[index]);
+        }
+#endif
+        return std::string{argv[index]};
+    };
+
+    if (tool == GpuiTool::Library) {
+        const bool shallow = argc == 4 && std::string_view{argv[3]} == "--shallow";
+        if ((argc != 3 && !shallow) || std::string_view{argv[2]}.empty()) {
+            session.Error("A library folder is required for discovery");
+            return false;
+        }
+        const auto directory = std::filesystem::path{Common::FS::ToU8String(path_argument(2))};
+        return Gpui::ScanLibrary(session, system, directory, !shallow);
+    }
+
+    if (argc != 3 && argc != 4) {
+        session.Error("A content operation is required");
+        return false;
+    }
+    const auto error = Gpui::RunContentCommand(system, argv[2], argc == 4 ? path_argument(3) : "");
+    if (!error.empty()) {
+        session.Error(error);
+        return false;
+    }
+    session.SendEvent("content_done");
+    return session.IsConnected();
+}
+
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(WriteCrashDump);
+    const char* crash_dump_directory = std::getenv("EDEN_NX2_CRASH_DUMP");
+    const bool local_crash_dump = crash_dump_directory != nullptr && *crash_dump_directory != '\0';
+#else
+    constexpr bool local_crash_dump = false;
 #endif
     Nx2Sampler::StartFromEnvironment();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
@@ -597,9 +658,49 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "240");
     SdlState* state = new SdlState();
     *appstate = state;
+    const std::string_view first_option = argc > 1 ? argv[1] : "";
+    const bool gpui_requested = first_option == "--gpui-session";
+    const auto gpui_tool = first_option == "--gpui-library"   ? GpuiTool::Library
+                           : first_option == "--gpui-content" ? GpuiTool::Content
+                                                              : GpuiTool::None;
+    std::unique_ptr<Gpui::Session> gpui_tool_session;
+    if (gpui_requested || gpui_tool != GpuiTool::None) {
+        auto session = Gpui::Session::Open();
+        if (!session) {
+            std::fputs("GPUI session mode requires inherited stdin, stdout and stderr.\n", stderr);
+            return SDL_APP_FAILURE;
+        }
+        if (gpui_requested) {
+            state->gpui_session = std::move(session);
+        } else {
+            gpui_tool_session = std::move(session);
+        }
+    }
+    if (gpui_requested) {
+        if (const char* name = std::getenv("EGLANTINE_GPUI_HOME_KEY")) {
+            const auto key = SDL_GetScancodeFromName(name);
+            if (key != SDL_SCANCODE_UNKNOWN) {
+                state->gpui_home_key = key;
+            }
+        }
+        if (const char* name = std::getenv("EGLANTINE_GPUI_HOME_BUTTON")) {
+            const auto button = SDL_GetGamepadButtonFromString(name);
+            if (button != SDL_GAMEPAD_BUTTON_INVALID) {
+                state->gpui_home_button = button;
+            }
+        }
+    }
+
+    const auto fail_session = [state](std::string_view message) {
+        if (state->gpui_session) {
+            state->gpui_session->Error(message);
+            state->gpui_start_error = true;
+        }
+        return SDL_APP_FAILURE;
+    };
 
 #ifdef _WIN32
-    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+    if (!gpui_requested && !gpui_tool_session && AttachConsole(ATTACH_PARENT_PROCESS)) {
         freopen("CONOUT$", "wb", stdout);
         freopen("CONOUT$", "wb", stderr);
     }
@@ -614,25 +715,49 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     }
 #endif
 
-    Common::Log::Initialize();
-    Common::Log::SetColorConsoleBackendEnabled(true);
-    Common::Log::Start();
+    if (!local_crash_dump && !gpui_tool_session) {
+        state->crash_reporter.Start(Frontend::SentryFrontend::Sdl);
+    }
 
-    int option_index = 0;
+    if (!gpui_tool_session) {
+        Common::Log::Initialize();
+        Common::Log::SetColorConsoleBackendEnabled(true);
+        Common::Log::Start();
+    }
+
 #ifdef _WIN32
     int argc_w = 0;
     auto argv_w = CommandLineToArgvW(GetCommandLineW(), &argc_w);
     if (argv_w == nullptr) {
         LOG_CRITICAL(Frontend, "Failed to get command line arguments");
-        return SDL_APP_FAILURE;
+        return fail_session("Failed to read game launch arguments");
     }
-    wchar_t** const matched_argv_w = argc_w == argc ? argv_w : nullptr;
+    wchar_t** matched_argv_w = argc_w == argc ? argv_w : nullptr;
 #else
-    wchar_t** argv_w = nullptr;
-    wchar_t** const matched_argv_w = nullptr;
+    wchar_t** matched_argv_w = nullptr;
 #endif
 
-    if (argc > 1 && std::string_view{argv[1]} == "--build-warm") {
+    if (gpui_tool_session) {
+        const bool success = RunGpuiTool(gpui_tool, *gpui_tool_session, state->system, argc, argv,
+                                         matched_argv_w);
+#ifdef _WIN32
+        LocalFree(argv_w);
+#endif
+        return success ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
+
+    // The private switch belongs to SDL only. Preserve both UTF-8 and wide arguments for Core.
+    if (gpui_requested) {
+        argv[1] = argv[0];
+        ++argv;
+        --argc;
+        if (matched_argv_w) {
+            matched_argv_w[1] = matched_argv_w[0];
+            ++matched_argv_w;
+        }
+    }
+
+    if (!gpui_requested && argc > 1 && std::string_view{argv[1]} == "--build-warm") {
         const bool ok = BuildWarm(state->system, argc, argv, matched_argv_w);
 #ifdef _WIN32
         LocalFree(argv_w);
@@ -644,6 +769,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
     LocalFree(argv_w);
 #endif
+    if (gpui_requested && (lp.filepath.empty() || lp.print_help || lp.print_version ||
+                           lp.pack_nup_source || lp.unpack_nup_source || lp.edit_nup_source)) {
+        return fail_session("A game path is required for a GPUI gameplay session");
+    }
     state->owned_config = std::make_unique<SdlConfig>(lp.config_path);
     state->config = state->owned_config.get();
     // Before anything loads a GPU driver.
@@ -679,7 +808,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     state->network_initialized = Network::Init();
     if (!state->network_initialized) {
         LOG_CRITICAL(Network, "Failed to initialize room networking");
-        return SDL_APP_FAILURE;
+        return fail_session("Failed to initialize room networking");
     }
 
     state->system.Initialize();
@@ -704,7 +833,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         break;
     default:
         LOG_CRITICAL(Frontend, "Invalid renderer backend");
-        return SDL_APP_FAILURE;
+        return fail_session("Invalid renderer backend");
     }
 
 #ifdef _WIN32
@@ -728,7 +857,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             // Booting as a frontend launch would clear the game's temp storage.
             LOG_CRITICAL(Frontend, "Restart handoff {} is missing or damaged, not booting",
                          Common::FS::PathToUTF8String(RestartHandoffPath()));
-            return SDL_APP_FAILURE;
+            return fail_session("The game restart handoff is missing or damaged");
         }
         state->system.GetUserChannel() = std::move(handoff->user_channel);
         load_parameters.program_id = handoff->program_id;
@@ -748,16 +877,16 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         break; // Expected case
     case Core::SystemResultStatus::ErrorGetLoader:
         LOG_CRITICAL(Frontend, "Failed to obtain loader for {}!", lp.filepath);
-        return SDL_APP_FAILURE;
+        return fail_session("The game format was not recognized or the file could not be read");
     case Core::SystemResultStatus::ErrorLoader:
         LOG_CRITICAL(Frontend, "Failed to load ROM!");
-        return SDL_APP_FAILURE;
+        return fail_session("Failed to load the game");
     case Core::SystemResultStatus::ErrorNotInitialized:
         LOG_CRITICAL(Frontend, "CPUCore not initialized");
-        return SDL_APP_FAILURE;
+        return fail_session("The emulator CPU was not initialized");
     case Core::SystemResultStatus::ErrorVideoCore:
         LOG_CRITICAL(Frontend, "Failed to initialize VideoCore!");
-        return SDL_APP_FAILURE;
+        return fail_session("Failed to initialize the game renderer");
     default:
         const u16 loader_id = u16(Core::SystemResultStatus::ErrorLoader);
         const u16 error_id = u16(load_result) - loader_id;
@@ -766,7 +895,8 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             "refer to the Eden wiki for more information or the Eden discord for "
             "additional help.\n\nError Code: {:04X}-{:04X}\nError Description: {}",
             loader_id, error_id, Loader::ResultStatus(error_id));
-        return SDL_APP_FAILURE;
+        return fail_session(fmt::format("Game load failed ({:04X}-{:04X}): {}", loader_id,
+                                        error_id, Loader::ResultStatus(error_id)));
     }
 
     if (lp.use_multiplayer) {
@@ -795,8 +925,11 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
             [](VideoCore::LoadCallbackStage, size_t value, size_t total) {});
     }
 
-    // don't do anything, SDL3 already exists for us :D
-    state->system.RegisterExitCallback([] {});
+    state->system.RegisterExitCallback([state, gpui_requested] {
+        if (gpui_requested) {
+            state->gpui_game_exit = true;
+        }
+    });
 
     // A game executing a program (e.g. restarting after a settings change) writes its launch state
     // to the restart handoff and quits with kRestartExitCode; the launcher boots the same file again
@@ -825,7 +958,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 
     // QLaunch launched applications (should) now reload shader cache.
     static std::mutex shader_cache_reload_mutex;
-    state->system.RegisterApplicationChangedCallback([&state](u64 changed_program_id) {
+    state->system.RegisterApplicationChangedCallback([state](u64 changed_program_id) {
         if (!Settings::values.use_disk_shader_cache.GetValue()) {
             return;
         }
@@ -846,6 +979,11 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         state->system.Run();
     });
 
+    if (state->gpui_session) {
+        for (std::size_t index = 0; index < Settings::values.players.GetValue().size(); ++index) {
+            state->system.HIDCore().GetEmulatedControllerByIndex(index)->SetHomeButtonEnabled(false);
+        }
+    }
     void(state->system.Run());
     if (state->system.DebuggerEnabled())
         state->system.InitializeDebugger();
@@ -867,6 +1005,9 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         }
     }
 #endif
+    if (state->gpui_session) {
+        state->gpui_session->SetState(Gpui::SessionState::Running);
+    }
     return SDL_APP_CONTINUE;
 }
 // EDEN_NX2_KEY_SCRIPT="seconds:code,seconds:-code,..." (or "@<file>"): press (code) or release (-code) keyboard
@@ -1039,9 +1180,131 @@ static void CheckSwitch2AutoPair(SdlState* state) {
     }
 }
 
+static void UpdateGpuiHome(SdlState& state) {
+    auto& session = *state.gpui_session;
+    const bool pressed = state.gpui_key_held || state.gpui_controller_held.has_value() ||
+                         state.gpui_mapped_home_held;
+    if (std::exchange(state.gpui_home_down, pressed) == pressed) {
+        return;
+    }
+    if (pressed && session.GetState() == Gpui::SessionState::Running &&
+        state.emu_window->HasInputFocus()) {
+        state.gpui_home_announced = true;
+        session.SendEvent("home_requested");
+    } else if (!pressed && std::exchange(state.gpui_home_announced, false)) {
+        session.SendEvent("home_released");
+    }
+}
+
+static bool RunGpuiSession(SdlState& state) {
+    auto& session = *state.gpui_session;
+    using enum Gpui::SessionState;
+
+    std::vector<Gpui::Request> requests;
+    if (state.gpui_game_exit || !session.Poll(requests)) {
+        session.SetState(Stopping);
+        return false;
+    }
+    state.gpui_mapped_home_held = false;
+    for (std::size_t index = 0; index < Settings::values.players.GetValue().size(); ++index) {
+        if (state.system.HIDCore().GetEmulatedControllerByIndex(index)->GetHomeButtonValue()) {
+            state.gpui_mapped_home_held = true;
+            break;
+        }
+    }
+    UpdateGpuiHome(state);
+    for (const auto& request : requests) {
+        if (session.GetState() == Stopping) {
+            session.Reply(request.id, request.command == Gpui::Command::Stop
+                                          ? std::string_view{}
+                                          : "The game is stopping");
+            continue;
+        }
+        switch (request.command) {
+        case Gpui::Command::Pause:
+            if (session.GetState() == Running) {
+                state.system.Pause();
+                state.input_subsystem.GetKeyboard()->ReleaseAllKeys();
+                if (!state.emu_window->SetSessionVisible(false)) {
+                    LOG_WARNING(Frontend, "Could not hide the paused game window: {}", SDL_GetError());
+                }
+                session.SetState(Paused);
+            }
+            break;
+        case Gpui::Command::Resume:
+            if (session.GetState() == Paused) {
+                if (!state.emu_window->SetSessionVisible(true)) {
+                    session.Reply(request.id, "Could not restore the game window");
+                    continue;
+                }
+                state.system.Run();
+                session.SetState(Running);
+            }
+            break;
+        case Gpui::Command::Stop:
+            session.SetState(Stopping);
+            break;
+        }
+        session.Reply(request.id);
+    }
+    return session.GetState() != Stopping;
+}
+
+static bool HandleGpuiHome(SdlState& state, const SDL_Event& event) {
+    switch (event.type) {
+    case SDL_EVENT_KEY_DOWN:
+        if (event.key.scancode == state.gpui_home_key) {
+            if (!event.key.repeat) {
+                state.gpui_key_held = true;
+                UpdateGpuiHome(state);
+            }
+            return true;
+        }
+        break;
+    case SDL_EVENT_KEY_UP:
+        if (event.key.scancode == state.gpui_home_key) {
+            state.gpui_key_held = false;
+            UpdateGpuiHome(state);
+            return true;
+        }
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        state.gpui_key_held = false;
+        UpdateGpuiHome(state);
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        if (event.gbutton.button == state.gpui_home_button && !state.gpui_controller_held) {
+            state.gpui_controller_held = event.gbutton.which;
+            UpdateGpuiHome(state);
+        }
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        if (event.gbutton.button == state.gpui_home_button &&
+            state.gpui_controller_held == event.gbutton.which) {
+            state.gpui_controller_held.reset();
+            UpdateGpuiHome(state);
+        }
+        break;
+    case SDL_EVENT_GAMEPAD_REMOVED:
+        if (state.gpui_controller_held == event.gdevice.which) {
+            state.gpui_controller_held.reset();
+            UpdateGpuiHome(state);
+        }
+        break;
+    default:
+        break;
+    }
+    return false;
+}
+
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
-    RunKeyScript(state->input_subsystem, state->system);
+    if (state->gpui_session && !RunGpuiSession(*state)) {
+        return SDL_APP_SUCCESS;
+    }
+    if (!state->gpui_session || state->gpui_session->GetState() == Gpui::SessionState::Running) {
+        RunKeyScript(state->input_subsystem, state->system);
+    }
     CheckSwitch2AutoPair(state);
 #ifdef YUZU_ENABLE_MCP
     if (state->mcp_host) {
@@ -1061,14 +1324,32 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
 }
 extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     SdlState *state = (SdlState *)appstate;
-    if (state->emu_window)
+    if (state->emu_window) {
+        if (state->gpui_session) {
+            if (HandleGpuiHome(*state, *event)) {
+                return SDL_APP_CONTINUE;
+            }
+            if (state->gpui_session->GetState() == Gpui::SessionState::Paused &&
+                event->type >= SDL_EVENT_KEY_DOWN && event->type <= SDL_EVENT_FINGER_CANCELED) {
+                return SDL_APP_CONTINUE;
+            }
+        }
         state->emu_window->OnEvent(*event);
+    }
     return SDL_APP_CONTINUE;
 }
 extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     SdlState *state = (SdlState *)appstate;
     if (!state) {
         return;
+    }
+    auto gpui_session = std::move(state->gpui_session);
+    if (gpui_session) {
+        if (result == SDL_APP_FAILURE && !state->gpui_start_error) {
+            gpui_session->Error("The gameplay host failed. See the emulator log for details.");
+        }
+        gpui_session->SetState(Gpui::SessionState::Stopping);
+        LOG_DEBUG(Frontend, "Stopping GPUI gameplay session");
     }
 #ifdef YUZU_ENABLE_MCP
     state->mcp_server.reset(); // stops serving before the system goes away
@@ -1079,13 +1360,23 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     // --version): the kernel is uninitialised then, and Pause()/ShutdownMainProcess() would
     // dereference it.
     if (state->system.IsPoweredOn()) {
-        void(state->system.Pause());
+        if (!gpui_session) {
+            state->system.Pause();
+        }
+        // GPUI can stop immediately after boot. Core shutdown requests cancellation before
+        // pausing, so startup work can release its waits before the emulation threads stop.
         state->system.ShutdownMainProcess();
+    }
+    if (gpui_session) {
+        LOG_DEBUG(Frontend, "Releasing GPUI gameplay host resources");
     }
     const bool network_initialized = state->network_initialized;
     delete state;
     if (network_initialized) {
         Network::Shutdown();
+    }
+    if (gpui_session) {
+        gpui_session->SetState(Gpui::SessionState::Stopped);
     }
     if (restart_requested) {
         // SDL3 maps SDL_APP_SUCCESS to exit code 0; quit SDL ourselves to return the restart code.

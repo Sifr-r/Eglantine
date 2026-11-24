@@ -22,7 +22,7 @@ class LaunchGameDialogFragment : DialogFragment() {
         val launchOptions = arrayOf(getString(R.string.global), getString(R.string.custom))
 
         if (savedInstanceState != null) {
-            selectedItem = savedInstanceState.getInt(SELECTED_ITEM)
+            selectedItem = savedInstanceState.getInt(SELECTED_ITEM, selectedItem)
         }
 
         return MaterialAlertDialogBuilder(requireContext())
@@ -32,7 +32,7 @@ class LaunchGameDialogFragment : DialogFragment() {
                     .actionGlobalEmulationActivity(game, selectedItem != 0)
                 requireParentFragment().findNavController().navigate(action)
             }
-            .setSingleChoiceItems(launchOptions, 1) { _: DialogInterface, i: Int ->
+            .setSingleChoiceItems(launchOptions, selectedItem) { _: DialogInterface, i: Int ->
                 selectedItem = i
             }
             .setNegativeButton(android.R.string.cancel, null)

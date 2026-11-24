@@ -6,7 +6,10 @@
 
 #pragma once
 
+#include <atomic>
+#include <functional>
 #include <optional>
+#include <thread>
 
 #include "common/common_types.h"
 #include "common/thread.h"
@@ -189,8 +192,22 @@ private:
     std::jthread worker;
 };
 
-void TestCommunication(const std::string& host, u16 port,
-                       const std::function<void()>& success_callback,
-                       const std::function<void()>& failure_callback);
+class CommunicationTestJob {
+public:
+    explicit CommunicationTestJob(const std::string& host, u16 port,
+                                  std::function<void(bool)> result_callback);
+    ~CommunicationTestJob();
+
+    CommunicationTestJob(const CommunicationTestJob&) = delete;
+    CommunicationTestJob& operator=(const CommunicationTestJob&) = delete;
+
+    void Stop();
+
+private:
+    Common::Event complete_event;
+    std::atomic<bool> succeeded{false};
+    std::atomic<bool> stopped{false};
+    std::jthread worker;
+};
 
 } // namespace InputCommon::CemuhookUDP

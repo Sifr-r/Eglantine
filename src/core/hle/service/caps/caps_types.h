@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <tuple>
 #include <type_traits>
 #include "common/common_funcs.h"
 #include "common/common_types.h"
@@ -61,41 +62,13 @@ struct AlbumFileDateTime {
 
     friend constexpr bool operator==(const AlbumFileDateTime&, const AlbumFileDateTime&) = default;
     friend constexpr bool operator>(const AlbumFileDateTime& a, const AlbumFileDateTime& b) {
-        if (a.year > b.year) {
-            return true;
-        }
-        if (a.month > b.month) {
-            return true;
-        }
-        if (a.day > b.day) {
-            return true;
-        }
-        if (a.hour > b.hour) {
-            return true;
-        }
-        if (a.minute > b.minute) {
-            return true;
-        }
-        return a.second > b.second;
-    };
+        return std::tie(a.year, a.month, a.day, a.hour, a.minute, a.second) >
+               std::tie(b.year, b.month, b.day, b.hour, b.minute, b.second);
+    }
     friend constexpr bool operator<(const AlbumFileDateTime& a, const AlbumFileDateTime& b) {
-        if (a.year < b.year) {
-            return true;
-        }
-        if (a.month < b.month) {
-            return true;
-        }
-        if (a.day < b.day) {
-            return true;
-        }
-        if (a.hour < b.hour) {
-            return true;
-        }
-        if (a.minute < b.minute) {
-            return true;
-        }
-        return a.second < b.second;
-    };
+        return std::tie(a.year, a.month, a.day, a.hour, a.minute, a.second) <
+               std::tie(b.year, b.month, b.day, b.hour, b.minute, b.second);
+    }
 };
 static_assert(sizeof(AlbumFileDateTime) == 0x8, "AlbumFileDateTime has incorrect size.");
 

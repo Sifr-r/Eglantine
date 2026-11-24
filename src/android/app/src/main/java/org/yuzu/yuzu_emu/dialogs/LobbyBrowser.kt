@@ -39,6 +39,7 @@ class LobbyBrowser(context: Context) : BottomSheetDialog(context) {
     private lateinit var binding: DialogLobbyBrowserBinding
     private lateinit var adapter: LobbyRoomAdapter
     private val handler = Handler(Looper.getMainLooper())
+    private var cachedRooms: List<NetPlayManager.RoomInfo> = emptyList()
     private val hideSystemBars: Boolean by lazy {
         runCatching {
             FullscreenHelper.shouldHideSystemBars(CompatUtils.findActivity(context))
@@ -142,16 +143,19 @@ class LobbyBrowser(context: Context) : BottomSheetDialog(context) {
 
         binding.clearButton.setOnClickListener {
             binding.searchText.setText("")
-            adapter.updateRooms(NetPlayManager.getPublicRooms())
+            adapter.filterAndSearch()
         }
     }
 
     private fun refreshRoomList() {
         NetPlayManager.refreshRoomListAsync { rooms ->
+            if (!isShowing) {
+                return@refreshRoomListAsync
+            }
+            cachedRooms = rooms
             binding.emptyView.visibility = if (rooms.isEmpty()) View.VISIBLE else View.GONE
             binding.roomList.visibility = if (rooms.isEmpty()) View.GONE else View.VISIBLE
             binding.appbar.visibility = if (rooms.isEmpty()) View.GONE else View.VISIBLE
-            adapter.updateRooms(rooms)
             adapter.filterAndSearch()
             binding.refreshButton.isEnabled = true
             binding.progressBar.visibility = View.GONE
@@ -187,12 +191,21 @@ class LobbyBrowser(context: Context) : BottomSheetDialog(context) {
             val result = NetPlayManager.netPlayJoinRoom(room.ip, room.port, username, password)
 
             handler.post {
+                val activity = runCatching { CompatUtils.findActivity(context) }.getOrNull()
+                if (!isShowing || activity?.isFinishing == true || activity?.isDestroyed == true) {
+                    return@post
+                }
                 if (result == 0) {
                     dismiss()
                     NetPlayDialog(context).show()
                 }
             }
         }.start()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        handler.removeCallbacksAndMessages(null)
     }
 
     inner class LobbyRoomAdapter(private val onRoomSelected: (NetPlayManager.RoomInfo) -> Unit) :
@@ -246,27 +259,26 @@ class LobbyBrowser(context: Context) : BottomSheetDialog(context) {
         }
 
         fun filterAndSearch() {
-            if (binding.searchText.text.toString().isEmpty() &&
-                !binding.chipHideFull.isChecked && !binding.chipHideEmpty.isChecked
-            ) {
-                adapter.updateRooms(NetPlayManager.getPublicRooms())
+            val query = binding.searchText.text.toString()
+            val hideFull = binding.chipHideFull.isChecked
+            val hideEmpty = binding.chipHideEmpty.isChecked
+
+            if (query.isEmpty() && !hideFull && !hideEmpty) {
+                updateRooms(cachedRooms)
                 return
             }
 
-            val baseList = NetPlayManager.getPublicRooms()
-            val filteredList = baseList.filter { room ->
-                (!binding.chipHideFull.isChecked || room.members.size < room.maxPlayers) &&
-                    (!binding.chipHideEmpty.isChecked || room.members.isNotEmpty())
+            val filteredList = cachedRooms.filter { room ->
+                (!hideFull || room.members.size < room.maxPlayers) &&
+                    (!hideEmpty || room.members.isNotEmpty())
             }
 
-            if (binding.searchText.text.toString().isEmpty() &&
-                (binding.chipHideFull.isChecked || binding.chipHideEmpty.isChecked)
-            ) {
-                adapter.updateRooms(filteredList)
+            if (query.isEmpty()) {
+                updateRooms(filteredList)
                 return
             }
 
-            val searchTerm = binding.searchText.text.toString().lowercase(Locale.getDefault())
+            val searchTerm = query.lowercase(Locale.getDefault())
             val searchAlgorithm = if (searchTerm.length > 1) Jaccard(2) else JaroWinkler()
             val sortedList: List<NetPlayManager.RoomInfo> = filteredList.mapNotNull { room ->
                 val roomName = room.name.lowercase(Locale.getDefault())
@@ -280,7 +292,7 @@ class LobbyBrowser(context: Context) : BottomSheetDialog(context) {
             }.sortedByDescending { it ->
                 it.score
             }.map { it.item }
-            adapter.updateRooms(sortedList)
+            updateRooms(sortedList)
         }
     }
 

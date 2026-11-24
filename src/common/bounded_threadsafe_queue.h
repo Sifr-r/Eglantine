@@ -5,11 +5,15 @@
 
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <memory>
 #include <mutex>
 #include <new>
+#include <type_traits>
+#include <utility>
 
 #include "common/polyfill_thread.h"
 
@@ -24,6 +28,19 @@ class SPSCQueue {
     static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be a power of two.");
 
 public:
+    SPSCQueue() noexcept {}
+
+    ~SPSCQueue() noexcept {
+        if constexpr (!std::is_trivially_destructible_v<T>) {
+            std::size_t read_index = consumer.index.load(std::memory_order::relaxed);
+            const std::size_t write_index = producer.index.load(std::memory_order::relaxed);
+            while (read_index != write_index) {
+                std::destroy_at(SlotPtr(read_index % Capacity));
+                ++read_index;
+            }
+        }
+    }
+
     template <typename... Args>
     bool TryEmplace(Args&&... args) noexcept {
         return Emplace<PushMode::Try>(std::forward<Args>(args)...);
@@ -92,7 +109,7 @@ private:
         // Determine the position to write to.
         const std::size_t pos = write_index % Capacity;
         // Emplace into the queue.
-        std::construct_at(std::addressof(m_data[pos]), std::forward<Args>(args)...);
+        std::construct_at(reinterpret_cast<T*>(m_data[pos].storage), std::forward<Args>(args)...);
         // Increment the write index.
         ++producer.index;
         // Notify the consumer that we have pushed into the queue.
@@ -129,8 +146,10 @@ private:
         }
         // Determine the position to read from.
         const std::size_t pos = read_index % Capacity;
-        // Pop the data off the queue, moving it.
-        t = std::move(m_data[pos]);
+        // Pop the data off the queue, moving it and ending the slot object lifetime.
+        T* const slot = SlotPtr(pos);
+        t = std::move(*slot);
+        std::destroy_at(slot);
         // Increment the read index.
         ++consumer.index;
         // Notify the producer that we have popped off the queue.
@@ -139,7 +158,15 @@ private:
         return true;
     }
 
-    std::array<T, Capacity> m_data;
+    struct Slot {
+        alignas(T) std::byte storage[sizeof(T)];
+    };
+
+    T* SlotPtr(std::size_t pos) noexcept {
+        return std::launder(reinterpret_cast<T*>(m_data[pos].storage));
+    }
+
+    std::array<Slot, Capacity> m_data;
     alignas(64) struct {
         std::atomic_size_t index{0};
         std::condition_variable_any cv;

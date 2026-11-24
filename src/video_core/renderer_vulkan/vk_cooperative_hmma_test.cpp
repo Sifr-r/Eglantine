@@ -4,15 +4,21 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
+#include <optional>
 #include <span>
+#include <system_error>
 #include <vector>
 
 #include "common/common_types.h"
+#include "common/fs/path_util.h"
 #include "common/logging.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "video_core/renderer_vulkan/vk_cooperative_hmma_test.h"
@@ -27,6 +33,107 @@ using Shader::Backend::SPIRV::COOPERATIVE_HMMA_TEST_LANE_WORDS;
 
 constexpr u32 LANES = GuestWarpSize;
 constexpr u32 BUFFER_WORDS = LANES * COOPERATIVE_HMMA_TEST_LANE_WORDS;
+constexpr u32 CALIBRATION_MAGIC = 0x484D4D41U; // "HMMA"
+constexpr u32 CALIBRATION_VERSION = 1U;
+
+struct CachedCalibrationRecord {
+    u32 magic{CALIBRATION_MAGIC};
+    u32 version{CALIBRATION_VERSION};
+    u32 device_id{};
+    u32 driver_id{};
+    u32 driver_version{};
+    u32 spirv_version{};
+    u32 tile_m{16};
+    u32 tile_n{8};
+    u32 tile_k{16};
+    u32 subgroup_size{LANES};
+    std::array<u32, 4> a_word_map{0, 2, 1, 3};
+    u32 supported{};
+};
+
+bool IsValidWordMap(const std::array<u32, 4>& map) {
+    std::array<bool, 4> seen{};
+    for (const u32 idx : map) {
+        if (idx >= 4 || seen[idx]) {
+            return false;
+        }
+        seen[idx] = true;
+    }
+    return true;
+}
+
+std::filesystem::path CalibrationCachePath() {
+    return Common::FS::GetEdenPath(Common::FS::EdenPath::ShaderDir) / "coop_hmma_calibration.bin";
+}
+
+std::optional<CoopHmmaProfile> TryLoadCachedProfile(const Device& device, u32 tile_m, u32 tile_n,
+                                                    u32 tile_k, u32 subgroup_size) {
+    if (const char* recalibrate = std::getenv("EDEN_NX2_RECALIBRATE_COOP");
+        recalibrate != nullptr && recalibrate[0] == '1') {
+        return std::nullopt;
+    }
+    try {
+        const std::filesystem::path path = CalibrationCachePath();
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) {
+            return std::nullopt;
+        }
+        std::ifstream file{path, std::ios::binary};
+        CachedCalibrationRecord rec{};
+        if (!file.read(reinterpret_cast<char*>(&rec), sizeof(rec))) {
+            return std::nullopt;
+        }
+        if (rec.magic != CALIBRATION_MAGIC || rec.version != CALIBRATION_VERSION ||
+            rec.device_id != device.GetDeviceID() ||
+            rec.driver_id != static_cast<u32>(device.GetDriverID()) ||
+            rec.driver_version != device.GetDriverVersion() ||
+            rec.spirv_version != device.SupportedSpirvVersion() || rec.tile_m != tile_m ||
+            rec.tile_n != tile_n || rec.tile_k != tile_k ||
+            rec.subgroup_size != subgroup_size || !IsValidWordMap(rec.a_word_map)) {
+            return std::nullopt;
+        }
+        return CoopHmmaProfile{
+            .supported = rec.supported != 0,
+            .tile_m = rec.tile_m,
+            .tile_n = rec.tile_n,
+            .tile_k = rec.tile_k,
+            .subgroup_size = rec.subgroup_size,
+            .a_word_map = rec.a_word_map,
+            .from_cache = true,
+        };
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+void SaveCachedProfile(const Device& device, const CoopHmmaProfile& profile) {
+    try {
+        const std::filesystem::path path = CalibrationCachePath();
+        std::error_code ec;
+        std::filesystem::create_directories(path.parent_path(), ec);
+        if (ec) {
+            return;
+        }
+        const CachedCalibrationRecord rec{
+            .magic = CALIBRATION_MAGIC,
+            .version = CALIBRATION_VERSION,
+            .device_id = device.GetDeviceID(),
+            .driver_id = static_cast<u32>(device.GetDriverID()),
+            .driver_version = device.GetDriverVersion(),
+            .spirv_version = device.SupportedSpirvVersion(),
+            .tile_m = profile.tile_m,
+            .tile_n = profile.tile_n,
+            .tile_k = profile.tile_k,
+            .subgroup_size = profile.subgroup_size,
+            .a_word_map = profile.a_word_map,
+            .supported = profile.supported ? 1U : 0U,
+        };
+        std::ofstream file{path, std::ios::binary | std::ios::trunc};
+        file.write(reinterpret_cast<const char*>(&rec), sizeof(rec));
+    } catch (...) {
+        // Non-fatal: calibration still applies for the current session.
+    }
+}
 
 /// The half-precision encoding of a small integer. Products and sums of the test's integers stay
 /// exact in half precision, so the results compare bit for bit, without any rounding involved.
@@ -51,9 +158,9 @@ struct Matrices {
     std::array<std::array<s32, 8>, 16> d{};
 };
 
-Matrices MakeMatrices() {
+Matrices MakeMatrices(u32 seed = 0x2545f491U) {
     // Every element differs from most others, so that any misplaced element changes the results.
-    u32 state = 0x2545f491;
+    u32 state = seed;
     const auto next = [&state] {
         state = state * 1664525U + 1013904223U;
         return static_cast<s32>((state >> 16) % 7) - 3;
@@ -126,17 +233,26 @@ u32 CountWrongLanes(const Matrices& m, std::span<const u32> words) {
     return wrong;
 }
 
-bool RunTest(const Device& device) {
+std::vector<std::array<u32, 4>> BuildCandidateWordMaps() {
+    std::vector<std::array<u32, 4>> candidates;
+    candidates.reserve(24);
+    constexpr std::array<u32, 4> nvidia_default{0, 2, 1, 3};
+    constexpr std::array<u32, 4> linear_identity{0, 1, 2, 3};
+    candidates.push_back(nvidia_default);
+    candidates.push_back(linear_identity);
+
+    std::array<u32, 4> perm{0, 1, 2, 3};
+    while (std::next_permutation(perm.begin(), perm.end())) {
+        if (perm != nvidia_default && perm != linear_identity) {
+            candidates.push_back(perm);
+        }
+    }
+    return candidates;
+}
+
+CoopHmmaProfile RunCalibration(const Device& device, u32 tile_m, u32 tile_n, u32 tile_k,
+                               u32 subgroup_size) {
     const auto& logical = device.GetLogical();
-    const std::vector<u32> code =
-        Shader::Backend::SPIRV::EmitCooperativeHmmaTest(device.SupportedSpirvVersion());
-    const vk::ShaderModule module = logical.CreateShaderModule(VkShaderModuleCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .codeSize = code.size() * sizeof(u32),
-        .pCode = code.data(),
-    });
     const VkDescriptorSetLayoutBinding binding{
         .binding = 0,
         .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -161,23 +277,6 @@ bool RunTest(const Device& device) {
         .pSetLayouts = &set_layout_handle,
         .pushConstantRangeCount = 0,
         .pPushConstantRanges = nullptr,
-    });
-    const vk::Pipeline pipeline = logical.CreateComputePipeline(VkComputePipelineCreateInfo{
-        .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-        .pNext = nullptr,
-        .flags = 0,
-        .stage{
-            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT,
-            .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = *module,
-            .pName = "main",
-            .pSpecializationInfo = nullptr,
-        },
-        .layout = *layout,
-        .basePipelineHandle = VK_NULL_HANDLE,
-        .basePipelineIndex = 0,
     });
     const VkDescriptorPoolSize pool_size{
         .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -214,16 +313,6 @@ bool RunTest(const Device& device) {
         },
         MemoryUsage::Download);
 
-    const Matrices matrices = MakeMatrices();
-    std::array<u32, BUFFER_WORDS> words{};
-    for (u32 lane = 0; lane < LANES; ++lane) {
-        WriteLane(matrices, lane,
-                  std::span{words}.subspan(lane * COOPERATIVE_HMMA_TEST_LANE_WORDS,
-                                           COOPERATIVE_HMMA_TEST_LANE_WORDS));
-    }
-    std::memcpy(buffer.Mapped().data(), words.data(), sizeof(words));
-    buffer.Flush();
-
     const VkDescriptorBufferInfo buffer_info{
         .buffer = *buffer,
         .offset = 0,
@@ -248,75 +337,189 @@ bool RunTest(const Device& device) {
     const vk::CommandPool command_pool = logical.CreateCommandPool(VkCommandPoolCreateInfo{
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
         .pNext = nullptr,
-        .flags = 0,
+        .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
         .queueFamilyIndex = device.GetGraphicsFamily(),
     });
     const vk::CommandBuffers command_buffers = command_pool.Allocate(1);
     const vk::CommandBuffer cmdbuf{command_buffers[0], device.GetDispatchLoader()};
-    cmdbuf.Begin(VkCommandBufferBeginInfo{
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = nullptr,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-        .pInheritanceInfo = nullptr,
-    });
-    cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
-    cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
-    cmdbuf.Dispatch(1, 1, 1);
-    const VkMemoryBarrier read_results{
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
-    };
-    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
-                           read_results);
-    cmdbuf.End();
     const vk::Fence fence = logical.CreateFence(VkFenceCreateInfo{
         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
     });
-    const VkCommandBuffer submitted = *cmdbuf;
-    const VkSubmitInfo submit{
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .pNext = nullptr,
-        .waitSemaphoreCount = 0,
-        .pWaitSemaphores = nullptr,
-        .pWaitDstStageMask = nullptr,
-        .commandBufferCount = 1,
-        .pCommandBuffers = &submitted,
-        .signalSemaphoreCount = 0,
-        .pSignalSemaphores = nullptr,
-    };
-    vk::Check(device.GetGraphicsQueue().Submit(submit, *fence));
-    vk::Check(fence.Wait());
 
-    buffer.Invalidate();
-    std::memcpy(words.data(), buffer.Mapped().data(), sizeof(words));
-    const u32 wrong = CountWrongLanes(matrices, words);
-    if (wrong != 0) {
-        LOG_WARNING(Render_Vulkan,
-                    "Cooperative matrices lay out elements differently on this driver ({} of {} "
-                    "lanes wrong): guest tensor operations stay in shader emulation",
-                    wrong, LANES);
-        return false;
+    const auto run_once = [&](const vk::Pipeline& pipeline, const Matrices& matrices) -> u32 {
+        std::array<u32, BUFFER_WORDS> words{};
+        for (u32 lane = 0; lane < LANES; ++lane) {
+            WriteLane(matrices, lane,
+                      std::span{words}.subspan(lane * COOPERATIVE_HMMA_TEST_LANE_WORDS,
+                                               COOPERATIVE_HMMA_TEST_LANE_WORDS));
+        }
+        std::memcpy(buffer.Mapped().data(), words.data(), sizeof(words));
+        buffer.Flush();
+
+        cmdbuf.Begin(VkCommandBufferBeginInfo{
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        });
+        cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+        cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
+        cmdbuf.Dispatch(1, 1, 1);
+        const VkMemoryBarrier read_results{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        };
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0,
+                               read_results);
+        cmdbuf.End();
+
+        const VkCommandBuffer submitted = *cmdbuf;
+        const VkSubmitInfo submit{
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .pNext = nullptr,
+            .waitSemaphoreCount = 0,
+            .pWaitSemaphores = nullptr,
+            .pWaitDstStageMask = nullptr,
+            .commandBufferCount = 1,
+            .pCommandBuffers = &submitted,
+            .signalSemaphoreCount = 0,
+            .pSignalSemaphores = nullptr,
+        };
+        vk::Check(device.GetGraphicsQueue().Submit(submit, *fence));
+        vk::Check(fence.Wait());
+        fence.Reset();
+
+        buffer.Invalidate();
+        std::memcpy(words.data(), buffer.Mapped().data(), sizeof(words));
+        return CountWrongLanes(matrices, words);
+    };
+
+    const Matrices primary_matrices = MakeMatrices(0x2545f491U);
+    const Matrices verify_matrices = MakeMatrices(0x9E3779B9U);
+    u32 best_wrong = LANES;
+
+    for (const auto& candidate : BuildCandidateWordMaps()) {
+        const std::vector<u32> code = Shader::Backend::SPIRV::EmitCooperativeHmmaTest(
+            device.SupportedSpirvVersion(), candidate, tile_m, tile_n, tile_k);
+        const vk::ShaderModule module = logical.CreateShaderModule(VkShaderModuleCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .codeSize = code.size() * sizeof(u32),
+            .pCode = code.data(),
+        });
+        const vk::Pipeline pipeline = logical.CreateComputePipeline(VkComputePipelineCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .stage{
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT,
+                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                .module = *module,
+                .pName = "main",
+                .pSpecializationInfo = nullptr,
+            },
+            .layout = *layout,
+            .basePipelineHandle = VK_NULL_HANDLE,
+            .basePipelineIndex = 0,
+        });
+
+        const u32 wrong = run_once(pipeline, primary_matrices);
+        best_wrong = (std::min)(best_wrong, wrong);
+        if (wrong == 0 && run_once(pipeline, verify_matrices) == 0) {
+            LOG_INFO(Render_Vulkan,
+                     "Guest tensor operations calibrated on cooperative matrices "
+                     "(tile={}x{}x{}, a_word_map=[{}, {}, {}, {}])",
+                     tile_m, tile_n, tile_k, candidate[0], candidate[1], candidate[2],
+                     candidate[3]);
+            return CoopHmmaProfile{
+                .supported = true,
+                .tile_m = tile_m,
+                .tile_n = tile_n,
+                .tile_k = tile_k,
+                .subgroup_size = subgroup_size,
+                .a_word_map = candidate,
+                .from_cache = false,
+            };
+        }
     }
-    LOG_INFO(Render_Vulkan, "Guest tensor operations run on cooperative matrices");
-    return true;
+
+    LOG_WARNING(Render_Vulkan,
+                "Cooperative matrices lay out elements incompatibly on this driver (best {} of "
+                "{} lanes wrong): guest tensor operations stay in shader emulation",
+                best_wrong, LANES);
+    return CoopHmmaProfile{
+        .supported = false,
+        .tile_m = tile_m,
+        .tile_n = tile_n,
+        .tile_k = tile_k,
+        .subgroup_size = subgroup_size,
+        .a_word_map = {0, 2, 1, 3},
+        .from_cache = false,
+    };
 }
 
 } // Anonymous namespace
 
-bool TestCooperativeHmma(const Device& device) {
+CoopHmmaProfile ProbeCooperativeHmma(const Device& device) {
+    const auto& caps = device.GetCoopMatrixCapabilities();
+    const u32 tile_m = caps.preferred_m != 0 ? caps.preferred_m : 16U;
+    const u32 tile_n = caps.preferred_n != 0 ? caps.preferred_n : 8U;
+    const u32 tile_k = caps.preferred_k != 0 ? caps.preferred_k : 16U;
+    const u32 subgroup_size = caps.subgroup_size != 0 ? caps.subgroup_size : LANES;
+
+    if (!device.IsCooperativeHmmaSupported() || tile_m != 16 || tile_n != 8 || tile_k != 16) {
+        return CoopHmmaProfile{
+            .supported = false,
+            .tile_m = tile_m,
+            .tile_n = tile_n,
+            .tile_k = tile_k,
+            .subgroup_size = subgroup_size,
+            .a_word_map = {0, 2, 1, 3},
+            .from_cache = false,
+        };
+    }
+
+    if (const auto cached = TryLoadCachedProfile(device, tile_m, tile_n, tile_k, subgroup_size)) {
+        if (cached->supported) {
+            LOG_INFO(Render_Vulkan,
+                     "Using cached cooperative matrix calibration (tile={}x{}x{}, "
+                     "a_word_map=[{}, {}, {}, {}])",
+                     cached->tile_m, cached->tile_n, cached->tile_k, cached->a_word_map[0],
+                     cached->a_word_map[1], cached->a_word_map[2], cached->a_word_map[3]);
+        }
+        return *cached;
+    }
+
     try {
-        return RunTest(device);
+        CoopHmmaProfile profile = RunCalibration(device, tile_m, tile_n, tile_k, subgroup_size);
+        SaveCachedProfile(device, profile);
+        return profile;
     } catch (const std::exception& exception) {
         LOG_WARNING(Render_Vulkan,
                     "Cooperative matrix self-test failed ({}): guest tensor operations stay in "
                     "shader emulation",
                     exception.what());
-        return false;
+        return CoopHmmaProfile{
+            .supported = false,
+            .tile_m = tile_m,
+            .tile_n = tile_n,
+            .tile_k = tile_k,
+            .subgroup_size = subgroup_size,
+            .a_word_map = {0, 2, 1, 3},
+            .from_cache = false,
+        };
     }
+}
+
+bool TestCooperativeHmma(const Device& device) {
+    return ProbeCooperativeHmma(device).supported;
 }
 
 } // namespace Vulkan

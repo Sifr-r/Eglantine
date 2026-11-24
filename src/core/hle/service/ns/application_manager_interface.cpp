@@ -27,11 +27,12 @@ namespace Service::NS {
 
 IApplicationManagerInterface::IApplicationManagerInterface(Core::System& system_)
     : ServiceFramework{system_, "IApplicationManagerInterface"},
-      service_context{system, "IApplicationManagerInterface"},
-      record_update_system_event{service_context}, sd_card_mount_status_event{service_context},
-      gamecard_update_detection_event{service_context},
-      gamecard_mount_status_event{service_context}, gamecard_mount_failure_event{service_context},
-      gamecard_waken_ready_event{service_context}, unknown_event{service_context} {
+      service_context{std::make_shared<KernelHelpers::ServiceContext>(system, "IApplicationManagerInterface")},
+      record_update_system_event{*service_context}, sd_card_mount_status_event{*service_context},
+      gamecard_update_detection_event{*service_context},
+      gamecard_mount_status_event{*service_context}, gamecard_mount_failure_event{*service_context},
+      gamecard_waken_ready_event{*service_context},
+      unknown_event{std::make_shared<Event>(*service_context)} {
     // clang-format off
     static const FunctionInfo functions[] = {
         {0, D<&IApplicationManagerInterface::ListApplicationRecord>, "ListApplicationRecord"},
@@ -850,15 +851,15 @@ Result IApplicationManagerInterface::RequestDownloadApplicationControlDataInBack
     LOG_INFO(Service_NS, "called, control_source={} app={:016X}",
              control_source, application_id);
 
-    unknown_event.Signal(system.Kernel());
+    unknown_event->Signal(system.Kernel());
     R_SUCCEED();
 }
 
 Result IApplicationManagerInterface::Unknown4022(
     OutCopyHandle<Kernel::KReadableEvent> out_event) {
     LOG_WARNING(Service_NS, "(STUBBED) called");
-    unknown_event.Signal(system.Kernel());
-    *out_event = unknown_event.GetHandle();
+    unknown_event->Signal(system.Kernel());
+    *out_event = unknown_event->GetHandle();
     R_SUCCEED();
 }
 
@@ -872,8 +873,8 @@ Result IApplicationManagerInterface::Unknown4042(OutInterface<IAsyncResult> out_
                                                  OutCopyHandle<Kernel::KReadableEvent> out_event,
                                                  u64 arg1, u64 arg2) {
     LOG_WARNING(Service_NS, "(STUBBED) called, arg1={:016X}, arg2={:016X}", arg1, arg2);
-    *out_event = unknown_event.GetHandle();
-    *out_interface = std::make_shared<IAsyncResult>(system, &unknown_event);
+    *out_event = unknown_event->GetHandle();
+    *out_interface = std::make_shared<IAsyncResult>(system, service_context, unknown_event);
     R_SUCCEED();
 }
 

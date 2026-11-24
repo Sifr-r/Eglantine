@@ -23,12 +23,19 @@ class NewInputProfileDialogFragment : DialogFragment() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         position = requireArguments().getInt(POSITION)
+        if (settingsViewModel.clickedItem !is InputProfileSetting) {
+            dismiss()
+            return
+        }
     }
 
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
+        val setting = settingsViewModel.clickedItem as? InputProfileSetting ?: run {
+            dismissAllowingStateLoss()
+            return super.onCreateDialog(savedInstanceState)
+        }
         binding = DialogEditTextBinding.inflate(layoutInflater)
 
-        val setting = settingsViewModel.clickedItem as InputProfileSetting
         return MaterialAlertDialogBuilder(requireContext())
             .setTitle(R.string.enter_profile_name)
             .setPositiveButton(android.R.string.ok) { _, _ ->
@@ -54,7 +61,7 @@ class NewInputProfileDialogFragment : DialogFragment() {
             }
             .setNegativeButton(android.R.string.cancel, null)
             .setView(binding.root)
-            .show()
+            .create()
     }
 
     companion object {

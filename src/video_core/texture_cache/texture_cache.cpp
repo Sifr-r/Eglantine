@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -12,6 +15,9 @@ namespace VideoCommon {
 TextureCacheChannelInfo::TextureCacheChannelInfo(Tegra::Control::ChannelState& state) noexcept
     : ChannelInfo(state)
 {}
+
+TextureCacheChannelInfo::TextureCacheChannelInfo(const Tegra::Control::ChannelStateBridge& bridge)
+    : ChannelInfo(bridge) {}
 
 template class VideoCommon::ChannelSetupCaches<VideoCommon::TextureCacheChannelInfo>;
 

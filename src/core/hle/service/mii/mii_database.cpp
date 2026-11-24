@@ -131,7 +131,7 @@ Result NintendoFigurineDatabase::CheckIntegrity() {
         return ResultInvalidDatabaseChecksum;
     }
 
-    if (database_length >= MaxDatabaseLength) {
+    if (static_cast<std::size_t>(database_length) > MaxDatabaseLength) {
         return ResultInvalidDatabaseLength;
     }
 

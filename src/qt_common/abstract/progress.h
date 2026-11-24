@@ -31,6 +31,9 @@ public slots:
 
     virtual bool close() = 0;
     virtual void show() = 0;
+
+signals:
+    void canceled();
 };
 
 std::unique_ptr<QtProgressDialog> newProgressDialog(const QString& labelText,

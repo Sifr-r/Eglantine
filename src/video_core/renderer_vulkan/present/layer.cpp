@@ -214,18 +214,27 @@ void Layer::RefreshResources(const Device& device, const Tegra::FramebufferConfi
     raw_width = framebuffer.width;
     raw_height = framebuffer.height;
     pixel_format = framebuffer.pixel_format;
-    anti_alias.emplace<std::monostate>();
 
     ReleaseRawImages();
+    anti_alias.emplace<std::monostate>();
     CreateStagingBuffer(device, framebuffer);
     CreateRawImages(device, framebuffer);
 }
 
 void Layer::SetAntiAliasPass(const Device& device) {
-    if (!std::holds_alternative<std::monostate>(anti_alias) && anti_alias_setting == filters.get_anti_aliasing())
+    const auto wanted = filters.get_anti_aliasing();
+    if ((wanted == Settings::AntiAliasing::None &&
+         std::holds_alternative<std::monostate>(anti_alias)) ||
+        (!std::holds_alternative<std::monostate>(anti_alias) && anti_alias_setting == wanted)) {
         return;
+    }
 
-    anti_alias_setting = filters.get_anti_aliasing();
+    if (!std::holds_alternative<std::monostate>(anti_alias)) {
+        for (const u64 tick : resource_ticks) {
+            scheduler.Wait(tick);
+        }
+    }
+    anti_alias_setting = wanted;
 
     const VkExtent2D render_area{
         .width = Settings::values.resolution_info.ScaleUp(raw_width),

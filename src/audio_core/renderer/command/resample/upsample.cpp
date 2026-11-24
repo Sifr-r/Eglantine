@@ -87,7 +87,11 @@ static void SrcProcessFrame(std::span<s32> output, std::span<const s32> input,
     u32 read_index{0};
 
     auto increment = [&]() -> void {
-        state->history[state->history_input_index] = input[read_index++];
+        if (read_index < input.size()) {
+            state->history[state->history_input_index] = input[read_index++];
+        } else {
+            state->history[state->history_input_index] = 0;
+        }
         state->history_input_index =
             static_cast<u16>((state->history_input_index + 1) % UpsamplerState::HistorySize);
         state->history_output_index =
@@ -209,7 +213,7 @@ auto UpsampleCommand::Dump([[maybe_unused]] const AudioRenderer::CommandListProc
     if (upsampler != nullptr) {
         string += fmt::format("\n\tUpsampler\n\t\tenabled {} sample count {}\n\tinputs: ",
                               upsampler->enabled, upsampler->sample_count);
-        for (u32 i = 0; i < upsampler->input_count; i++) {
+        for (u32 i = 0; i < (std::min)(upsampler->input_count, static_cast<u32>(MaxChannels)); i++) {
             string += fmt::format("{:02X}, ", upsampler->inputs[i]);
         }
     }
@@ -218,13 +222,21 @@ auto UpsampleCommand::Dump([[maybe_unused]] const AudioRenderer::CommandListProc
 
 void UpsampleCommand::Process(const AudioRenderer::CommandListProcessor& processor) {
     const auto info{reinterpret_cast<UpsamplerInfo*>(upsampler_info)};
-    const auto input_count{(std::min)(info->input_count, buffer_count)};
+    if (info == nullptr || samples_buffer == 0 || inputs == 0 || info->sample_count == 0) {
+        return;
+    }
+
+    const auto input_count{(std::min)((std::min)(info->input_count, buffer_count),
+                                      static_cast<u32>(MaxChannels))};
     const std::span<const s16> inputs_{reinterpret_cast<const s16*>(inputs), input_count};
 
     for (u32 i = 0; i < input_count; i++) {
         const auto channel{inputs_[i]};
 
-        if (channel >= 0 && channel < static_cast<s16>(processor.buffer_count)) {
+        if (channel >= 0 && channel < static_cast<s16>(processor.buffer_count) &&
+            channel < static_cast<s16>(buffer_count) &&
+            static_cast<size_t>(channel + 1) * processor.sample_count <=
+                processor.mix_buffers.size()) {
             auto state{&info->states[i]};
             std::span<s32> output{
                 reinterpret_cast<s32*>(samples_buffer + info->sample_count * channel * sizeof(s32)),

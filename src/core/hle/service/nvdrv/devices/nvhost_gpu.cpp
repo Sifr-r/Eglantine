@@ -42,7 +42,7 @@ Tegra::CommandHeader BuildFenceAction(Tegra::Engines::Puller::FenceOperation op,
 
 nvhost_gpu::nvhost_gpu(Core::System& system_, EventInterface& events_interface_,
                        NvCore::Container& core_)
-    : nvdevice{system_}, events_interface{events_interface_}, core{core_},
+    : nvdevice{system_, Kind}, events_interface{events_interface_}, core{core_},
       syncpoint_manager{core_.GetSyncpointManager()}, nvmap{core.GetNvMapFile()},
       channel_state{system.GPU().AllocateChannel()} {
     channel_syncpoint = syncpoint_manager.AllocateSyncpoint(false);

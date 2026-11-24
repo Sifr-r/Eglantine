@@ -236,7 +236,7 @@ public:
                 // bitmap
                 for (int bit = 1; bit < 64; bit++) {
                     if ((relr & (1ULL << bit)) != 0) {
-                        incr(relr_where + i * sizeof(Elf64_Addr));
+                        incr(relr_where + static_cast<VAddr>(bit - 1) * sizeof(Elf64_Addr));
                     }
                 }
                 relr_where += 63 * sizeof(Elf64_Addr);

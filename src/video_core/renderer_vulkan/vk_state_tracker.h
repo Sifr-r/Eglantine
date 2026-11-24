@@ -13,6 +13,7 @@
 #include <limits>
 
 #include "common/common_types.h"
+#include "video_core/control/channel_state_bridge.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/maxwell_3d.h"
 
@@ -299,13 +300,22 @@ public:
         return has_changed;
     }
 
+    void SetupTables(const Tegra::Control::ChannelStateBridge& bridge);
+
     void SetupTables(Tegra::Control::ChannelState& channel_state);
+
+    void ChangeChannel(const Tegra::Control::ChannelStateBridge& bridge);
 
     void ChangeChannel(Tegra::Control::ChannelState& channel_state);
 
     /// Stops using the bound channel's flags, for when it goes away.
     void ClearChannel() {
         flags = &default_flags;
+        channel_bridge = Tegra::Control::ChannelStateBridge::FromDirtyFlags(default_flags);
+    }
+
+    [[nodiscard]] const Tegra::Control::ChannelStateBridge& ChannelBridge() const noexcept {
+        return channel_bridge;
     }
 
     void InvalidateState();
@@ -327,6 +337,7 @@ private:
 
     Tegra::Engines::Maxwell3D::DirtyState::Flags* flags;
     Tegra::Engines::Maxwell3D::DirtyState::Flags default_flags;
+    Tegra::Control::ChannelStateBridge channel_bridge;
     Tegra::Engines::Maxwell3D::DirtyState::Flags invalidation_flags;
     Maxwell::PrimitiveTopology current_topology = INVALID_TOPOLOGY;
     bool two_sided_stencil = false;

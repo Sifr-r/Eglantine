@@ -40,18 +40,47 @@ namespace {
     }
 }
 
+[[nodiscard]] inline std::unique_ptr<Process> CreateProcessWithLoader(Loader::AppLoader& loader, Loader::ResultStatus& out_load_result, Core::System& system) {
+    auto process = std::make_unique<Process>(system);
+    if (process->Initialize(loader, out_load_result)) {
+        return process;
+    }
+    return nullptr;
+}
+
 [[nodiscard]] inline std::unique_ptr<Process> CreateProcessImpl(std::unique_ptr<Loader::AppLoader>& out_loader, Loader::ResultStatus& out_load_result, Core::System& system, FileSys::VirtualFile file, u64 program_id, u64 program_index) {
     // Get the appropriate loader to parse this NCA.
     out_loader = Loader::GetLoader(system, file, program_id, program_index);
     // Ensure we have a loader which can parse the NCA.
     if (out_loader) {
-        // Try to load the process.
-        auto process = std::make_unique<Process>(system);
-        if (process->Initialize(*out_loader, out_load_result)) {
-            return process;
-        }
+        return CreateProcessWithLoader(*out_loader, out_load_result, system);
     }
     return nullptr;
+}
+
+std::unique_ptr<Process> FinishApplicationProcess(std::vector<u8>& out_control, Loader::AppLoader& loader, Core::System& system, std::unique_ptr<Process> process) {
+    FileSys::NACP nacp;
+    if (loader.ReadControlData(nacp) == Loader::ResultStatus::Success) {
+        out_control = nacp.GetRawBytes();
+    } else {
+        out_control.resize(sizeof(FileSys::RawNACP));
+        std::fill(out_control.begin(), out_control.end(), (u8) 0);
+    }
+
+    auto& storage = system.GetContentProviderUnion();
+    Service::Glue::ApplicationLaunchProperty launch{};
+    launch.title_id = process->GetProgramId();
+
+    FileSys::PatchManager pm{launch.title_id, system.GetFileSystemController(), storage};
+    launch.version = pm.GetGameVersion().value_or(0);
+
+    // TODO(DarkLordZach): When FSController/Game Card Support is added, if
+    // current_process_game_card use correct StorageId
+    launch.base_game_storage_id = GetStorageIdForFrontendSlot(storage.GetSlotForEntry(launch.title_id, FileSys::ContentRecordType::Program));
+    launch.update_storage_id = GetStorageIdForFrontendSlot(storage.GetSlotForEntry(FileSys::GetUpdateTitleID(launch.title_id), FileSys::ContentRecordType::Program));
+
+    system.GetARPManager().Register(launch.title_id, launch, out_control);
+    return process;
 }
 
 } // Anonymous namespace
@@ -86,29 +115,16 @@ std::unique_ptr<Process> CreateProcess(Core::System& system, u64 program_id, u8 
 }
 
 std::unique_ptr<Process> CreateApplicationProcess(std::vector<u8>& out_control, std::unique_ptr<Loader::AppLoader>& out_loader, Loader::ResultStatus& out_load_result, Core::System& system, FileSys::VirtualFile file, u64 program_id, u64 program_index) {
-    if (auto process = CreateProcessImpl(out_loader, out_load_result, system, file, program_id, program_index); process) {
-        FileSys::NACP nacp;
-        if (out_loader->ReadControlData(nacp) == Loader::ResultStatus::Success) {
-            out_control = nacp.GetRawBytes();
-        } else {
-            out_control.resize(sizeof(FileSys::RawNACP));
-            std::fill(out_control.begin(), out_control.end(), (u8) 0);
-        }
+    out_loader = Loader::GetLoader(system, std::move(file), program_id, program_index);
+    if (!out_loader) {
+        return nullptr;
+    }
+    return CreateApplicationProcess(out_control, *out_loader, out_load_result, system);
+}
 
-        auto& storage = system.GetContentProviderUnion();
-        Service::Glue::ApplicationLaunchProperty launch{};
-        launch.title_id = process->GetProgramId();
-
-        FileSys::PatchManager pm{launch.title_id, system.GetFileSystemController(), storage};
-        launch.version = pm.GetGameVersion().value_or(0);
-
-        // TODO(DarkLordZach): When FSController/Game Card Support is added, if
-        // current_process_game_card use correct StorageId
-        launch.base_game_storage_id = GetStorageIdForFrontendSlot(storage.GetSlotForEntry(launch.title_id, FileSys::ContentRecordType::Program));
-        launch.update_storage_id = GetStorageIdForFrontendSlot(storage.GetSlotForEntry(FileSys::GetUpdateTitleID(launch.title_id), FileSys::ContentRecordType::Program));
-
-        system.GetARPManager().Register(launch.title_id, launch, out_control);
-        return process;
+std::unique_ptr<Process> CreateApplicationProcess(std::vector<u8>& out_control, Loader::AppLoader& loader, Loader::ResultStatus& out_load_result, Core::System& system) {
+    if (auto process = CreateProcessWithLoader(loader, out_load_result, system); process) {
+        return FinishApplicationProcess(out_control, loader, system, std::move(process));
     }
     return nullptr;
 }

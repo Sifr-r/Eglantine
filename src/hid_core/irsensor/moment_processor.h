@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <mutex>
+
 #include "common/bit_field.h"
 #include "common/common_types.h"
 #include "hid_core/irsensor/irs_types.h"
@@ -76,7 +78,9 @@ private:
     u8 GetPixel(const std::vector<u8>& data, std::size_t x, std::size_t y) const;
     MomentStatistic GetStatistic(const std::vector<u8>& data, std::size_t start_x,
                                  std::size_t start_y, std::size_t width, std::size_t height) const;
+    void StartProcessorLocked();
 
+    mutable std::mutex mutex;
     MomentSharedMemory* shared_memory = nullptr;
     MomentProcessorState next_state{};
 

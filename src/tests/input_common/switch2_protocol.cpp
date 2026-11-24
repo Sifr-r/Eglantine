@@ -5,9 +5,11 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <span>
+#include <string>
 #include <vector>
 
 #include <catch2/catch_approx.hpp>
@@ -23,6 +25,10 @@
 #include "input_common/helpers/switch2_protocol/switch2_driver.h"
 #include "input_common/helpers/switch2_protocol/switch2_transport.h"
 #include "input_common/helpers/switch2_protocol/switch2_types.h"
+
+#ifdef EGLANTINE_ENABLE_RUST_SWITCH2_IO
+#include "eglantine_switch2_io.h"
+#endif
 
 using namespace InputCommon::Switch2;
 using namespace std::chrono_literals;
@@ -1570,4 +1576,164 @@ TEST_CASE("Switch2Controllers Dual Joy-Con Roll steering handles disconnect, Mer
             ReadMappedAxis(engine, split_left_axis_map, Settings::NativeAnalog::LStick, false) ==
             Catch::Approx(1000.0 / 1500.0));
     }
+}
+
+TEST_CASE("Switch2 protocol codecs match Rust FFI parity", "[switch2]") {
+    const auto exercise_codecs = [] {
+        REQUIRE(IsSupportedProductId(static_cast<u16>(ProductId::JoyCon2Right)));
+        REQUIRE(IsSupportedProductId(static_cast<u16>(ProductId::JoyCon2Left)));
+        REQUIRE(IsSupportedProductId(static_cast<u16>(ProductId::ProController2)));
+        REQUIRE(IsSupportedProductId(static_cast<u16>(ProductId::NsoGameCube)));
+        REQUIRE_FALSE(IsSupportedProductId(0x2009U));
+
+        REQUIRE(ProductIdToControllerType(ProductId::JoyCon2Left) == ControllerType::Left);
+        REQUIRE(ProductIdToControllerType(ProductId::JoyCon2Right) == ControllerType::Right);
+        REQUIRE(ProductIdToControllerType(ProductId::ProController2) == ControllerType::Pro);
+        REQUIRE(ProductIdToControllerType(ProductId::NsoGameCube) == ControllerType::GameCube);
+        REQUIRE(ProductName(ProductId::ProController2) == "Switch 2 Pro Controller");
+        REQUIRE(FeatureMaskForProduct(ProductId::JoyCon2Left) == FeatureFlags::JoyCon);
+        REQUIRE(FeatureMaskForProduct(ProductId::ProController2) == FeatureFlags::Standard);
+
+        std::array<u8, MinimumInputReportSize + 1> usb_raw{};
+        usb_raw[0] = CommonReportId;
+        WriteU32LE(usb_raw, 1, 0x11223344U);
+        const auto stripped = StripHidReportId(usb_raw);
+        REQUIRE(stripped.has_value());
+        REQUIRE(stripped->size() == MinimumInputReportSize);
+
+        std::array<u8, 16> adv{};
+        WriteU16LE(adv, 3, NintendoVendorId);
+        WriteU16LE(adv, 5, static_cast<u16>(ProductId::JoyCon2Right));
+        adv[10] = 0x11;
+        adv[15] = 0x66;
+        const auto ble = ParseBleManufacturerData(adv);
+        REQUIRE(ble.has_value());
+        REQUIRE(ble->product_id == ProductId::JoyCon2Right);
+        REQUIRE_FALSE(ble->is_pairing_mode);
+
+        std::array<u8, UserCalibrationBlockSize> user_cal{};
+        WriteU16LE(user_cal, 0, UserCalibrationMagic);
+        const auto c_pack = PackStickXY(2050U, 2040U);
+        const auto max_pack = PackStickXY(1450U, 1550U);
+        const auto min_pack = PackStickXY(1400U, 1300U);
+        std::copy(c_pack.begin(), c_pack.end(), user_cal.begin() + 2);
+        std::copy(max_pack.begin(), max_pack.end(), user_cal.begin() + 5);
+        std::copy(min_pack.begin(), min_pack.end(), user_cal.begin() + 8);
+        const auto parsed_user = ParseUserStickCalibration(user_cal);
+        REQUIRE(parsed_user.has_value());
+        REQUIRE(parsed_user->center_x == 2050U);
+        REQUIRE(parsed_user->min_y == 1300U);
+
+        std::array<u8, 37> cinfo_buf{};
+        cinfo_buf[2] = 'S';
+        cinfo_buf[3] = 'W';
+        cinfo_buf[4] = '2';
+        WriteU16LE(cinfo_buf, 18, NintendoVendorId);
+        WriteU16LE(cinfo_buf, 20, static_cast<u16>(ProductId::NsoGameCube));
+        WriteRgb24(cinfo_buf, 25, 0x123456U);
+        const auto cinfo = ParseControllerInfo(cinfo_buf);
+        REQUIRE(cinfo.has_value());
+        REQUIRE(cinfo->serial_number == "SW2");
+        REQUIRE(cinfo->product_id == ProductId::NsoGameCube);
+        REQUIRE(cinfo->body_color == 0x123456U);
+
+        const VibrationPacketData vib = VibrationPacketData::FromVibrationStatus(
+            {.low_amplitude = 0.6f,
+             .low_frequency = 120.0f,
+             .high_amplitude = 0.4f,
+             .high_frequency = 240.0f,
+             .type = Common::Input::VibrationAmplificationType::Linear});
+        const auto enc5 = vib.Encode5Bytes();
+        const auto ble_vib = BuildVibrationReport(0x03U, true, vib);
+        REQUIRE(ble_vib.size() == 33U);
+        REQUIRE(std::equal(enc5.begin(), enc5.end(), ble_vib.begin() + 2));
+
+        const auto usb_pro = BuildUsbVibrationReport(ProductId::ProController2, 0x05U, vib);
+        REQUIRE(usb_pro.size() == 64U);
+        REQUIRE(usb_pro[0] == 0x02U);
+        REQUIRE(usb_pro[1] == 0x55U);
+        REQUIRE(std::equal(enc5.begin(), enc5.end(), usb_pro.begin() + 2));
+
+        const auto usb_gc = BuildUsbVibrationReport(ProductId::NsoGameCube, 0x05U, vib);
+        REQUIRE(usb_gc == std::vector<u8>{0x03, 0x55, 0x01, 0, 0, 0, 0});
+
+        const auto usb_jc = BuildUsbVibrationReport(ProductId::JoyCon2Left, 0x05U, vib);
+        REQUIRE(usb_jc.size() == 7U);
+        REQUIRE(usb_jc[0] == 0x01U);
+
+        auto input_raw = MakeNativeInputReport(static_cast<u32>(PadButton::A), 2600U, 1500U,
+                                               1800U, 2400U);
+        WriteS16LE(input_raw, 48, 2048);
+        WriteS16LE(input_raw, 54, 100);
+        const auto parsed_input =
+            ParseInputReport(input_raw, *parsed_user, *parsed_user, DefaultStickDeadzone);
+        REQUIRE(parsed_input.has_value());
+        const auto motion = ConvertImuToMotion(*parsed_input, {0.0f, 0.0f, 0.0f}, 4000ULL);
+        REQUIRE(motion.accel_x == Catch::Approx(0.5));
+        REQUIRE(motion.delta_timestamp == 4000ULL);
+
+        const auto mem_req = BuildMemoryReadPayload(0x40U, MemoryAddress::ControllerInfo);
+        const auto cmd_pkt =
+            BuildCommandPacket(CommandId::Memory, SubCommandId::MemoryRead, mem_req, true);
+        REQUIRE(cmd_pkt.size() == 16U);
+
+        REQUIRE(ReverseLowerBits4(0x01U) == 0x08U);
+        REQUIRE(SignedLoopingDifference16(65530U, 5U) == 11);
+
+        GyroMouseProcessor gyro_proc;
+        const auto t0 = std::chrono::steady_clock::time_point{10s};
+        const auto g_out = gyro_proc.Process(
+            *parsed_input, ControllerType::Pro, false, true, Settings::Switch2GyroMouseMode::Yaw,
+            Settings::Switch2GyroActivationMode::Hold, 1.0f, t0);
+        REQUIRE(g_out.active);
+
+        OpticalMouseProcessor opt_proc;
+        const auto valid_mouse = MakeValidMouseReport(100U, 200U, 300U, 400U);
+        REQUIRE(opt_proc.Process(valid_mouse, ControllerType::Left, true).active);
+    };
+
+    exercise_codecs();
+
+#ifdef EGLANTINE_ENABLE_RUST_SWITCH2_IO
+    const auto set_env = [](const char* name, const char* value) {
+#ifdef _WIN32
+        _putenv_s(name, value != nullptr ? value : "");
+#else
+        if (value != nullptr) {
+            setenv(name, value, 1);
+        } else {
+            unsetenv(name);
+        }
+#endif
+    };
+    const auto get_env = [](const char* name) -> std::pair<bool, std::string> {
+        const char* val = std::getenv(name);
+        return val != nullptr ? std::pair<bool, std::string>{true, std::string{val}}
+                              : std::pair<bool, std::string>{false, std::string{}};
+    };
+    const auto prev_mode = get_env("EDEN_NX2_RUST_SWITCH2_IO");
+    const auto prev_verify = get_env("EDEN_NX2_RUST_SWITCH2_IO_VERIFY");
+    SCOPE_EXIT {
+        set_env("EDEN_NX2_RUST_SWITCH2_IO", prev_mode.first ? prev_mode.second.c_str() : nullptr);
+        set_env("EDEN_NX2_RUST_SWITCH2_IO_VERIFY",
+                prev_verify.first ? prev_verify.second.c_str() : nullptr);
+    };
+
+    set_env("EDEN_NX2_RUST_SWITCH2_IO_VERIFY", "1");
+    set_env("EDEN_NX2_RUST_SWITCH2_IO", nullptr);
+    exercise_codecs();
+
+    set_env("EDEN_NX2_RUST_SWITCH2_IO_VERIFY", nullptr);
+    set_env("EDEN_NX2_RUST_SWITCH2_IO", "1");
+    exercise_codecs();
+
+    // Direct BLE UUID & static product string parity check against C ABI
+    std::size_t uuid_len = 0;
+    const char* uuid_ptr = egl_sw2_ble_uuid(EGL_SW2_UUID_INPUT_REPORT, &uuid_len);
+    REQUIRE(std::string_view{uuid_ptr, uuid_len} == InputReportUuid);
+    uuid_ptr = egl_sw2_ble_uuid(EGL_SW2_UUID_COMMAND_WRITE, &uuid_len);
+    REQUIRE(std::string_view{uuid_ptr, uuid_len} == CommandWriteUuid);
+    uuid_ptr = egl_sw2_ble_uuid(EGL_SW2_UUID_COMMAND_RESPONSE, &uuid_len);
+    REQUIRE(std::string_view{uuid_ptr, uuid_len} == CommandResponseUuid);
+#endif
 }

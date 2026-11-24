@@ -10,6 +10,7 @@
 #pragma once
 
 #include <list>
+#include <mutex>
 
 #include "core/hle/service/am/am_types.h"
 #include "core/hle/service/os/event.h"
@@ -57,33 +58,39 @@ public:
     }
 
     bool GetForcedSuspend() {
+        std::scoped_lock lk{m_lock};
         return m_forced_suspend;
     }
 
     bool GetExitRequested() {
+        std::scoped_lock lk{m_lock};
         return m_has_requested_exit;
     }
 
     ActivityState GetActivityState() {
+        std::scoped_lock lk{m_lock};
         return m_activity_state;
     }
 
     FocusState GetAndClearFocusState() {
+        std::scoped_lock lk{m_lock};
         m_acknowledged_focus_state = m_requested_focus_state;
         return m_acknowledged_focus_state;
     }
 
     void SetFocusState(Kernel::KernelCore& kernel, FocusState state) {
+        std::scoped_lock lk{m_lock};
         if (m_requested_focus_state != state) {
             m_has_focus_state_changed = true;
         }
         m_requested_focus_state = state;
-        this->SignalSystemEventIfNeeded(kernel);
+        this->SignalSystemEventIfNeededLocked(kernel);
     }
 
     void RequestExit(Kernel::KernelCore& kernel) {
+        std::scoped_lock lk{m_lock};
         m_has_requested_exit = true;
-        this->SignalSystemEventIfNeeded(kernel);
+        this->SignalSystemEventIfNeededLocked(kernel);
     }
 
     void RequestResumeNotification() {
@@ -91,15 +98,17 @@ public:
         // If an applet makes a concurrent request to receive resume notifications
         // while it is being suspended, the first resume notification will be lost.
         // This is not the case with other notification types.
+        std::scoped_lock lk{m_lock};
         if (m_resume_notification_enabled) {
             m_has_resume = true;
         }
     }
 
     void RequestFocusStateChangedNotification(Kernel::KernelCore& kernel) {
+        std::scoped_lock lk{m_lock};
         if (m_focus_state_changed_notification_enabled) {
             m_has_focus_state_changed = true;
-            this->SignalSystemEventIfNeeded(kernel);
+            this->SignalSystemEventIfNeededLocked(kernel);
         }
     }
 
@@ -107,33 +116,40 @@ public:
 
 public:
     void SetFocusStateChangedNotificationEnabled(Kernel::KernelCore& kernel, bool enabled) {
+        std::scoped_lock lk{m_lock};
         m_focus_state_changed_notification_enabled = enabled;
-        this->SignalSystemEventIfNeeded(kernel);
+        this->SignalSystemEventIfNeededLocked(kernel);
     }
 
     void SetOperationModeChangedNotificationEnabled(Kernel::KernelCore& kernel, bool enabled) {
+        std::scoped_lock lk{m_lock};
         m_operation_mode_changed_notification_enabled = enabled;
-        this->SignalSystemEventIfNeeded(kernel);
+        this->SignalSystemEventIfNeededLocked(kernel);
     }
 
     void SetPerformanceModeChangedNotificationEnabled(Kernel::KernelCore& kernel, bool enabled) {
+        std::scoped_lock lk{m_lock};
         m_performance_mode_changed_notification_enabled = enabled;
-        this->SignalSystemEventIfNeeded(kernel);
+        this->SignalSystemEventIfNeededLocked(kernel);
     }
 
     void SetResumeNotificationEnabled(bool enabled) {
+        std::scoped_lock lk{m_lock};
         m_resume_notification_enabled = enabled;
     }
 
     void SetActivityState(ActivityState state) {
+        std::scoped_lock lk{m_lock};
         m_activity_state = state;
     }
 
     void SetSuspendMode(SuspendMode mode) {
+        std::scoped_lock lk{m_lock};
         m_suspend_mode = mode;
     }
 
     void SetForcedSuspend(bool enabled) {
+        std::scoped_lock lk{m_lock};
         m_forced_suspend = enabled;
     }
 
@@ -156,10 +172,12 @@ private:
     FocusState GetFocusStateWhileBackground(bool is_obscured) const;
 
 private:
-    AppletMessage PopMessageInOrderOfPriority();
-    bool ShouldSignalSystemEvent();
+    AppletMessage PopMessageInOrderOfPriorityLocked();
+    bool ShouldSignalSystemEventLocked() const;
+    void SignalSystemEventIfNeededLocked(Kernel::KernelCore& kernel);
 
 private:
+    mutable std::mutex m_lock{};
     Event m_system_event;
     Event m_operation_mode_changed_system_event;
     Event m_operation_mode_refresh_event;

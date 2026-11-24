@@ -32,12 +32,15 @@
 
 #include "common/common_types.h"
 #include "common/thread_worker.h"
+#include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/value.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/host_translate_info.h"
 #include "shader_recompiler/object_pool.h"
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/runtime_info.h"
+#include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_vulkan/draw_skip_policy.h"
@@ -118,6 +121,33 @@ struct ShaderPools {
     Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_block{32};
 };
 
+struct DirectSm86CompileResult {
+    bool compiled_direct{};
+    std::vector<u32> spirv;
+    Shader::Info info;
+    Shader::Backend::Bindings bindings;
+};
+
+/// Test hook overriding EDEN_NX2_DIRECT_SM86 (`std::nullopt` restores env-var behavior).
+void SetDirectSm86EnabledOverride(std::optional<bool> enabled) noexcept;
+
+/// Returns whether direct SM86-to-SPIR-V compilation is currently enabled.
+[[nodiscard]] bool IsDirectSm86Enabled() noexcept;
+
+/// Returns whether direct SM86-to-SPIR-V compilation currently supports `stage`.
+[[nodiscard]] bool DirectSm86SupportsStage(Shader::Stage stage) noexcept;
+
+/// Attempts direct SM86 SPIR-V compilation on a live ComputeEnvironment/GenericEnvironment before
+/// falling back lazily to LowerToMaxwell + Maxwell CFG/SPIR-V translation.
+[[nodiscard]] DirectSm86CompileResult CompileComputeStageWithLazyFallback(
+    ShaderPools& pools, VideoCommon::GenericEnvironment& env, const Shader::Profile& profile,
+    const Shader::HostTranslateInfo& host_info, u32 max_shared_memory = 0, u64 unique_hash = 0);
+
+/// Same as above for a serialized warm-cache FileEnvironment.
+[[nodiscard]] DirectSm86CompileResult CompileComputeStageWithLazyFallback(
+    ShaderPools& pools, VideoCommon::FileEnvironment& env, const Shader::Profile& profile,
+    const Shader::HostTranslateInfo& host_info, u32 max_shared_memory = 0, u64 unique_hash = 0);
+
 struct ComputePipelineVariant {
     std::unique_ptr<ComputePipeline> pipeline;
     std::vector<std::pair<u32, u32>> null_pointer_slots;
@@ -173,6 +203,10 @@ public:
 
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
+
+protected:
+    void OnDebugRejectionsRefreshed(bool unrejected,
+                                    std::span<const u64> dropped_hashes) override;
 
 private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineSlowPath(bool is_indexed);
@@ -257,7 +291,8 @@ private:
     std::unique_ptr<GraphicsPipeline> CreateGraphicsPipeline(
         ShaderPools& pools, const GraphicsPipelineCacheKey& key,
         std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-        bool build_in_parallel, bool native_turing = false, bool parallel_stages = false);
+        bool build_in_parallel, bool native_turing = false, bool parallel_stages = false,
+        bool has_generic_envs = false);
 
     /// Runs task(0..count-1) on the translation workers and this thread; rethrows the first
     /// exception a task threw.
@@ -275,7 +310,8 @@ private:
                                                     const ComputePipelineCacheKey& key,
                                                     Shader::Environment& env,
                                                     PipelineStatistics* statistics,
-                                                    bool build_in_parallel);
+                                                    bool build_in_parallel,
+                                                    bool is_generic_env = false);
 
     void SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                       const vk::PipelineCache& pipeline_cache, u32 cache_version);

@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <span>
 
@@ -327,9 +328,19 @@ void HLE_D7333D26E0A93EDE::Execute(Core::System& system, Engines::Maxwell3D& max
     const_buffer.address_low = address << 8;
 }
 void HLE_BindShader::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    if (parameters.size() < 5) {
+        return;
+    }
     maxwell3d.RefreshParameters();
     auto& regs = maxwell3d.regs;
     const u32 index = parameters[0];
+    if (static_cast<u64>(index) + 34 >= regs.shadow_scratch.size()) {
+        return;
+    }
+    const size_t bind_group_id = parameters[3] & 0x7F;
+    if (bind_group_id >= std::size(regs.bind_groups)) {
+        return;
+    }
     if ((parameters[1] - regs.shadow_scratch[28 + index]) == 0) {
         return;
     }
@@ -345,7 +356,6 @@ void HLE_BindShader::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d
     const_buffer.address_high = (address >> 24) & 0xFF;
     const_buffer.address_low = address << 8;
 
-    const size_t bind_group_id = parameters[3] & 0x7F;
     auto& bind_group = regs.bind_groups[bind_group_id];
     bind_group.raw_config = 0x11;
     maxwell3d.ProcessCBBind(bind_group_id);
@@ -360,6 +370,9 @@ void HLE_SetRasterBoundingBox::Execute(Core::System& system, Engines::Maxwell3D&
     regs.raster_bounding_box.pad.Assign(scratch_data & raster_enabled);
 }
 void HLE_ClearConstBuffer::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
+    if (parameters.size() < 3) {
+        return;
+    }
     static constexpr std::array<u32, 0x7000> zeroes{}; //must be bigger than either 7000 or 5F00
     maxwell3d.RefreshParameters();
     auto& regs = maxwell3d.regs;
@@ -367,7 +380,8 @@ void HLE_ClearConstBuffer::Execute(Core::System& system, Engines::Maxwell3D& max
     regs.const_buffer.address_high = parameters[0];
     regs.const_buffer.address_low = parameters[1];
     regs.const_buffer.offset = 0;
-    maxwell3d.ProcessCBMultiData(zeroes.data(), parameters[2] * 4);
+    const u64 clear_words = (std::min)(u64{parameters[2]} * 4, u64{zeroes.size()});
+    maxwell3d.ProcessCBMultiData(zeroes.data(), static_cast<u32>(clear_words));
 }
 void HLE_ClearMemory::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> parameters, [[maybe_unused]] u32 method) {
     maxwell3d.RefreshParameters();
@@ -429,6 +443,9 @@ void HLE_TransformFeedbackSetup::Execute(Core::System& system, Engines::Maxwell3
 }
 
 void MacroInterpreterImpl::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, std::span<const u32> params, u32 method) {
+    if (params.empty() || code.empty()) {
+        return;
+    }
     Reset();
 
     registers[1] = params[0];
@@ -441,8 +458,10 @@ void MacroInterpreterImpl::Execute(Core::System& system, Engines::Maxwell3D& max
         keep_executing = Step(system, maxwell3d, false);
     }
 
-    // Assert the the macro used all the input parameters
-    ASSERT(next_parameter_index == parameters.size());
+    if (next_parameter_index != parameters.size()) {
+        LOG_DEBUG(HW_GPU, "MacroInterpreter did not consume all parameters ({} != {})",
+                  next_parameter_index, parameters.size());
+    }
 }
 
 /// Resets the execution engine state, zeroing registers, etc.
@@ -462,6 +481,11 @@ void MacroInterpreterImpl::Reset() {
 /// the interpreter should keep running.
 /// @param is_delay_slot Whether the current step is being executed due to a delay slot in a previous instruction.
 bool MacroInterpreterImpl::Step(Core::System& system, Engines::Maxwell3D& maxwell3d, bool is_delay_slot) {
+    if ((pc % sizeof(u32)) != 0 || pc / sizeof(u32) >= code.size()) {
+        LOG_ERROR(HW_GPU, "MacroInterpreter PC out of bounds ({:#x} >= {:#x})", pc,
+                  code.size() * sizeof(u32));
+        return false;
+    }
     u32 base_address = pc;
 
     Macro::Opcode opcode = GetOpcode();
@@ -469,7 +493,10 @@ bool MacroInterpreterImpl::Step(Core::System& system, Engines::Maxwell3D& maxwel
 
     // Update the program counter if we were delayed
     if (delayed_pc) {
-        ASSERT(is_delay_slot);
+        if (!is_delay_slot) {
+            LOG_ERROR(HW_GPU, "MacroInterpreter delayed PC outside delay slot");
+            return false;
+        }
         pc = *delayed_pc;
         delayed_pc = {};
     }
@@ -651,8 +678,9 @@ bool MacroInterpreterImpl::EvaluateBranchCondition(Macro::BranchCondition cond, 
 
 /// Reads an opcode at the current program counter location.
 Macro::Opcode MacroInterpreterImpl::GetOpcode() const {
-    ASSERT((pc % sizeof(u32)) == 0);
-    ASSERT(pc < code.size() * sizeof(u32));
+    if ((pc % sizeof(u32)) != 0 || pc / sizeof(u32) >= code.size()) {
+        return Macro::Opcode{0};
+    }
     return {code[pc / sizeof(u32)]};
 }
 
@@ -684,7 +712,11 @@ u32 MacroInterpreterImpl::Read(Engines::Maxwell3D& maxwell3d, u32 method) const 
 
 /// Returns the next parameter in the parameter queue.
 u32 MacroInterpreterImpl::FetchParameter() {
-    ASSERT(next_parameter_index < parameters.size());
+    if (next_parameter_index >= parameters.size()) {
+        LOG_ERROR(HW_GPU, "MacroInterpreter FetchParameter out of bounds ({} >= {})",
+                  next_parameter_index, parameters.size());
+        return 0;
+    }
     return parameters[next_parameter_index++];
 }
 

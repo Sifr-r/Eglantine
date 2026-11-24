@@ -9,6 +9,8 @@
 
 #include <array>
 #include <bitset>
+#include <cstddef>
+#include <vector>
 
 #include "common/common_types.h"
 #include "dynarmic/backend/x64/hostloc.h"
@@ -162,7 +164,28 @@ constexpr size_t ABI_SHADOW_SPACE = 0;  // bytes
 
 //static_assert(ABI_ALL_CALLER_SAVE.count() + ABI_ALL_CALLEE_SAVE.count() == 31, "Invalid total number of registers");
 
+#ifdef _WIN32
+struct PrologueInfo {
+    enum class OpKind : u8 {
+        PushNonVol,
+        AllocStack,
+        SaveXmm128,
+    };
+    struct Op {
+        OpKind kind;
+        u8 code_offset;
+        u8 reg;
+        size_t offset_or_size;
+    };
+    const u8* begin = nullptr;
+    u8 prolog_size = 0;
+    std::vector<Op> ops;
+};
+
+void ABI_PushCalleeSaveRegistersAndAdjustStack(BlockOfCode& code, size_t frame_size = 0, PrologueInfo* prologue_info = nullptr);
+#else
 void ABI_PushCalleeSaveRegistersAndAdjustStack(BlockOfCode& code, size_t frame_size = 0);
+#endif
 void ABI_PopCalleeSaveRegistersAndAdjustStack(BlockOfCode& code, size_t frame_size = 0);
 void ABI_PushCallerSaveRegistersAndAdjustStack(BlockOfCode& code, size_t frame_size = 0);
 void ABI_PopCallerSaveRegistersAndAdjustStack(BlockOfCode& code, size_t frame_size = 0);

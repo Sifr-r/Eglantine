@@ -1,12 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <QWidget>
+
 #include "common/settings_input.h"
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
 #include "yuzu/util/controller_navigation.h"
 
-ControllerNavigation::ControllerNavigation(Core::HID::HIDCore& hid_core, QWidget* parent) {
+ControllerNavigation::ControllerNavigation(Core::HID::HIDCore& hid_core, QWidget* parent)
+    : QObject(parent) {
     player1_controller = hid_core.GetEmulatedController(Core::HID::NpadIdType::Player1);
     handheld_controller = hid_core.GetEmulatedController(Core::HID::NpadIdType::Handheld);
     Core::HID::ControllerUpdateCallback engine_callback{

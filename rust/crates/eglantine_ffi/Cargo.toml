@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "eglantine_ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "eglantine_rs"
+crate-type = ["staticlib"]
+
+[features]
+default = ["ampere", "ampere-spirv", "nup", "switch2-io"]
+ampere = ["dep:eglantine_ampere_core"]
+ampere-spirv = ["dep:eglantine_ampere_spirv"]
+nup = ["dep:eglantine_nup_fs"]
+switch2-io = ["dep:eglantine_switch2_io"]
+
+[dependencies]
+eglantine_ampere_core = { path = "../ampere_core", optional = true }
+eglantine_ampere_spirv = { path = "../ampere_spirv", optional = true }
+eglantine_nup_fs = { path = "../nup_fs", optional = true }
+eglantine_switch2_io = { path = "../switch2_io", optional = true }

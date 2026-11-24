@@ -1,10 +1,15 @@
 # Eden on Switch 2 titles (branch `nx2`)
 
-Local experiment: get Eden (Switch 1 emulator) to load a Switch 2 title's loose ExeFS and push
-boot as far as it goes. Nothing here is upstreamed or pushed. Graphics (Ampere / NVN2) is out of
-scope for this pass.
+This is a historical log of local experiments on `nx2`. The initial pass focused on booting
+loose ExeFS. Later entries include Ampere and NVN2 graphics work. Titles, symptoms, performance,
+local paths and suggested fixes describe the recorded runs.
 
-## Setup
+For current behavior, see the [architecture ledger](ARCHITECTURE.md#3-core-domain-contracts)
+and [debugging toolchain](ARCHITECTURE.md#5-the-switch-2-debugging-toolchain-toolsnx2).
+Use the [baseline procedure](migration_docs/00_PREREQUISITES_AND_BASELINE.md) to reproduce a
+finding on the target build. Look up previously identified programs in the [shader catalogue](tools/nx2/catalog/README.md).
+
+## Recorded setup
 
 - Source + build live in `C:\dev\eden` (a worktree of `eden-nx2/`, branch `nx2`). The original
   working folder path is ~180 chars, and `cl.exe` can't open its PDB from a build folder there
@@ -233,7 +238,7 @@ faulting stack as module+offset, then a minidump), `EDEN_NX2_AUTO_STUB`, `EDEN_N
 report/semaphore write). `C:\dev\crashrun.sh` runs eden-cli under cdb and prints the crash stack;
 `C:\dev\stackdump.sh <main> <seconds>` dumps host thread stacks of a running test.
 
-## Where it stops now
+## Recorded title outcomes
 
 All runs: `EDEN_NX2_AUTO_STUB=1`, 12 GB memory layout, loose ExeFS with the sibling `romfs/`.
 
@@ -246,7 +251,7 @@ UP0), TMML (0xb69) in two graphics shaders, "reserved attribute 23" (a[0x5c]) re
 (`C:\dev\run.sh`) move any title-4 save to `C:\dev\save_backups` first so they start a new game.
 Scripted input: `EDEN_NX2_KEY_SCRIPT="50:4,50.5:-4,55:79,55.4:-79,57:4,57.5:-4"`.
 
-**Title 3**: last checked before the graphics work; should now track title 4.
+**Title 3**: last checked before the graphics work. Similar behavior to title 4 was a hypothesis at the time.
 
 **Title 1, 1.8.0 update** (`updates/917504/exefs`, same program id): needs the GameChat and
 camera stubs of rows 123-127, then plays (Qt frontend `eden.exe`, ~20 fps on row 128's hardware) with
@@ -261,13 +266,18 @@ Offline shader check: `nx2work/lowertest/lowertest.exe C:/dev/shaders_title1 [-a
 
 **Title 2**: main/sdk/subsdk0 fail LZ4 and SHA-256 checks; can't be run from these files.
 
-## Prioritized next steps
+## Proposed next steps from these runs
+
+Check each item against the current source and repeat the relevant title or test before reopening it.
+For example, the [platform profile](src/core/platform_profile.cpp) now configures six guest
+cores for a confirmed Switch 2 title, and the [split notes](NX2_GPU_THREAD_SPLIT.md) record the
+GPU threading follow-up.
 
 1. **Title 4 past the intro**: lower the 64-bit add with carry (UIADD3/IADD3 carry-out and .X
    carry-in), TMML, and attribute 0x5c; then whatever the next area needs (dump + lowertest).
    Squid/paint-splat hatch on the menu. A faster tensor-core emulation (shared-memory HMMA) would
    replace the bilinear upscale stand-in.
-2. **Title 1 / title 3** retests with the current tree; dump their shaders and widen the lowering.
+2. **Title 1 / title 3** retests on the experiment branch, followed by shader dumps and lowering updates.
 3. Replace guesses with real protocol knowledge: syncpt page layout, the semaphore mirror page,
    gsv 214 (GPU-only memory) and vi2 present buffer availability (real buffer release instead of
    the fence wait), gsv 1510 formats, svcGetInfo 29-33.

@@ -28,6 +28,7 @@ class System;
 
 namespace FileSys {
 class NACP;
+class ProgramMetadata;
 } // namespace FileSys
 
 namespace Kernel {
@@ -53,6 +54,15 @@ enum class FileType {
     NUP,
     DeconstructedRomDirectory,
 };
+
+enum class FileExtensionUse {
+    DesktopGame,
+    AndroidGame,
+    AndroidExternalContent,
+};
+
+/// Returns lowercase extensions without a leading dot for the requested frontend use.
+std::vector<std::string> GetFileExtensions(FileExtensionUse use);
 
 /**
  * Identifies the type of a supported file/container based on its structure.
@@ -356,6 +366,14 @@ public:
     using Modules = std::map<VAddr, std::string>;
 
     virtual ResultStatus ReadNSOModules(Modules& modules) {
+        return ResultStatus::ErrorNotImplemented;
+    }
+
+    /**
+     * Read the effective program metadata (main.npdm) without loading modules or building RomFS.
+     */
+    virtual ResultStatus ReadProgramMetadata(Core::System& system,
+                                             FileSys::ProgramMetadata& out_metadata) {
         return ResultStatus::ErrorNotImplemented;
     }
 

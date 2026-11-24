@@ -18,6 +18,7 @@
 #include "common/logging.h"
 #include "common/scm_rev.h"
 #include "common/cpu_features.h"
+#include "core/loader/loader.h"
 #include "core/memory.h"
 
 #include <QGuiApplication>
@@ -57,12 +58,16 @@ std::unique_ptr<Core::System> system = nullptr;
 std::shared_ptr<FileSys::RealVfsFilesystem> vfs = nullptr;
 std::unique_ptr<FileSys::ManualContentProvider> provider = nullptr;
 std::unique_ptr<EmuThread> emu_thread = nullptr;
+std::mutex renderer_mutex;
+std::atomic<bool> renderer_active{false};
 
-const QStringList supported_file_extensions = {QStringLiteral("nro"), QStringLiteral("nso"),
-                                               QStringLiteral("nca"), QStringLiteral("xci"),
-                                               QStringLiteral("xcz"), QStringLiteral("nsp"),
-                                               QStringLiteral("nsz"), QStringLiteral("nup"),
-                                               QStringLiteral("kip")};
+const QStringList supported_file_extensions = [] {
+    QStringList extensions;
+    for (const auto& extension : Loader::GetFileExtensions(Loader::FileExtensionUse::DesktopGame)) {
+        extensions.append(QString::fromStdString(extension));
+    }
+    return extensions;
+}();
 
 Core::Frontend::WindowSystemType GetWindowSystemType() {
     // Determine WSI type based on Qt platform.
@@ -280,6 +285,14 @@ void Init(QWidget* root) {
 
     // Remove cached contents generated during the previous session
     RemoveCachedContents();
+}
+
+void Shutdown() {
+    emu_thread.reset();
+    system.reset();
+    provider.reset();
+    vfs.reset();
+    rootObject = nullptr;
 }
 
 std::filesystem::path GetEdenCommand() {

@@ -5,6 +5,10 @@
 resolver = "2"
 members = [
     "crates/ampere_core",
+    "crates/ampere_spirv",
+    "crates/nup_fs",
+    "crates/switch2_io",
+    "crates/eglantine_ffi",
 ]
 
 [workspace.package]

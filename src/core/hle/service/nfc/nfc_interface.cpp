@@ -326,7 +326,7 @@ Result NfcInterface::TranslateResultToServiceError(Result result) const {
 
     switch (backend) {
     case BackendType::Mifare:
-        return TranslateResultToNfp(result);
+        return TranslateResultToMifare(result);
     case BackendType::Nfp: {
         return TranslateResultToNfp(result);
     }

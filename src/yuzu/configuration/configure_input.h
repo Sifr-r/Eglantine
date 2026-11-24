@@ -49,6 +49,9 @@ public:
     /// Save all button configurations to settings file.
     void ApplyConfiguration();
 
+    /// Discard unapplied changes across all player controllers.
+    void RestoreConfiguration();
+
     QList<QWidget*> GetSubTabs() const;
 
 private:

@@ -27,9 +27,7 @@ using namespace Dynarmic;
 
 void SkipWhitespace(std::string_view& sv) {
     auto nextpos{sv.find_first_not_of(' ')};
-    if (nextpos != std::string::npos) {
-        sv.remove_prefix(nextpos);
-    }
+    sv.remove_prefix(nextpos == std::string::npos ? sv.size() : nextpos);
 }
 
 void SkipHeader(std::string_view& sv) {
@@ -48,6 +46,9 @@ std::string_view NextToken(std::string_view& sv) {
 u64 ParseHex(std::string_view hex) {
     u64 result = 0;
     while (!hex.empty()) {
+        if (hex.front() == ':') {
+            return result;
+        }
         result <<= 4;
         if (hex.front() >= '0' && hex.front() <= '9') {
             result += hex.front() - '0';
@@ -55,8 +56,6 @@ u64 ParseHex(std::string_view hex) {
             result += hex.front() - 'a' + 0xA;
         } else if (hex.front() >= 'A' && hex.front() <= 'F') {
             result += hex.front() - 'A' + 0xA;
-        } else if (hex.front() == ':') {
-            return result;
         } else {
             fmt::print("Character {} is not a valid hex character\n", hex.front());
         }

@@ -45,20 +45,28 @@ RenderdocAPI::RenderdocAPI() {
 #endif
 }
 
-RenderdocAPI::~RenderdocAPI() = default;
+RenderdocAPI::~RenderdocAPI() {
+    if (rdoc_api) {
+        auto* api = static_cast<RENDERDOC_API_1_6_0*>(rdoc_api);
+        if (api->IsFrameCapturing() != 0) {
+            api->DiscardFrameCapture(NULL, NULL);
+        }
+        is_capturing = false;
+    }
+}
 
 void RenderdocAPI::ToggleCapture() {
-    if (!rdoc_api) [[unlikely]] {
+    if (!rdoc_api) {
         return;
     }
 
     auto* api = static_cast<RENDERDOC_API_1_6_0*>(rdoc_api);
-    if (!is_capturing) {
+    if (api->IsFrameCapturing() == 0) {
         api->StartFrameCapture(NULL, NULL);
     } else {
-        api->EndFrameCapture(NULL, NULL);
+        (void)api->EndFrameCapture(NULL, NULL);
     }
-    is_capturing = !is_capturing;
+    is_capturing = api->IsFrameCapturing() != 0;
 }
 
 } // namespace Tools

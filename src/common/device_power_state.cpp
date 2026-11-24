@@ -15,6 +15,7 @@ extern std::atomic<bool> g_has_battery;
 #elif defined(__APPLE__)
 #include <TargetConditionals.h>
 #if TARGET_OS_MAC
+#include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/ps/IOPSKeys.h>
 #include <IOKit/ps/IOPowerSources.h>
 #endif
@@ -50,31 +51,63 @@ namespace Common {
         info.has_battery = g_has_battery.load(std::memory_order_relaxed);
 
 #elif defined(__APPLE__) && TARGET_OS_MAC
+        info.has_battery = false;
         CFTypeRef info_ref = IOPSCopyPowerSourcesInfo();
-        CFArrayRef sources = IOPSCopyPowerSourcesList(info_ref);
-        if (CFArrayGetCount(sources) > 0) {
-            CFDictionaryRef battery =
-                IOPSGetPowerSourceDescription(info_ref, CFArrayGetValueAtIndex(sources, 0));
+        if (info_ref != nullptr) {
+            CFArrayRef sources = IOPSCopyPowerSourcesList(info_ref);
+            if (sources != nullptr) {
+                const CFIndex count = CFArrayGetCount(sources);
+                for (CFIndex i = 0; i < count; ++i) {
+                    CFTypeRef source = CFArrayGetValueAtIndex(sources, i);
+                    if (source == nullptr) {
+                        continue;
+                    }
+                    CFDictionaryRef battery = IOPSGetPowerSourceDescription(info_ref, source);
+                    if (battery == nullptr) {
+                        continue;
+                    }
+                    CFTypeRef ps_type = CFDictionaryGetValue(battery, CFSTR(kIOPSTypeKey));
+                    if (ps_type == nullptr || CFGetTypeID(ps_type) != CFStringGetTypeID() ||
+                        !CFEqual(ps_type, CFSTR(kIOPSInternalBatteryType))) {
+                        continue;
+                    }
+                    CFTypeRef is_present = CFDictionaryGetValue(battery, CFSTR(kIOPSIsPresentKey));
+                    if (is_present != nullptr && CFGetTypeID(is_present) == CFBooleanGetTypeID() &&
+                        CFBooleanGetValue(static_cast<CFBooleanRef>(is_present)) == 0) {
+                        continue;
+                    }
 
-            CFNumberRef curNum =
-                (CFNumberRef)CFDictionaryGetValue(battery, CFSTR(kIOPSCurrentCapacityKey));
-            CFNumberRef maxNum =
-                (CFNumberRef)CFDictionaryGetValue(battery, CFSTR(kIOPSMaxCapacityKey));
-            int cur = 0, max = 0;
-            CFNumberGetValue(curNum, kCFNumberIntType, &cur);
-            CFNumberGetValue(maxNum, kCFNumberIntType, &max);
+                    info.has_battery = true;
 
-            if (max > 0)
-                info.percentage = (cur * 100) / max;
+                    CFTypeRef cur_ref =
+                        CFDictionaryGetValue(battery, CFSTR(kIOPSCurrentCapacityKey));
+                    CFTypeRef max_ref =
+                        CFDictionaryGetValue(battery, CFSTR(kIOPSMaxCapacityKey));
+                    int cur = 0;
+                    int max = 0;
+                    if (cur_ref != nullptr && CFGetTypeID(cur_ref) == CFNumberGetTypeID() &&
+                        max_ref != nullptr && CFGetTypeID(max_ref) == CFNumberGetTypeID() &&
+                        CFNumberGetValue(static_cast<CFNumberRef>(cur_ref), kCFNumberIntType,
+                                         &cur) != 0 &&
+                        CFNumberGetValue(static_cast<CFNumberRef>(max_ref), kCFNumberIntType,
+                                         &max) != 0 &&
+                        cur >= 0 && max > 0) {
+                        info.percentage = (cur * 100) / max;
+                    }
 
-            CFBooleanRef isCharging =
-                (CFBooleanRef)CFDictionaryGetValue(battery, CFSTR(kIOPSIsChargingKey));
-            info.charging = CFBooleanGetValue(isCharging);
-        } else {
-            info.has_battery = false;
+                    CFTypeRef is_charging =
+                        CFDictionaryGetValue(battery, CFSTR(kIOPSIsChargingKey));
+                    if (is_charging != nullptr &&
+                        CFGetTypeID(is_charging) == CFBooleanGetTypeID()) {
+                        info.charging =
+                            CFBooleanGetValue(static_cast<CFBooleanRef>(is_charging)) != 0;
+                    }
+                    break;
+                }
+                CFRelease(sources);
+            }
+            CFRelease(info_ref);
         }
-        CFRelease(sources);
-        CFRelease(info_ref);
 
 #elif defined(__linux__)
         const char* battery_path = "/sys/class/power_supply/BAT0/";

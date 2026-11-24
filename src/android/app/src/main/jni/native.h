@@ -4,7 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include <optional>
+#include <string>
 
 #include <android/native_window_jni.h>
 #include "common/android/applets/software_keyboard.h"
@@ -59,6 +61,8 @@ public:
                                                  const bool frontend_initiated);
 
     Common::Android::SoftwareKeyboard::AndroidKeyboard* SoftwareKeyboard();
+    void SubmitInlineKeyboardText(const std::u16string& text);
+    void SubmitInlineKeyboardInput(int key_code);
 
     static void OnEmulationStarted();
 
@@ -72,8 +76,11 @@ private:
 
 private:
     // Window management
+    mutable std::mutex m_window_mutex;
     std::unique_ptr<EmuWindow_Android> m_window;
     ANativeWindow* m_native_window{};
+    std::mutex m_gpu_drain_mutex;
+    bool m_gpu_ready{false};
 
     // Core emulation
     Core::System m_system;
@@ -84,6 +91,7 @@ private:
     Core::SystemResultStatus m_load_result{Core::SystemResultStatus::ErrorNotInitialized};
     std::atomic<bool> m_is_running = false;
     std::atomic<bool> m_is_paused = false;
+    std::mutex m_keyboard_mutex;
     Common::Android::SoftwareKeyboard::AndroidKeyboard* m_software_keyboard{};
     std::unique_ptr<FileSys::ManualContentProvider> m_manual_provider;
     int m_applet_id{1};

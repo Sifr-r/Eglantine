@@ -138,6 +138,8 @@ class Host1x;
 } // namespace Host1x
 
 class MemoryManager;
+struct NativeMacroContext;
+struct NativeQmdStateTable;
 
 class GPU final {
 public:
@@ -160,6 +162,10 @@ public:
     std::shared_ptr<Control::ChannelState> AllocateChannel();
 
     void InitChannel(Control::ChannelState& to_init, u64 program_id);
+
+    [[nodiscard]] std::shared_ptr<NativeMacroContext> GetOrCreateNativeMacroContext();
+    [[nodiscard]] std::shared_ptr<NativeMacroContext> GetNativeMacroContext() const;
+    [[nodiscard]] std::shared_ptr<NativeQmdStateTable> GetOrCreateNativeQmdTable();
 
     void BindChannel(s32 channel_id);
 
@@ -283,6 +289,10 @@ public:
 
     /// Notify rasterizer that any caches of the specified region should be flushed and invalidated
     void FlushAndInvalidateRegion(DAddr addr, u64 size);
+
+    /// Returns the owning System instance for this GPU session.
+    [[nodiscard]] Core::System& System();
+    [[nodiscard]] const Core::System& System() const;
 
 private:
     struct Impl;

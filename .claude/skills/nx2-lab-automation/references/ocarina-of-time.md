@@ -1,18 +1,23 @@
 # The Legend of Zelda: Ocarina of Time (Switch 2, NUP)
 
-- Game: `/run/media/kraibse/SOINC/emulation/Switch 2/games/The Legend of Zelda Ocarina of TIme [04004860224DEC000].nup`
-  (a standalone update NUP; boots the update program directly). Shader cache key `0400486024dec000`.
-- Firmware: `/run/media/kraibse/SOINC/emulation/Switch 2/firmware/firmware` (user-provided).
-- Shader dumps: `~/Documents/hermes/eglantine/oot-shader-dump` (all 1937 lowered as of 6b934346d7).
+- Use a locally available standalone update NUP and the active profile's firmware. The program
+  ID is `0400486024DEC000` and the shader cache key is lowercase.
+- Use separate scratch paths for the diagnostics, configuration copy and shader dumps.
 
 ## Reaching a scene
 
 - Title screen with 3D background after ~90 s (first boot of a build is longer: pipelines compile).
 - `press a` (hold 200) at the title -> load screen; `a` again picks the newest save, `a` confirms;
   gameplay ~40-75 s later (Kokiri Forest in the user's save).
-- Script: `scripts/to_gameplay.sh` in this skill.
+- The Zsh helper's defaults point to the original lab machine. Set `REPO` and `D`, put
+  `qt-copy.ini` under `D`, then pass your local `--game` and `--dump-dir` as extra launcher
+  arguments. Create the dump directory first. The helper leaves its owned session running when
+  it reaches the save. Stop that session with `python3 -I tools/nx2/lab_ctl.py -d "$D" stop`.
 
 ## Findings so far (2026-11-05)
+
+These observations describe the builds tested on that date. Confirm the current tensor path
+and scene against a new capture before reusing their conclusions.
 
 - 3D image goes through an HMMA network (DLSS-like). Title: 11 compute programs, final pass
   `6093c9143ba0904d` (TEX.F16 input `0x28`, dither TLD `0x2e`, SUST.P RGBA to `0x32`).

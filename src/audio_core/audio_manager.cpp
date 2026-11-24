@@ -20,8 +20,8 @@ AudioManager::AudioManager() {
         std::unique_lock l{events.GetAudioEventLock()};
         events.ClearEvents();
         while (!stop_token.stop_requested()) {
-            const auto timed_out{events.Wait(l, std::chrono::seconds(2))};
-            if (events.CheckAudioEventSet(Event::Type::Max)) {
+            const auto timed_out{events.Wait(l, stop_token, std::chrono::seconds(2))};
+            if (stop_token.stop_requested() || events.CheckAudioEventSet(Event::Type::Max)) {
                 break;
             }
             for (size_t i = 0; i < buffer_events.size(); i++) {
@@ -31,7 +31,7 @@ AudioManager::AudioManager() {
                         buffer_events[i]();
                     }
                 }
-                events.SetAudioEvent(event_type, false);
+                events.SetAudioEventLocked(event_type, false);
             }
         }
     });
@@ -47,12 +47,12 @@ void AudioManager::Shutdown() {
 
 Result AudioManager::SetOutManager(BufferEventFunc buffer_func) {
     if (thread.joinable()) {
-        std::scoped_lock l{lock};
+        std::scoped_lock l{lock, events.GetAudioEventLock()};
         const auto index{events.GetManagerIndex(Event::Type::AudioOutManager)};
         if (buffer_events[index] == nullptr) {
             buffer_events[index] = std::move(buffer_func);
             needs_update = true;
-            events.SetAudioEvent(Event::Type::AudioOutManager, true);
+            events.SetAudioEventLocked(Event::Type::AudioOutManager, true);
         }
         return ResultSuccess;
     }
@@ -61,12 +61,12 @@ Result AudioManager::SetOutManager(BufferEventFunc buffer_func) {
 
 Result AudioManager::SetInManager(BufferEventFunc buffer_func) {
     if (thread.joinable()) {
-        std::scoped_lock l{lock};
+        std::scoped_lock l{lock, events.GetAudioEventLock()};
         const auto index{events.GetManagerIndex(Event::Type::AudioInManager)};
         if (buffer_events[index] == nullptr) {
             buffer_events[index] = std::move(buffer_func);
             needs_update = true;
-            events.SetAudioEvent(Event::Type::AudioInManager, true);
+            events.SetAudioEventLocked(Event::Type::AudioInManager, true);
         }
         return ResultSuccess;
     }

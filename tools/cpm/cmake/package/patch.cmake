@@ -42,10 +42,18 @@ endif()
 
 # get last patch number + 1
 list(LENGTH patches patches_len)
-math(EXPR last_index "${patches_len} - 1")
-list(GET patches ${last_index} patch)
-string(REGEX MATCH "[0-9][0-9][0-9][0-9]" number "${patch}")
-math(EXPR new_patchnum "${number} + 1")
+if(patches_len EQUAL 0)
+    set(new_patchnum 1)
+else()
+    math(EXPR last_index "${patches_len} - 1")
+    list(GET patches ${last_index} patch)
+    get_filename_component(patch_filename "${patch}" NAME)
+    if(patch_filename MATCHES "([0-9][0-9][0-9][0-9])")
+        math(EXPR new_patchnum "${CMAKE_MATCH_1} + 1")
+    else()
+        math(EXPR new_patchnum "${patches_len} + 1")
+    endif()
+endif()
 
 # now pad it for filename usage
 set(padded "0000${new_patchnum}")

@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include "common/container/unordered_map.h"
@@ -298,7 +299,7 @@ private:
 
     mutable std::mutex mutex;
     mutable std::mutex mutex_callback;
-    bool configuring{false};
+    std::atomic<bool> configuring{false};
     const std::string input_engine;
     int last_callback_key = 0;
     ::Common::unordered_map<PadIdentifier, ControllerData> controller_list;

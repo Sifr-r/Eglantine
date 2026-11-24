@@ -416,7 +416,7 @@ void RunTestInstance(Dynarmic::A32::Jit& jit,
             if constexpr (sizeof(decltype(instruction)) == 2) {
                 fmt::print("{:04x} ?\n", instruction);
             } else {
-                fmt::print("{}", Dynarmic::Common::DisassembleAArch64(instruction, current_pc));
+                fmt::print("{}", Dynarmic::Common::DisassembleAArch32(false, current_pc, reinterpret_cast<const u8*>(&instruction), sizeof(instruction)));
             }
             current_pc += sizeof(decltype(instruction));
         }

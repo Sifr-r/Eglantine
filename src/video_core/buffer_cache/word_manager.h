@@ -170,10 +170,12 @@ struct WordManager {
         std::span<u64> no_hot_words = Span(Type::NoHot);
         std::span<u64> hot_clean_words = Span(Type::HotClean);
         std::span<u64> state_words = Span(type);
+        std::span<u64> cpu_words = Span(Type::CPU);
         [[maybe_unused]] std::span<u64> untracked_words = Span(Type::Untracked);
         [[maybe_unused]] std::span<u64> cached_words = Span(Type::CachedCPU);
         CollectedRanges ranges;
         IterateWords(dirty_addr - cpu_addr, size, [&](size_t index, u64 mask) {
+            u64 formerly_hot_mask = 0;
             if (hot_pages && enable) {
                 if (type == Type::CPU) {
                     // Whoever marks a hot page modified (a write made by the GPU in the middle of
@@ -187,6 +189,7 @@ struct WordManager {
                         flip_words[index] |= flipped;
                     }
                 } else if (type == Type::GPU) {
+                    formerly_hot_mask = hot_words[index] & mask & ~cached_words[index];
                     no_hot_words[index] |= mask;
                     hot_words[index] &= ~mask;
                     hot_clean_words[index] &= ~mask;
@@ -194,6 +197,8 @@ struct WordManager {
             }
             if (type == Type::CPU || type == Type::CachedCPU) {
                 CollectChangedRanges(!enable, index, untracked_words[index], mask, ranges);
+            } else if (type == Type::GPU && enable && formerly_hot_mask != 0) {
+                CollectChangedRanges(true, index, untracked_words[index], formerly_hot_mask, ranges);
             }
             if (enable) {
                 state_words[index] |= mask;
@@ -201,6 +206,10 @@ struct WordManager {
                     untracked_words[index] |= mask;
                 if (type == Type::CPU)
                     cached_words[index] &= ~mask;
+                if (type == Type::GPU && formerly_hot_mask != 0) {
+                    cpu_words[index] &= ~formerly_hot_mask;
+                    untracked_words[index] &= ~formerly_hot_mask;
+                }
             } else {
                 if (type == Type::CPU)
                     cached_words[index] &= ~(state_words[index] & mask);
@@ -208,12 +217,14 @@ struct WordManager {
                 if (type == Type::CPU || type == Type::CachedCPU)
                     untracked_words[index] &= ~mask;
             }
-            if (type == Type::CPU || type == Type::CachedCPU) {
+            if (type == Type::CPU || type == Type::CachedCPU ||
+                (type == Type::GPU && enable && formerly_hot_mask != 0)) {
                 NoteCleanWord(index);
             }
         });
         if (!ranges.empty()) {
-            ApplyCollectedRanges(ranges, (!enable) ? 1 : -1);
+            const bool retrack = !enable || type == Type::GPU;
+            ApplyCollectedRanges(ranges, retrack ? 1 : -1);
         }
     }
 

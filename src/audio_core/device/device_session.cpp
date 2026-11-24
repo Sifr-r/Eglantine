@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "audio_core/audio_core.h"
 #include "audio_core/audio_manager.h"
 #include "audio_core/device/audio_buffer.h"
@@ -90,29 +92,46 @@ void DeviceSession::ClearBuffers() {
 }
 
 void DeviceSession::AppendBuffers(std::span<const AudioBuffer> buffers) {
+    if (!stream || !handle || channel_count == 0) {
+        return;
+    }
+
+    const u64 frame_bytes = static_cast<u64>(channel_count) * sizeof(s16);
     for (const auto& buffer : buffers) {
+        if (buffer.size > MaxDeviceBufferSize) {
+            continue;
+        }
+        const u64 frames = buffer.size / frame_bytes;
+        const u64 sample_count = frames * channel_count;
         Sink::SinkBuffer new_buffer{
-            .frames = buffer.size / (channel_count * sizeof(s16)),
+            .frames = frames,
             .frames_played = 0,
             .tag = buffer.tag,
             .consumed = false,
         };
 
-        tmp_samples.resize_destructive(buffer.size / sizeof(s16));
+        tmp_samples.resize_destructive(sample_count);
         if (type == Sink::StreamType::In) {
             stream->AppendBuffer(new_buffer, tmp_samples);
         } else {
             Core::Memory::CpuGuestMemory<s16, Core::Memory::GuestMemoryFlags::UnsafeRead> samples(
-                handle->GetMemory(), buffer.samples, buffer.size / sizeof(s16));
+                handle->GetMemory(), buffer.samples, sample_count);
             stream->AppendBuffer(new_buffer, samples);
         }
     }
 }
 
 void DeviceSession::ReleaseBuffer(const AudioBuffer& buffer) const {
-    if (type == Sink::StreamType::In) {
-        auto samples{stream->ReleaseBuffer(buffer.size / sizeof(s16))};
-        handle->GetMemory().WriteBlockUnsafe(buffer.samples, samples.data(), buffer.size);
+    if (type == Sink::StreamType::In && stream && handle && channel_count != 0 &&
+        buffer.size <= MaxDeviceBufferSize) {
+        const u64 frame_bytes = static_cast<u64>(channel_count) * sizeof(s16);
+        const u64 sample_count = (buffer.size / frame_bytes) * channel_count;
+        auto samples{stream->ReleaseBuffer(sample_count)};
+        const u64 bytes_to_write =
+            (std::min<u64>)(sample_count * sizeof(s16), samples.size() * sizeof(s16));
+        if (bytes_to_write > 0) {
+            handle->GetMemory().WriteBlockUnsafe(buffer.samples, samples.data(), bytes_to_write);
+        }
     }
 }
 

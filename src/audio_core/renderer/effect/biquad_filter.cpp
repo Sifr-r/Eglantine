@@ -17,6 +17,7 @@ void BiquadFilterInfo::Update(BehaviorInfo::ErrorInfo& error_info,
     mix_id = in_params.mix_id;
     process_order = in_params.process_order;
     enabled = in_params.enabled;
+    parameter_version2 = false;
 
     error_info.error_code = ResultSuccess;
     error_info.address = CpuAddr(0);
@@ -31,6 +32,7 @@ void BiquadFilterInfo::Update(BehaviorInfo::ErrorInfo& error_info,
     mix_id = in_params.mix_id;
     process_order = in_params.process_order;
     enabled = in_params.enabled;
+    parameter_version2 = true;
 
     error_info.error_code = ResultSuccess;
     error_info.address = CpuAddr(0);
@@ -39,19 +41,12 @@ void BiquadFilterInfo::Update(BehaviorInfo::ErrorInfo& error_info,
 void BiquadFilterInfo::UpdateForCommandGeneration() {
     usage_state = enabled ? UsageState::Enabled : UsageState::Disabled;
 
-    auto* params_v1 = reinterpret_cast<ParameterVersion1*>(parameter.data());
-    auto* params_v2 = reinterpret_cast<ParameterVersion2*>(parameter.data());
-
-    const auto raw_state_v1 = static_cast<u8>(params_v1->state);
-    const auto raw_state_v2 = static_cast<u8>(params_v2->state);
-
-    if (raw_state_v1 <= static_cast<u8>(ParameterState::Updated)) {
-        params_v1->state = ParameterState::Updated;
-    } else if (raw_state_v2 <= static_cast<u8>(ParameterState::Updated)) {
-        params_v2->state = ParameterState::Updated;
+    if (parameter_version2) {
+        auto* params = reinterpret_cast<ParameterVersion2*>(parameter.data());
+        params->state = ParameterState::Updated;
     } else {
-        params_v1->state = ParameterState::Updated;
-        params_v2->state = ParameterState::Updated;
+        auto* params = reinterpret_cast<ParameterVersion1*>(parameter.data());
+        params->state = ParameterState::Updated;
     }
 }
 

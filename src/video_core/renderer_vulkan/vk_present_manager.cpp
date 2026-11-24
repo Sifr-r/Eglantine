@@ -504,6 +504,14 @@ void PresentManager::RecreateSwapchain(Frame* frame) {
 }
 
 void PresentManager::SetImageCount() {
+    if (swapchain.GetImageCount() == 0) {
+        if (image_count == 0) {
+            image_count = MAX_FRAMES_IN_FLIGHT;
+        }
+        swapchain_image_count = image_count.load();
+        swapchain_image_format = swapchain.GetImageFormat();
+        return;
+    }
     // We cannot have more than 7 images in flight at any given time.
     // FRAMES_IN_FLIGHT is 8, and the cache TICKS_TO_DESTROY is 8.
     // Mali drivers will give us 6.
@@ -577,8 +585,29 @@ void PresentManager::CopyToSwapchainImpl(Frame* frame) {
         RecreateSwapchain(frame);
     }
 
-    while (swapchain.AcquireNextImage(!use_present_thread)) {
+    if (!swapchain.HasImages()) {
+        DiscardFrame(frame);
+        return;
+    }
+
+    bool acquired = false;
+    for (u32 attempt = 0; attempt < MAX_PRESENT_ATTEMPTS; ++attempt) {
+        const auto result = swapchain.AcquireNextImage(!use_present_thread);
+        if (result == Swapchain::AcquireResult::Success) {
+            acquired = true;
+            break;
+        }
+        if (result == Swapchain::AcquireResult::Unavailable) {
+            break;
+        }
         RecreateSwapchain(frame);
+        if (!swapchain.HasImages()) {
+            break;
+        }
+    }
+    if (!acquired) {
+        DiscardFrame(frame);
+        return;
     }
 
     const vk::CommandBuffer cmdbuf{frame->cmdbuf};

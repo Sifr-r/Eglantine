@@ -19,6 +19,11 @@
 #include <vector>
 #include "common/common_types.h"
 
+#ifdef EGLANTINE_ENABLE_RUST_AMPERE
+#include <cstdio>
+#include "eglantine_ampere.h"
+#endif
+
 namespace Shader::Ampere {
 
 struct Instruction {
@@ -285,6 +290,107 @@ inline bool CollectRegisterOperands(const Instruction& input, Callback&& operand
         operand(24, 2);
         break;
     }
+    case 0xb9b: { // SUST.P: coordinates at 24, data at 32.
+        const u32 channels = static_cast<u32>(std::popcount(input.Bits(72, 4)));
+        if (channels == 0) return false;
+        operand(24, input.Bits(61, 3) >= 4 ? 3U : 2U);
+        operand(32, channels);
+        break;
+    }
+    case 0x593: { // SUATOM.D: Rd at 16, coordinates at 24, data at 32.
+        const u32 dimension = input.Bits(61, 3);
+        if (dimension != 3 && dimension != 5) return false;
+        operand(16);
+        operand(24, dimension == 5 ? 3U : 2U);
+        operand(32);
+        break;
+    }
+    case 0x326: case 0x526: // IPA: only Rd at 16 is a GPR (0x526 index is a UR, offset at 64).
+        operand(16);
+        break;
+    case 0x234: // HSETP2 register form: Ra at 24, Rb at 32.
+        operand(24);
+        operand(32);
+        break;
+    case 0x434: case 0x634: // HSETP2 immediate / cbuf form: Ra at 24.
+        operand(24);
+        break;
+    case 0xb69: case 0xf69: case 0x36a: { // TMML
+        const u32 dimension = input.Bits(61, 3);
+        const u32 mask = input.Bits(72, 4);
+        if (dimension >= 4 || mask == 0) return false;
+        const u32 components = static_cast<u32>(std::popcount(mask));
+        const bool split = input.Bits(64, 8) != 255;
+        operand(16, split ? (std::min)(components, 2U) : components);
+        if (split && components > 2) {
+            operand(64, components - 2U);
+        }
+        constexpr std::array<u32, 4> coordinate_count{1, 2, 3, 3};
+        const u32 coordinates = coordinate_count[dimension];
+        const u32 source_b = input.Bits(32, 8);
+        const u32 in_a = source_b == 255 || opcode == 0x36a ? coordinates : (coordinates + 1) / 2;
+        operand(24, in_a);
+        if (opcode == 0x36a) {
+            operand(32);
+        } else if (in_a < coordinates && source_b != 255) {
+            operand(32, coordinates - in_a);
+        }
+        break;
+    }
+    case 0xb60: case 0xf60: case 0x361: { // TEX
+        const u32 dimension = input.Bits(61, 3);
+        const u32 mask = input.Bits(72, 4);
+        if (dimension == 6 || mask == 0) return false;
+        const u32 components = static_cast<u32>(std::popcount(mask));
+        const bool f16 = input.Bits(79, 1) != 0;
+        const bool split = input.Bits(64, 8) != 255;
+        operand(16, f16 ? (split ? 1U : (components + 1) / 2)
+                        : (split ? (std::min)(components, 2U) : components));
+        if (split && components > 2) {
+            operand(64, f16 ? 1U : (components - 2U));
+        }
+        constexpr std::array<u32, 8> coordinate_count{1, 2, 3, 3, 2, 3, 0, 4};
+        const u32 coordinates = coordinate_count[dimension];
+        const u32 lod = input.Bits(87, 3);
+        const bool has_lod = lod == 2 || lod == 3 || lod == 6 || lod == 7;
+        const bool offsets = input.Bits(76, 1) != 0;
+        const bool depth_compare = input.Bits(78, 1) != 0;
+        const u32 handle_slot = opcode == 0x361 ? 1U : 0U;
+        const u32 count = coordinates + handle_slot + (has_lod ? 1U : 0U) +
+                          (offsets ? 1U : 0U) + (depth_compare ? 1U : 0U);
+        const u32 in_a = opcode == 0x361 && !input.Bits(60, 1) ? coordinates
+                       : count <= 4 ? (count + 1) / 2 : opcode == 0x361 ? coordinates : 4U;
+        operand(24, in_a);
+        if (count > in_a && input.Bits(32, 8) != 255) {
+            operand(32, count - in_a);
+        }
+        break;
+    }
+    case 0xb63: case 0xf63: { // TLD4
+        const u32 dimension = input.Bits(61, 3);
+        const u32 mask = input.Bits(72, 4);
+        const u32 offset_mode = input.Bits(76, 2);
+        if ((dimension != 1 && dimension != 5) || offset_mode == 3 || mask == 0) return false;
+        const bool array = dimension == 5;
+        const bool depth = input.Bits(78, 1) != 0;
+        const u32 coordinates = array ? 3U : 2U;
+        const u32 meta = (offset_mode == 1 ? 1U : offset_mode == 2 ? 2U : 0U) + (depth ? 1U : 0U);
+        const u32 in_a = meta ? coordinates : (coordinates + 1) / 2;
+        const u32 in_b = meta ? meta : coordinates - in_a;
+        const u32 components = static_cast<u32>(std::popcount(mask));
+        const bool split = input.Bits(64, 8) != 255;
+        const bool f16 = input.Bits(79, 2) == 1;
+        operand(16, f16 ? (split ? 1U : (components + 1) / 2)
+                        : (split ? (std::min)(components, 2U) : components));
+        if (split && components > 2) {
+            operand(64, f16 ? 1U : (components - 2U));
+        }
+        operand(24, in_a);
+        if (in_b > 0 && input.Bits(32, 8) != 255) {
+            operand(32, in_b);
+        }
+        break;
+    }
     default:
         return false;
     }
@@ -483,6 +589,20 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 && opcode != 0xb6c && opcode != 0xf6c && opcode != 0x986 && opcode != 0x987 && opcode != 0xf66 && opcode != 0x988 && opcode != 0x927 && opcode != 0x9a8 && opcode != 0x98e && opcode != 0x59f) continue;
                 const u32 reg = insn.Bits(bit, 8);
                 if (reg < 255 && reg + 1 > shadow_boundary) requires_shadow = true;
+            }
+        }
+        if (opcode == 0xb63 || opcode == 0xf63) {
+            const u32 gather_dim = insn.Bits(61, 3);
+            const u32 gather_offset_mode = insn.Bits(76, 2);
+            const bool gather_array = gather_dim == 5;
+            const bool gather_meta =
+                gather_offset_mode == 1 || gather_offset_mode == 2 || insn.Bits(78, 1) != 0;
+            const u32 gather_in_a = gather_meta ? (gather_array ? 3U : 2U) : gather_array ? 2U : 1U;
+            const u32 gather_source_a = insn.Bits(24, 8);
+            if ((gather_dim == 1 || gather_array) && gather_offset_mode != 3 &&
+                insn.Bits(72, 4) != 0 && (gather_array || gather_meta) &&
+                gather_source_a < shadow_boundary && gather_source_a + gather_in_a > shadow_boundary) {
+                return fail(index, "native texture gather mode");
             }
         }
         if (requires_shadow) {
@@ -2656,6 +2776,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 const u32 reg = element(source_b, i);
                 std::optional<u32> imm;
                 if (offset_mode == 2 && i < 2) {
+                    const u32 scan_reg = element(code[index].Bits(32, 8), i);
                     for (u32 cursor = index; cursor > 0;) {
                         if (std::ranges::any_of(relocations, [cursor](const Relocation& r) {
                                 return r.target == static_cast<s64>(cursor);
@@ -2680,8 +2801,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                                                            : (high == 255 ? count : (std::min)(count, 2U));
                             const u32 second_count = packed ? (count > 2 ? 1U : 0U)
                                                             : (count > 2 ? count - 2 : 0U);
-                            if ((target != 255 && reg >= target && reg < target + first_count) ||
-                                (high != 255 && reg >= high && reg < high + second_count))
+                            if ((target != 255 && scan_reg >= target && scan_reg < target + first_count) ||
+                                (high != 255 && scan_reg >= high && scan_reg < high + second_count))
                                 return fail(index, "native per-tap gather offset clobber");
                             continue;
                         }
@@ -2690,8 +2811,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                             const u32 first_count = (std::min)((std::max)(channels, 1U), 2U);
                             const u32 second = def.Bits(64, 8);
                             const u32 second_count = channels > 2 ? channels - 2 : 0U;
-                            if ((target != 255 && reg >= target && reg < target + first_count) ||
-                                (second != 255 && reg >= second && reg < second + second_count))
+                            if ((target != 255 && scan_reg >= target && scan_reg < target + first_count) ||
+                                (second != 255 && scan_reg >= second && scan_reg < second + second_count))
                                 return fail(index, "native per-tap gather offset clobber");
                             continue;
                         }
@@ -2711,7 +2832,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                             : (op == 0x83b) ? (1U << def.Bits(72, 2))
                             : (op == 0xb82) ? (width == 5 ? 2U : 1U)
                             : 1U;
-                        if (target == 255 || reg < target || reg >= target + count)
+                        if (target == 255 || scan_reg < target || scan_reg >= target + count)
                             continue;
                         const bool move = op == 0x802 && !def.Bits(24, 8) && def.words[2] == 0xf00;
                         const bool imad = op == 0x424 && def.Bits(24, 8) == 255 && def.words[2] == 0x078e00ff;
@@ -3568,8 +3689,11 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 } else {
                     emit(0x5c10000000000000ULL | predicate | 250 | (u64{a} << 8) | (u64{insn.Bits(32, 8)} << 20));
                 }
-                const auto save = [&](u32 mask) { emit(0x38e8000000070000ULL | 253 | (u64{255} << 8) | (u64{mask} << 20)); };
-                const auto restore = [&](u32 mask) { emit(0x38f0000000070000ULL | (u64{253} << 8) | (u64{mask} << 20)); };
+                // When guarded_uniform is active, R253 holds the saved guard predicate; use R254
+                // for carry-in predicate swaps so the outer guard predicate is not clobbered.
+                const u32 scratch_reg{guarded_uniform ? 254U : 253U};
+                const auto save = [&](u32 mask) { emit(0x38e8000000070000ULL | scratch_reg | (u64{255} << 8) | (u64{mask} << 20)); };
+                const auto restore = [&](u32 mask) { emit(0x38f0000000070000ULL | (u64{scratch_reg} << 8) | (u64{mask} << 20)); };
                 if (!carry_in) {
                     // carry = (a + b) < a, unsigned
                     const u32 target = rewritten_uniform ? 6 - carry_out : carry_out;
@@ -3587,14 +3711,15 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
                 const u32 condition = insn.Bits(87, 3);
                 const u32 source = rewritten_uniform && condition != 7 ? 6 - condition : condition;
                 const u32 mask = 1U << source;
+                const bool swap_carry = rewritten_uniform && condition != 7 && !(guarded_uniform && source == guard_slot);
                 mov_imm(252, 1);
-                if (rewritten_uniform && condition != 7) {
+                if (swap_carry) {
                     save(mask);
                     emit(0x38f0000000070000ULL | (u64{239} << 8) | (u64{mask} << 20));
                 }
                 emit(0x5ca0000000000000ULL | predicate | 251 | (u64{252} << 8) | (u64{255} << 20) |
                      (u64{source} << 39) | (u64{insn.Bits(90, 1)} << 42));
-                if (rewritten_uniform && condition != 7) restore(mask);
+                if (swap_carry) restore(mask);
                 emit(base(0x5c10000000000000ULL) | (u64{250} << 8) | (u64{251} << 20));
                 break;
             }
@@ -3791,7 +3916,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
             if (s64{index} * 16 + 16 + relative != 0)
                 return fail(index, "native return relative base");
             emit(0xe32000000007000fULL);
-            bool complete = !computed_branch;
+            bool complete = !computed_branch && std::none_of(relocations.begin(), relocations.end(),
+                [&](const Relocation& relocation) { return relocation.target > index; });
             for (u32 target : call_targets) complete &= target <= index;
             if (complete) return finish(index);
             break;
@@ -3990,8 +4116,8 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32 
     return fail(static_cast<u32>(code.size()), main_exited ? "native program lacks captured library return" : "native program has no unconditional EXIT");
 }
 
-inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
-                                      LoweringOptions options = {}) {
+inline LoweredProgram LowerToMaxwellCpp(std::span<const Instruction> code,
+                                          LoweringOptions options = {}) {
     // Programs using uniform registers above UR27 are lowered again with mirrors for them.
     u32 high_uniforms = 0;
     for (;;) {
@@ -4000,5 +4126,182 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
         high_uniforms = lowered.high_uniform_registers;
     }
 }
+
+#ifdef EGLANTINE_ENABLE_RUST_AMPERE
+
+namespace detail {
+
+inline bool IsEnvFlagEnabled(const char* name) {
+    const char* const value = std::getenv(name);
+    return value != nullptr && std::string_view{value} == "1";
+}
+
+struct ScopedAmpereLoweredProgram {
+    EglAmpereLoweredProgram raw{};
+    ScopedAmpereLoweredProgram() = default;
+    ~ScopedAmpereLoweredProgram() {
+        egl_ampere_free_lowered(&raw);
+    }
+    ScopedAmpereLoweredProgram(const ScopedAmpereLoweredProgram&) = delete;
+    ScopedAmpereLoweredProgram& operator=(const ScopedAmpereLoweredProgram&) = delete;
+};
+
+inline bool CopyFromRustLowered(const EglAmpereLoweredProgram& raw, LoweredProgram& out) {
+    if ((raw.instruction_count > 0 && raw.instructions == nullptr) ||
+        (raw.source_instruction_offset_count > 0 && raw.source_instruction_offsets == nullptr) ||
+        (raw.error_len > 0 && raw.error == nullptr)) {
+        return false;
+    }
+    if (raw.instruction_count > 0) {
+        out.instructions.assign(raw.instructions, raw.instructions + raw.instruction_count);
+    }
+    if (raw.source_instruction_offset_count > 0) {
+        out.source_instruction_offsets.assign(
+            raw.source_instruction_offsets,
+            raw.source_instruction_offsets + raw.source_instruction_offset_count);
+    }
+    out.source_size = raw.source_size;
+    out.required_texture_buffer = raw.required_texture_buffer;
+    out.high_uniform_registers = raw.high_uniform_registers;
+    out.error_offset = raw.error_offset;
+    if (raw.error_len > 0) {
+        out.error.assign(raw.error, raw.error_len);
+    }
+    return true;
+}
+
+inline std::optional<std::string> FindLoweredProgramMismatch(const LoweredProgram& cpp_prog,
+                                                             const LoweredProgram& rust_prog) {
+    if (cpp_prog.error != rust_prog.error) {
+        return fmt::format("error mismatch: cpp='{}' rust='{}'", cpp_prog.error, rust_prog.error);
+    }
+    if (cpp_prog.error_offset != rust_prog.error_offset) {
+        return fmt::format("error_offset mismatch: cpp={:#x} rust={:#x}", cpp_prog.error_offset,
+                           rust_prog.error_offset);
+    }
+    if (cpp_prog.source_size != rust_prog.source_size) {
+        return fmt::format("source_size mismatch: cpp={} rust={}", cpp_prog.source_size,
+                           rust_prog.source_size);
+    }
+    if (cpp_prog.required_texture_buffer != rust_prog.required_texture_buffer) {
+        return fmt::format("required_texture_buffer mismatch: cpp={} rust={}",
+                           cpp_prog.required_texture_buffer, rust_prog.required_texture_buffer);
+    }
+    if (cpp_prog.high_uniform_registers != rust_prog.high_uniform_registers) {
+        return fmt::format("high_uniform_registers mismatch: cpp={} rust={}",
+                           cpp_prog.high_uniform_registers, rust_prog.high_uniform_registers);
+    }
+    if (cpp_prog.source_instruction_offsets.size() != rust_prog.source_instruction_offsets.size()) {
+        return fmt::format("source_instruction_offsets count mismatch: cpp={} rust={}",
+                           cpp_prog.source_instruction_offsets.size(),
+                           rust_prog.source_instruction_offsets.size());
+    }
+    for (size_t idx = 0; idx < cpp_prog.source_instruction_offsets.size(); ++idx) {
+        if (cpp_prog.source_instruction_offsets[idx] != rust_prog.source_instruction_offsets[idx]) {
+            return fmt::format("source_instruction_offsets[{}] mismatch: cpp={} rust={}", idx,
+                               cpp_prog.source_instruction_offsets[idx],
+                               rust_prog.source_instruction_offsets[idx]);
+        }
+    }
+    if (cpp_prog.instructions.size() != rust_prog.instructions.size()) {
+        return fmt::format("instructions count mismatch: cpp={} rust={}",
+                           cpp_prog.instructions.size(), rust_prog.instructions.size());
+    }
+    for (size_t idx = 0; idx < cpp_prog.instructions.size(); ++idx) {
+        if (cpp_prog.instructions[idx] != rust_prog.instructions[idx]) {
+            return fmt::format("instructions[{}] mismatch: cpp={:#018x} rust={:#018x}", idx,
+                               cpp_prog.instructions[idx], rust_prog.instructions[idx]);
+        }
+    }
+    return std::nullopt;
+}
+
+[[noreturn]] inline void AbortVerifyMismatch(std::span<const Instruction> code,
+                                             std::string_view caller, std::string_view detail) {
+    const auto* c_code =
+        code.empty() ? nullptr : reinterpret_cast<const EglAmpereInstruction*>(code.data());
+    const u64 program_key = egl_ampere_native_program_key(c_code, code.size());
+    const std::string line = fmt::format("[EDEN_NX2_RUST_AMPERE_VERIFY] {} mismatch (key={:016x}): {}",
+                                         caller, program_key, detail);
+    std::fprintf(stderr, "%s\n", line.c_str());
+    std::fflush(stderr);
+    std::abort();
+}
+
+inline void VerifyLoweredProgramsMatch(std::span<const Instruction> code,
+                                       const LoweredProgram& cpp_prog,
+                                       const LoweredProgram& rust_prog, std::string_view caller) {
+    if (const auto mismatch = FindLoweredProgramMismatch(cpp_prog, rust_prog)) {
+        AbortVerifyMismatch(code, caller, *mismatch);
+    }
+}
+
+inline bool TryLowerToMaxwellRust(std::span<const Instruction> code, LoweringOptions options,
+                                  LoweredProgram& out, int32_t& out_rc) {
+    static_assert(sizeof(Instruction) == sizeof(EglAmpereInstruction));
+    static_assert(alignof(Instruction) == alignof(EglAmpereInstruction));
+    const EglAmpereLoweringOptions c_options{
+        .geometry = static_cast<uint8_t>(options.geometry ? 1U : 0U),
+        .tensor = static_cast<uint8_t>(options.tensor ? 1U : 0U),
+        .compact_tensor = static_cast<uint8_t>(options.compact_tensor ? 1U : 0U),
+        .lower_extended_override = -1,
+        ._pad = {0, 0, 0, 0},
+        .native_code_address = options.native_code_address,
+    };
+    ScopedAmpereLoweredProgram guard;
+    const auto* c_code =
+        code.empty() ? nullptr : reinterpret_cast<const EglAmpereInstruction*>(code.data());
+    out_rc = egl_ampere_lower_to_maxwell(c_code, code.size(), &c_options, &guard.raw);
+    if (out_rc != 0 || !CopyFromRustLowered(guard.raw, out)) {
+        out.instructions.clear();
+        out.source_instruction_offsets.clear();
+        out.error = "rust ampere FFI lowering error";
+        return false;
+    }
+    return true;
+}
+
+} // namespace detail
+
+inline LoweredProgram LowerToMaxwellRust(std::span<const Instruction> code,
+                                           LoweringOptions options = {}) {
+    LoweredProgram result;
+    int32_t rc = 0;
+    if (!detail::TryLowerToMaxwellRust(code, options, result, rc)) {
+        std::fprintf(stderr, "[EDEN_NX2_RUST_AMPERE] egl_ampere_lower_to_maxwell failed (rc=%d)\n",
+                     static_cast<int>(rc));
+        std::fflush(stderr);
+    }
+    return result;
+}
+
+inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+                                       LoweringOptions options = {}) {
+    if (detail::IsEnvFlagEnabled("EDEN_NX2_RUST_AMPERE_VERIFY")) {
+        LoweredProgram cpp_prog = LowerToMaxwellCpp(code, options);
+        LoweredProgram rust_prog;
+        int32_t rc = 0;
+        if (!detail::TryLowerToMaxwellRust(code, options, rust_prog, rc)) {
+            detail::AbortVerifyMismatch(
+                code, "LowerToMaxwell",
+                fmt::format("egl_ampere_lower_to_maxwell FFI failure (rc={})", rc));
+        }
+        detail::VerifyLoweredProgramsMatch(code, cpp_prog, rust_prog, "LowerToMaxwell");
+        return cpp_prog;
+    }
+    if (detail::IsEnvFlagEnabled("EDEN_NX2_RUST_AMPERE")) {
+        return LowerToMaxwellRust(code, options);
+    }
+    return LowerToMaxwellCpp(code, options);
+}
+
+#else
+
+inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code,
+                                       LoweringOptions options = {}) {
+    return LowerToMaxwellCpp(code, options);
+}
+
+#endif
 
 } // namespace Shader::Ampere

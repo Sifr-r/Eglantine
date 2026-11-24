@@ -357,23 +357,33 @@ VirtualDir VfsDirectory::CreateDirectoryAbsolute(std::string_view path) {
     return GetParentDirectory()->CreateDirectoryAbsolute(path);
 }
 
+static bool CleanSubdirectoryContents(VfsDirectory& dir) {
+    bool success = true;
+    for (const auto& file : dir.GetFiles()) {
+        if (!dir.DeleteFile(file->GetName())) {
+            success = false;
+        }
+    }
+
+    for (const auto& sdir : dir.GetSubdirectories()) {
+        if (!dir.DeleteSubdirectoryRecursive(sdir->GetName())) {
+            success = false;
+        }
+    }
+
+    return success;
+}
+
 bool VfsDirectory::DeleteSubdirectoryRecursive(std::string_view name) {
     auto dir = GetSubdirectory(name);
     if (dir == nullptr) {
         return false;
     }
 
-    bool success = true;
-    for (const auto& file : dir->GetFiles()) {
-        if (!DeleteFile(file->GetName())) {
-            success = false;
-        }
-    }
+    bool success = CleanSubdirectoryContents(*dir);
 
-    for (const auto& sdir : dir->GetSubdirectories()) {
-        if (!dir->DeleteSubdirectoryRecursive(sdir->GetName())) {
-            success = false;
-        }
+    if (!DeleteSubdirectory(name)) {
+        success = false;
     }
 
     return success;
@@ -385,20 +395,7 @@ bool VfsDirectory::CleanSubdirectoryRecursive(std::string_view name) {
         return false;
     }
 
-    bool success = true;
-    for (const auto& file : dir->GetFiles()) {
-        if (!dir->DeleteFile(file->GetName())) {
-            success = false;
-        }
-    }
-
-    for (const auto& sdir : dir->GetSubdirectories()) {
-        if (!dir->DeleteSubdirectoryRecursive(sdir->GetName())) {
-            success = false;
-        }
-    }
-
-    return success;
+    return CleanSubdirectoryContents(*dir);
 }
 
 bool VfsDirectory::Copy(std::string_view src, std::string_view dest) {

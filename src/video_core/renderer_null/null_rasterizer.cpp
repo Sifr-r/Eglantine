@@ -8,7 +8,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/alignment.h"
+#include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -49,7 +52,9 @@ void RasterizerNull::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
     } else {
         gpu_memory->Write<u32>(gpu_addr, payload);
     }
-    Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*cpu_addr, payload);
+    if (const auto nx2_session = m_gpu.System().Nx2Session()) {
+        nx2_session->SemaphoreWaiters().OnWrite(*cpu_addr, payload);
+    }
 }
 void RasterizerNull::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                u32 size) {}

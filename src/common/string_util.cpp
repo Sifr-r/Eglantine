@@ -47,8 +47,21 @@ bool SplitPath(const std::string& full_path, std::string* _pPath, std::string* _
 
 #ifdef __ANDROID__
     if (full_path[0] != '/') {
-        *_pPath = Common::FS::Android::GetParentDirectory(full_path);
-        *_pFilename = Common::FS::Android::GetFilename(full_path);
+        if (_pPath) {
+            *_pPath = Common::FS::Android::GetParentDirectory(full_path);
+        }
+        if (_pFilename || _pExtension) {
+            const std::string filename = Common::FS::Android::GetFilename(full_path);
+            const std::size_t ext_pos = filename.rfind('.');
+            const std::size_t name_end =
+                (ext_pos == std::string::npos) ? filename.size() : ext_pos;
+            if (_pFilename) {
+                *_pFilename = filename.substr(0, name_end);
+            }
+            if (_pExtension) {
+                *_pExtension = filename.substr(name_end);
+            }
+        }
         return true;
     }
 #endif

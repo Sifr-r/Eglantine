@@ -33,7 +33,7 @@ namespace {
 // Sessions = 0x03, NrrInfos = 0x40, NroInfos = 0x40
 // This may not be enough for some mods (plugin.nro dependant games) like SSBU
 // Suppose someone loads like 64 plugins of these, now what?
-constexpr size_t MaxSessions = 0x03; // No change
+constexpr size_t MaxSessions = 0x04; // 2 ldr:ro + 2 ro:1
 constexpr size_t MaxNrrInfos = 0x100; // Up to 256 NRRs
 constexpr size_t MaxNroInfos = 0x100; // Up to 256 NROs
 
@@ -316,14 +316,17 @@ public:
     explicit RoContext() = default;
 
     Result RegisterProcess(Kernel::KernelCore& kernel, size_t* out_context_id, Kernel::KProcess* process, u64 process_id) {
-        // Validate process id.
+        // Validate process handle and id.
+        R_UNLESS(process != nullptr, RO::ResultInvalidProcess);
         R_UNLESS(process->GetProcessId() == process_id, RO::ResultInvalidProcess);
 
         // Check if a process context already exists.
         R_UNLESS(this->GetContextByProcessId(process_id) == nullptr, RO::ResultInvalidSession);
 
         // Allocate a context to manage the process handle.
-        *out_context_id = this->AllocateContext(kernel, process, process_id);
+        const size_t context_id = this->AllocateContext(kernel, process, process_id);
+        R_UNLESS(context_id != InvalidContextId, RO::ResultInvalidSession);
+        *out_context_id = context_id;
 
         R_SUCCEED();
     }
@@ -556,8 +559,7 @@ private:
             }
         }
 
-        // Failure to find a free context is actually an abort condition.
-        UNREACHABLE();
+        return InvalidContextId;
     }
 
     void FreeContext(Kernel::KernelCore& kernel, size_t context_id) {
@@ -616,6 +618,7 @@ public:
     }
 
     Result RegisterProcessHandle(ClientProcessId client_pid, InCopyHandle<Kernel::KProcess> process) {
+        R_UNLESS(m_context_id == InvalidContextId, RO::ResultInvalidSession);
         // Register the process.
         R_RETURN(m_ro->RegisterProcess(system.Kernel(), std::addressof(m_context_id), process.Get(), *client_pid));
     }
@@ -656,9 +659,12 @@ void LoopProcess(Core::System& system) {
     const auto RoInterfaceFactoryForUser = [&, ro] {
         return std::make_shared<RoInterface>(system, "ldr:ro", ro, NrrKind::User);
     };
+    const auto RoInterfaceFactoryForJitPlugin = [&, ro] {
+        return std::make_shared<RoInterface>(system, "ro:1", ro, NrrKind::JitPlugin);
+    };
 
     server_manager->RegisterNamedService("ldr:ro", std::move(RoInterfaceFactoryForUser), 2);
-    server_manager->RegisterNamedService("ro:1", std::make_shared<RoInterface>(system, "ro:1", ro, NrrKind::JitPlugin), 2);
+    server_manager->RegisterNamedService("ro:1", std::move(RoInterfaceFactoryForJitPlugin), 2);
     server_manager->RegisterNamedService("ro:dmnt", std::make_shared<IDebugMonitorInterface>(system), 2);
     ServerManager::RunServer(std::move(server_manager));
 }

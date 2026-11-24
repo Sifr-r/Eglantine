@@ -30,18 +30,14 @@
 #include "core/debugger/debugger.h"
 #include "core/debugger/nx2_debug_tools.h"
 #include "core/device_memory.h"
-#include "core/file_sys/card_image.h"
-#include "core/file_sys/content_archive.h"
 #include "core/file_sys/fs_filesystem.h"
-#include "core/file_sys/nup_container.h"
 #include "core/file_sys/patch_manager.h"
-#include "core/file_sys/program_metadata.h"
 #include "core/file_sys/registered_cache.h"
-#include "core/file_sys/romfs_factory.h"
-#include "core/file_sys/savedata_factory.h"
-#include "core/file_sys/submission_package.h"
 #include "core/file_sys/vfs/vfs_concat.h"
 #include "core/file_sys/vfs/vfs_real.h"
+#include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
+#include "core/nx2_session_state.h"
+#include "core/platform_profile.h"
 #include "core/gpu_dirty_memory_manager.h"
 #include "core/hle/kernel/k_memory_manager.h"
 #include "core/hle/kernel/k_process.h"
@@ -78,7 +74,9 @@
 #include "hid_core/hid_core.h"
 #include "network/network.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_diag.h"
+#include "video_core/nx2_gpu_latency.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/renderer_base.h"
 #include "video_core/video_core.h"
@@ -128,64 +126,6 @@ FileSys::VirtualFile GetGameFileFromPath(const FileSys::VirtualFilesystem& vfs,
 
 namespace {
 
-// Detect the platform before initializing the kernel memory layout and guest clock.
-bool IsSwitch2Program(const FileSys::VirtualFile& file, u64 program_id, std::size_t program_index) {
-    FileSys::ProgramMetadata metadata;
-    if (FileSys::NupContainer::IsNupFile(file)) {
-        FileSys::NupContainer nup{file};
-        if (nup.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
-        }
-        const auto base = nup.FindBasePackage();
-        const auto update = nup.FindBestUpdatePackage();
-        std::optional<std::size_t> program;
-        if (update && nup.GetExeFSDir(*update) != nullptr) {
-            program = update;
-        } else if (base && nup.GetExeFSDir(*base) != nullptr) {
-            program = base;
-        }
-        const auto exefs = program ? nup.GetExeFSDir(*program) : nullptr;
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
-    }
-    const auto type = file != nullptr ? Loader::IdentifyFile(file) : Loader::FileType::Unknown;
-    if (type == Loader::FileType::XCI || type == Loader::FileType::XCZ) {
-        const FileSys::XCI xci{file, program_id, program_index};
-        if (xci.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
-        }
-        const auto partition = xci.GetSecurePartitionNSP();
-        const auto program = partition != nullptr
-                                 ? partition->GetNCA(xci.GetProgramTitleID(),
-                                                     FileSys::ContentRecordType::Program)
-                                 : nullptr;
-        const auto exefs = program != nullptr ? program->GetExeFS() : nullptr;
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
-    }
-    if (type == Loader::FileType::NSP || type == Loader::FileType::NSZ) {
-        const FileSys::NSP nsp{file, program_id, program_index};
-        if (nsp.GetStatus() != Loader::ResultStatus::Success) {
-            return false;
-        }
-        auto exefs = nsp.GetExeFS();
-        if (!nsp.IsExtractedType()) {
-            const auto program =
-                nsp.GetNCA(nsp.GetProgramTitleID(), FileSys::ContentRecordType::Program);
-            exefs = program != nullptr ? program->GetExeFS() : nullptr;
-        }
-        const auto npdm = exefs != nullptr ? exefs->GetFile("main.npdm") : nullptr;
-        return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-               metadata.IsSwitch2();
-    }
-    const auto dir = file != nullptr ? file->GetContainingDirectory() : nullptr;
-    const auto npdm = dir != nullptr ? dir->GetFile("main.npdm") : nullptr;
-    return npdm != nullptr && metadata.Load(npdm) == Loader::ResultStatus::Success &&
-           metadata.IsSwitch2();
-}
-
 /// Frame spike recorder source: every application thread's CPU ticks, counting the running
 /// thread of each core up to now (the kernel only adds a thread's time when it switches out).
 bool ReadGuestThreadTicks(void* user, std::vector<VideoCommon::Nx2Spikes::GuestThreadTicks>& out,
@@ -198,7 +138,8 @@ bool ReadGuestThreadTicks(void* user, std::vector<VideoCommon::Nx2Spikes::GuestT
     }
     clock = system.CoreTiming().GetClockTicks();
     std::array<std::pair<const Kernel::KThread*, s64>, Hardware::NUM_CPU_CORES> running{};
-    for (size_t core = 0; core < running.size(); ++core) {
+    const size_t active_cores = kernel.ActiveCoreCount();
+    for (size_t core = 0; core < active_cores; ++core) {
         const Kernel::KScheduler& scheduler = kernel.Scheduler(core);
         running[core] = {scheduler.GetSchedulerCurrentThread(), scheduler.GetLastContextSwitchTime()};
     }
@@ -238,6 +179,8 @@ struct System::Impl {
           reporter{system}, applet_manager{system}, frontend_applets{system}, profile_manager{} {}
 
     ~Impl() {
+        TeardownSubsystems();
+        EndNx2Session();
         // The kernel's slab objects live in the guest RAM arena. The member destructors below
         // free that arena before the kernel is destroyed, so the kernel's object list has to
         // be emptied while the arena is still alive.
@@ -247,6 +190,7 @@ struct System::Impl {
     u64 program_id;
 
     void Initialize(System& system) {
+        SetShuttingDown(false);
         device_memory.emplace();
 
         is_multicore = Settings::values.use_multi_core.GetValue();
@@ -268,7 +212,9 @@ struct System::Impl {
 
         auto const is_async_gpu = Settings::values.use_asynchronous_gpu_emulation.GetValue();
 
+        kernel.SetActiveCoreCount(platform_profile.cpu_cores);
         kernel.SetMulticore(is_multicore);
+        cpu_manager.SetActiveCoreCount(platform_profile.cpu_cores);
         cpu_manager.SetMulticore(is_multicore);
         cpu_manager.SetAsyncGpu(is_async_gpu);
     }
@@ -436,16 +382,28 @@ struct System::Impl {
             fs_controller.InitTempStorage();
         }
 
-        const bool switch2_program =
-            virtual_filesystem != nullptr &&
-            IsSwitch2Program(GetGameFileFromPath(virtual_filesystem, filepath), params.program_id,
-                             params.program_index);
-        Settings::SetCurrentProgramIsSwitch2(switch2_program);
+        const auto file =
+            virtual_filesystem != nullptr ? GetGameFileFromPath(virtual_filesystem, filepath) : nullptr;
+        auto loader =
+            file != nullptr ? Loader::GetLoader(system, file, params.program_id, params.program_index)
+                            : nullptr;
+
+        SetShuttingDown(false);
+        platform_profile = ResolvePlatformProfile(
+            system, loader.get(), ParsePlatformOverride(std::getenv("EDEN_NX2_PLATFORM")));
+        LOG_INFO(Core, "Platform profile: {} (cntfrq={} Hz, cores={}, daddr={} bits)",
+                 PlatformResolutionName(platform_profile.resolution), platform_profile.guest_cntfrq,
+                 platform_profile.cpu_cores, platform_profile.device_address_bits);
+
+        kernel.SetActiveCoreCount(platform_profile.cpu_cores);
+        cpu_manager.SetActiveCoreCount(platform_profile.cpu_cores);
+        SyncNx2SessionToPlatformProfile();
+        Settings::SetCurrentProgramIsSwitch2(platform_profile.IsSwitch2());
         Settings::SetAstcRecompressionOverride(std::nullopt);
 
         // Switch 2 titles size their heap from the total memory and need the 12 GiB layout. Set it
         // as a per-game value, so RestoreGlobalState brings back the configured layout afterwards.
-        if (switch2_program &&
+        if (platform_profile.force_12gb_memory_layout &&
             Settings::values.memory_layout_mode.GetValue() != Settings::MemoryLayout::Memory_12Gb) {
             LOG_INFO(Core, "Switch 2 program: using the 12 GiB memory layout");
             Settings::values.memory_layout_mode.SetGlobal(false);
@@ -460,9 +418,7 @@ struct System::Impl {
             const char* value = std::getenv("EDEN_NX2_CNTFRQ");
             return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
         }();
-        const u64 cntfrq = forced_cntfrq != 0 ? forced_cntfrq
-                           : switch2_program  ? Common::WallClock::Switch2CNTFRQ
-                                              : Common::WallClock::CNTFRQ;
+        const u64 cntfrq = forced_cntfrq != 0 ? forced_cntfrq : platform_profile.guest_cntfrq;
         Common::g_wall_clock.SetGuestCNTFRQ(cntfrq);
         LOG_INFO(Core, "Guest counter frequency: {} Hz", cntfrq);
 
@@ -472,19 +428,21 @@ struct System::Impl {
             current_application_filepath = filepath;
         }
 
-        const auto file = GetGameFileFromPath(virtual_filesystem, filepath);
-
-        // Create the application process
+        // Create the application process using the same loader that resolved platform_profile.
         Loader::ResultStatus load_result{};
         std::vector<u8> control;
-        auto process = Service::AM::CreateApplicationProcess(control, app_loader, load_result, system, file, params.program_id, params.program_index);
+        std::unique_ptr<Service::Process> process;
+        if (loader != nullptr) {
+            process = Service::AM::CreateApplicationProcess(control, *loader, load_result, system);
+            app_loader = std::move(loader);
+        }
         if (load_result != Loader::ResultStatus::Success) {
             LOG_CRITICAL(Core, "Failed to load ROM (Error {})!", load_result);
             ShutdownMainProcess();
             return SystemResultStatus(u32(SystemResultStatus::ErrorLoader) + u32(load_result));
         }
 
-        if (!app_loader) {
+        if (!app_loader || !process) {
             LOG_CRITICAL(Core, "Failed to obtain loader for {}!", filepath);
             ShutdownMainProcess();
             return SystemResultStatus::ErrorGetLoader;
@@ -567,11 +525,10 @@ struct System::Impl {
         return SystemResultStatus::Success;
     }
 
-    void ShutdownMainProcess() {
+    void TeardownSubsystems() {
         VideoCommon::Nx2Spikes::SetGuestThreadSource({});
         debug_service.reset();
         SetShuttingDown(true);
-        Common::ADPF::Shutdown();
 
         // Reset per-game flags
         Settings::values.use_squashed_iterated_blend = false;
@@ -579,23 +536,41 @@ struct System::Impl {
         is_powered_on = false;
         exit_locked = false;
         exit_requested = false;
-        if (gpu_core)
+        if (gpu_core) {
             gpu_core->NotifyShutdown();
+        }
 
         stop_event.request_stop();
         // Keep the timer thread paused for the whole teardown: it is the thread that runs the
         // timing event callbacks, and those callbacks reach into the services, the guest
         // processes and the cheat engine that are destroyed below.
         core_timing.SyncPause(true);
-        Network::CancelPendingSocketOperations();
-        kernel.SuspendEmulation(true);
+        const bool kernel_initialized = kernel.IsInitialized();
+        if (kernel_initialized) {
+            kernel.SuspendEmulation(true);
+        }
         // The cheat engine's event callback dereferences the guest process, so it has to go
         // before the kernel releases the processes.
         cheat_engine.reset();
-        kernel.CloseServices();
-        kernel.ShutdownCores();
+        if (service_manager) {
+            service_manager->CancelBlockingGets();
+        }
+        if (kernel_initialized) {
+            kernel.CloseServices();
+            kernel.ShutdownCores();
+        }
+        cpu_manager.Shutdown();
         services.reset();
+        if (kernel_initialized) {
+            kernel.DestroyServices();
+        }
         service_manager.reset();
+        {
+            std::scoped_lock lk{general_channel_mutex};
+            general_channel_event.reset();
+            general_channel_context.reset();
+            general_channel.clear();
+        }
         fs_controller.Reset();
         core_timing.ClearPendingEvents();
         app_loader.reset();
@@ -603,10 +578,20 @@ struct System::Impl {
         gpu_core.reset();
         host1x_core.reset();
         perf_stats.reset();
-        cpu_manager.Shutdown();
         debugger.reset();
-        kernel.Shutdown();
+        if (kernel_initialized) {
+            kernel.Shutdown();
+        }
         stop_event = {};
+
+        // Reset all glue registrations
+        arp_manager.ResetAll();
+    }
+
+    void ShutdownMainProcess() {
+        Common::ADPF::Shutdown();
+        Network::CancelPendingSocketOperations();
+        TeardownSubsystems();
         Network::RestartSocketOperations();
 
         if (auto room_member = Network::GetRoomMember().lock()) {
@@ -614,14 +599,18 @@ struct System::Impl {
             room_member->SendGameInfo(game_info);
         }
 
-        // Reset all glue registrations
-        arp_manager.ResetAll();
-
         // The guest RAM section keeps every page the game touched until it is destroyed (up to
         // 12 GiB), and the next Load reuses it. Switch 2 only: Switch 1 keeps its behaviour.
         // InitializeKernel creates it again, sized for the next game.
-        if (Settings::CurrentProgramIsSwitch2()) {
+        if (platform_profile.reset_dram_on_shutdown || Settings::CurrentProgramIsSwitch2()) {
             device_memory.reset();
+        }
+        platform_profile = MakePlatformProfile(PlatformResolution::DefaultSwitch1);
+        kernel.SetActiveCoreCount(platform_profile.cpu_cores);
+        cpu_manager.SetActiveCoreCount(platform_profile.cpu_cores);
+        EndNx2Session();
+        if (!Nx2SessionState::HasActiveSessions()) {
+            Settings::SetCurrentProgramIsSwitch2(false);
         }
 
         LOG_DEBUG(Core, "Shutdown OK");
@@ -682,7 +671,7 @@ struct System::Impl {
     std::optional<Tools::RenderdocAPI> renderdoc_api;
     std::optional<Tegra::GPU> gpu_core;
 
-    std::array<Core::GPUDirtyMemoryManager, Core::Hardware::NUM_CPU_CORES> gpu_dirty_memory_managers;
+    std::array<Core::GPUDirtyMemoryManager, Core::Hardware::NUM_CPU_CORES + 1> gpu_dirty_memory_managers;
     std::vector<std::vector<u8>> user_channel;
     std::vector<std::vector<u8>> general_channel;
 
@@ -694,7 +683,14 @@ struct System::Impl {
     /// Service manager
     std::shared_ptr<Service::SM::ServiceManager> service_manager;
     /// ContentProviderUnion instance
-    std::unique_ptr<FileSys::ContentProviderUnion> content_provider;
+    std::unique_ptr<FileSys::ContentProviderUnion> content_provider{
+        std::make_unique<FileSys::ContentProviderUnion>()};
+    /// Platform profile resolved for the current session
+    PlatformProfile platform_profile{MakePlatformProfile(PlatformResolution::DefaultSwitch1)};
+    /// Switch 2 per-session state (nullptr on Switch 1 sessions)
+    mutable std::mutex nx2_session_mutex;
+    std::shared_ptr<Nx2SessionState> nx2_session;
+    std::atomic<bool> has_nx2_session{false};
     /// AppLoader used to load the current executing application
     std::unique_ptr<Loader::AppLoader> app_loader;
     std::stop_source stop_event;
@@ -717,6 +713,45 @@ struct System::Impl {
             general_channel_context.emplace(system, "GeneralChannel");
             general_channel_event.emplace(*general_channel_context);
         }
+    }
+
+    void SyncNx2SessionToPlatformProfile() {
+        EndNx2Session();
+        if (!platform_profile.IsSwitch2()) {
+            return;
+        }
+        auto next = Nx2SessionState::Create();
+        next->SetAmpere(true);
+        std::scoped_lock lock{nx2_session_mutex};
+        nx2_session = std::move(next);
+        has_nx2_session.store(true, std::memory_order_release);
+    }
+
+    void EndNx2Session() {
+        std::shared_ptr<Nx2SessionState> previous;
+        {
+            std::scoped_lock lock{nx2_session_mutex};
+            has_nx2_session.store(false, std::memory_order_release);
+            previous = std::exchange(nx2_session, nullptr);
+        }
+        if (previous) {
+            previous->Retire();
+        }
+        if (!Nx2SessionState::HasActiveSessions()) {
+            ResetLegacyNx2ProcessGlobals();
+        }
+    }
+
+    static void ResetLegacyNx2ProcessGlobals() {
+        Service::Nvidia::Devices::g_nx2_driver.store(false, std::memory_order_release);
+        Tegra::g_nx2_ampere.store(false, std::memory_order_release);
+        g_nx2_present_count.store(0, std::memory_order_release);
+        Tegra::Nx2ClearSemaphoreRegions();
+        Tegra::Nx2ClearSparseRegions();
+        Tegra::Nx2ClearGpuWrittenPages();
+        Tegra::Nx2ClearAsyncReports();
+        Service::Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Reset();
+        VideoCommon::Nx2GpuLatency::Reset();
     }
 };
 
@@ -1103,6 +1138,69 @@ void System::RegisterHostThread() {
 
 bool System::IsMulticore() const {
     return impl->is_multicore;
+}
+
+const PlatformProfile& System::Platform() const {
+    return impl->platform_profile;
+}
+
+void System::SetPlatformProfile(PlatformProfile profile) {
+    if (impl->kernel.IsInitialized()) {
+        LOG_ERROR(Core, "Ignoring SetPlatformProfile after KernelCore initialization");
+        return;
+    }
+    impl->platform_profile = profile;
+    impl->kernel.SetActiveCoreCount(profile.cpu_cores);
+    impl->cpu_manager.SetActiveCoreCount(profile.cpu_cores);
+    if (impl->host1x_core.has_value()) {
+        impl->host1x_core->MemoryManager().SetDeviceAddressBits(profile.device_address_bits);
+    }
+    impl->SyncNx2SessionToPlatformProfile();
+}
+
+void System::InitializeGpuForTesting(Frontend::EmuWindow& emu_window) {
+    if (!impl->device_memory.has_value()) {
+        impl->device_memory.emplace();
+    }
+    if (!impl->host1x_core.has_value()) {
+        impl->host1x_core.emplace(*this);
+    }
+    if (!impl->gpu_core.has_value()) {
+        VideoCore::CreateGPU(impl->gpu_core, emu_window, *this);
+    }
+    impl->is_powered_on.store(true, std::memory_order_relaxed);
+}
+
+std::shared_ptr<Nx2SessionState> System::EnsureNx2Session() {
+    if (impl->has_nx2_session.load(std::memory_order_acquire)) {
+        std::scoped_lock lock{impl->nx2_session_mutex};
+        if (impl->nx2_session) {
+            return impl->nx2_session;
+        }
+    }
+    std::scoped_lock lock{impl->nx2_session_mutex};
+    if (impl->nx2_session) {
+        return impl->nx2_session;
+    }
+    if (!impl->platform_profile.IsSwitch2() &&
+        !impl->platform_profile.allow_contradictory_nx2_gpu_query) {
+        return {};
+    }
+    auto session = Nx2SessionState::Create();
+    if (impl->platform_profile.IsSwitch2()) {
+        session->SetAmpere(true);
+    }
+    impl->nx2_session = session;
+    impl->has_nx2_session.store(true, std::memory_order_release);
+    return session;
+}
+
+std::shared_ptr<Nx2SessionState> System::Nx2Session() const {
+    if (!impl->has_nx2_session.load(std::memory_order_acquire)) {
+        return {};
+    }
+    std::scoped_lock lock{impl->nx2_session_mutex};
+    return impl->nx2_session;
 }
 
 bool System::DebuggerEnabled() const {

@@ -27,7 +27,10 @@ namespace VideoCommon {
 template <typename T, typename Id = u32>
 class DescriptorTable {
 public:
+    static constexpr u32 MaxDescriptorLimit = 0x3FFFFFU;
+
     [[nodiscard]] bool Synchronize(GPUVAddr gpu_addr, u32 limit) noexcept {
+        limit = (std::min)(limit, MaxDescriptorLimit);
         bool ret = !(current_gpu_addr == gpu_addr && current_limit == limit);
         if (ret) {
             Refresh(gpu_addr, limit);
@@ -44,11 +47,14 @@ public:
     template <class MemoryManager>
     [[nodiscard]] std::pair<T, bool> Read(const MemoryManager& gpu_memory, u32 index) noexcept {
         DEBUG_ASSERT(index <= current_limit);
+        if (index >= descriptors.size()) {
+            return {T{}, false};
+        }
         if (invalidated) {
             ClearReadDescriptors();
             invalidated = false;
         }
-        const GPUVAddr gpu_addr = current_gpu_addr + index * sizeof(T);
+        const GPUVAddr gpu_addr = current_gpu_addr + static_cast<u64>(index) * sizeof(T);
         const u64 page_offset = gpu_addr & Core::Memory::YUZU_PAGEMASK;
         std::pair<T, bool> result;
         // This runs for every texture and sampler of every draw. An entry within one page is
@@ -102,12 +108,14 @@ public:
     }
 
     void Refresh(GPUVAddr gpu_addr, u32 limit) noexcept {
+        limit = (std::min)(limit, MaxDescriptorLimit);
         current_gpu_addr = gpu_addr;
         current_limit = limit;
         // Mario Brothership reallocates a lot of times, so use aggressive pre-alloc sizes
         // std::vector<T> by default uses quadratic growth, but that isn't even enough to satisfy brothership
-        const size_t num_descriptors = ((limit + 0x80000) & (~0x7ffff)) + 1;
-        read_descriptors.resize(Common::DivCeil(num_descriptors, 64U));
+        const size_t num_descriptors =
+            ((static_cast<size_t>(limit) + 0x80000) & (~size_t{0x7ffff})) + 1;
+        read_descriptors.resize(Common::DivCeil(num_descriptors, size_t{64}));
         ClearReadDescriptors();
         invalidated = false;
         //

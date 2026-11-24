@@ -184,6 +184,7 @@ class QuickSettings(val emulationFragment: EmulationFragment) {
         titleView.text = YuzuApplication.appContext.getString(name)
         switchContainer.visibility = View.VISIBLE
 
+        switchView.isEnabled = isEnabled
         switchView.isChecked = isChecked
 
         switchView.setOnCheckedChangeListener { _, checked ->
@@ -192,7 +193,9 @@ class QuickSettings(val emulationFragment: EmulationFragment) {
         }
 
         switchContainer.setOnClickListener {
-            switchView.toggle()
+            if (switchView.isEnabled) {
+                switchView.toggle()
+            }
         }
         container.addView(itemView)
 

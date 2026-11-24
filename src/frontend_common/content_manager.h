@@ -112,8 +112,8 @@ inline bool RemoveMod(const Service::FileSystem::FileSystemController& fs_contro
                       const u64 program_id, const std::string& mod_name) {
     // Check general Mods (LayeredFS and IPS)
     const auto mod_dir = fs_controller.GetModificationLoadRoot(program_id);
-    if (mod_dir != nullptr) {
-        return mod_dir->DeleteSubdirectoryRecursive(mod_name);
+    if (mod_dir != nullptr && mod_dir->DeleteSubdirectoryRecursive(mod_name)) {
+        return true;
     }
 
     // Check SDMC mod directory (RomFS LayeredFS)
@@ -163,6 +163,9 @@ inline InstallResult InstallNSP(Core::System& system, FileSys::VfsFilesystem& vf
 
     std::shared_ptr<FileSys::NSP> nsp;
     FileSys::VirtualFile file = vfs.OpenFile(filename, FileSys::OpenMode::Read);
+    if (file == nullptr) {
+        return InstallResult::Failure;
+    }
     const auto lower_name = boost::to_lower_copy(file->GetName());
 
     if (lower_name.ends_with("nsp") || lower_name.ends_with("nsz")) {

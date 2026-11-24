@@ -208,13 +208,36 @@ object GpuDriverHelper {
 
     external fun supportsCustomDriverLoading(): Boolean
 
-    external fun getSystemDriverInfo(
-        surface: Surface = Surface(SurfaceTexture(true)),
+    fun getSystemDriverInfo(
         hookLibPath: String = GpuDriverHelper.hookLibPath!!
+    ): Array<String>? = withSurface { surface ->
+        getSystemDriverInfoImpl(surface, hookLibPath)
+    }
+
+    fun getGpuModel(
+        hookLibPath: String
+    ): String? = withSurface { surface ->
+        getGpuModelImpl(surface, hookLibPath)
+    }
+
+    private inline fun <T> withSurface(block: (Surface) -> T): T {
+        val surfaceTexture = SurfaceTexture(true)
+        val surface = Surface(surfaceTexture)
+        return try {
+            block(surface)
+        } finally {
+            surface.release()
+            surfaceTexture.release()
+        }
+    }
+
+    private external fun getSystemDriverInfoImpl(
+        surface: Surface,
+        hookLibPath: String
     ): Array<String>?
 
-    external fun getGpuModel(
-        surface: Surface = Surface(SurfaceTexture(true)),
+    private external fun getGpuModelImpl(
+        surface: Surface,
         hookLibPath: String
     ): String?
 

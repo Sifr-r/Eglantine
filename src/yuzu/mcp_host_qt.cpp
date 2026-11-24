@@ -89,7 +89,7 @@ void QtMcpHost::OnStatsUpdated(const Core::PerfStatsResults& results,
 Mcp::PerfSnapshot QtMcpHost::GetPerfSnapshot() {
     std::scoped_lock lock{perf_mutex};
     Mcp::PerfSnapshot snapshot = perf;
-    if (!window.emulation_running) {
+    if (!window.emulation_running.load(std::memory_order_acquire)) {
         snapshot.valid = false;
     }
     return snapshot;
@@ -277,13 +277,9 @@ std::optional<Mcp::Frame> QtMcpHost::CaptureFrame(u32 width, std::chrono::millis
 /// Asks the renderer for a 16:9 screenshot max_width wide and waits up to `timeout` for it.
 std::optional<QImage> QtMcpHost::CaptureImage(u32 max_width, std::chrono::milliseconds timeout,
                                               std::string& error) {
-    if (!window.emulation_running || !QtCommon::system || !QtCommon::system->IsPoweredOn()) {
+    if (!window.emulation_running.load(std::memory_order_acquire) ||
+        !QtCommon::renderer_active.load(std::memory_order_acquire)) {
         error = "no game is running";
-        return std::nullopt;
-    }
-    auto& renderer = QtCommon::system->Renderer();
-    if (renderer.IsScreenshotPending()) {
-        error = "another screenshot is in progress; retry";
         return std::nullopt;
     }
     const u32 width = std::clamp<u32>(max_width, 160, 3840);
@@ -299,19 +295,34 @@ std::optional<QImage> QtMcpHost::CaptureImage(u32 max_width, std::chrono::millis
     capture->image = QImage(QSize(static_cast<int>(width), static_cast<int>(height)),
                             QImage::Format_RGB32);
     auto future = capture->done.get_future();
-    renderer.RequestScreenshot(
-        capture->image.bits(),
-        [capture](bool invert_y) {
-            if (invert_y) {
+
+    {
+        std::scoped_lock lk{QtCommon::renderer_mutex};
+        if (!window.emulation_running.load(std::memory_order_acquire) ||
+            !QtCommon::renderer_active.load(std::memory_order_acquire) || !QtCommon::system ||
+            !QtCommon::system->IsPoweredOn() || QtCommon::system->IsShuttingDown()) {
+            error = "no game is running";
+            return std::nullopt;
+        }
+        auto& renderer = QtCommon::system->Renderer();
+        if (renderer.IsScreenshotPending()) {
+            error = "another screenshot is in progress; retry";
+            return std::nullopt;
+        }
+        renderer.RequestScreenshot(
+            capture->image.bits(),
+            [capture](bool invert_y) {
+                if (invert_y) {
 #if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
-                capture->image = capture->image.flipped(Qt::Vertical);
+                    capture->image = capture->image.flipped(Qt::Vertical);
 #else
-                capture->image = capture->image.mirrored(false, true);
+                    capture->image = capture->image.mirrored(false, true);
 #endif
-            }
-            capture->done.set_value(true);
-        },
-        layout);
+                }
+                capture->done.set_value(true);
+            },
+            layout);
+    }
 
     if (future.wait_for(timeout) != std::future_status::ready) {
         error = "timed out waiting for a frame (the game may be paused, loading, or the window "

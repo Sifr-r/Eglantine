@@ -87,7 +87,7 @@ void TranslatorVisitor::BAR(u64 insn) {
     if (bar.imm_b != 0) {
         throw NotImplementedException("Non-zero input B");
     }
-    if (bar.pred != IR::Pred::PT && bar.neg_pred != 0) {
+    if (bar.pred != IR::Pred::PT || bar.neg_pred != 0) {
         throw NotImplementedException("Non-true input predicate");
     }
     ir.Barrier();

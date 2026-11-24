@@ -607,8 +607,10 @@ void GraphicsPipeline::GenerateTransformFeedbackState() {
         num_xfb_buffers_active++;
 
         const auto& locations = key.xfb_state.varyings[feedback];
+        const u32 varying_count =
+            (std::min)(layout.varying_count, static_cast<u32>(locations.size() * 4));
         std::optional<u32> current_index;
-        for (u32 offset = 0; offset < layout.varying_count; ++offset) {
+        for (u32 offset = 0; offset < varying_count; ++offset) {
             const auto get_attribute = [&locations](u32 index) -> u32 {
                 switch (index % 4) {
                 case 0:

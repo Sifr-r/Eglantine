@@ -9,6 +9,7 @@
 
 #ifdef _WIN32
 #include <cstring>
+#include <string>
 #include <processthreadsapi.h>
 #include <windows.h>
 #else
@@ -41,18 +42,21 @@ void CheckVulkan() {
 bool CheckEnvVars(bool* is_child) {
 #ifdef _WIN32
     // Check environment variable to see if we are the child
-    char variable_contents[8];
-    const DWORD startup_check_var =
-        GetEnvironmentVariableA(STARTUP_CHECK_ENV_VAR, variable_contents, 8);
-    if (startup_check_var > 0 && std::strncmp(variable_contents, ENV_VAR_ENABLED_TEXT, 8) == 0) {
+    char variable_contents[8]{};
+    const DWORD startup_check_var = GetEnvironmentVariableA(
+        STARTUP_CHECK_ENV_VAR, variable_contents, static_cast<DWORD>(sizeof(variable_contents)));
+    if (startup_check_var > 0 && startup_check_var < sizeof(variable_contents) &&
+        std::strncmp(variable_contents, ENV_VAR_ENABLED_TEXT, sizeof(variable_contents)) == 0) {
         CheckVulkan();
         return true;
     }
 
     // Don't perform startup checks if we are a child process
-    char is_child_s[8];
-    const DWORD is_child_len = GetEnvironmentVariableA(IS_CHILD_ENV_VAR, is_child_s, 8);
-    if (is_child_len > 0 && std::strncmp(is_child_s, ENV_VAR_ENABLED_TEXT, 8) == 0) {
+    char is_child_s[8]{};
+    const DWORD is_child_len = GetEnvironmentVariableA(IS_CHILD_ENV_VAR, is_child_s,
+                                                       static_cast<DWORD>(sizeof(is_child_s)));
+    if (is_child_len > 0 && is_child_len < sizeof(is_child_s) &&
+        std::strncmp(is_child_s, ENV_VAR_ENABLED_TEXT, sizeof(is_child_s)) == 0) {
         *is_child = true;
         return false;
     } else if (!SetEnvironmentVariableA(IS_CHILD_ENV_VAR, ENV_VAR_ENABLED_TEXT)) {
@@ -152,28 +156,43 @@ bool StartupChecks(const char* arg0, bool* has_broken_vulkan, bool perform_vulka
 
 #ifdef _WIN32
 bool SpawnChild(const char* arg0, PROCESS_INFORMATION* pi, int flags) {
-    STARTUPINFOA startup_info;
+    STARTUPINFOW startup_info;
 
     std::memset(&startup_info, '\0', sizeof(startup_info));
     startup_info.cb = sizeof(startup_info);
 
-    char p_name[255];
-    std::strncpy(p_name, arg0, 254);
-    p_name[254] = '\0';
+    // arg0 is in the system code page, loses every character that page lacks and is not quoted.
+    // Ask Windows for the real path of this executable and quote it: the folder may contain
+    // spaces and any Unicode character.
+    (void)arg0;
+    std::wstring exe_path(MAX_PATH, L'\0');
+    DWORD length = 0;
+    while ((length = GetModuleFileNameW(nullptr, exe_path.data(),
+                                        static_cast<DWORD>(exe_path.size()))) == exe_path.size() &&
+           exe_path.size() < 32768) {
+        // Truncated: paths can be longer than MAX_PATH
+        exe_path.resize(exe_path.size() * 2);
+    }
+    if (length == 0 || length >= exe_path.size()) {
+        fmt::print(stderr, "GetModuleFileNameW failed with error {}\n", GetLastError());
+        return false;
+    }
+    exe_path.resize(length);
+    std::wstring command_line = L'"' + exe_path + L'"';
 
-    const bool process_created = CreateProcessA(nullptr,       // lpApplicationName
-                                                p_name,        // lpCommandLine
-                                                nullptr,       // lpProcessAttributes
-                                                nullptr,       // lpThreadAttributes
-                                                false,         // bInheritHandles
-                                                flags,         // dwCreationFlags
-                                                nullptr,       // lpEnvironment
-                                                nullptr,       // lpCurrentDirectory
-                                                &startup_info, // lpStartupInfo
-                                                pi             // lpProcessInformation
+    const bool process_created = CreateProcessW(exe_path.c_str(),    // lpApplicationName
+                                                command_line.data(), // lpCommandLine
+                                                nullptr,             // lpProcessAttributes
+                                                nullptr,             // lpThreadAttributes
+                                                false,               // bInheritHandles
+                                                flags,               // dwCreationFlags
+                                                nullptr,             // lpEnvironment
+                                                nullptr,             // lpCurrentDirectory
+                                                &startup_info,       // lpStartupInfo
+                                                pi                   // lpProcessInformation
     );
     if (!process_created) {
-        fmt::print(stderr, "CreateProcessA failed with error {}\n", GetLastError());
+        fmt::print(stderr, "CreateProcessW failed with error {}\n", GetLastError());
         return false;
     }
 

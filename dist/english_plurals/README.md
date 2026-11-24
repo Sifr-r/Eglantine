@@ -1,21 +1,30 @@
-# English Plurals
+# English plurals in Qt
 
-Qt has "Translation Rules for Plurals", small example
+Qt chooses a singular or plural translation for a string with a count:
 
 ```cpp
-    // Take a source line like
-    tr("Building: %n shader(s)", "", i)
+tr("Building: %n shader(s)", "", i)
 
-    // i = 1:
-    Building: 1 shader
-    // i = 2:
-    Building: 2 shaders
+// i = 1 displays "Building: 1 shader".
+// i = 2 displays "Building: 2 shaders".
 ```
 
-For Yuzu the source language used is English, for all other languages handling of plurals is handled by Qt and the translation collaboration site. Handling plurals in the source language (English) requires special consideration.
+The frontend source language is English. Translators handle the other languages'
+plural forms through [the Qt translation workflow](../languages/README.md). English
+plural forms are maintained here because the translation service uses English as the source.
 
-With CMake flag GENERATE_QT_TRANSLATION a generated_en.ts file is created from the source. It ignored by git (`.gitignore` in the project root). It is placed in this directory so that the relative refrences with the source code is correct.
+## Refresh the English forms
 
-Having the plurals look nice isn't critical, and automation to use translation collaboration sites may require specifing the project language as "Pirate English", so this has been done manually.
+In a Qt-enabled build with Qt Linguist tools, set `ENABLE_QT_TRANSLATION=ON` and
+`GENERATE_QT_TRANSLATION=ON` at CMake configure time. Then build the
+`translation` target from the repository root:
 
-The en.ts in this directory is taken from a build, edited in Qt Linguist and then committed. As the code is in XML, using the tool is not strictly required.
+```sh
+cmake --build build --target translation
+```
+
+The target refreshes `dist/languages/en.ts` and creates the Git-ignored
+`generated_en.ts` in this directory. Its location preserves relative source references.
+Use the generated plural messages to update the tracked `en.ts` here in Qt Linguist or
+an XML editor. The Qt build compiles that reviewed file into `en.qm`.
+See the [Qt CMake rules](../../src/yuzu/CMakeLists.txt).

@@ -33,17 +33,22 @@ import org.yuzu.yuzu_emu.databinding.ListItemSettingsHeaderBinding
 import org.yuzu.yuzu_emu.features.input.NativeInput
 import org.yuzu.yuzu_emu.features.input.model.AnalogDirection
 import org.yuzu.yuzu_emu.features.settings.model.AbstractIntSetting
+import org.yuzu.yuzu_emu.features.settings.model.FxUniformSliderSetting
 import org.yuzu.yuzu_emu.features.settings.model.Settings
 import org.yuzu.yuzu_emu.features.settings.model.view.*
 import org.yuzu.yuzu_emu.features.settings.ui.viewholder.*
+import org.yuzu.yuzu_emu.utils.NativePostProcessing
 import org.yuzu.yuzu_emu.utils.ParamPackage
+import java.util.IdentityHashMap
 
-class SettingsAdapter(
+class SettingsAdapter private constructor(
     private val fragment: Fragment,
-    private val context: Context
+    private val context: Context,
+    private val diffCallback: DiffCallback
 ) : ListAdapter<SettingsItem, SettingViewHolder>(
-    AsyncDifferConfig.Builder(DiffCallback()).build()
+    AsyncDifferConfig.Builder(diffCallback).build()
 ) {
+    constructor(fragment: Fragment, context: Context) : this(fragment, context, DiffCallback())
     private val settingsViewModel: SettingsViewModel
         get() = ViewModelProvider(fragment.requireActivity())[SettingsViewModel::class.java]
 
@@ -152,6 +157,25 @@ class SettingsAdapter(
 
     override fun getItemViewType(position: Int): Int {
         return currentList[position].type
+    }
+
+    override fun submitList(list: List<SettingsItem>?) {
+        submitList(list, null)
+    }
+
+    override fun submitList(list: List<SettingsItem>?, commitCallback: Runnable?) {
+        val nextSnapshots = IdentityHashMap<SettingsItem, ItemSnapshot>(list?.size ?: 0)
+        list?.forEach { item ->
+            nextSnapshots[item] = ItemSnapshot.from(item)
+        }
+        diffCallback.stagedSnapshots = nextSnapshots
+        super.submitList(
+            list,
+            Runnable {
+                diffCallback.committedSnapshots = nextSnapshots
+                commitCallback?.run()
+            }
+        )
     }
 
     fun onBooleanClick(item: SwitchSetting, checked: Boolean, position: Int) {
@@ -482,14 +506,6 @@ class SettingsAdapter(
             position
         ).show(fragment.childFragmentManager, SettingsDialogFragment.TAG)
 
-        // reset language if detected
-        if (item.setting.key == "app_language") {
-            // recreate page apply language change instantly
-            fragment.requireActivity().recreate()
-
-            settingsViewModel.setShouldRecreateForLanguageChange(true)
-        }
-
         return true
     }
 
@@ -519,13 +535,136 @@ class SettingsAdapter(
         ).show(fragment.childFragmentManager, GpuUnswizzleDialogFragment.TAG)
     }
 
+    private data class ItemSnapshot(
+        val title: String,
+        val description: String,
+        val isEditable: Boolean,
+        val clearable: Boolean,
+        val needsRuntimeGlobal: Boolean,
+        val extraState: String
+    ) {
+        companion object {
+            fun from(item: SettingsItem): ItemSnapshot {
+                val extraState = when (item) {
+                    is SwitchSetting -> "switch:${item.getIsChecked(item.needsRuntimeGlobal)}"
+                    is SingleChoiceSetting -> "sc:${item.getSelectedValue()}"
+                    is StringSingleChoiceSetting -> "ssc:${item.getSelectedValue()}"
+                    is IntSingleChoiceSetting -> buildString {
+                        append("isc:").append(item.getSelectedValue())
+                        append(':').append(item.choices.joinToString("\u0000"))
+                        append(':').append(item.values.joinToString(","))
+                    }
+                    is SliderSetting -> "slider:${item.getSelectedValue()}:${item.units}"
+                    is SpinBoxSetting -> "spin:${item.getSelectedValue()}"
+                    is StringInputSetting -> "str:${item.getSelectedValue()}"
+                    is DateTimeSetting -> "dt:${item.getValue()}"
+                    is GpuUnswizzleSetting -> {
+                        "unswizzle:${item.isEnabled()}:${item.getTextureSize()}:" +
+                            "${item.getStreamSize()}:${item.getChunkSize()}"
+                    }
+                    is PathSetting -> "path:${item.iconId}:${item.getCurrentPath()}:${item.getDefaultPath()}"
+                    is InputProfileSetting -> "profile:${item.getCurrentProfile()}"
+                    is AnalogInputSetting -> {
+                        val stickParam = NativeInput.getStickParam(item.playerIndex, item.nativeAnalog).serialize()
+                        "analog:${item.getSelectedValue()}:$stickParam"
+                    }
+                    is ButtonInputSetting -> {
+                        val buttonParam = NativeInput.getButtonParam(item.playerIndex, item.nativeButton).serialize()
+                        "button:${item.getSelectedValue()}:$buttonParam"
+                    }
+                    is ModifierInputSetting -> {
+                        val stickParam = NativeInput.getStickParam(item.playerIndex, item.nativeAnalog).serialize()
+                        "modifier:${item.getSelectedValue()}:$stickParam"
+                    }
+                    is SubmenuSetting -> "submenu:${item.iconId}:${item.menuKey}"
+                    is RunnableSetting -> "runnable:${item.iconId}:${item.isRunnable}"
+                    is FxToolbarSetting -> {
+                        "fxtoolbar:${item.addLabelId}:${item.listOpen}:${item.presetLabel}:${item.hasEffects}"
+                    }
+                    is FxPresetSetting -> "fxpreset:${item.deletable}"
+                    is FxShaderCardSetting -> buildString {
+                        append("fxshader:").append(item.index).append(':').append(item.expanded)
+                        if (item.expanded) {
+                            for (uniform in item.uniforms) {
+                                if (uniform.uiType == NativePostProcessing.UI_HIDDEN) {
+                                    continue
+                                }
+                                for (component in 0 until uniform.components) {
+                                    val sliderSetting = FxUniformSliderSetting(item.index, uniform, component)
+                                    append(':').append(uniform.name).append('[').append(component).append("]=")
+                                        .append(sliderSetting.getInt(false))
+                                }
+                            }
+                        }
+                    }
+                    else -> ""
+                }
+                return ItemSnapshot(
+                    title = item.title,
+                    description = item.description,
+                    isEditable = item.isEditable,
+                    clearable = item.clearable,
+                    needsRuntimeGlobal = item.needsRuntimeGlobal,
+                    extraState = extraState
+                )
+            }
+        }
+    }
+
     private class DiffCallback : DiffUtil.ItemCallback<SettingsItem>() {
+        @Volatile
+        var committedSnapshots: IdentityHashMap<SettingsItem, ItemSnapshot> = IdentityHashMap()
+
+        @Volatile
+        var stagedSnapshots: IdentityHashMap<SettingsItem, ItemSnapshot> = IdentityHashMap()
+
         override fun areItemsTheSame(oldItem: SettingsItem, newItem: SettingsItem): Boolean {
-            return oldItem.setting.key == newItem.setting.key
+            if (oldItem.type != newItem.type || oldItem::class != newItem::class) {
+                return false
+            }
+            val oldKey = oldItem.setting.key
+            val newKey = newItem.setting.key
+            if (oldKey.isNotEmpty() || newKey.isNotEmpty()) {
+                return oldKey == newKey
+            }
+            return when (oldItem) {
+                is SubmenuSetting -> {
+                    val other = newItem as SubmenuSetting
+                    oldItem.menuKey == other.menuKey &&
+                        oldItem.titleId == other.titleId &&
+                        oldItem.titleString == other.titleString
+                }
+                is PathSetting -> oldItem.pathType == (newItem as PathSetting).pathType
+                is InputProfileSetting -> oldItem.playerIndex == (newItem as InputProfileSetting).playerIndex
+                is ButtonInputSetting -> {
+                    val other = newItem as ButtonInputSetting
+                    oldItem.playerIndex == other.playerIndex &&
+                        oldItem.nativeButton == other.nativeButton
+                }
+                is AnalogInputSetting -> {
+                    val other = newItem as AnalogInputSetting
+                    oldItem.playerIndex == other.playerIndex &&
+                        oldItem.nativeAnalog == other.nativeAnalog &&
+                        oldItem.analogDirection == other.analogDirection
+                }
+                is ModifierInputSetting -> {
+                    val other = newItem as ModifierInputSetting
+                    oldItem.playerIndex == other.playerIndex &&
+                        oldItem.nativeAnalog == other.nativeAnalog
+                }
+                is FxToolbarSetting -> true
+                is FxShaderCardSetting -> {
+                    val other = newItem as FxShaderCardSetting
+                    oldItem.index == other.index && oldItem.titleString == other.titleString
+                }
+                else -> oldItem.titleId == newItem.titleId && oldItem.titleString == newItem.titleString
+            }
         }
 
         override fun areContentsTheSame(oldItem: SettingsItem, newItem: SettingsItem): Boolean {
-            return oldItem.setting.key == newItem.setting.key
+            val oldSnapshot = committedSnapshots[oldItem] ?: return false
+            val newSnapshot = stagedSnapshots[newItem] ?: return false
+            return oldSnapshot == newSnapshot
         }
     }
 }

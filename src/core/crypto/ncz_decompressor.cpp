@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -85,6 +86,11 @@ std::optional<std::pair<std::vector<Section>, std::optional<BlockHeader>>> Parse
         Section s{};
         s.offset = static_cast<s64>(Le(e, 8));
         s.size = static_cast<s64>(Le(e + 8, 8));
+        if (s.offset < 0 || s.size < 0 ||
+            static_cast<u64>(s.offset) >
+                (std::numeric_limits<u64>::max)() - static_cast<u64>(s.size)) {
+            return std::nullopt;
+        }
         s.crypto_type = Le(e + 16, 8);
         std::memcpy(s.key.data(), e + 32, 16);
         std::memcpy(s.counter.data(), e + 48, 16);
@@ -141,6 +147,7 @@ public:
             if (id >= sizes.size()) break;
             if (cache_id != id && !Load(id)) break;
             const u64 in = position - id * block_size;
+            if (in >= cache.size()) break;
             const std::size_t n = static_cast<std::size_t>(
                 std::min<u64>(out.size() - done, cache.size() - in));
             std::memcpy(out.data() + done, cache.data() + in, n);
@@ -152,21 +159,33 @@ public:
 
 private:
     bool Load(u64 id) {
+        cache_id = ~0ULL;
         u64 want = block_size;
         if (id + 1 == sizes.size()) {
             const u64 rem = decompressed_size % block_size;
             if (rem > 0) want = rem; // avoid the 0-size bug from the original nsz
         }
-        try { cache.resize(static_cast<std::size_t>(want)); }
-        catch (const std::bad_alloc&) { return false; }
+        if (want > (std::numeric_limits<std::size_t>::max)()) {
+            return false;
+        }
+        std::vector<u8> next_cache;
+        try {
+            next_cache.resize(static_cast<std::size_t>(want));
+        } catch (const std::bad_alloc&) {
+            return false;
+        }
         const u32 csize = sizes[id];
         if (csize < want) {
             const auto comp = source->ReadBytes(csize, offsets[id]);
             if (comp.size() != csize ||
-                Common::Compression::DecompressDataZSTD(comp, cache) != want) return false;
-        } else if (source->Read(cache.data(), cache.size(), offsets[id]) != cache.size()) {
+                Common::Compression::DecompressDataZSTD(comp, next_cache) != want) {
+                return false;
+            }
+        } else if (source->Read(next_cache.data(), next_cache.size(), offsets[id]) !=
+                   next_cache.size()) {
             return false;
         }
+        cache = std::move(next_cache);
         cache_id = id;
         return true;
     }
@@ -256,13 +275,14 @@ private:
 // requested offset, so sequential install reads are O(n) instead of O(n^2).
 class SolidNczFile final : public FileSys::VfsFile {
 public:
-    SolidNczFile(std::string name_, FileSys::VirtualFile source_,
+    SolidNczFile(std::string name_, FileSys::VirtualFile source_, std::vector<u8> hdr_,
                  std::vector<Section> sections_, u64 payload_start_)
         : name{std::move(name_)}, source{std::move(source_)}, sections{std::move(sections_)},
-          payload_start{payload_start_} {
-        const auto raw_header = source->ReadBytes(HeaderSize, 0);
-        data.assign(raw_header.begin(), raw_header.end());
-        frontier = HeaderSize;
+          payload_start{payload_start_}, data{std::move(hdr_)} {
+        if (data.size() < HeaderSize) {
+            data.resize(HeaderSize, 0);
+        }
+        frontier = data.size();
     }
 
     ~SolidNczFile() override {
@@ -284,10 +304,11 @@ public:
     std::size_t Read(u8* out, std::size_t len, std::size_t off) const override {
         std::scoped_lock lock{mutex};
         const u64 nca_size = GetSize();
-        if (off >= nca_size) return 0;
+        if (len == 0 || off >= nca_size) return 0;
         len = static_cast<std::size_t>(std::min<u64>(len, nca_size - off));
         const u64 needed = off + len;
         if (needed > frontier && !DecodeTo(needed)) return 0;
+        if (needed > data.size()) return 0;
         std::memcpy(out, data.data() + off, len);
         return len;
     }
@@ -322,6 +343,22 @@ private:
             const u64 end = std::max<u64>(static_cast<u64>(s.offset) + static_cast<u64>(s.size),
                                           begin);
             if (end <= frontier) continue;
+            if (begin > frontier) {
+                const u64 pad_end = std::min<u64>(needed, begin);
+                const u64 gap = pad_end - frontier;
+                if (gap > data.max_size() - data.size()) {
+                    return false;
+                }
+                try {
+                    data.resize(data.size() + static_cast<std::size_t>(gap), 0);
+                } catch (const std::bad_alloc&) {
+                    return false;
+                }
+                frontier = pad_end;
+                if (frontier >= needed) {
+                    break;
+                }
+            }
             u64 pos = std::max<u64>(begin, frontier);
 
             std::optional<AESCipher<Key128>> cipher;
@@ -332,6 +369,10 @@ private:
                 std::size_t produced = 0;
                 while (produced < want) {
                     if (in.pos >= in.size) {
+                        if (read_pos >= file_size) {
+                            LOG_ERROR(Crypto, "Solid NCZ: truncated");
+                            return false;
+                        }
                         const u64 remaining = file_size - read_pos;
                         const std::size_t chunk = static_cast<std::size_t>(
                             std::min<u64>(Chunk, remaining));
@@ -363,7 +404,7 @@ private:
                 frontier = pos;
             }
         }
-        return frontier >= needed;
+        return frontier >= needed && data.size() >= needed;
     }
 
     const std::string name;
@@ -402,7 +443,10 @@ FileSys::VirtualFile OpenNcz(const FileSys::VirtualFile& f, std::string_view nam
     }
 
     if (allow_solid) {
-        return std::make_shared<SolidNczFile>(std::string{name}, f, std::move(sections), ps);
+        auto hdr = f->ReadBytes(HeaderSize, 0);
+        if (hdr.size() != HeaderSize) return nullptr;
+        return std::make_shared<SolidNczFile>(std::string{name}, f, std::move(hdr),
+                                              std::move(sections), ps);
     }
 
     LOG_DEBUG(Crypto, "Solid NCZ {} skipped (only NCZBLOCK is supported for play)", name);

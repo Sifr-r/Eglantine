@@ -27,6 +27,10 @@ void DeviceSinkCommand::Process(const AudioRenderer::CommandListProcessor& proce
     constexpr s32 max = (std::numeric_limits<s16>::max)();
 
     auto stream{processor.GetOutputSinkStream()};
+    if (input_count == 0 || input_count > MaxChannels || stream == nullptr) {
+        return;
+    }
+
     stream->SetSystemChannels(input_count);
 
     Sink::SinkBuffer out_buffer{
@@ -38,7 +42,11 @@ void DeviceSinkCommand::Process(const AudioRenderer::CommandListProcessor& proce
 
     std::array<s16, TargetSampleCount * MaxChannels> samples{};
     for (u32 channel = 0; channel < input_count; channel++) {
-        const auto offset{inputs[channel] * out_buffer.frames};
+        if (inputs[channel] < 0 ||
+            static_cast<size_t>(inputs[channel] + 1) * out_buffer.frames > sample_buffer.size()) {
+            continue;
+        }
+        const auto offset{static_cast<size_t>(inputs[channel]) * out_buffer.frames};
 
         for (u32 index = 0; index < out_buffer.frames; index++) {
             samples[index * input_count + channel] =

@@ -258,7 +258,10 @@ std::optional<json> Protocol::Dispatch(const json& message, const HttpRequest& r
         return ok(json{{"resources", std::move(list)}});
     }
     if (method == "resources/read") {
-        const std::string uri = params.value("uri", "");
+        if (!params.is_object() || !params.contains("uri") || !params["uri"].is_string()) {
+            return JsonRpcError(id, kInvalidParams, "resources/read requires a string 'uri'");
+        }
+        const std::string uri = params["uri"].get<std::string>();
         for (const auto& r : options.resources) {
             if (r.uri == uri) {
                 ToolContext context = context_factory();
@@ -283,10 +286,19 @@ std::optional<json> Protocol::Dispatch(const json& message, const HttpRequest& r
         return ok(json{{"prompts", std::move(list)}});
     }
     if (method == "prompts/get") {
-        const std::string name = params.value("name", "");
+        if (!params.is_object() || !params.contains("name") || !params["name"].is_string()) {
+            return JsonRpcError(id, kInvalidParams, "prompts/get requires a string 'name'");
+        }
+        if (params.contains("arguments") && !params["arguments"].is_null() &&
+            !params["arguments"].is_object()) {
+            return JsonRpcError(id, kInvalidParams, "prompts/get 'arguments' must be an object");
+        }
+        const std::string name = params["name"].get<std::string>();
         for (const auto& p : options.prompts) {
             if (p.name == name) {
-                const json args = params.value("arguments", json::object());
+                const json args = (params.contains("arguments") && params["arguments"].is_object())
+                                      ? params["arguments"]
+                                      : json::object();
                 std::string text;
                 try {
                     text = p.render(args);

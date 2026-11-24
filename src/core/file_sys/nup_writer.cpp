@@ -10,6 +10,7 @@
 #include <array>
 #include <cctype>
 #include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <limits>
@@ -18,6 +19,7 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -28,10 +30,18 @@
 
 #include "common/fs/file.h"
 #include "common/fs/path_util.h"
+#include "common/logging.h"
+#include "common/settings.h"
 #include "core/file_sys/control_metadata.h"
 #include "core/file_sys/nup_container.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/loader/deconstructed_rom_directory.h"
+
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+#include <openssl/rand.h>
+
+#include "eglantine_nup_fs.h"
+#endif
 
 #include <fmt/format.h>
 
@@ -1471,33 +1481,505 @@ private:
     u64 file_counted = 0;
 };
 
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+class VerificationScratch {
+public:
+    VerificationScratch(const fs::path& parent, std::error_code& ec) {
+        const auto absolute_parent = fs::absolute(parent.empty() ? fs::path{"."} : parent, ec);
+        if (ec) {
+            return;
+        }
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            u64 suffix;
+            if (RAND_bytes(reinterpret_cast<unsigned char*>(&suffix),
+                           static_cast<int>(sizeof(suffix))) != 1) {
+                ec = std::make_error_code(std::errc::io_error);
+                return;
+            }
+            auto candidate = absolute_parent / fmt::format(".nup-verify-{:016x}", suffix);
+            if (fs::create_directory(candidate, ec)) {
+                path = std::move(candidate);
+                return;
+            }
+            if (ec && ec != std::errc::file_exists) {
+                return;
+            }
+        }
+        ec = std::make_error_code(std::errc::file_exists);
+    }
+
+    VerificationScratch(const VerificationScratch&) = delete;
+    VerificationScratch& operator=(const VerificationScratch&) = delete;
+
+    ~VerificationScratch() {
+        if (path.empty()) {
+            return;
+        }
+        std::error_code ec;
+        fs::remove_all(path, ec);
+        if (ec) {
+            LOG_WARNING(Loader, "Cannot remove NUP verification scratch {}: {}", ToUtf8(path),
+                        ec.message());
+        }
+    }
+
+    [[nodiscard]] const fs::path& Path() const {
+        return path;
+    }
+
+private:
+    fs::path path;
+};
+
+void ReportVerificationSetupError(std::string_view operation, const std::error_code& ec,
+                                  std::string* error_out) {
+    auto message =
+        fmt::format("Cannot prepare Rust NUP {} verification: {}", operation, ec.message());
+    LOG_ERROR(Loader, "{}", message);
+    if (error_out) {
+        *error_out = std::move(message);
+    }
+}
+
+enum class RustNupWriterMode {
+    Cpp,
+    Rust,
+    Verify,
+};
+
+RustNupWriterMode GetRustNupWriterMode() {
+    const char* verify_env = std::getenv("EDEN_NX2_RUST_NUP_VERIFY");
+    if (verify_env != nullptr && verify_env[0] == '1') {
+        return RustNupWriterMode::Verify;
+    }
+    const char* mode_env = std::getenv("EDEN_NX2_RUST_NUP");
+    if (mode_env != nullptr) {
+        if (std::string_view{mode_env} == "verify") {
+            return RustNupWriterMode::Verify;
+        }
+        if (mode_env[0] == '1') {
+            return RustNupWriterMode::Rust;
+        }
+    }
+    return RustNupWriterMode::Cpp;
+}
+
+size_t NupZstdCompressStreamed(void* dst, size_t dst_capacity, const void* src, size_t src_size,
+                               int compression_level) {
+    struct ThreadCCtx {
+        ZSTD_CCtx* cctx{nullptr};
+        int configured_level{std::numeric_limits<int>::min()};
+        ThreadCCtx() : cctx{ZSTD_createCCtx()} {}
+        ~ThreadCCtx() {
+            if (cctx != nullptr) {
+                ZSTD_freeCCtx(cctx);
+            }
+        }
+    };
+    thread_local ThreadCCtx tl;
+    if (tl.cctx == nullptr) {
+        return ZSTD_compress(dst, 0, "x", 1, compression_level);
+    }
+    if (tl.configured_level != compression_level) {
+        if (ZSTD_isError(
+                ZSTD_CCtx_setParameter(tl.cctx, ZSTD_c_compressionLevel, compression_level)) ||
+            ZSTD_isError(ZSTD_CCtx_setParameter(tl.cctx, ZSTD_c_nbWorkers, 0)) ||
+            ZSTD_isError(ZSTD_CCtx_setParameter(tl.cctx, ZSTD_c_contentSizeFlag, 1)) ||
+            ZSTD_isError(ZSTD_CCtx_setParameter(tl.cctx, ZSTD_c_checksumFlag, 0)) ||
+            ZSTD_isError(ZSTD_CCtx_setParameter(tl.cctx, ZSTD_c_dictIDFlag, 0))) {
+            return ZSTD_compress(dst, 0, "x", 1, compression_level);
+        }
+        tl.configured_level = compression_level;
+    }
+    if (ZSTD_isError(ZSTD_CCtx_reset(tl.cctx, ZSTD_reset_session_only)) ||
+        ZSTD_isError(ZSTD_CCtx_setPledgedSrcSize(tl.cctx, src_size))) {
+        return ZSTD_compress(dst, 0, "x", 1, compression_level);
+    }
+    const auto* in_bytes = static_cast<const u8*>(src);
+    ZSTD_outBuffer out{dst, dst_capacity, 0};
+    size_t offset = 0;
+    while (offset < src_size) {
+        const size_t chunk = std::min<size_t>(ReadBufferSize, src_size - offset);
+        ZSTD_inBuffer in{in_bytes + offset, chunk, 0};
+        while (in.pos < in.size) {
+            const size_t rc = ZSTD_compressStream2(tl.cctx, &out, &in, ZSTD_e_continue);
+            if (ZSTD_isError(rc)) {
+                return rc;
+            }
+        }
+        offset += chunk;
+    }
+    ZSTD_inBuffer empty{nullptr, 0, 0};
+    size_t rem = 0;
+    do {
+        rem = ZSTD_compressStream2(tl.cctx, &out, &empty, ZSTD_e_end);
+        if (ZSTD_isError(rem)) {
+            return rem;
+        }
+    } while (rem > 0);
+    return out.pos;
+}
+
+EglNupZstdOps MakeWriterZstdOps() {
+    return EglNupZstdOps{
+        .compress = &NupZstdCompressStreamed,
+        .decompress = &ZSTD_decompress,
+        .compress_bound = &ZSTD_compressBound,
+        .is_error = &ZSTD_isError,
+    };
+}
+
+std::string PathToUtf8Native(const fs::path& p) {
+    return Common::FS::PathToUTF8String(p);
+}
+
+struct ScopedRustString {
+    EglNupOwnedString raw{};
+    ~ScopedRustString() {
+        egl_nup_free_string(&raw);
+    }
+    ScopedRustString() = default;
+    ScopedRustString(const ScopedRustString&) = delete;
+    ScopedRustString& operator=(const ScopedRustString&) = delete;
+};
+
+struct ScopedRustMeta {
+    EglNupOwnedMetadata raw{};
+    ~ScopedRustMeta() {
+        egl_nup_free_metadata(&raw);
+    }
+    ScopedRustMeta() = default;
+    ScopedRustMeta(const ScopedRustMeta&) = delete;
+    ScopedRustMeta& operator=(const ScopedRustMeta&) = delete;
+};
+
+std::string TakeRustStr(const EglNupOwnedString& s) {
+    if (s.data == nullptr || s.len == 0) {
+        return {};
+    }
+    return std::string(s.data, s.len);
+}
+
+Metadata CopyRustMetadata(const EglNupOwnedMetadata& src) {
+    Metadata out;
+    out.title_name = TakeRustStr(src.title_name);
+    if (src.icon.data != nullptr && src.icon.len > 0) {
+        out.icon.assign(src.icon.data, src.icon.data + src.icon.len);
+    }
+    out.display_version = TakeRustStr(src.display_version);
+    out.publisher = TakeRustStr(src.publisher);
+    out.localized_titles.reserve(src.localized_title_count);
+    for (size_t i = 0; i < src.localized_title_count; ++i) {
+        out.localized_titles.emplace_back(TakeRustStr(src.localized_titles[i].lang),
+                                          TakeRustStr(src.localized_titles[i].value));
+    }
+    out.version_source = TakeRustStr(src.version_source);
+    return out;
+}
+
+bool MetadataEqual(const Metadata& a, const Metadata& b) {
+    return a.title_name == b.title_name && a.icon == b.icon &&
+           a.display_version == b.display_version && a.publisher == b.publisher &&
+           a.localized_titles == b.localized_titles && a.version_source == b.version_source;
+}
+
+struct RustCallbackCtx {
+    const std::function<void(const PackProgress&)>* progress{};
+    const std::atomic_bool* cancel{};
+};
+
+void BridgeProgress(void* ctx, const EglNupPackProgress* p) {
+    const auto* bridge = static_cast<const RustCallbackCtx*>(ctx);
+    if (bridge != nullptr && bridge->progress != nullptr && *bridge->progress && p != nullptr) {
+        (*bridge->progress)(PackProgress{
+            .bytes_done = p->bytes_done,
+            .bytes_total = p->bytes_total,
+            .files_done = p->files_done,
+            .files_total = p->files_total,
+        });
+    }
+}
+
+uint8_t BridgeCancel(void* ctx) {
+    const auto* bridge = static_cast<const RustCallbackCtx*>(ctx);
+    if (bridge != nullptr && bridge->cancel != nullptr &&
+        bridge->cancel->load(std::memory_order_relaxed)) {
+        return 1;
+    }
+    return 0;
+}
+
+bool FilesByteIdentical(const fs::path& a, const fs::path& b) {
+    std::error_code ec;
+    const auto sa = fs::file_size(a, ec);
+    if (ec) {
+        return false;
+    }
+    const auto sb = fs::file_size(b, ec);
+    if (ec || sa != sb) {
+        return false;
+    }
+    Common::FS::IOFile fa{a, Common::FS::FileAccessMode::Read};
+    Common::FS::IOFile fb{b, Common::FS::FileAccessMode::Read};
+    if (!fa.IsOpen() || !fb.IsOpen()) {
+        return false;
+    }
+    std::vector<u8> ba(1024 * 1024);
+    std::vector<u8> bb(1024 * 1024);
+    u64 rem = sa;
+    while (rem > 0) {
+        const auto chunk = static_cast<size_t>(std::min<u64>(ba.size(), rem));
+        if (fa.ReadSpan(std::span<u8>{ba.data(), chunk}) != chunk ||
+            fb.ReadSpan(std::span<u8>{bb.data(), chunk}) != chunk ||
+            std::memcmp(ba.data(), bb.data(), chunk) != 0) {
+            return false;
+        }
+        rem -= chunk;
+    }
+    return true;
+}
+
+bool DirectoriesTreeEqual(const fs::path& dir_a, const fs::path& dir_b) {
+    std::error_code ec;
+    auto list_rel = [&](const fs::path& root, std::vector<std::pair<std::string, bool>>& out_list) {
+        for (const auto& entry : fs::recursive_directory_iterator(root, ec)) {
+            if (ec) {
+                return false;
+            }
+            const auto rel = ToUtf8(fs::relative(entry.path(), root, ec));
+            if (ec) {
+                return false;
+            }
+            out_list.emplace_back(rel, entry.is_directory(ec));
+            if (ec) {
+                return false;
+            }
+        }
+        std::ranges::sort(out_list);
+        return true;
+    };
+    std::vector<std::pair<std::string, bool>> list_a, list_b;
+    if (!list_rel(dir_a, list_a) || !list_rel(dir_b, list_b) || list_a != list_b) {
+        return false;
+    }
+    for (const auto& [rel, is_dir] : list_a) {
+        if (!is_dir && !FilesByteIdentical(dir_a / FromUtf8(rel), dir_b / FromUtf8(rel))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+PackResult PackDumpRustImpl(const fs::path& dump_root, const fs::path& archive,
+                            const PackOptions& options,
+                            const std::function<void(const PackProgress&)>& progress,
+                            const std::atomic_bool* cancel, std::string* error_out) {
+    const std::string dump_utf8 = PathToUtf8Native(dump_root);
+    const std::string arch_utf8 = PathToUtf8Native(archive);
+    std::vector<EglNupLocalizedPair> pairs;
+    pairs.reserve(options.metadata.localized_titles.size());
+    for (const auto& [lang, val] : options.metadata.localized_titles) {
+        pairs.push_back(EglNupLocalizedPair{
+            .lang = lang.data(),
+            .lang_len = lang.size(),
+            .value = val.data(),
+            .value_len = val.size(),
+        });
+    }
+    const EglNupPackOptions copts{
+        .delete_sources = static_cast<uint8_t>(options.delete_sources ? 1 : 0),
+        ._pad = {},
+        .zstd_level = static_cast<int32_t>(options.zstd_level),
+        .chunk_bytes = options.chunk_bytes,
+        .raw_threshold = options.raw_threshold,
+        .nacp_language_index = static_cast<int32_t>(Settings::values.language_index.GetValue()),
+        ._pad2 = 0,
+        .metadata =
+            EglNupMetadata{
+                .title_name = options.metadata.title_name.data(),
+                .title_name_len = options.metadata.title_name.size(),
+                .icon = options.metadata.icon.data(),
+                .icon_len = options.metadata.icon.size(),
+                .display_version = options.metadata.display_version.data(),
+                .display_version_len = options.metadata.display_version.size(),
+                .publisher = options.metadata.publisher.data(),
+                .publisher_len = options.metadata.publisher.size(),
+                .localized_titles = pairs.data(),
+                .localized_title_count = pairs.size(),
+            },
+    };
+    const auto zstd = MakeWriterZstdOps();
+    RustCallbackCtx bridge{&progress, cancel};
+    ScopedRustString err{};
+    const auto rc = egl_nup_pack_dump(
+        dump_utf8.data(), dump_utf8.size(), arch_utf8.data(), arch_utf8.size(), &copts, &zstd,
+        progress ? &BridgeProgress : nullptr, &bridge, cancel ? &BridgeCancel : nullptr, &bridge,
+        &err.raw);
+    if (error_out && rc != EGL_NUP_PACK_SUCCESS) {
+        *error_out = TakeRustStr(err.raw);
+    }
+    return static_cast<PackResult>(rc);
+}
+
+ExtractResult ExtractNupRustImpl(const fs::path& archive, const fs::path& out_dir,
+                                 const std::function<void(const PackProgress&)>& progress_cb,
+                                 const std::atomic_bool* cancel, std::string* error_out) {
+    const std::string arch_utf8 = PathToUtf8Native(archive);
+    const std::string out_utf8 = PathToUtf8Native(out_dir);
+    const auto zstd = MakeWriterZstdOps();
+    RustCallbackCtx bridge{&progress_cb, cancel};
+    ScopedRustString err{};
+    const auto rc = egl_nup_extract(
+        arch_utf8.data(), arch_utf8.size(), out_utf8.data(), out_utf8.size(), &zstd,
+        progress_cb ? &BridgeProgress : nullptr, &bridge, cancel ? &BridgeCancel : nullptr,
+        &bridge, &err.raw);
+    if (error_out && rc != EGL_NUP_EXTRACT_SUCCESS) {
+        *error_out = TakeRustStr(err.raw);
+    }
+    return static_cast<ExtractResult>(rc);
+}
+
+EditResult EditNupMetadataRustImpl(const fs::path& archive, const MetadataEdit& edit,
+                                   std::string* error_out, const std::atomic_bool* cancel,
+                                   const std::function<void(const PackProgress&)>& progress_cb) {
+    const std::string arch_utf8 = PathToUtf8Native(archive);
+    std::vector<EglNupLocalizedPair> pairs;
+    if (edit.localized_titles) {
+        pairs.reserve(edit.localized_titles->size());
+        for (const auto& [lang, val] : *edit.localized_titles) {
+            pairs.push_back(EglNupLocalizedPair{
+                .lang = lang.data(),
+                .lang_len = lang.size(),
+                .value = val.data(),
+                .value_len = val.size(),
+            });
+        }
+    }
+    const EglNupMetadataEdit cedit{
+        .has_title_name = static_cast<uint8_t>(edit.title_name.has_value() ? 1 : 0),
+        .has_icon = static_cast<uint8_t>(edit.icon.has_value() ? 1 : 0),
+        .has_display_version = static_cast<uint8_t>(edit.display_version.has_value() ? 1 : 0),
+        .has_publisher = static_cast<uint8_t>(edit.publisher.has_value() ? 1 : 0),
+        .has_localized_titles = static_cast<uint8_t>(edit.localized_titles.has_value() ? 1 : 0),
+        ._pad = {},
+        .values =
+            EglNupMetadata{
+                .title_name = edit.title_name ? edit.title_name->data() : nullptr,
+                .title_name_len = edit.title_name ? edit.title_name->size() : 0,
+                .icon = edit.icon ? edit.icon->data() : nullptr,
+                .icon_len = edit.icon ? edit.icon->size() : 0,
+                .display_version = edit.display_version ? edit.display_version->data() : nullptr,
+                .display_version_len = edit.display_version ? edit.display_version->size() : 0,
+                .publisher = edit.publisher ? edit.publisher->data() : nullptr,
+                .publisher_len = edit.publisher ? edit.publisher->size() : 0,
+                .localized_titles = pairs.data(),
+                .localized_title_count = pairs.size(),
+            },
+    };
+    RustCallbackCtx bridge{&progress_cb, cancel};
+    ScopedRustString err{};
+    const auto rc = egl_nup_edit_metadata(
+        arch_utf8.data(), arch_utf8.size(), &cedit, progress_cb ? &BridgeProgress : nullptr,
+        &bridge, cancel ? &BridgeCancel : nullptr, &bridge, &err.raw);
+    if (error_out && rc != EGL_NUP_EDIT_SUCCESS && rc != EGL_NUP_EDIT_NO_CHANGE) {
+        *error_out = TakeRustStr(err.raw);
+    }
+    return static_cast<EditResult>(rc);
+}
+#endif
+
 } // namespace
 
 bool IsLooseDump(const fs::path& dir) {
-    return HasBootableExeFS(dir);
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    const auto mode = GetRustNupWriterMode();
+    if (mode == RustNupWriterMode::Rust) {
+        const auto utf8 = PathToUtf8Native(dir);
+        return egl_nup_is_loose_dump(utf8.data(), utf8.size()) != 0;
+    }
+#endif
+    const bool cpp_res = HasBootableExeFS(dir);
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    if (mode == RustNupWriterMode::Verify) {
+        const auto utf8 = PathToUtf8Native(dir);
+        const bool rust_res = egl_nup_is_loose_dump(utf8.data(), utf8.size()) != 0;
+        if (rust_res != cpp_res) {
+            LOG_CRITICAL(Loader, "NUP IsLooseDump mismatch for {}: cpp={} rust={}",
+                         PathToUtf8Native(dir), cpp_res, rust_res);
+            return false;
+        }
+    }
+#endif
+    return cpp_res;
 }
 
 std::optional<fs::path> DumpRootFromMain(const fs::path& main) {
-    // The Qt game list stores the exefs folder rather than exefs/main.
-    std::error_code ec;
-    const auto exefs = fs::is_directory(main, ec) ? main : main.parent_path();
-    if (Lower(ToUtf8(exefs.filename())) != "exefs") {
-        return std::nullopt;
+    auto resolve_cpp = [](const fs::path& p) -> std::optional<fs::path> {
+        // The Qt game list stores the exefs folder rather than exefs/main.
+        std::error_code ec;
+        const auto exefs = fs::is_directory(p, ec) ? p : p.parent_path();
+        if (Lower(ToUtf8(exefs.filename())) != "exefs") {
+            return std::nullopt;
+        }
+        auto root = exefs.parent_path();
+        const auto name = Lower(ToUtf8(root.filename()));
+        if (name == "base") {
+            root = root.parent_path();
+        } else if (ParseDecimal(name) && Lower(ToUtf8(root.parent_path().filename())) == "updates") {
+            root = root.parent_path().parent_path();
+        }
+        if (!HasBootableExeFS(root)) {
+            return std::nullopt;
+        }
+        return root;
+    };
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    const auto mode = GetRustNupWriterMode();
+    if (mode == RustNupWriterMode::Rust) {
+        const auto utf8 = PathToUtf8Native(main);
+        ScopedRustString out{};
+        if (egl_nup_dump_root_from_main(utf8.data(), utf8.size(), &out.raw) == 0) {
+            return std::nullopt;
+        }
+        return FromUtf8(TakeRustStr(out.raw));
     }
-    auto root = exefs.parent_path();
-    const auto name = Lower(ToUtf8(root.filename()));
-    if (name == "base") {
-        root = root.parent_path();
-    } else if (ParseDecimal(name) && Lower(ToUtf8(root.parent_path().filename())) == "updates") {
-        root = root.parent_path().parent_path();
+#endif
+    const auto cpp_res = resolve_cpp(main);
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    if (mode == RustNupWriterMode::Verify) {
+        const auto utf8 = PathToUtf8Native(main);
+        ScopedRustString out{};
+        const bool ok = egl_nup_dump_root_from_main(utf8.data(), utf8.size(), &out.raw) != 0;
+        const auto rust_res =
+            ok ? std::optional<fs::path>{FromUtf8(TakeRustStr(out.raw))}
+               : std::optional<fs::path>{};
+        std::error_code eq_ec;
+        const bool match =
+            (cpp_res.has_value() == rust_res.has_value()) &&
+            (!cpp_res.has_value() || fs::equivalent(*cpp_res, *rust_res, eq_ec));
+        if (!match) {
+            LOG_CRITICAL(Loader, "NUP DumpRootFromMain mismatch for {}", PathToUtf8Native(main));
+            return std::nullopt;
+        }
     }
-    if (!IsLooseDump(root)) {
-        return std::nullopt;
-    }
-    return root;
+#endif
+    return cpp_res;
 }
 
 Metadata ProbeMetadata(const fs::path& dump_root) {
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    const auto mode = GetRustNupWriterMode();
+    if (mode == RustNupWriterMode::Rust) {
+        const auto utf8 = PathToUtf8Native(dump_root);
+        ScopedRustMeta out{};
+        if (egl_nup_probe_metadata(utf8.data(), utf8.size(),
+                                   static_cast<int32_t>(Settings::values.language_index.GetValue()),
+                                   &out.raw) != 0) {
+            return {};
+        }
+        return CopyRustMetadata(out.raw);
+    }
+#endif
     RealVfsFilesystem vfs;
     const auto base = FindDirectory(dump_root, "base");
     const auto updates = FindDirectory(dump_root, "updates");
@@ -1561,6 +2043,23 @@ Metadata ProbeMetadata(const fs::path& dump_root) {
         }
         probe(dir, "update " + std::to_string(version), true);
     }
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    if (mode == RustNupWriterMode::Verify) {
+        const auto utf8 = PathToUtf8Native(dump_root);
+        ScopedRustMeta out{};
+        if (egl_nup_probe_metadata(utf8.data(), utf8.size(),
+                                   static_cast<int32_t>(Settings::values.language_index.GetValue()),
+                                   &out.raw) != 0) {
+            LOG_CRITICAL(Loader, "Rust ProbeMetadata failed for {}", utf8);
+            return {};
+        }
+        const auto rust_res = CopyRustMetadata(out.raw);
+        if (!MetadataEqual(result, rust_res)) {
+            LOG_CRITICAL(Loader, "NUP ProbeMetadata mismatch for {}", utf8);
+            return {};
+        }
+    }
+#endif
     return result;
 }
 
@@ -1569,34 +2068,115 @@ fs::path DefaultArchivePath(const fs::path& dump_root) {
     if (!root.has_filename()) {
         root = root.parent_path();
     }
-    return root.parent_path() / (root.filename().u8string() + u8".nup");
+    const auto cpp_res = root.parent_path() / (root.filename().u8string() + u8".nup");
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    const auto mode = GetRustNupWriterMode();
+    if (mode == RustNupWriterMode::Rust) {
+        const auto utf8 = PathToUtf8Native(dump_root);
+        ScopedRustString out{};
+        if (egl_nup_default_archive_path(utf8.data(), utf8.size(), &out.raw) == 0) {
+            return FromUtf8(TakeRustStr(out.raw));
+        }
+    }
+#endif
+    return cpp_res;
 }
 
 bool HasResumableJournal(const fs::path& archive) {
     std::error_code ec;
-    return fs::exists(WithSuffix(archive, ".part"), ec) &&
-           fs::exists(WithSuffix(archive, ".journal"), ec);
+    const bool cpp_res = fs::exists(WithSuffix(archive, ".part"), ec) &&
+                         fs::exists(WithSuffix(archive, ".journal"), ec);
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    const auto mode = GetRustNupWriterMode();
+    if (mode == RustNupWriterMode::Rust) {
+        const auto utf8 = PathToUtf8Native(archive);
+        return egl_nup_has_resumable_journal(utf8.data(), utf8.size()) != 0;
+    }
+    if (mode == RustNupWriterMode::Verify) {
+        const auto utf8 = PathToUtf8Native(archive);
+        const bool rust_res = egl_nup_has_resumable_journal(utf8.data(), utf8.size()) != 0;
+        if (rust_res != cpp_res) {
+            LOG_CRITICAL(Loader, "NUP HasResumableJournal mismatch: cpp={} rust={}", cpp_res,
+                         rust_res);
+            return false;
+        }
+    }
+#endif
+    return cpp_res;
 }
 
 PackResult PackDump(const fs::path& dump_root, const fs::path& archive, const PackOptions& options,
                     const std::function<void(const PackProgress&)>& progress,
                     const std::atomic_bool* cancel, std::string* error_out) {
-    Packer packer{dump_root, archive, options, progress, cancel};
-    try {
-        return packer.Run();
-    } catch (const PackError& e) {
-        packer.Abort();
-        if (error_out) {
-            *error_out = e.what();
-        }
-        return e.result;
-    } catch (const std::exception& e) {
-        packer.Abort();
-        if (error_out) {
-            *error_out = e.what();
-        }
-        return PackResult::IoError;
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    const auto mode = GetRustNupWriterMode();
+    if (mode == RustNupWriterMode::Rust) {
+        return PackDumpRustImpl(dump_root, archive, options, progress, cancel, error_out);
     }
+    const bool had_journal = HasResumableJournal(archive);
+    std::error_code exist_ec;
+    const bool target_existed = fs::exists(archive, exist_ec);
+#endif
+    const auto run_cpp = [&]() -> PackResult {
+        Packer packer{dump_root, archive, options, progress, cancel};
+        try {
+            return packer.Run();
+        } catch (const PackError& e) {
+            packer.Abort();
+            if (error_out) {
+                *error_out = e.what();
+            }
+            return e.result;
+        } catch (const std::exception& e) {
+            packer.Abort();
+            if (error_out) {
+                *error_out = e.what();
+            }
+            return PackResult::IoError;
+        }
+    };
+    const PackResult cpp_res = run_cpp();
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    if (mode == RustNupWriterMode::Verify && !options.delete_sources && !had_journal) {
+        std::error_code ec;
+        const VerificationScratch scratch{archive.parent_path(), ec};
+        if (ec) {
+            ReportVerificationSetupError("PackDump", ec,
+                                         cpp_res == PackResult::Success ? error_out : nullptr);
+            return cpp_res == PackResult::Success ? PackResult::IoError : cpp_res;
+        }
+        const auto verify_archive = scratch.Path() / "archive.nup";
+        if (target_existed) {
+            // Give the verifier the same existing-target error as the primary pack.
+            Common::FS::IOFile marker{verify_archive, Common::FS::FileAccessMode::Write};
+            if (!marker.IsOpen()) {
+                ReportVerificationSetupError("PackDump", std::make_error_code(std::errc::io_error),
+                                             cpp_res == PackResult::Success ? error_out : nullptr);
+                return cpp_res == PackResult::Success ? PackResult::IoError : cpp_res;
+            }
+        }
+        std::string rust_err;
+        const auto rust_res =
+            PackDumpRustImpl(dump_root, verify_archive, options, {}, cancel, &rust_err);
+        bool ok = (rust_res == cpp_res);
+        if (ok && cpp_res == PackResult::Success) {
+            ok = FilesByteIdentical(archive, verify_archive);
+        }
+        if (!ok) {
+            LOG_CRITICAL(Loader,
+                         "NUP PackDump differential mismatch: cpp={} rust={} (err={})",
+                         static_cast<int>(cpp_res), static_cast<int>(rust_res), rust_err);
+            if (cpp_res == PackResult::Success && !target_existed) {
+                RemoveFile(archive);
+            }
+            if (error_out) {
+                *error_out = "Rust NUP PackDump differential mismatch";
+            }
+            return PackResult::IoError;
+        }
+    }
+#endif
+    return cpp_res;
 }
 
 namespace {
@@ -1718,6 +2298,12 @@ std::filesystem::path DefaultExtractPath(const std::filesystem::path& archive) {
 ExtractResult ExtractNup(const std::filesystem::path& archive, const std::filesystem::path& out_dir,
                          const std::function<void(const PackProgress&)>& progress_cb,
                          const std::atomic_bool* cancel, std::string* error_out) {
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    const auto mode = GetRustNupWriterMode();
+    if (mode == RustNupWriterMode::Rust) {
+        return ExtractNupRustImpl(archive, out_dir, progress_cb, cancel, error_out);
+    }
+#endif
     // True once this call has claimed out_dir by creating it or verifying that it is
     // empty. Cleanup only removes output this call can safely claim; failures before that
     // point (missing archive, uncreatable or non-empty output) leave everything untouched.
@@ -1737,6 +2323,7 @@ ExtractResult ExtractNup(const std::filesystem::path& archive, const std::filesy
             }
         }
     };
+    ExtractResult cpp_res = ExtractResult::IoError;
     try {
         std::error_code ec;
         if (!fs::is_regular_file(archive, ec)) {
@@ -1816,7 +2403,7 @@ ExtractResult ExtractNup(const std::filesystem::path& archive, const std::filesy
         for (const auto& [index, dest] : targets) {
             WriteDir(nup.GetPackageDir(index), dest, progress, progress_cb, cancel, last_report);
         }
-        return ExtractResult::Success;
+        cpp_res = ExtractResult::Success;
     } catch (const ExtractError& e) {
         if (e.result != ExtractResult::Success) {
             cleanup();
@@ -1824,14 +2411,48 @@ ExtractResult ExtractNup(const std::filesystem::path& archive, const std::filesy
         if (error_out) {
             *error_out = e.what();
         }
-        return e.result;
+        cpp_res = e.result;
     } catch (const std::exception& e) {
         cleanup();
         if (error_out) {
             *error_out = e.what();
         }
-        return ExtractResult::IoError;
+        cpp_res = ExtractResult::IoError;
     }
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    if (mode == RustNupWriterMode::Verify && cpp_res == ExtractResult::Success) {
+        std::error_code ec;
+        const auto destination = fs::canonical(out_dir, ec);
+        auto parent = destination.parent_path();
+        if (!ec && parent == destination) {
+            parent = fs::temp_directory_path(ec);
+        }
+        if (ec) {
+            ReportVerificationSetupError("ExtractNup", ec, error_out);
+            return ExtractResult::IoError;
+        }
+        const VerificationScratch scratch{parent, ec};
+        if (ec) {
+            ReportVerificationSetupError("ExtractNup", ec, error_out);
+            return ExtractResult::IoError;
+        }
+        const auto verify_dir = scratch.Path() / "extracted";
+        std::string rust_err;
+        const auto rust_res =
+            ExtractNupRustImpl(archive, verify_dir, {}, cancel, &rust_err);
+        const bool ok = (rust_res == ExtractResult::Success) &&
+                        DirectoriesTreeEqual(out_dir, verify_dir);
+        if (!ok) {
+            LOG_CRITICAL(Loader, "NUP ExtractNup differential mismatch (err={})", rust_err);
+            cleanup();
+            if (error_out) {
+                *error_out = "Rust NUP ExtractNup differential mismatch";
+            }
+            return ExtractResult::IoError;
+        }
+    }
+#endif
+    return cpp_res;
 }
 
 namespace {
@@ -1913,6 +2534,17 @@ size_t NupEditTargetIndex(const std::vector<FileSys::NupContainer::PackageInfo>&
 } // namespace
 
 Metadata ProbeNupMetadata(const fs::path& archive) {
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    const auto mode = GetRustNupWriterMode();
+    if (mode == RustNupWriterMode::Rust) {
+        const auto utf8 = PathToUtf8Native(archive);
+        ScopedRustMeta out{};
+        if (egl_nup_probe_nup_metadata(utf8.data(), utf8.size(), &out.raw) != 0) {
+            return {};
+        }
+        return CopyRustMetadata(out.raw);
+    }
+#endif
     Metadata out;
     RealVfsFilesystem vfs;
     const auto file =
@@ -1939,20 +2571,91 @@ Metadata ProbeNupMetadata(const fs::path& archive) {
         out.display_version = package.display_version;
     }
     out.version_source = "NUP";
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    if (mode == RustNupWriterMode::Verify) {
+        const auto utf8 = PathToUtf8Native(archive);
+        ScopedRustMeta rout{};
+        if (egl_nup_probe_nup_metadata(utf8.data(), utf8.size(), &rout.raw) != 0) {
+            LOG_CRITICAL(Loader, "Rust ProbeNupMetadata failed for {}", utf8);
+            return {};
+        }
+        const auto rust_res = CopyRustMetadata(rout.raw);
+        if (!MetadataEqual(out, rust_res)) {
+            LOG_CRITICAL(Loader, "NUP ProbeNupMetadata mismatch for {}", utf8);
+            return {};
+        }
+    }
+#endif
     return out;
 }
+
+static bool HasMetadataEdit(const MetadataEdit& edit) {
+    return edit.title_name || edit.icon || edit.display_version || edit.publisher ||
+           edit.localized_titles;
+}
+
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+static EditResult EditNupMetadataCpp(const fs::path& archive, const MetadataEdit& edit,
+                                     std::string* error_out, const std::atomic_bool* cancel,
+                                     const std::function<void(const PackProgress&)>& progress_cb);
+#endif
 
 EditResult EditNupMetadata(const fs::path& archive, const MetadataEdit& edit,
                            std::string* error_out, const std::atomic_bool* cancel,
                            const std::function<void(const PackProgress&)>& progress_cb) {
+#ifdef EGLANTINE_ENABLE_RUST_NUP
+    const auto mode = GetRustNupWriterMode();
+    if (mode == RustNupWriterMode::Rust) {
+        return EditNupMetadataRustImpl(archive, edit, error_out, cancel, progress_cb);
+    }
+    if (mode == RustNupWriterMode::Verify) {
+        std::error_code ec;
+        if (!HasMetadataEdit(edit) || !fs::is_regular_file(archive, ec)) {
+            return EditNupMetadataCpp(archive, edit, error_out, cancel, progress_cb);
+        }
+        const VerificationScratch scratch{archive.parent_path(), ec};
+        if (ec) {
+            ReportVerificationSetupError("EditNupMetadata", ec, error_out);
+            return EditResult::IoError;
+        }
+        const auto verify_archive = scratch.Path() / "archive.nup";
+        if (!fs::copy_file(archive, verify_archive, ec)) {
+            ReportVerificationSetupError("EditNupMetadata",
+                                         ec ? ec : std::make_error_code(std::errc::io_error),
+                                         error_out);
+            return EditResult::IoError;
+        }
+        const auto cpp_res = EditNupMetadataCpp(archive, edit, error_out, cancel, progress_cb);
+        std::string rust_err;
+        const auto rust_res = EditNupMetadataRustImpl(verify_archive, edit, &rust_err, cancel, {});
+        bool ok = (rust_res == cpp_res);
+        if (ok && cpp_res == EditResult::Success) {
+            ok = FilesByteIdentical(archive, verify_archive);
+        }
+        if (!ok) {
+            LOG_CRITICAL(Loader, "NUP EditNupMetadata differential mismatch: cpp={} rust={}",
+                         static_cast<int>(cpp_res), static_cast<int>(rust_res));
+            if (error_out) {
+                *error_out = "Rust NUP EditNupMetadata differential mismatch";
+            }
+            return EditResult::IoError;
+        }
+        return cpp_res;
+    }
+    return EditNupMetadataCpp(archive, edit, error_out, cancel, progress_cb);
+}
+
+static EditResult EditNupMetadataCpp(const fs::path& archive, const MetadataEdit& edit,
+                                     std::string* error_out, const std::atomic_bool* cancel,
+                                     const std::function<void(const PackProgress&)>& progress_cb) {
+#endif
     const auto fail = [&](EditResult result, const std::string& message) {
         if (error_out) {
             *error_out = message;
         }
         return result;
     };
-    if (!edit.title_name && !edit.icon && !edit.display_version && !edit.publisher &&
-        !edit.localized_titles) {
+    if (!HasMetadataEdit(edit)) {
         return EditResult::NoChange;
     }
     std::error_code ec;

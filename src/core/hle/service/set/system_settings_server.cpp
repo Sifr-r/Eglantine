@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstring>
 #include <fstream>
 
 #include "common/assert.h"
@@ -31,6 +33,7 @@ namespace Service::Set {
 namespace {
 constexpr u32 SETTINGS_VERSION{4u};
 constexpr auto SETTINGS_MAGIC = Common::MakeMagic('y', 'u', 'z', 'u', '_', 's', 'e', 't');
+constexpr Result ResultInvalidArgument{ErrorModule::Settings, 3};
 struct SettingsHeader {
     u64 magic;
     u32 version;
@@ -45,7 +48,7 @@ void SyncGlobalLanguageFromCode(LanguageCode language_code) {
     }
 
     const std::size_t index = static_cast<std::size_t>(std::distance(available_language_codes.begin(), it));
-    if (index >= static_cast<std::size_t>(Settings::values.language_index.GetValue())) {
+    if (index <= static_cast<std::size_t>(Settings::Language::Thai)) {
         Settings::values.language_index.SetValue(static_cast<Settings::Language>(index));
     }
 }
@@ -568,10 +571,16 @@ Result ISystemSettingsServer::GetEulaVersions(
     Out<s32> out_count, OutArray<EulaVersion, BufferAttr_HipcMapAlias> out_eula_versions) {
     LOG_INFO(Service_SET, "called, elements={}", m_system_settings.eula_version_count);
 
-    *out_count =
-        (std::min)(m_system_settings.eula_version_count, static_cast<s32>(out_eula_versions.size()));
-    memcpy(out_eula_versions.data(), m_system_settings.eula_versions.data(),
-           static_cast<std::size_t>(*out_count) * sizeof(EulaVersion));
+    const s32 stored_count = std::clamp<s32>(
+        m_system_settings.eula_version_count, 0,
+        static_cast<s32>(m_system_settings.eula_versions.size()));
+    const std::size_t count =
+        (std::min)(static_cast<std::size_t>(stored_count), out_eula_versions.size());
+    *out_count = static_cast<s32>(count);
+    if (count > 0) {
+        std::memcpy(out_eula_versions.data(), m_system_settings.eula_versions.data(),
+                    count * sizeof(EulaVersion));
+    }
     R_SUCCEED();
 }
 
@@ -579,11 +588,14 @@ Result ISystemSettingsServer::SetEulaVersions(
     InArray<EulaVersion, BufferAttr_HipcMapAlias> eula_versions) {
     LOG_INFO(Service_SET, "called, elements={}", eula_versions.size());
 
-    ASSERT(eula_versions.size() <= m_system_settings.eula_versions.size());
+    R_UNLESS(eula_versions.size() <= m_system_settings.eula_versions.size(),
+             ResultInvalidArgument);
 
     m_system_settings.eula_version_count = static_cast<s32>(eula_versions.size());
-    std::memcpy(m_system_settings.eula_versions.data(), eula_versions.data(),
-                eula_versions.size() * sizeof(EulaVersion));
+    if (!eula_versions.empty()) {
+        std::memcpy(m_system_settings.eula_versions.data(), eula_versions.data(),
+                    eula_versions.size() * sizeof(EulaVersion));
+    }
     SetSaveNeeded();
     R_SUCCEED();
 }
@@ -635,11 +647,17 @@ Result ISystemSettingsServer::GetAccountNotificationSettings(
     LOG_INFO(Service_SET, "called, elements={}",
              m_system_settings.account_notification_settings_count);
 
-    *out_count = (std::min)(m_system_settings.account_notification_settings_count,
-                          static_cast<s32>(out_account_notification_settings.size()));
-    memcpy(out_account_notification_settings.data(),
-           m_system_settings.account_notification_settings.data(),
-           static_cast<std::size_t>(*out_count) * sizeof(AccountNotificationSettings));
+    const s32 stored_count = std::clamp<s32>(
+        m_system_settings.account_notification_settings_count, 0,
+        static_cast<s32>(m_system_settings.account_notification_settings.size()));
+    const std::size_t count =
+        (std::min)(static_cast<std::size_t>(stored_count), out_account_notification_settings.size());
+    *out_count = static_cast<s32>(count);
+    if (count > 0) {
+        std::memcpy(out_account_notification_settings.data(),
+                    m_system_settings.account_notification_settings.data(),
+                    count * sizeof(AccountNotificationSettings));
+    }
 
     R_SUCCEED();
 }
@@ -648,14 +666,17 @@ Result ISystemSettingsServer::SetAccountNotificationSettings(
     InArray<AccountNotificationSettings, BufferAttr_HipcMapAlias> account_notification_settings) {
     LOG_INFO(Service_SET, "called, elements={}", account_notification_settings.size());
 
-    ASSERT(account_notification_settings.size() <=
-           m_system_settings.account_notification_settings.size());
+    R_UNLESS(account_notification_settings.size() <=
+                 m_system_settings.account_notification_settings.size(),
+             ResultInvalidArgument);
 
     m_system_settings.account_notification_settings_count =
         static_cast<s32>(account_notification_settings.size());
-    std::memcpy(m_system_settings.account_notification_settings.data(),
-                account_notification_settings.data(),
-                account_notification_settings.size() * sizeof(AccountNotificationSettings));
+    if (!account_notification_settings.empty()) {
+        std::memcpy(m_system_settings.account_notification_settings.data(),
+                    account_notification_settings.data(),
+                    account_notification_settings.size() * sizeof(AccountNotificationSettings));
+    }
     SetSaveNeeded();
     R_SUCCEED();
 }
@@ -1082,13 +1103,13 @@ Result ISystemSettingsServer::GetConsoleInformationUploadFlag(Out<bool> out_flag
 
 Result ISystemSettingsServer::SetConsoleInformationUploadFlag(bool flag) {
     LOG_INFO(Service_SET, "called {}", flag);
-    m_system_settings.usb_30_enable_flag = flag;
+    m_system_settings.console_information_upload_flag = flag;
     SetSaveNeeded();
     R_SUCCEED();
 }
 
 Result ISystemSettingsServer::GetAutomaticApplicationDownloadFlag(Out<bool> out_flag) {
-    LOG_INFO(Service_SET, "called {}", m_system_settings.usb_30_enable_flag);
+    LOG_INFO(Service_SET, "called {}", m_system_settings.automatic_application_download_flag);
     *out_flag = m_system_settings.automatic_application_download_flag;
     R_SUCCEED();
 }
@@ -1177,10 +1198,13 @@ Result ISystemSettingsServer::GetDeviceNickName(
     OutLargeData<std::array<u8, 0x80>, BufferAttr_HipcMapAlias> out_device_name) {
     LOG_DEBUG(Service_SET, "called");
 
+    const auto device_name = ::Settings::values.device_name.GetValue();
+    const std::size_t string_size = (std::min)(device_name.size(), out_device_name->size());
+
     *out_device_name = {};
-    const auto device_name_buffer = ::Settings::values.device_name.GetValue().c_str();
-    memcpy(out_device_name->data(), device_name_buffer,
-           ::Settings::values.device_name.GetValue().size());
+    if (string_size > 0) {
+        std::memcpy(out_device_name->data(), device_name.data(), string_size);
+    }
 
     R_SUCCEED();
 }

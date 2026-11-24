@@ -385,11 +385,12 @@ Result IHidServer::GetXpadIds(Out<u64> out_count,
     LOG_DEBUG(Service_HID, "called");
 
     // This function has been hardcoded since 10.0.0+
-    out_basic_pad_ids[0] = 0;
-    out_basic_pad_ids[1] = 1;
-    out_basic_pad_ids[2] = 2;
-    out_basic_pad_ids[3] = 3;
-    *out_count = 4;
+    constexpr std::size_t max_xpad_ids = 4;
+    const std::size_t count = (std::min)(max_xpad_ids, out_basic_pad_ids.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        out_basic_pad_ids[i] = static_cast<u32>(i);
+    }
+    *out_count = static_cast<u64>(count);
     R_SUCCEED();
 }
 
@@ -1071,6 +1072,7 @@ Result IHidServer::GetActualVibrationGcErmCommand(
 
     if (!has_active_aruid) {
         *out_gc_erm_command = Core::HID::VibrationGcErmCommand::Stop;
+        R_SUCCEED();
     }
 
     R_TRY(IsVibrationHandleValid(vibration_device_handle));
@@ -1106,6 +1108,7 @@ Result IHidServer::IsVibrationDeviceMounted(
               vibration_device_handle.npad_type, vibration_device_handle.npad_id,
               vibration_device_handle.device_index, aruid.pid);
 
+    *out_is_mounted = false;
     R_TRY(IsVibrationHandleValid(vibration_device_handle));
 
     NpadVibrationBase* device = GetResourceManager()->GetVibrationDevice(vibration_device_handle);

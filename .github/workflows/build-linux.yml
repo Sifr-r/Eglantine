@@ -110,9 +110,38 @@ jobs:
             libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
             libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
 
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - name: Cache Rust build artifacts (restore and save)
+        if: env.CACHE_SAVE == 'true'
+        uses: actions/cache@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Cache Rust build artifacts (restore only)
+        if: env.CACHE_SAVE != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            build/release/rust-target
+            rust/target
+          key: rust-v1-${{ env.PLATFORM }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+          restore-keys: |
+            rust-v1-${{ env.PLATFORM }}-
+
+      - name: Run Rust workspace tests
+        shell: bash
+        run: cargo test --manifest-path rust/Cargo.toml --locked --offline
+
       - name: Install Qt on Linux x86_64
         if: runner.arch != 'ARM64'
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4.5.0
         with:
           version: "6.8.3"
           host: linux
@@ -123,7 +152,7 @@ jobs:
 
       - name: Install Qt on Linux ARM64
         if: runner.arch == 'ARM64'
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4.5.0
         with:
           version: "6.8.3"
           host: linux_arm64
@@ -242,10 +271,29 @@ jobs:
           tools="$RUNNER_TEMP/linuxdeploy"
           mkdir -p "$tools"
           arch=$(uname -m)   # aarch64 or x86_64
+          # Pinned SHA-256 digests for linuxdeploy (2026-11-01) and linuxdeploy-plugin-qt (2026-08-22)
+          # because Qt 6 / Wayland plugin deployment and patchelf 0.19.1 are only published on continuous.
+          case "$arch" in
+            x86_64)
+              linuxdeploy_sha256="df908b19f1ed1cdafa79508d415aa12d6c56ce4d56d4149aa8c09286718706e5"
+              plugin_qt_sha256="cfc1055b2b9dbc08412b579f20990b7b41a17b61beaa5847dc9477c96c9e9617"
+              ;;
+            aarch64)
+              linuxdeploy_sha256="f38e4d7cebf20d8073ec4e00e0a167ac146cd8585fe2f8fe82df27d74f2bd8e1"
+              plugin_qt_sha256="d5b5a9020065cefda8c7af7c9500f686b23640eac50c88201a81752c6ee2e49c"
+              ;;
+            *)
+              echo "Unsupported architecture for linuxdeploy: $arch" >&2
+              exit 1
+              ;;
+          esac
           curl -fsSL -o "$tools/linuxdeploy-$arch.AppImage" \
             "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-$arch.AppImage"
           curl -fsSL -o "$tools/linuxdeploy-plugin-qt-$arch.AppImage" \
             "https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-$arch.AppImage"
+          printf '%s  %s\n%s  %s\n' \
+            "$linuxdeploy_sha256" "$tools/linuxdeploy-$arch.AppImage" \
+            "$plugin_qt_sha256" "$tools/linuxdeploy-plugin-qt-$arch.AppImage" | sha256sum -c -
           chmod +x "$tools"/*.AppImage
           # The desktop file names its icon dev.eglantine.eglantine.
           icon="$RUNNER_TEMP/dev.eglantine.eglantine.png"

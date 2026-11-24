@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <cstring>
 #include <type_traits>
 #include <fmt/ranges.h>
 
@@ -185,7 +187,12 @@ struct Ssid {
     }
 
     bool operator==(const Ssid& b) const {
-        return (length == b.length) && (std::memcmp(raw.data(), b.raw.data(), length) == 0);
+        if (length != b.length) {
+            return false;
+        }
+        const std::size_t compare_length =
+            (std::min)(static_cast<std::size_t>(length), SsidLengthMax);
+        return std::memcmp(raw.data(), b.raw.data(), compare_length) == 0;
     }
 
     bool operator!=(const Ssid& b) const {

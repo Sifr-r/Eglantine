@@ -28,6 +28,7 @@
 #include "common/settings.h"
 #include "common/thread.h"
 #include "core/core.h"
+#include "core/platform_profile.h"
 #include "core/file_sys/nup_container.h"
 #include "core/file_sys/romfs.h"
 #include "core/file_sys/vfs/vfs.h"
@@ -414,7 +415,7 @@ std::optional<std::string> WarmFilesStale(const fs::path& warm_file) {
 }
 
 bool RefreshWarmFiles(Core::System& system, u64 title_id, std::stop_token stop) {
-    if (title_id == 0 || !Settings::CurrentProgramIsSwitch2()) {
+    if (title_id == 0 || !system.Platform().IsSwitch2()) {
         return false;
     }
     const auto reason = WarmFilesStale(ComputeWarmPath(title_id));

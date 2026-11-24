@@ -66,14 +66,8 @@ struct Nx2SysmixStreams {
     std::mutex mutex;
     std::map<u32, std::shared_ptr<Nx2SysmixStream>> streams;
     u32 next_id{1};
+    std::atomic<u32> next_session_id{1};
 };
-
-// Streams are created through audsmx:u but started and stopped through auddmg:u (AttachStream and
-// DetachStream), so both services share one list.
-inline std::shared_ptr<Nx2SysmixStreams> Nx2SysmixStreamList() {
-    static const auto list = std::make_shared<Nx2SysmixStreams>();
-    return list;
-}
 
 namespace Devmgr {
 
@@ -93,10 +87,11 @@ namespace Devmgr {
 // - 800(u32 stream id): detach it again (Stop).
 class IUserSession final : public ServiceFramework<IUserSession> {
 public:
-    explicit IUserSession(Core::System& system_)
+    explicit IUserSession(Core::System& system_, std::shared_ptr<Nx2SysmixStreams> streams_)
         : ServiceFramework{system_, "nx2:auddmg:u:manager"},
           service_context{system_, "nx2:auddmg:u:manager"},
-          state_event{service_context.CreateEvent("nx2:auddmg:u:StateEvent")} {
+          state_event{service_context.CreateEvent("nx2:auddmg:u:StateEvent")},
+          streams{std::move(streams_)} {
         // clang-format off
         static const FunctionInfo functions[] = {
             {0, &IUserSession::ListVirtualOutputDevices, "ListVirtualOutputDevices"},
@@ -203,9 +198,8 @@ private:
     }
 
     void SetStreamEngaged(u32 stream_id, bool engaged) {
-        const auto list = Nx2SysmixStreamList();
-        std::scoped_lock lk{list->mutex};
-        if (const auto it = list->streams.find(stream_id); it != list->streams.end()) {
+        std::scoped_lock lk{streams->mutex};
+        if (const auto it = streams->streams.find(stream_id); it != streams->streams.end()) {
             it->second->engaged = engaged;
             it->second->owed_frames = 0;
             if (it->second->state_event) {
@@ -216,14 +210,15 @@ private:
 
     KernelHelpers::ServiceContext service_context;
     Kernel::KEvent* state_event;
+    std::shared_ptr<Nx2SysmixStreams> streams;
 };
 
 // Switch 2 "auddmg:u" (nn::audio::devmgr::IUserSessionManager): command 0 (16 bytes and the pid)
 // returns the user session.
 class IUserSessionManager final : public ServiceFramework<IUserSessionManager> {
 public:
-    explicit IUserSessionManager(Core::System& system_)
-        : ServiceFramework{system_, "nx2:auddmg:u"} {
+    explicit IUserSessionManager(Core::System& system_, std::shared_ptr<Nx2SysmixStreams> streams_)
+        : ServiceFramework{system_, "nx2:auddmg:u"}, streams{std::move(streams_)} {
         // clang-format off
         static const FunctionInfo functions[] = {
             {0, &IUserSessionManager::OpenUserSession, "OpenUserSession"},
@@ -237,8 +232,10 @@ private:
         LOG_DEBUG(Service_Audio, "called");
         IPC::ResponseBuilder rb{ctx, 2, 0, 1};
         rb.Push(ResultSuccess);
-        rb.PushIpcInterface<IUserSession>(ctx, system);
+        rb.PushIpcInterface<IUserSession>(ctx, system, streams);
     }
+
+    std::shared_ptr<Nx2SysmixStreams> streams;
 };
 
 } // namespace Devmgr
@@ -316,9 +313,9 @@ private:
                  stream->id, sample_type, channels, sample_rate, frames, prefill, flags);
         const u32 sample_bytes = sample_type == 5 ? 4 : sample_type == 2 ? 2 : 0;
         const u64 data_offset = 0x1040 + ((flags & 1) ? 0x80 : 0);
+        const u64 data_bytes = u64{frames + 1} * channels * sample_bytes;
         if (!frames || frames > 48000 || !channels || channels > 8 ||
-            (sample_bytes &&
-             data_offset + u64{frames + 1} * channels * sample_bytes > stream->size)) {
+            data_offset > stream->size || data_bytes > stream->size - data_offset) {
             IPC::ResponseBuilder rb{ctx, 2};
             rb.Push(ResultInvalidArgument);
             return;
@@ -339,7 +336,9 @@ private:
                 stream->output = system.AudioCore().GetOutputSink().AcquireSinkStream(
                     system, channels == 1 ? 2 : channels, "NX2 Sysmix",
                     AudioCore::Sink::StreamType::Out);
-                stream->output->SetSystemVolume(stream->gain);
+                if (stream->output) {
+                    stream->output->SetSystemVolume(stream->gain);
+                }
             } else {
                 LOG_WARNING(Service_Audio,
                             "Unsupported sysmix output format: type {} channels {} rate {}",
@@ -448,8 +447,10 @@ private:
 // - 2 / 3(buffer of u32 stream ids): engage / disengage those streams.
 class IUserSession final : public ServiceFramework<IUserSession> {
 public:
-    explicit IUserSession(Core::System& system_)
-        : ServiceFramework{system_, "nx2:audsmx:u:session"} {
+    explicit IUserSession(Core::System& system_, std::shared_ptr<Nx2SysmixStreams> streams_)
+        : ServiceFramework{system_, "nx2:audsmx:u:session"},
+          streams{std::move(streams_)},
+          session_id{streams->next_session_id++} {
         // clang-format off
         static const FunctionInfo functions[] = {
             {1, &IUserSession::CreateStream, "CreateStream"},
@@ -460,9 +461,9 @@ public:
         RegisterHandlers(functions);
         drain_timer = Core::Timing::CreateEvent(
             "nx2:audsmx:u drain",
-            [streams = streams, &system = system, owner = session_id](
+            [streams_ref = streams, &system = system, owner = session_id](
                 s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
-                Drain(system, *streams, owner);
+                Drain(system, *streams_ref, owner);
                 return std::nullopt;
             });
         system.CoreTiming().ScheduleLoopingEvent(DrainInterval, DrainInterval, drain_timer);
@@ -572,6 +573,14 @@ private:
         const auto buffer = rp.Pop<u64>();
         const auto size = rp.Pop<u64>();
         const auto name = Common::StringFromBuffer(ctx.ReadBuffer(0));
+        if (buffer == 0 || size < 0x1040 ||
+            !system.ApplicationMemory().IsValidVirtualAddressRange(buffer, size)) {
+            LOG_ERROR(Service_Audio, "Invalid sysmix buffer: buffer={:#x} size={:#x}", buffer,
+                      size);
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(ResultInvalidArgument);
+            return;
+        }
         auto stream = std::make_shared<Nx2SysmixStream>();
         stream->buffer = buffer;
         stream->size = size;
@@ -619,9 +628,8 @@ private:
         SetEngaged(ctx, false);
     }
 
-    static inline std::atomic<u32> next_session_id{1};
-    const u32 session_id = next_session_id++;
-    std::shared_ptr<Nx2SysmixStreams> streams = Nx2SysmixStreamList();
+    std::shared_ptr<Nx2SysmixStreams> streams;
+    const u32 session_id;
     std::shared_ptr<Core::Timing::EventType> drain_timer;
 };
 
@@ -629,8 +637,8 @@ private:
 // a copy handle) returns the user session.
 class IUserSessionManager final : public ServiceFramework<IUserSessionManager> {
 public:
-    explicit IUserSessionManager(Core::System& system_)
-        : ServiceFramework{system_, "nx2:audsmx:u"} {
+    explicit IUserSessionManager(Core::System& system_, std::shared_ptr<Nx2SysmixStreams> streams_)
+        : ServiceFramework{system_, "nx2:audsmx:u"}, streams{std::move(streams_)} {
         // clang-format off
         static const FunctionInfo functions[] = {
             {0, &IUserSessionManager::OpenUserSession, "OpenUserSession"},
@@ -644,8 +652,10 @@ private:
         LOG_DEBUG(Service_Audio, "called");
         IPC::ResponseBuilder rb{ctx, 2, 0, 1};
         rb.Push(ResultSuccess);
-        rb.PushIpcInterface<IUserSession>(ctx, system);
+        rb.PushIpcInterface<IUserSession>(ctx, system, streams);
     }
+
+    std::shared_ptr<Nx2SysmixStreams> streams;
 };
 
 } // namespace Sysmix

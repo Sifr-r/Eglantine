@@ -12,6 +12,8 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <vector>
@@ -297,15 +299,19 @@ public:
     std::array<Engines::EngineTypes, max_subchannels> subchannel_type;
 
     Engines::Puller puller;
-    std::mutex sync_mutex;
-    std::condition_variable sync_cv;
+    struct SyncState : std::enable_shared_from_this<SyncState> {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool synced{false};
+        bool aborted{false};
+    };
+    std::shared_ptr<SyncState> sync_state;
 
     VideoCore::RasterizerInterface* rasterizer = nullptr;
 
     const bool ib_enable : 1 = true; ///< IB mode enabled
     bool dma_increment_once : 1 = false;
-    bool signal_sync : 1 = false;
-    bool synced : 1 = false;
+    bool signal_sync = false;
 };
 
 } // namespace Tegra

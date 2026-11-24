@@ -110,10 +110,13 @@ object NativeConfig {
     @Synchronized
     external fun setString(key: String, value: String)
 
+    @Synchronized
     external fun getIsRuntimeModifiable(key: String): Boolean
 
+    @Synchronized
     external fun getPairedSettingKey(key: String): String
 
+    @Synchronized
     external fun getIsSwitchable(key: String): Boolean
 
     @Synchronized
@@ -122,8 +125,10 @@ object NativeConfig {
     @Synchronized
     external fun setGlobal(key: String, global: Boolean)
 
+    @Synchronized
     external fun getIsSaveable(key: String): Boolean
 
+    @Synchronized
     external fun getDefaultToString(key: String): String
 
     /**

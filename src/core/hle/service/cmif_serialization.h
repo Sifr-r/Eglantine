@@ -8,6 +8,7 @@
 
 #include "common/div_ceil.h"
 
+#include "core/hle/kernel/svc_results.h"
 #include "core/hle/service/cmif_types.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/service.h"
@@ -131,10 +132,10 @@ struct RequestLayout {
     u32 domain_interface_count;
 };
 
-template <typename MethodArguments, size_t PrevAlign = 1, size_t DataOffset = 0, size_t ArgIndex = 0>
+template <typename MethodArguments, bool IncludeTrailingPid, size_t PrevAlign = 1, size_t DataOffset = 0, size_t ReadEnd = 0, size_t ArgIndex = 0>
 constexpr u32 GetInRawDataSize() {
     if constexpr (ArgIndex >= std::tuple_size_v<MethodArguments>) {
-        return static_cast<u32>(DataOffset);
+        return static_cast<u32>(IncludeTrailingPid ? DataOffset : ReadEnd);
     } else {
         using ArgType = std::tuple_element_t<ArgIndex, MethodArguments>;
 
@@ -147,9 +148,13 @@ constexpr u32 GetInRawDataSize() {
             constexpr size_t ArgOffset = Common::AlignUp(DataOffset, ArgAlign);
             constexpr size_t ArgEnd = ArgOffset + ArgSize;
 
-            return GetInRawDataSize<MethodArguments, ArgAlign, ArgEnd, ArgIndex + 1>();
+            // PID values come from the special header. Their inline slots affect the layout of
+            // later arguments, but a trailing PID does not require any raw bytes to be read.
+            constexpr size_t NextReadEnd = ArgumentTraits<ArgType>::Type == ArgumentType::InData
+                                               ? ArgEnd : ReadEnd;
+            return GetInRawDataSize<MethodArguments, IncludeTrailingPid, ArgAlign, ArgEnd, NextReadEnd, ArgIndex + 1>();
         } else {
-            return GetInRawDataSize<MethodArguments, PrevAlign, DataOffset, ArgIndex + 1>();
+            return GetInRawDataSize<MethodArguments, IncludeTrailingPid, PrevAlign, DataOffset, ReadEnd, ArgIndex + 1>();
         }
     }
 }
@@ -198,18 +203,19 @@ constexpr RequestLayout GetNonDomainReplyInLayout() {
     return RequestLayout{
         .copy_handle_count = GetArgumentTypeCount<ArgumentType::InCopyHandle, MethodArguments>(),
         .move_handle_count = 0,
-        .cmif_raw_data_size = GetInRawDataSize<MethodArguments>(),
+        .cmif_raw_data_size = GetInRawDataSize<MethodArguments, false>(),
         .domain_interface_count = 0,
     };
 }
 
 template <typename MethodArguments>
 constexpr RequestLayout GetDomainReplyInLayout() {
+    constexpr u32 domain_interface_count = GetArgumentTypeCount<ArgumentType::InInterface, MethodArguments>();
     return RequestLayout{
         .copy_handle_count = GetArgumentTypeCount<ArgumentType::InCopyHandle, MethodArguments>(),
         .move_handle_count = 0,
-        .cmif_raw_data_size = GetInRawDataSize<MethodArguments>(),
-        .domain_interface_count = GetArgumentTypeCount<ArgumentType::InInterface, MethodArguments>(),
+        .cmif_raw_data_size = GetInRawDataSize<MethodArguments, domain_interface_count != 0>(),
+        .domain_interface_count = domain_interface_count,
     };
 }
 
@@ -246,9 +252,9 @@ constexpr RequestLayout GetReplyOutLayout(bool is_domain) {
 using OutTemporaryBuffers = std::array<Common::ScratchBuffer<u8>, 3>;
 
 template <typename MethodArguments, typename CallArguments, size_t PrevAlign = 1, size_t DataOffset = 0, size_t HandleIndex = 0, size_t InBufferIndex = 0, size_t OutBufferIndex = 0, bool RawDataFinished = false, size_t ArgIndex = 0>
-void ReadInArgument(bool is_domain, CallArguments& args, const u8* raw_data, HLERequestContext& ctx, OutTemporaryBuffers& temp) {
+bool ReadInArgument(bool is_domain, CallArguments& args, const u8* raw_data, HLERequestContext& ctx, OutTemporaryBuffers& temp) {
     if constexpr (ArgIndex >= std::tuple_size_v<CallArguments>) {
-        return;
+        return true;
     } else {
         using ArgType = std::tuple_element_t<ArgIndex, MethodArguments>;
 
@@ -279,12 +285,22 @@ void ReadInArgument(bool is_domain, CallArguments& args, const u8* raw_data, HLE
             constexpr size_t ArgOffset = Common::AlignUp(DataOffset, ArgAlign);
             constexpr size_t ArgEnd = ArgOffset + ArgSize;
 
-            ASSERT(is_domain);
-            ASSERT(ctx.GetDomainMessageHeader().input_object_count > 0);
+            const auto mgr = ctx.GetManager();
+            if (!is_domain || !mgr || !ctx.HasDomainMessageHeader() ||
+                ctx.GetDomainMessageHeader().input_object_count == 0) {
+                return false;
+            }
 
             u32 value{};
             std::memcpy(&value, raw_data + ArgOffset, ArgSize);
-            std::get<ArgIndex>(args) = ctx.GetDomainHandler<typename ArgType::element_type>(value - 1);
+            if (value == 0 || value > mgr->DomainHandlerCount()) {
+                return false;
+            }
+            auto handler = ctx.GetDomainHandler<typename ArgType::element_type>(value - 1);
+            if (!handler) {
+                return false;
+            }
+            std::get<ArgIndex>(args) = std::move(handler);
 
             return ReadInArgument<MethodArguments, CallArguments, ArgAlign, ArgEnd, HandleIndex, InBufferIndex, OutBufferIndex, true, ArgIndex + 1>(is_domain, args, raw_data, ctx, temp);
         } else if constexpr (ArgumentTraits<ArgType>::Type == ArgumentType::InCopyHandle) {
@@ -342,13 +358,15 @@ void ReadInArgument(bool is_domain, CallArguments& args, const u8* raw_data, HLE
         } else if constexpr (ArgumentTraits<ArgType>::Type == ArgumentType::OutBuffer) {
             using ElementType = typename ArgType::Type;
 
-            // Set up scratch buffer.
+            // Pre-populate with existing guest bytes so partial service writes preserve the tail.
             auto& buffer = temp[OutBufferIndex];
-            if (ctx.CanWriteBuffer(OutBufferIndex)) {
-                buffer.resize_destructive(ctx.GetWriteBufferSize(OutBufferIndex));
-            } else {
-                buffer.resize_destructive(0);
+            bool use_buffer_b = (ArgType::Attr & BufferAttr_HipcMapAlias) != 0;
+            if constexpr (ArgType::Attr & BufferAttr_HipcAutoSelect) {
+                const auto& descriptors = ctx.BufferDescriptorB();
+                use_buffer_b = OutBufferIndex < descriptors.size() &&
+                               descriptors[OutBufferIndex].Size() != 0;
             }
+            ctx.ReadOutputBuffer(buffer, use_buffer_b, OutBufferIndex);
 
             ElementType* ptr = (ElementType*) buffer.data();
             size_t size = buffer.size() / sizeof(ElementType);
@@ -451,17 +469,34 @@ void CmifReplyWrapImpl(HLERequestContext& ctx, T& t, Result (T::*f)(A...)) {
             ctx.HasDomainMessageHeader(), mgr ? u32(mgr->DomainHandlerCount()) : 0u,
             ctx.Description());
     }
-    const bool is_domain = Domain ? mgr->IsDomain() : false;
+    const bool is_domain = Domain && mgr != nullptr ? mgr->IsDomain() : false;
 
     static_assert(ConstIfReference<A...>(), "Arguments taken by reference must be const");
     using MethodArguments = std::tuple<std::remove_cvref_t<A>...>;
+    const RequestLayout request_layout = GetReplyInLayout<MethodArguments>(is_domain);
+    const size_t request_bytes = request_layout.domain_interface_count == 0
+        ? request_layout.cmif_raw_data_size
+        : Common::AlignUp(request_layout.cmif_raw_data_size, sizeof(u32)) +
+              request_layout.domain_interface_count * sizeof(u32);
+    if (request_bytes > ctx.GetRequestArgumentSize()) {
+        IPC::ResponseBuilder{ctx, 2}.Push(Kernel::ResultInvalidSize);
+        return;
+    }
+    if (request_layout.domain_interface_count != 0 &&
+        (!is_domain || !ctx.HasDomainMessageHeader() ||
+         ctx.GetDomainMessageHeader().input_object_count < request_layout.domain_interface_count)) {
+        IPC::ResponseBuilder{ctx, 2}.Push(Kernel::ResultInvalidHandle);
+        return;
+    }
 
     OutTemporaryBuffers buffers{};
     auto call_arguments = std::tuple<typename UnwrapArg<A>::Type...>();
 
     // Read inputs.
-    const size_t offset_plus_command_id = ctx.GetDataPayloadOffset() + 2;
-    ReadInArgument<MethodArguments>(is_domain, call_arguments, reinterpret_cast<u8*>(ctx.CommandBuffer() + offset_plus_command_id), ctx, buffers);
+    if (!ReadInArgument<MethodArguments>(is_domain, call_arguments, reinterpret_cast<u8*>(ctx.CommandBuffer() + ctx.GetRequestArgumentOffset()), ctx, buffers)) {
+        IPC::ResponseBuilder{ctx, 2}.Push(Kernel::ResultInvalidHandle);
+        return;
+    }
 
     // Call.
     const auto Callable = [&]<typename... CallArgs>(CallArgs&... args) {

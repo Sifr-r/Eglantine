@@ -292,7 +292,15 @@ std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exef
 AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile file_,
                                                                          bool override_update_)
     : AppLoader(std::move(file_)), override_update(override_update_) {
+    if (file == nullptr) {
+        return;
+    }
+
     const auto file_dir = file->GetContainingDirectory();
+    if (file_dir == nullptr) {
+        return;
+    }
+
     const auto sidecar_dirs = FindSidecarDirs(file_dir);
 
     // Title ID
@@ -367,8 +375,8 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
 
 AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(
     FileSys::VirtualDir directory, bool override_update_)
-    : AppLoader(directory->GetFile("main")), dir(std::move(directory)),
-      override_update(override_update_) {
+    : AppLoader(directory != nullptr ? directory->GetFile("main") : nullptr),
+      dir(std::move(directory)), override_update(override_update_) {
     romfs_exefs_dir = dir;
 }
 
@@ -383,11 +391,28 @@ const FileSys::VirtualFile& AppLoader_DeconstructedRomDirectory::LooseRomFS() {
 }
 
 FileType AppLoader_DeconstructedRomDirectory::IdentifyType(const FileSys::VirtualFile& dir_file) {
-    if (FileSys::IsDirectoryExeFS(dir_file->GetContainingDirectory())) {
+    if (dir_file == nullptr) {
+        return FileType::Error;
+    }
+
+    const auto containing_dir = dir_file->GetContainingDirectory();
+    if (containing_dir == nullptr) {
+        return FileType::Error;
+    }
+
+    if (FileSys::IsDirectoryExeFS(containing_dir)) {
         return FileType::DeconstructedRomDirectory;
     }
 
     return FileType::Error;
+}
+
+FileType AppLoader_DeconstructedRomDirectory::GetFileType() const {
+    if (dir != nullptr) {
+        return FileSys::IsDirectoryExeFS(dir) ? FileType::DeconstructedRomDirectory
+                                              : FileType::Error;
+    }
+    return IdentifyType(file);
 }
 
 AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirectory::Load(
@@ -612,6 +637,49 @@ ResultStatus AppLoader_DeconstructedRomDirectory::ReadNSOModules(Modules& out_mo
     }
 
     out_modules = this->modules;
+    return ResultStatus::Success;
+}
+
+ResultStatus AppLoader_DeconstructedRomDirectory::ReadProgramMetadata(
+    Core::System& system, FileSys::ProgramMetadata& out_metadata) {
+    FileSys::VirtualDir effective_dir = dir;
+    if (effective_dir == nullptr) {
+        if (file == nullptr) {
+            return ResultStatus::ErrorNullFile;
+        }
+        effective_dir = file->GetContainingDirectory();
+    }
+    if (effective_dir == nullptr) {
+        return ResultStatus::ErrorMissingNPDM;
+    }
+
+    FileSys::VirtualFile npdm = effective_dir->GetFile("main.npdm");
+    if (npdm == nullptr) {
+        return ResultStatus::ErrorMissingNPDM;
+    }
+
+    const ResultStatus load_res = out_metadata.Load(npdm);
+    if (load_res != ResultStatus::Success) {
+        return load_res;
+    }
+
+    if (override_update) {
+        const FileSys::PatchManager patch_manager(
+            out_metadata.GetTitleID(), system.GetFileSystemController(), system.GetContentProvider());
+        effective_dir = patch_manager.PatchExeFS(effective_dir);
+        if (effective_dir == nullptr) {
+            return ResultStatus::ErrorMissingNPDM;
+        }
+        npdm = effective_dir->GetFile("main.npdm");
+        if (npdm == nullptr) {
+            return ResultStatus::ErrorMissingNPDM;
+        }
+        const ResultStatus reload_res = out_metadata.Reload(npdm);
+        if (reload_res != ResultStatus::Success) {
+            return reload_res;
+        }
+    }
+
     return ResultStatus::Success;
 }
 

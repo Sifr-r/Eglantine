@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <cstring>
+#include <limits>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <utility>
-#include <span>
-#include <cctype>
 #include "common/container/unordered_map.h"
 
 #include "common/hex_util.h"
@@ -147,6 +150,83 @@ static IPSwitchRecord EscapeStringSequences(std::string_view sv) {
     return r;
 }
 
+namespace {
+
+std::string_view TrimLeadingAsciiSpace(std::string_view sv) {
+    while (!sv.empty() && std::isspace(static_cast<unsigned char>(sv.front()))) {
+        sv.remove_prefix(1);
+    }
+    return sv;
+}
+
+std::optional<s64> ParseSignedOffsetShift(std::string_view sv) {
+    sv = TrimLeadingAsciiSpace(sv);
+    if (sv.empty()) {
+        return std::nullopt;
+    }
+
+    bool negative = false;
+    if (sv.front() == '-') {
+        negative = true;
+        sv.remove_prefix(1);
+    } else if (sv.front() == '+') {
+        sv.remove_prefix(1);
+    }
+
+    int base = 10;
+    if (sv.size() >= 2 && sv[0] == '0' && (sv[1] == 'x' || sv[1] == 'X')) {
+        base = 16;
+        sv.remove_prefix(2);
+    } else if (sv.size() >= 2 && sv[0] == '0') {
+        base = 8;
+    }
+
+    if (sv.empty()) {
+        return std::nullopt;
+    }
+
+    u64 magnitude = 0;
+    const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), magnitude, base);
+    if (ec != std::errc{} || ptr == sv.data()) {
+        return std::nullopt;
+    }
+
+    if (negative) {
+        constexpr u64 max_neg = static_cast<u64>((std::numeric_limits<s64>::max)()) + 1ULL;
+        if (magnitude > max_neg) {
+            return std::nullopt;
+        }
+        if (magnitude == max_neg) {
+            return (std::numeric_limits<s64>::min)();
+        }
+        return -static_cast<s64>(magnitude);
+    }
+
+    if (magnitude > static_cast<u64>((std::numeric_limits<s64>::max)())) {
+        return std::nullopt;
+    }
+    return static_cast<s64>(magnitude);
+}
+
+std::optional<u64> ParseHexOffset(std::string_view sv) {
+    sv = TrimLeadingAsciiSpace(sv);
+    if (sv.size() >= 2 && sv[0] == '0' && (sv[1] == 'x' || sv[1] == 'X')) {
+        sv.remove_prefix(2);
+    }
+    if (sv.empty()) {
+        return std::nullopt;
+    }
+
+    u64 value = 0;
+    const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value, 16);
+    if (ec != std::errc{} || ptr == sv.data()) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+} // namespace
+
 void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
     LOG_INFO(Loader, "IPSwitchCompiler: '{}'", patch_text->GetName());
     bool is_little_endian = true;
@@ -162,6 +242,10 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
             // yes, @nsobid too -- NSO Build ID Specifier
             case 'n':
             case 'N':
+                if (line.size() < 8) {
+                    LOG_WARNING(Loader, "Malformed @nsobid directive {}", line);
+                    break;
+                }
                 nso_build_id = Common::HexStringToArray<0x20>(fmt::format("{:0<64}", line.substr(8)));
                 break;
             // @stop
@@ -182,7 +266,16 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
             case 'f':
             case 'F': {
                 if (line.starts_with("@flag offset_shift")) {
-                    offset_shift = std::strtoll(line.data() + 19, nullptr, 0);  // Offset Shift Flag
+                    if (line.size() > 18 &&
+                        std::isspace(static_cast<unsigned char>(line[18]))) {
+                        if (const auto parsed_shift = ParseSignedOffsetShift(line.substr(18))) {
+                            offset_shift = *parsed_shift; // Offset Shift Flag
+                        } else {
+                            LOG_WARNING(Loader, "Malformed @flag offset_shift directive {}", line);
+                        }
+                    } else {
+                        LOG_WARNING(Loader, "Malformed @flag offset_shift directive {}", line);
+                    }
                 } else if (line.starts_with("@flag print_values")) {
                     //print_values = true; // Force printing of applied values
                 }
@@ -204,18 +297,22 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
         } else if (patches.empty()) {
             LOG_WARNING(Loader, "Invalid line not in a patch {}", line);
         } else {
-            size_t offset = size_t(std::strtoul(line.data(), nullptr, 16));
-            offset += size_t(offset_shift);
+            const auto parsed_offset = ParseHexOffset(line);
+            if (!parsed_offset) {
+                LOG_WARNING(Loader, "Invalid offset in patch line {}", line);
+                return true;
+            }
+            const u64 offset = *parsed_offset + static_cast<u64>(offset_shift);
             if (auto const first_quote = line.find_first_of("\"\'"); first_quote != std::string::npos) {
                 // string replacement
                 char quote = line[first_quote];
                 auto const start = line.cbegin() + first_quote + 1;
                 auto end = start;
                 for (; end < line.cend() && *end != quote; )
-                    end += (*end == '\\') ? 2 : 1;
+                    end += (*end == '\\' && end + 1 < line.cend()) ? 2 : 1;
                 if (start <= line.cend() && end <= line.cend()) {
                     LOG_INFO(Loader, "[S] value @ {:#08X} ", offset);
-                    patches.back().records.insert_or_assign(u32(offset), EscapeStringSequences({start, end}));
+                    patches.back().records.insert_or_assign(static_cast<u32>(offset), EscapeStringSequences({start, end}));
                 } else {
                     LOG_WARNING(Loader, "invalid string");
                 }
@@ -229,7 +326,7 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
                     r.data.resize(hs.size());
                     std::memcpy(r.data.data(), hs.data(), hs.size());
                     LOG_INFO(Loader, "[H] value @ {:#08X}", offset);
-                    patches.back().records.insert_or_assign(u32(offset), std::move(r));
+                    patches.back().records.insert_or_assign(static_cast<u32>(offset), std::move(r));
                 } else {
                     LOG_WARNING(Loader, "invalid line");
                 }
@@ -245,7 +342,7 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
         auto end = start;
         for (; end < bytes.end() && *end != '\n' && *end != '\r'; ++end)
             ;
-        it = end + 1; //prepare for next line
+        it = (end == bytes.end()) ? end : end + 1; //prepare for next line
         std::string_view const sline{
             reinterpret_cast<const char*>(bytes.data() + std::distance(bytes.begin(), start)),
             size_t(std::distance(start, end))
@@ -253,7 +350,7 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
         if (sline.size() > 0) {
             auto p = sline.cbegin();
             // skip space off line
-            for (; p < sline.cend() && std::isspace(*p); ++p)
+            for (; p < sline.cend() && std::isspace(static_cast<unsigned char>(*p)); ++p)
                 ;
             // now make a nominal preprocessed line: remove comments
             char quote = '\0';
@@ -261,7 +358,7 @@ void IPSwitchCompiler::Parse(std::span<u8 const> bytes) {
             auto last_char = p;
             for (; p < sline.cend(); ) {
                 // we dont check for "//", IPS checks for '/' only...
-                if (std::isspace(*p)) {
+                if (std::isspace(static_cast<unsigned char>(*p))) {
                     ++p;
                 } else if ((!quote && p[0] == '/')
                 || (!quote && p[0] == '#')) {

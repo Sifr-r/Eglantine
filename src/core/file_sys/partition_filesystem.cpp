@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <utility>
 
 #include "common/logging.h"
@@ -23,8 +24,10 @@ bool PartitionFilesystem::Header::HasValidMagicValue() const {
 }
 
 PartitionFilesystem::PartitionFilesystem(VirtualFile file) {
+    const std::size_t file_size = file->GetSize();
+
     // At least be as large as the header
-    if (file->GetSize() < sizeof(Header)) {
+    if (file_size < sizeof(Header)) {
         status = Loader::ResultStatus::ErrorBadPFSHeader;
         return;
     }
@@ -43,9 +46,24 @@ PartitionFilesystem::PartitionFilesystem(VirtualFile file) {
 
     is_hfs = pfs_header.magic == Common::MakeMagic('H', 'F', 'S', '0');
 
-    std::size_t entry_size = is_hfs ? sizeof(HFSEntry) : sizeof(PFSEntry);
-    std::size_t metadata_size =
-        sizeof(Header) + (pfs_header.num_entries * entry_size) + pfs_header.strtab_size;
+    const std::size_t entry_size = is_hfs ? sizeof(HFSEntry) : sizeof(PFSEntry);
+    const std::size_t num_entries = pfs_header.num_entries;
+    const std::size_t strtab_size = pfs_header.strtab_size;
+    constexpr std::size_t max_size = (std::numeric_limits<std::size_t>::max)();
+    if (num_entries > (max_size - sizeof(Header)) / entry_size) {
+        status = Loader::ResultStatus::ErrorIncorrectPFSFileSize;
+        return;
+    }
+    const std::size_t entries_bytes = num_entries * entry_size;
+    if (strtab_size > max_size - sizeof(Header) - entries_bytes) {
+        status = Loader::ResultStatus::ErrorIncorrectPFSFileSize;
+        return;
+    }
+    const std::size_t metadata_size = sizeof(Header) + entries_bytes + strtab_size;
+    if (metadata_size > file_size) {
+        status = Loader::ResultStatus::ErrorIncorrectPFSFileSize;
+        return;
+    }
 
     // Actually read in now...
     std::vector<u8> file_data = file->ReadBytes(metadata_size);
@@ -57,13 +75,20 @@ PartitionFilesystem::PartitionFilesystem(VirtualFile file) {
         return;
     }
 
-    std::size_t entries_offset = sizeof(Header);
-    std::size_t strtab_offset = entries_offset + (pfs_header.num_entries * entry_size);
-    content_offset = strtab_offset + pfs_header.strtab_size;
-    for (u16 i = 0; i < pfs_header.num_entries; i++) {
+    const std::size_t entries_offset = sizeof(Header);
+    const std::size_t strtab_offset = entries_offset + entries_bytes;
+    content_offset = strtab_offset + strtab_size;
+    for (std::size_t i = 0; i < num_entries; ++i) {
         FSEntry entry;
 
         memcpy(&entry, &file_data[entries_offset + (i * entry_size)], sizeof(FSEntry));
+        if (entry.strtab_offset >= strtab_size) {
+            offsets.clear();
+            sizes.clear();
+            pfs_files.clear();
+            status = Loader::ResultStatus::ErrorBadPFSHeader;
+            return;
+        }
         std::string name(
             reinterpret_cast<const char*>(&file_data[strtab_offset + entry.strtab_offset]));
 

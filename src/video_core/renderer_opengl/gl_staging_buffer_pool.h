@@ -19,19 +19,34 @@ namespace OpenGL {
 
 using namespace Common::Literals;
 
+struct StagingBuffers;
+
 struct StagingBufferMap {
+    StagingBufferMap() = default;
+    StagingBufferMap(const StagingBufferMap& rhs);
+    StagingBufferMap& operator=(const StagingBufferMap& rhs);
+    StagingBufferMap(StagingBufferMap&& rhs) noexcept;
+    StagingBufferMap& operator=(StagingBufferMap&& rhs) noexcept;
     ~StagingBufferMap();
 
-    std::span<u8> mapped_span;
+    std::span<u8> mapped_span{};
     size_t offset = 0;
-    OGLSync* sync;
-    GLuint buffer;
-    size_t index;
+    StagingBuffers* owner = nullptr;
+    GLuint buffer = 0;
+    size_t index = 0;
+
+private:
+    void Release() noexcept;
 };
 
 struct StagingBuffers {
     explicit StagingBuffers(GLenum storage_flags_, GLenum map_flags_);
     ~StagingBuffers();
+
+    StagingBuffers(const StagingBuffers&) = delete;
+    StagingBuffers& operator=(const StagingBuffers&) = delete;
+    StagingBuffers(StagingBuffers&&) = delete;
+    StagingBuffers& operator=(StagingBuffers&&) = delete;
 
     StagingBufferMap RequestMap(size_t requested_size, bool insert_fence, bool deferred = false);
 
@@ -44,10 +59,12 @@ struct StagingBuffers {
     struct StagingBufferAlloc {
         OGLSync sync;
         OGLBuffer buffer;
-        u8* map;
-        size_t size;
-        size_t sync_index;
-        bool deferred;
+        u8* map{};
+        size_t size{};
+        size_t sync_index{};
+        u32 ref_count{};
+        bool deferred{};
+        bool insert_fence{};
     };
     std::vector<StagingBufferAlloc> allocs;
     GLenum storage_flags;
@@ -91,7 +108,12 @@ public:
     StagingBufferPool() = default;
     ~StagingBufferPool() = default;
 
-    StagingBufferMap RequestUploadBuffer(size_t size);
+    StagingBufferPool(const StagingBufferPool&) = delete;
+    StagingBufferPool& operator=(const StagingBufferPool&) = delete;
+    StagingBufferPool(StagingBufferPool&&) = delete;
+    StagingBufferPool& operator=(StagingBufferPool&&) = delete;
+
+    StagingBufferMap RequestUploadBuffer(size_t size, bool deferred = false);
     StagingBufferMap RequestDownloadBuffer(size_t size, bool deferred = false);
     void FreeDeferredStagingBuffer(StagingBufferMap& buffer);
 

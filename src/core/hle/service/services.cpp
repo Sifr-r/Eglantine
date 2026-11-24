@@ -95,8 +95,10 @@ Services::Services(std::shared_ptr<SM::ServiceManager>& sm, Core::System& system
         {"nvservices", &Nvidia::LoopProcess},
         {"bsdsocket",  &Sockets::LoopProcess},
     })
-        kernel.RunOnHostCoreProcess(std::string(e.first), [&system, f = e.second] { f(system); }).detach();
-    kernel.RunOnHostCoreProcess("vi",         [&, token] { VI::LoopProcess(system, token); }).detach();
+        host_threads.push_back(
+            kernel.RunOnHostCoreProcess(std::string(e.first), [&system, f = e.second] { f(system); }));
+    host_threads.push_back(
+        kernel.RunOnHostCoreProcess("vi", [&, token] { VI::LoopProcess(system, token); }));
     // Avoid cold clones of lambdas -- succintly
     for (auto const& e : std::vector<std::pair<std::string_view, void (*)(Core::System&)>>{
         {"sm",         &SM::LoopProcess},

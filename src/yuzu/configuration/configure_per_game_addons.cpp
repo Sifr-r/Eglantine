@@ -5,7 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <filesystem>
 #include <memory>
+#include <system_error>
 #include <utility>
 
 #include <fmt/format.h>
@@ -21,7 +23,9 @@
 
 #include "common/common_types.h"
 #include "common/fs/fs.h"
+#include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
+#include "common/logging.h"
 #include "configuration/addon/mod_select_dialog.h"
 #include "core/core.h"
 #include "core/file_sys/patch_manager.h"
@@ -236,12 +240,27 @@ void ConfigurePerGameAddons::AddonDeleteRequested(QList<QModelIndex> selected) {
     if (choice == QtCommon::Frontend::StandardButton::No)
         return;
 
+    QStringList failed;
     for (const QModelIndex& index : filtered) {
-        std::filesystem::remove_all(index.data(PATCH_LOCATION).toString().toStdString());
+        const auto patch_location = index.data(PATCH_LOCATION).toString().toStdString();
+        std::error_code ec;
+        std::filesystem::remove_all(std::filesystem::path{Common::FS::ToU8String(patch_location)},
+                                    ec);
+        if (ec) {
+            LOG_ERROR(Frontend, "Failed to delete mod '{}': {}", patch_location, ec.message());
+            failed << index.data().toString();
+        }
     }
 
-    QtCommon::Frontend::Information(tr("Successfully deleted"),
-                                    tr("Successfully deleted all selected mods."));
+    if (failed.empty()) {
+        QtCommon::Frontend::Information(tr("Successfully deleted"),
+                                        tr("Successfully deleted all selected mods."));
+    } else {
+        QtCommon::Frontend::Critical(
+            tr("Mod Delete Failed"),
+            tr("Failed to delete the following mods:\n\t%1\nCheck the log for details.")
+                .arg(failed.join(QStringLiteral("\n\t"))));
+    }
 
     item_model->removeRows(0, item_model->rowCount());
     list_items.clear();
@@ -302,7 +321,9 @@ void ConfigurePerGameAddons::LoadConfiguration() {
     const auto loader = Loader::GetLoader(system, file);
 
     FileSys::VirtualFile update_raw;
-    loader->ReadUpdateRaw(update_raw);
+    if (loader != nullptr) {
+        loader->ReadUpdateRaw(update_raw);
+    }
 
     const auto& disabled = Settings::values.disabled_addons[title_id];
 

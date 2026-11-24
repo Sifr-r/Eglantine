@@ -52,7 +52,11 @@ public:
     template <typename Derived>
         requires(std::derived_from<Derived, KAutoObject>)
     static KScopedAutoObject<Derived> Find(KernelCore& kernel, const char* name) {
-        return {kernel, static_cast<Derived*>(Find(kernel, name).GetPointerUnsafe())};
+        KScopedAutoObject obj = Find(kernel, name);
+        if (obj.IsNull()) {
+            return {kernel, nullptr};
+        }
+        return {kernel, obj->DynamicCast<Derived*>()};
     }
 
 private:

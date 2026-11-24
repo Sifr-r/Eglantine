@@ -32,12 +32,29 @@ s64 GetMaxPermissibleResidentMapCount() {
 
 HeapTracker::HeapTracker(Common::HostMemory& buffer)
     : m_buffer(buffer), m_max_resident_map_count(GetMaxPermissibleResidentMapCount()) {}
-HeapTracker::~HeapTracker() = default;
+
+HeapTracker::~HeapTracker() {
+    std::scoped_lock lk{m_rebuild_lock, m_lock};
+
+    auto it = m_mappings.begin();
+    while (it != m_mappings.end()) {
+        auto* const item = std::addressof(*it);
+        if (item->is_resident) {
+            m_resident_mappings.erase(m_resident_mappings.iterator_to(*item));
+            --m_resident_map_count;
+        }
+        --m_map_count;
+        it = m_mappings.erase(it);
+        delete item;
+    }
+}
 
 void HeapTracker::Map(size_t virtual_offset, size_t host_offset, size_t length,
                       MemoryPermission perm, bool is_separate_heap) {
     // When mapping other memory, map pages immediately.
     if (!is_separate_heap) {
+        std::shared_lock rebuild_lk{m_rebuild_lock};
+        std::scoped_lock lk{m_lock};
         m_buffer.Map(virtual_offset, host_offset, length, perm, false);
         return;
     }
@@ -65,10 +82,10 @@ void HeapTracker::Map(size_t virtual_offset, size_t host_offset, size_t length,
 }
 
 void HeapTracker::Unmap(size_t virtual_offset, size_t size, bool is_separate_heap) {
+    std::scoped_lock lk{m_rebuild_lock, m_lock};
+
     // If this is a separate heap...
     if (is_separate_heap) {
-        std::scoped_lock lk{m_lock};
-
         const SeparateHeapMap key{
             .vaddr = virtual_offset,
         };
@@ -170,6 +187,7 @@ bool HeapTracker::DeferredMapSeparateHeap(size_t virtual_offset) {
     bool rebuild_required = false;
 
     {
+        std::shared_lock rebuild_lk{m_rebuild_lock};
         std::scoped_lock lk{m_lock};
 
         // Check to ensure this was a non-resident separate heap mapping.
@@ -205,6 +223,10 @@ bool HeapTracker::DeferredMapSeparateHeap(size_t virtual_offset) {
 
 void HeapTracker::RebuildSeparateHeapAddressSpace() {
     std::scoped_lock lk{m_rebuild_lock, m_lock};
+
+    if (m_resident_map_count <= m_max_resident_map_count || m_resident_mappings.empty()) {
+        return;
+    }
 
     ASSERT(!m_resident_mappings.empty());
 

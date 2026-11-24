@@ -49,6 +49,40 @@ fpsimd_context* GetFloatingPointState(mcontext_t& host_ctx) {
 using namespace Common::Literals;
 constexpr u32 StackSize = 128_KiB;
 
+void ForwardHostSignal(const struct sigaction& orig_action, int sig, void* raw_info,
+                       void* raw_context) {
+    auto* const info = static_cast<siginfo_t*>(raw_info);
+    if ((orig_action.sa_flags & SA_SIGINFO) != 0 && orig_action.sa_sigaction != nullptr) {
+        orig_action.sa_sigaction(sig, info, raw_context);
+        return;
+    }
+
+    // si_code <= 0 means the signal was sent (kill, tgkill, raise) rather than raised by a faulting
+    // instruction, so returning does not deliver it again.
+    const bool sent = info != nullptr && info->si_code <= 0;
+    if (orig_action.sa_handler == SIG_IGN) {
+        if (sent) {
+            // Drop it, but keep this handler installed for guest faults.
+            return;
+        }
+        // The kernel kills on a faulting instruction whose signal is ignored.
+        Common::SigAction(sig, &orig_action, nullptr);
+        return;
+    }
+    if (orig_action.sa_handler == SIG_DFL || orig_action.sa_handler == nullptr) {
+        struct sigaction dfl{};
+        dfl.sa_handler = SIG_DFL;
+        Common::SigAction(sig, &dfl, nullptr);
+        if (sent) {
+            // Pending until this handler returns, then the default action runs.
+            raise(sig);
+        }
+        // Otherwise the instruction faults again on return.
+        return;
+    }
+    orig_action.sa_handler(sig);
+}
+
 } // namespace
 
 void* ArmNce::RestoreGuestContext(void* raw_context) {
@@ -194,44 +228,18 @@ bool ArmNce::HandleGuestIllegalInstruction(GuestContext* guest_ctx, void* raw_in
 }
 
 void ArmNce::HandleHostAlignmentFault(int sig, void* raw_info, void* raw_context) {
-    return g_orig_bus_action.sa_sigaction(sig, static_cast<siginfo_t*>(raw_info), raw_context);
+    ForwardHostSignal(g_orig_bus_action, sig, raw_info, raw_context);
 }
 
 void ArmNce::HandleHostAccessFault(int sig, void* raw_info, void* raw_context) {
-    return g_orig_segv_action.sa_sigaction(sig, static_cast<siginfo_t*>(raw_info), raw_context);
+    ForwardHostSignal(g_orig_segv_action, sig, raw_info, raw_context);
 }
 
 // Only SA_SIGINFO is looked at in the previous action's flags; SA_RESETHAND and SA_NODEFER are not
 // emulated. A library that installs its own SIGILL handler after NCE does replaces this one, and
 // guest SIGILLs then reach that handler instead.
 void ArmNce::HandleHostIllegalInstruction(int sig, void* raw_info, void* raw_context) {
-    auto* const info = static_cast<siginfo_t*>(raw_info);
-    if (g_orig_ill_action.sa_flags & SA_SIGINFO) {
-        return g_orig_ill_action.sa_sigaction(sig, info, raw_context);
-    }
-
-    // si_code <= 0 means the signal was sent (kill, tgkill, raise) rather than raised by a faulting
-    // instruction, so returning does not deliver it again.
-    const bool sent = info->si_code <= 0;
-    if (g_orig_ill_action.sa_handler == SIG_IGN) {
-        if (sent) {
-            // Drop it, but keep this handler installed for guest SIGILLs.
-            return;
-        }
-        // The kernel kills on a faulting instruction whose SIGILL is ignored.
-        Common::SigAction(sig, &g_orig_ill_action, nullptr);
-        return;
-    }
-    if (g_orig_ill_action.sa_handler == SIG_DFL) {
-        Common::SigAction(sig, &g_orig_ill_action, nullptr);
-        if (sent) {
-            // Pending until this handler returns, then the default action runs.
-            raise(sig);
-        }
-        // Otherwise the instruction faults again on return.
-        return;
-    }
-    g_orig_ill_action.sa_handler(sig);
+    ForwardHostSignal(g_orig_ill_action, sig, raw_info, raw_context);
 }
 
 void ArmNce::LockThread(Kernel::KThread* thread) {
@@ -376,7 +384,7 @@ void ArmNce::Initialize() {
         alignment_fault_action.sa_sigaction =
             reinterpret_cast<HandlerType>(&ArmNce::GuestAlignmentFaultSignalHandler);
         alignment_fault_action.sa_mask = signal_mask;
-        Common::SigAction(GuestAlignmentFaultSignal, &alignment_fault_action, nullptr);
+        Common::SigAction(GuestAlignmentFaultSignal, &alignment_fault_action, &g_orig_bus_action);
 
         struct sigaction access_fault_action {};
         access_fault_action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART;

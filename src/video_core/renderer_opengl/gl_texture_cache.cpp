@@ -583,7 +583,7 @@ void TextureCacheRuntime::Finish() {
 }
 
 StagingBufferMap TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {
-    return staging_buffer_pool.RequestUploadBuffer(size);
+    return staging_buffer_pool.RequestUploadBuffer(size, deferred);
 }
 
 StagingBufferMap TextureCacheRuntime::DownloadStagingBuffer(size_t size, bool deferred) {
@@ -741,7 +741,17 @@ Image::Image(TextureCacheRuntime& runtime_, const VideoCommon::ImageInfo& info_,
         gl_format = tuple.format;
         gl_type = tuple.type;
     }
-    const int max_host_mip_levels = std::bit_width(info.size.width);
+    const u32 max_dimension = [&] {
+        switch (info.type) {
+        case ImageType::e1D:
+            return info.size.width;
+        case ImageType::e3D:
+            return (std::max)(info.size.width, (std::max)(info.size.height, info.size.depth));
+        default:
+            return (std::max)(info.size.width, info.size.height);
+        }
+    }();
+    const int max_host_mip_levels = std::bit_width((std::max)(max_dimension, 1U));
     gl_num_levels = (std::min)(info.resources.levels, max_host_mip_levels);
     texture = MakeImage(info, gl_internal_format, gl_num_levels);
     current_texture = texture.handle;
@@ -1063,7 +1073,7 @@ void Image::Scale(bool up_scale) {
     const GLuint read_fbo = runtime->rescale_read_fbos[fbo_index].handle;
     const GLuint draw_fbo = runtime->rescale_draw_fbos[fbo_index].handle;
     for (s32 layer = 0; layer < info.resources.layers; ++layer) {
-        for (s32 level = 0; level < info.resources.levels; ++level) {
+        for (s32 level = 0; level < gl_num_levels; ++level) {
             const u32 src_level_width = (std::max)(1u, src_width >> level);
             const u32 src_level_height = (std::max)(1u, src_height >> level);
             const u32 dst_level_width = (std::max)(1u, dst_width >> level);
@@ -1422,8 +1432,13 @@ void FormatConversionPass::ConvertImage(Image& dst_image, Image& src_image,
     for (const ImageCopy& copy : copies) {
         const auto src_origin = MakeCopyOrigin(copy.src_offset, copy.src_subresource, src_target);
         const auto dst_origin = MakeCopyOrigin(copy.dst_offset, copy.dst_subresource, dst_target);
-        const auto region = MakeCopyRegion(copy.extent, copy.dst_subresource, dst_target);
-        const u32 copy_size = region.width * region.height * region.depth * img_bpp;
+        const auto src_region = MakeCopyRegion(copy.extent, copy.src_subresource, src_target);
+        const auto dst_region = MakeCopyRegion(copy.extent, copy.dst_subresource, dst_target);
+        const size_t src_copy_size = static_cast<size_t>(src_region.width) * src_region.height *
+                                     src_region.depth * img_bpp;
+        const size_t dst_copy_size = static_cast<size_t>(dst_region.width) * dst_region.height *
+                                     dst_region.depth * BytesPerBlock(dst_image.info.format);
+        const u32 copy_size = static_cast<u32>((std::max)(src_copy_size, dst_copy_size));
         if (pbo_size < copy_size) {
             intermediate_pbo.Create();
             pbo_size = Common::NextPow2(copy_size);
@@ -1433,18 +1448,31 @@ void FormatConversionPass::ConvertImage(Image& dst_image, Image& src_image,
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glPixelStorei(GL_PACK_ROW_LENGTH, copy.extent.width);
         glBindBuffer(GL_PIXEL_PACK_BUFFER, intermediate_pbo.handle);
-        glGetTextureSubImage(src_image.Handle(), src_origin.level, src_origin.x, src_origin.y,
-                             src_origin.z, region.width, region.height, region.depth,
-                             src_image.GlFormat(), src_image.GlType(),
-                             static_cast<GLsizei>(pbo_size), nullptr);
+        if (src_target == GL_TEXTURE_1D_ARRAY) {
+            glGetTextureSubImage(src_image.Handle(), src_origin.level, src_origin.x, src_origin.z,
+                                 0, src_region.width, src_region.depth, 1, src_image.GlFormat(),
+                                 src_image.GlType(), static_cast<GLsizei>(pbo_size), nullptr);
+        } else {
+            glGetTextureSubImage(src_image.Handle(), src_origin.level, src_origin.x, src_origin.y,
+                                 src_origin.z, src_region.width, src_region.height,
+                                 src_region.depth, src_image.GlFormat(), src_image.GlType(),
+                                 static_cast<GLsizei>(pbo_size), nullptr);
+        }
 
         // Copy from PBO to destination in desired GL format
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, copy.extent.width);
         glBindBuffer(GL_PIXEL_UNPACK_BUFFER, intermediate_pbo.handle);
-        glTextureSubImage3D(dst_image.Handle(), dst_origin.level, dst_origin.x, dst_origin.y,
-                            dst_origin.z, region.width, region.height, region.depth,
-                            dst_image.GlFormat(), dst_image.GlType(), nullptr);
+        if (dst_target == GL_TEXTURE_1D_ARRAY) {
+            glTextureSubImage2D(dst_image.Handle(), dst_origin.level, dst_origin.x, dst_origin.z,
+                                dst_region.width, dst_region.depth, dst_image.GlFormat(),
+                                dst_image.GlType(), nullptr);
+        } else {
+            glTextureSubImage3D(dst_image.Handle(), dst_origin.level, dst_origin.x, dst_origin.y,
+                                dst_origin.z, dst_region.width, dst_region.height,
+                                dst_region.depth, dst_image.GlFormat(), dst_image.GlType(),
+                                nullptr);
+        }
     }
 
     // Swap component order of S8D24 to ABGR8 reinterprets

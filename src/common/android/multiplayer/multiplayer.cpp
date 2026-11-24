@@ -15,6 +15,7 @@
 #include "web_service/verify_user_jwt.h"
 #include "web_service/web_result.h"
 
+#include <algorithm>
 #include <thread>
 #include <chrono>
 
@@ -33,7 +34,14 @@ void AndroidMultiplayer::AddNetPlayMessage(jint type, jstring msg) {
 
 void AndroidMultiplayer::AddNetPlayMessage(int type, const std::string &msg) {
     JNIEnv *env = IDCache::GetEnvForThread();
-    AddNetPlayMessage(type, Common::Android::ToJString(env, msg));
+    if (env == nullptr) {
+        return;
+    }
+    jstring j_msg = Common::Android::ToJString(env, msg);
+    AddNetPlayMessage(static_cast<jint>(type), j_msg);
+    if (j_msg != nullptr) {
+        env->DeleteLocalRef(j_msg);
+    }
 }
 
 void AndroidMultiplayer::ClearChat() {
@@ -180,7 +188,7 @@ NetPlayStatus AndroidMultiplayer::NetPlayCreateRoom(const std::string &ipaddress
     port = (port == 0) ? Network::DefaultRoomPort : static_cast<u16>(port);
 
     if (!room->Create(room_name, "", ipaddress, static_cast<u16>(port), password,
-                      static_cast<u32>(std::min(max_players, 16)), username, game,
+                      static_cast<u32>(std::clamp(max_players, 1, 16)), username, game,
                       CreateVerifyBackend(isPublic), {})) {
         return NetPlayStatus::CREATE_ROOM_ERROR;
     }
@@ -237,6 +245,11 @@ NetPlayStatus AndroidMultiplayer::NetPlayCreateRoom(const std::string &ipaddress
     }
 
     // If join failed while room is created, clean up the room
+    if (isPublic) {
+        if (auto session = announce_multiplayer_session.lock()) {
+            session->Stop();
+        }
+    }
     room->Destroy();
     return NetPlayStatus::CREATE_ROOM_ERROR;
 }

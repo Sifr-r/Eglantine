@@ -11,11 +11,18 @@
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/file_sys/program_metadata.h"
+#include "core/hle/kernel/global_scheduler_context.h"
+#include "core/hle/kernel/k_condition_variable.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_scheduler.h"
+#include "core/hle/kernel/k_scoped_resource_reservation.h"
+#include "core/hle/kernel/k_thread_queue.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/svc_common.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/heap_mapper.h"
 #include "core/hle/service/nx2_gsv.h"
+#include "core/memory.h"
 #include "tests/core/system_test_context.h"
 #include "video_core/host1x/host1x.h"
 
@@ -113,6 +120,101 @@ TEST_CASE("The kernel keeps its object list container after the shutdown", "[nx2
     // in the guest RAM arena that the system frees before it destroys the kernel.
     CHECK(kernel.ObjectListContainer().GetOwnedCount(nullptr) == 0);
     CHECK(objects_before > 0);
+}
+
+TEST_CASE("Mutex unlock wakes a condition variable waiter transferred to its owner",
+          "[core][condition-variable]") {
+    const ScopedSystemTestContext context;
+    Core::System system;
+    system.Initialize();
+    auto& kernel = system.Kernel();
+    kernel.Initialize();
+    SCOPE_EXIT { system.ShutdownMainProcess(); };
+
+    auto* process = Kernel::KProcess::Create(kernel);
+    REQUIRE(process != nullptr);
+    Kernel::KProcess::Register(kernel, process);
+    SCOPE_EXIT { process->Close(kernel); };
+    const auto metadata = FileSys::ProgramMetadata::GetDefault();
+    REQUIRE(process->LoadFromMetadata(kernel, metadata, Kernel::PageSize, {}, 0).IsSuccess());
+
+    Kernel::KScopedResourceReservation memory_reservation(
+        kernel, process, Kernel::Svc::LimitableResource::PhysicalMemoryMax, Kernel::PageSize);
+    REQUIRE(memory_reservation.Succeeded());
+    Kernel::KProcessAddress mutex_address{};
+    REQUIRE(process->GetPageTable().MapPages(&mutex_address, 1, Kernel::KMemoryState::Stack,
+                                             Kernel::KMemoryPermission::UserReadWrite)
+                .IsSuccess());
+    SCOPE_EXIT {
+        CHECK(process->GetPageTable().UnmapPages(mutex_address, 1, Kernel::KMemoryState::Stack)
+                  .IsSuccess());
+    };
+
+    const auto initialize_thread = [&](Kernel::KThread*& thread) {
+        Kernel::KScopedResourceReservation reservation(
+            kernel, process, Kernel::Svc::LimitableResource::ThreadCountMax);
+        REQUIRE(reservation.Succeeded());
+        thread = Kernel::KThread::Create(kernel);
+        REQUIRE(thread != nullptr);
+        REQUIRE(Kernel::KThread::InitializeUserThread(system, thread, {}, 0,
+                                                      mutex_address + Kernel::PageSize, 0x2c, 0,
+                                                      process)
+                    .IsSuccess());
+        Kernel::KThread::Register(kernel, thread);
+        reservation.Commit();
+    };
+
+    Kernel::KThread* owner{};
+    SCOPE_EXIT {
+        if (owner) {
+            kernel.GlobalSchedulerContext().RemoveThread(owner);
+            owner->Close(kernel);
+        }
+    };
+    initialize_thread(owner);
+    Kernel::KThread* waiter{};
+    SCOPE_EXIT {
+        if (waiter) {
+            kernel.GlobalSchedulerContext().RemoveThread(waiter);
+            waiter->Close(kernel);
+        }
+    };
+    initialize_thread(waiter);
+
+    auto* original_thread = Kernel::GetCurrentThreadPointer(kernel);
+    Kernel::SetCurrentThread(kernel, owner);
+    owner->EnableDispatch(kernel);
+    SCOPE_EXIT {
+        owner->DisableDispatch(kernel);
+        Kernel::SetCurrentThread(kernel, original_thread);
+    };
+
+    auto& memory = process->GetMemory();
+    const auto address = GetInteger(mutex_address);
+    constexpr u32 OwnerTag = 0x8000;
+    constexpr u32 WaiterTag = 0x8001;
+    memory.Write32(address, OwnerTag | Kernel::Svc::HandleWaitMask);
+
+    Kernel::KThreadQueue queue{kernel};
+    Kernel::KScopedSchedulerLock lock{kernel};
+    // Start immediately after the condition variable signal moved the waiter to the mutex owner.
+    waiter->SetUserAddressKey(mutex_address, WaiterTag);
+    owner->AddWaiter(kernel, waiter);
+    waiter->BeginWait(kernel, &queue);
+    waiter->SetWaitReasonForDebugging(Kernel::ThreadWaitReasonForDebugging::ConditionVar);
+    SCOPE_EXIT {
+        if (waiter->GetLockOwner(kernel) == owner) {
+            owner->RemoveWaiter(kernel, waiter);
+        }
+        waiter->ClearWaitQueue();
+        waiter->SetState(kernel, Kernel::ThreadState::Initialized);
+    };
+
+    CHECK(Kernel::KConditionVariable::SignalToAddress(kernel, mutex_address) == ResultSuccess);
+    CHECK(memory.Read32(address) == WaiterTag);
+    CHECK(waiter->GetLockOwner(kernel) == nullptr);
+    CHECK(waiter->GetState() == Kernel::ThreadState::Runnable);
+    CHECK(waiter->GetWaitResult() == ResultSuccess);
 }
 
 TEST_CASE("Nvidia Container::WithSession safely guards active sessions across close races",

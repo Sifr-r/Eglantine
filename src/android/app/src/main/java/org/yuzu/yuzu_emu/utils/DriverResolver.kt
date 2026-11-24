@@ -284,6 +284,27 @@ object DriverResolver {
         )
     }
 
+    private fun resolveContainedFile(parentDir: File, filename: String): File {
+        val safeName = filename
+            .substringAfterLast('/')
+            .substringAfterLast('\\')
+            .trim()
+        if (safeName.isEmpty() || safeName == "." || safeName == ".." || safeName.contains('\u0000')) {
+            throw IOException("Invalid driver filename: $filename")
+        }
+        val canonicalParent = parentDir.canonicalFile
+        val candidate = File(canonicalParent, safeName).canonicalFile
+        val parentPrefix = if (canonicalParent.path.endsWith(File.separator)) {
+            canonicalParent.path
+        } else {
+            canonicalParent.path + File.separator
+        }
+        if (!candidate.path.startsWith(parentPrefix)) {
+            throw IOException("Driver path escapes target directory: $filename")
+        }
+        return candidate
+    }
+
     /**
      * Download a driver file to the cache directory
      * @param resolvedDriver The resolved driver information
@@ -304,7 +325,7 @@ object DriverResolver {
                 val cacheDir = context.externalCacheDir ?: throw IOException("Failed to access cache directory")
                 cacheDir.mkdirs()
 
-                val file = File(cacheDir, resolvedDriver.filename)
+                val file = resolveContainedFile(cacheDir, resolvedDriver.filename)
 
                 // If file already exists in cache and has content, return it
                 if (file.exists() && file.length() > 0) {
@@ -372,12 +393,16 @@ object DriverResolver {
         context: Context,
         onProgress: ((Float) -> Unit)? = null
     ): Uri? {
-        // Extract filename from path (support both separators)
-        val filename = driverPath.substringAfterLast('/').substringAfterLast('\\')
-
-        // Check if driver already exists locally
-        val localPath = "${GpuDriverHelper.driverStoragePath}$filename"
-        val localFile = File(localPath)
+        // Validate and resolve against internal driver storage
+        val storageDir = File(GpuDriverHelper.driverStoragePath)
+        val localFile = try {
+            resolveContainedFile(storageDir, driverPath)
+        } catch (e: IOException) {
+            Log.error("[DriverResolver] Invalid driver path '$driverPath': ${e.message}")
+            return null
+        }
+        val filename = localFile.name
+        val localPath = localFile.path
 
         if (localFile.exists() && localFile.length() > 0) {
             Log.info("[DriverResolver] Driver already exists locally: $localPath")
@@ -404,9 +429,10 @@ object DriverResolver {
         val downloadedUri = Uri.fromFile(downloadedFile)
         if (GpuDriverHelper.copyDriverToInternalStorage(downloadedUri)) {
             Log.info("[DriverResolver] Successfully installed driver to internal storage")
+            val installedFile = File(GpuDriverHelper.driverStoragePath, downloadedFile.name)
             // Clean up cache file
             downloadedFile.delete()
-            return Uri.fromFile(File(localPath))
+            return Uri.fromFile(installedFile)
         } else {
             Log.error("[DriverResolver] Failed to copy driver to internal storage")
             downloadedFile.delete()

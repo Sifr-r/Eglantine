@@ -147,15 +147,19 @@ void ConfigureGraphics::PopulateVSyncModeSelection(bool use_setting) {
     const int current_index = //< current selected vsync mode from combobox
         vsync_mode_combobox->currentIndex();
     const auto current_mode = //< current selected vsync mode as a VkPresentModeKHR
-        current_index == -1 || use_setting
+        current_index < 0 ||
+                static_cast<std::size_t>(current_index) >= vsync_mode_combobox_enum_map.size() ||
+                use_setting
             ? VSyncSettingToMode(Settings::values.vsync_mode.GetValue())
-            : vsync_mode_combobox_enum_map[current_index];
+            : vsync_mode_combobox_enum_map[static_cast<std::size_t>(current_index)];
     int index{};
     const int device{vulkan_device_combobox->currentIndex()}; //< current selected Vulkan device
 
     const auto& present_modes = //< relevant vector of present modes for the selected device or API
-        backend == Settings::RendererBackend::Vulkan && device > -1 ? device_present_modes[device]
-                                                                    : default_present_modes;
+        backend == Settings::RendererBackend::Vulkan && device >= 0 &&
+                static_cast<std::size_t>(device) < device_present_modes.size()
+            ? device_present_modes[static_cast<std::size_t>(device)]
+            : default_present_modes;
 
     vsync_mode_combobox->clear();
     vsync_mode_combobox_enum_map.clear();
@@ -190,11 +194,16 @@ void ConfigureGraphics::PopulateVSyncModeSelection(bool use_setting) {
 
 void ConfigureGraphics::UpdateVsyncSetting() const {
     const Settings::RendererBackend backend{GetCurrentGraphicsBackend()};
-    if (backend == Settings::RendererBackend::Null) {
+    if (backend == Settings::RendererBackend::Null || vsync_mode_combobox == nullptr) {
         return;
     }
 
-    const auto mode = vsync_mode_combobox_enum_map[vsync_mode_combobox->currentIndex()];
+    const int idx = vsync_mode_combobox->currentIndex();
+    if (idx < 0 || static_cast<std::size_t>(idx) >= vsync_mode_combobox_enum_map.size()) {
+        return;
+    }
+
+    const auto mode = vsync_mode_combobox_enum_map[static_cast<std::size_t>(idx)];
     const auto vsync_mode = PresentModeToSetting(mode);
     Settings::values.vsync_mode.SetValue(vsync_mode);
 }

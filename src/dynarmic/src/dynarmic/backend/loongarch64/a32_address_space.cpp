@@ -8,6 +8,7 @@
 #include "dynarmic/backend/loongarch64/a32_jitstate.h"
 #include "dynarmic/backend/loongarch64/abi.h"
 #include "dynarmic/backend/loongarch64/emit_loongarch64.h"
+#include "dynarmic/backend/loongarch64/stack_layout.h"
 #include "dynarmic/frontend/A32/a32_location_descriptor.h"
 #include "dynarmic/frontend/A32/translate/a32_translate.h"
 #include "dynarmic/ir/opt_passes.h"
@@ -55,12 +56,17 @@ void A32AddressSpace::ClearCache() {
 void A32AddressSpace::EmitPrelude() {
     prelude_info.run_code = GetCursorPtr<PreludeInfo::RunCodeFuncType>();
 
-    // Save all GPRs except sp (r3) and tp (r2)
-    la_addi_d(&cb.as, LA_SP, LA_SP, -64 * 8);
+    constexpr int32_t stack_layout_size = static_cast<int32_t>(sizeof(StackLayout));
+    constexpr int32_t frame_size = 64 * 8 + stack_layout_size;
+    static_assert(frame_size <= 2047);
+    static_assert(frame_size % 16 == 0);
+
+    // Save all GPRs except sp (r3) and tp (r2) above StackLayout
+    la_addi_d(&cb.as, LA_SP, LA_SP, -frame_size);
     for (u32 i = 1; i < 32; i++) {
         if (i == LA_SP || i == LA_TP)
             continue;
-        la_st_d(&cb.as, static_cast<la_gpr_t>(i), LA_SP, static_cast<int32_t>(i * 8));
+        la_st_d(&cb.as, static_cast<la_gpr_t>(i), LA_SP, stack_layout_size + static_cast<int32_t>(i * 8));
     }
 
     // Set up reserved registers and jump to block entry
@@ -74,9 +80,9 @@ void A32AddressSpace::EmitPrelude() {
     for (u32 i = 1; i < 32; i++) {
         if (i == LA_SP || i == LA_TP)
             continue;
-        la_ld_d(&cb.as, static_cast<la_gpr_t>(i), LA_SP, static_cast<int32_t>(i * 8));
+        la_ld_d(&cb.as, static_cast<la_gpr_t>(i), LA_SP, stack_layout_size + static_cast<int32_t>(i * 8));
     }
-    la_addi_d(&cb.as, LA_SP, LA_SP, 64 * 8);
+    la_addi_d(&cb.as, LA_SP, LA_SP, frame_size);
     la_ret(&cb.as);
 
     prelude_info.end_of_prelude = GetCursorPtr<CodePtr>();

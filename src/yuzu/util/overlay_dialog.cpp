@@ -47,6 +47,17 @@ OverlayDialog::OverlayDialog(QWidget* parent, Core::System& system, const QStrin
     // TODO (Morph): Remove this when InputInterpreter no longer relies on the HID backend
     if (system.IsPoweredOn() && !ui->buttonsDialog->isHidden()) {
         input_interpreter = std::make_unique<InputInterpreter>(system);
+        input_timer.setInterval(50);
+        connect(&input_timer, &QTimer::timeout, this, [this] {
+            if (!input_interpreter) {
+                return;
+            }
+            input_interpreter->PollInput();
+            HandleButtonPressedOnce<Core::HID::NpadButton::A, Core::HID::NpadButton::B,
+                                    Core::HID::NpadButton::Left, Core::HID::NpadButton::Right,
+                                    Core::HID::NpadButton::StickLLeft,
+                                    Core::HID::NpadButton::StickLRight>();
+        });
 
         StartInputThread();
     }
@@ -233,20 +244,13 @@ void OverlayDialog::TranslateButtonPress(Core::HID::NpadButton button) {
 }
 
 void OverlayDialog::StartInputThread() {
-    input_thread = std::jthread([&](std::stop_token stoken) {
-        while (!stoken.stop_requested()) {
-            input_interpreter->PollInput();
-            HandleButtonPressedOnce<Core::HID::NpadButton::A, Core::HID::NpadButton::B,
-                                    Core::HID::NpadButton::Left, Core::HID::NpadButton::Right,
-                                    Core::HID::NpadButton::StickLLeft,
-                                    Core::HID::NpadButton::StickLRight>();
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-    });
+    if (input_interpreter) {
+        input_timer.start();
+    }
 }
 
 void OverlayDialog::StopInputThread() {
-    input_thread.request_stop();
+    input_timer.stop();
 }
 
 void OverlayDialog::keyPressEvent(QKeyEvent* e) {

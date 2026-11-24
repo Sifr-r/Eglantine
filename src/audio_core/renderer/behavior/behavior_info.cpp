@@ -113,7 +113,7 @@ bool BehaviorInfo::IsCommandProcessingTimeEstimatorVersion4Supported() const {
 }
 
 bool BehaviorInfo::IsCommandProcessingTimeEstimatorVersion5Supported() const {
-    return CheckFeatureSupported(SupportTags::CommandProcessingTimeEstimatorVersion4,
+    return CheckFeatureSupported(SupportTags::CommandProcessingTimeEstimatorVersion5,
                                  user_revision);
 }
 

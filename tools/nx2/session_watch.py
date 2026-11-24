@@ -325,12 +325,23 @@ class Watcher:
             shutil.copy2(self.a.log, self.out / "eden_log.txt")
         except OSError:
             pass
-        j = subprocess.run(["journalctl", "--since", f"@{int(self.started)}", "--no-pager"],
-                           capture_output=True, text=True).stdout
-        hits = [x for x in j.splitlines()
-                if re.search(r"eglantine.*(segfault|trap)|\(eglantine\).*terminated abnormally", x)]
+        journalctl = shutil.which("journalctl")
+        if not journalctl:
+            journal_lines = ["journalctl not installed"]
+        else:
+            try:
+                r = subprocess.run([journalctl, "--since", f"@{int(self.started)}", "--no-pager"],
+                                   capture_output=True, text=True, timeout=30)
+                hits = [x for x in r.stdout.splitlines()
+                        if re.search(r"eglantine.*(segfault|trap)|\(eglantine\).*terminated abnormally", x)]
+                if r.returncode != 0 and not hits:
+                    journal_lines = [f"journalctl exited with {r.returncode}"]
+                else:
+                    journal_lines = hits[-5:] or ["no crash line in the journal"]
+            except (OSError, subprocess.SubprocessError) as e:
+                journal_lines = [f"journalctl failed: {e}"]
         report += ["", "## Kernel / systemd", "```",
-                   *(hits[-5:] or ["no crash line in the journal"]), "```",
+                   *journal_lines, "```",
                    "", "## Last log events", "```"]
         report += [f"{e['seq']} [{e['kind']}] {e['source']}: {e['msg'][:160]}" for e in recent]
         report += ["```", "", "## Last IPC calls (full list in ipc-tail.jsonl)", "```"]

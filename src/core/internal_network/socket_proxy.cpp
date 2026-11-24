@@ -101,6 +101,8 @@ std::pair<ProxySocket::AcceptResult, Errno> ProxySocket::Accept() {
 
 Errno ProxySocket::Connect(SockAddrIn addr_in) {
     LOG_WARNING(Network, "(STUBBED) called");
+    std::lock_guard guard(packets_mutex);
+    remote_endpoint = addr_in;
     return Errno::SUCCESS;
 }
 
@@ -246,7 +248,33 @@ std::pair<s32, Errno> ProxySocket::SendTo(u32 flags, std::span<const u8> message
                                           const SockAddrIn* addr) {
     ASSERT((flags & ~FLAG_MSG_DONTWAIT) == 0);
 
-    if (!is_bound) {
+    bool is_closed{};
+    bool bound{};
+    bool broadcast_enabled{};
+    Protocol sock_protocol{};
+    SockAddrIn source_endpoint{};
+    std::optional<SockAddrIn> connected_endpoint{};
+    {
+        std::lock_guard guard(packets_mutex);
+        is_closed = closed;
+        bound = is_bound;
+        broadcast_enabled = broadcast;
+        sock_protocol = protocol;
+        source_endpoint = local_endpoint;
+        connected_endpoint = remote_endpoint;
+    }
+
+    if (is_closed) {
+        return {-1, Errno::BADF};
+    }
+
+    const std::optional<SockAddrIn> target_endpoint =
+        addr != nullptr ? std::optional<SockAddrIn>{*addr} : connected_endpoint;
+    if (!target_endpoint) {
+        return {-1, Errno::NOTCONN};
+    }
+
+    if (!bound) {
         LOG_ERROR(Network, "ProxySocket is not bound!");
         return {static_cast<s32>(message.size()), Errno::SUCCESS};
     }
@@ -258,12 +286,12 @@ std::pair<s32, Errno> ProxySocket::SendTo(u32 flags, std::span<const u8> message
     }
 
     ProxyPacket packet;
-    packet.local_endpoint = local_endpoint;
-    packet.remote_endpoint = *addr;
-    packet.protocol = protocol;
-    packet.broadcast = broadcast && packet.remote_endpoint.ip[3] == 255;
+    packet.local_endpoint = source_endpoint;
+    packet.remote_endpoint = *target_endpoint;
+    packet.protocol = sock_protocol;
+    packet.broadcast = broadcast_enabled && packet.remote_endpoint.ip[3] == 255;
 
-    auto& ip = local_endpoint.ip;
+    auto& ip = source_endpoint.ip;
     auto ipv4 = Network::GetHostIPv4Address();
     // If the ip is all zeroes (INADDR_ANY) or if it matches the hosts ip address,
     // replace it with a "fake" routing address

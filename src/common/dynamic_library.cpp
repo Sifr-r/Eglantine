@@ -83,6 +83,7 @@ std::string DynamicLibrary::GetVersionedFilename(const char* libname, int major,
 }
 
 bool DynamicLibrary::Open(const char* filename) {
+    Close();
 #ifdef _WIN32
     handle = reinterpret_cast<void*>(LoadLibraryA(filename));
 #else

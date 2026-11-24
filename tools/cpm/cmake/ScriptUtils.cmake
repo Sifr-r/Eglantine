@@ -150,13 +150,37 @@ function(format_cpmfile)
     set(tmp_file ${TMP}/cpmfile.json)
 
     execute_process(COMMAND ${command}
-        INPUT_FILE ${file}
-        OUTPUT_FILE ${tmp_file})
+        INPUT_FILE "${file}"
+        OUTPUT_FILE "${tmp_file}"
+        RESULT_VARIABLE format_res
+        ERROR_VARIABLE format_err)
 
-    # TODO: error handling, mv, cp?
-    file(COPY_FILE ${tmp_file} ${file})
+    if (NOT "${format_res}" STREQUAL "0")
+        file(REMOVE_RECURSE "${TMP}")
+        fatal("Failed to format ${file} (result ${format_res}): ${format_err}")
+    endif()
 
-    file(REMOVE_RECURSE ${TMP})
+    if (NOT EXISTS "${tmp_file}")
+        file(REMOVE_RECURSE "${TMP}")
+        fatal("Formatter did not produce ${tmp_file}")
+    endif()
+
+    file(SIZE "${tmp_file}" tmp_size)
+    if (NOT tmp_size GREATER 0)
+        file(REMOVE_RECURSE "${TMP}")
+        fatal("Formatter produced empty output for ${file}")
+    endif()
+
+    file(READ "${tmp_file}" tmp_content)
+    string(JSON json_type ERROR_VARIABLE json_err TYPE "${tmp_content}")
+    if (json_err OR NOT "${json_type}" STREQUAL "OBJECT")
+        file(REMOVE_RECURSE "${TMP}")
+        fatal("Formatter produced invalid JSON for ${file}: ${json_err}")
+    endif()
+
+    file(COPY_FILE "${tmp_file}" "${file}")
+
+    file(REMOVE_RECURSE "${TMP}")
 endfunction()
 
 # Computes expected SHA512 hash of a package
@@ -246,7 +270,7 @@ function(get_latest_tag out)
     # strip out prefixes e.g. boost-, openssl-, v
     # NOTE: subrels e.g. -1 at the end may cause issues.
     string(REGEX REPLACE "[^0-9.-]" "" t_numeric_version "${version}")
-    string(REGEX REPLACE "-$|^-" "" t_numeric_version "${numeric_version}")
+    string(REGEX REPLACE "-$|^-" "" t_numeric_version "${t_numeric_version}")
 
     # now api req
     cpm_download_var("${api}${endpoint}" tags)

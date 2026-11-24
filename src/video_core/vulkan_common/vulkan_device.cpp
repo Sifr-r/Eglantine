@@ -15,6 +15,8 @@
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <random>
+#include <system_error>
 #include <thread>
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
@@ -744,7 +746,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
 
     // VK_EXT_descriptor_buffer requires VK_KHR_buffer_device_address
-    if (extensions.descriptor_buffer && !features.buffer_device_address.bufferDeviceAddress) {
+    if (extensions.descriptor_buffer && !extensions.buffer_device_address) {
         LOG_WARNING(Render_Vulkan, "Descriptor buffer needs buffer device address, disabling.");
         RemoveExtensionFeature(extensions.descriptor_buffer, features.descriptor_buffer,
                                VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
@@ -778,10 +780,17 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         features.shader_float16_int8.shaderFloat16 = VK_TRUE;
     }
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
+    if (!HasSynchronization2()) {
+        dld.vkCmdPipelineBarrier2 = nullptr;
+        dld.vkQueueSubmit2 = nullptr;
+    }
     features.shader_float16_int8.shaderFloat16 = float16_math;
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
+    if (video_decode_family) {
+        video_decode_queue = logical.GetQueue(*video_decode_family);
+    }
 
 #ifdef EGLANTINE_STREAMLINE
     if (streamline_extensions) {
@@ -850,7 +859,11 @@ Device::~Device() {
         Streamline::Stop();
     }
 #endif
-    SaveStaticPipelineCache();
+    try {
+        SaveStaticPipelineCache();
+    } catch (...) {
+        // Best effort: a failed save must not stop the device teardown.
+    }
     ShutdownGPULogging();
     for (auto& pools : separate_pools) {
         for (VmaPool pool : pools) {
@@ -884,30 +897,55 @@ VmaPool Device::GetSeparatePool(SeparatePool kind, u32 memory_type) const {
 }
 
 void Device::LoadStaticPipelineCache() {
-    const auto create = [this](size_t size, const void* data) {
+    const auto create = [this](std::span<const char> data) {
         static_pipeline_cache = logical.CreatePipelineCache({
             .sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO,
             .pNext = nullptr,
             .flags = 0,
-            .initialDataSize = size,
-            .pInitialData = data,
+            .initialDataSize = data.size(),
+            .pInitialData = data.empty() ? nullptr : data.data(),
         });
     };
     if (!owns_static_pipeline_cache) {
-        create(0, nullptr);
+        create({});
         return;
     }
-    const auto filename = StaticPipelineCacheFilename();
+    // Device can outlive the path manager during process teardown.
+    static_pipeline_cache_filename = StaticPipelineCacheFilename();
+    const auto& filename = static_pipeline_cache_filename;
     if (filename.empty()) {
-        create(0, nullptr);
+        create({});
         return;
     }
+    CreateStaticPipelineCache(ReadStaticPipelineCache(filename), create);
+}
+
+void Device::SaveStaticPipelineCache() const {
+    if (!owns_static_pipeline_cache || !static_pipeline_cache) {
+        return;
+    }
+    const auto& filename = static_pipeline_cache_filename;
+    if (filename.empty()) {
+        return;
+    }
+    size_t size = 0;
+    std::vector<char> data;
+    if (static_pipeline_cache.Read(&size, nullptr) != VK_SUCCESS || size == 0) {
+        return;
+    }
+    data.resize(size);
+    if (static_pipeline_cache.Read(&size, data.data()) != VK_SUCCESS) {
+        return;
+    }
+    WriteStaticPipelineCache(filename, std::span{data}.first(size));
+}
+
+std::vector<char> ReadStaticPipelineCache(const std::filesystem::path& filename) {
     std::vector<char> data;
     try {
         std::ifstream file(filename, std::ios::binary | std::ios::ate);
         if (!file.is_open()) {
-            create(0, nullptr);
-            return;
+            return {};
         }
         file.exceptions(std::ifstream::failbit | std::ifstream::badbit);
         const size_t total = static_cast<size_t>(file.tellg());
@@ -915,52 +953,73 @@ void Device::LoadStaticPipelineCache() {
         std::array<char, 8> magic{};
         u32 version{};
         if (total < magic.size() + sizeof(version)) {
-            create(0, nullptr);
-            return;
+            return {};
         }
         file.read(magic.data(), magic.size())
             .read(reinterpret_cast<char*>(&version), sizeof(version));
         if (magic != STATIC_CACHE_MAGIC_NUMBER || version != STATIC_CACHE_VERSION) {
-            create(0, nullptr);
-            return;
+            return {};
         }
         data.resize(total - magic.size() - sizeof(version));
         file.read(data.data(), static_cast<std::streamsize>(data.size()));
-    } catch (const std::ios_base::failure& e) {
-        create(0, nullptr);
-        return;
+    } catch (const std::ios_base::failure&) {
+        return {};
     }
-    create(data.size(), data.empty() ? nullptr : data.data());
+    return data;
 }
 
-void Device::SaveStaticPipelineCache() const {
-    if (!owns_static_pipeline_cache || !static_pipeline_cache) {
-        return;
-    }
-    const auto filename = StaticPipelineCacheFilename();
-    if (filename.empty()) {
-        return;
-    }
-    size_t size = 0;
-    std::vector<char> data;
-    static_pipeline_cache.Read(&size, nullptr);
-    if (size == 0) {
-        return;
-    }
-    data.resize(size);
-    static_pipeline_cache.Read(&size, data.data());
+bool WriteStaticPipelineCache(const std::filesystem::path& filename, std::span<const char> data) {
+    return WriteStaticPipelineCache(filename, data, [] {
+        // Unique per writer: two instances saving at once each rename a whole file.
+        std::random_device random;
+        return fmt::format(".{:08x}{:08x}.tmp", random(), random());
+    });
+}
+
+bool WriteStaticPipelineCache(const std::filesystem::path& filename, std::span<const char> data,
+                              const std::function<std::string()>& unique_suffix) {
+    auto temporary = filename;
     try {
-        std::ofstream file(filename, std::ios::binary | std::ios::trunc);
-        file.exceptions(std::ofstream::failbit);
-        if (!file.is_open()) {
-            return;
-        }
+        temporary += unique_suffix();
+    } catch (const std::exception& e) {
+        LOG_ERROR(Render_Vulkan, "Couldn't name a temporary static pipeline cache: {}", e.what());
+        return false;
+    }
+    try {
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        file.exceptions(std::ofstream::failbit | std::ofstream::badbit);
         file.write(STATIC_CACHE_MAGIC_NUMBER.data(), STATIC_CACHE_MAGIC_NUMBER.size())
             .write(reinterpret_cast<const char*>(&STATIC_CACHE_VERSION),
                    sizeof(STATIC_CACHE_VERSION))
-            .write(data.data(), static_cast<std::streamsize>(size));
-    } catch (const std::ios_base::failure& e) {
-        Common::FS::RemoveFile(filename);
+            .write(data.data(), static_cast<std::streamsize>(data.size()));
+        file.close();
+    } catch (const std::ios_base::failure&) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return false;
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, filename, error);
+    if (error) {
+        LOG_ERROR(Render_Vulkan, "Couldn't replace the static pipeline cache: {}", error.message());
+        Common::FS::RemoveFile(temporary);
+        return false;
+    }
+    return true;
+}
+
+void CreateStaticPipelineCache(std::span<const char> data,
+                               const std::function<void(std::span<const char>)>& create) {
+    if (data.empty()) {
+        create({});
+        return;
+    }
+    try {
+        create(data);
+    } catch (const vk::Exception& e) {
+        LOG_ERROR(Render_Vulkan, "Driver rejected the static pipeline cache ({}), starting empty",
+                  e.what());
+        create({});
     }
 }
 
@@ -1105,10 +1164,6 @@ bool Device::GetSuitability(bool requires_swapchain) {
     bool suitable = true;
 
     // Configure properties.
-    VkPhysicalDeviceVulkan12Features features_1_2{};
-    VkPhysicalDeviceVulkan13Features features_1_3{};
-
-    // Configure properties.
     properties.properties = physical.GetProperties();
 
     // Set instance version.
@@ -1221,16 +1276,6 @@ bool Device::GetSuitability(bool requires_swapchain) {
 
     // Set next pointer.
     void** next = &features2.pNext;
-
-    // Vulkan 1.2 and 1.3 features
-    if (instance_version >= VK_API_VERSION_1_2) {
-        features_1_2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-        features_1_3.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-
-        features_1_2.pNext = &features_1_3;
-
-        *next = &features_1_2;
-    }
 
 // Test all features we know about. If the feature is not available in core at our
 // current API version, and was not enabled by an extension, skip testing the feature.
@@ -1412,13 +1457,12 @@ bool Device::GetSuitability(bool requires_swapchain) {
     // Intel Windows < 27.20.100.0: Broken VertexInputDynamicState
     // Same for NVIDIA Proprietary < 580.119.02, unknown when VIDS was first NOT broken
     // Disable VertexInputDynamicState on old Intel Windows drivers
-    if (extensions.vertex_input_dynamic_state) {
-        const u32 version = (properties.properties.driverVersion << 3) >> 3;
-        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && version < VK_MAKE_API_VERSION(27, 20, 100, 0))
-        || (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && version < VK_MAKE_API_VERSION(580, 119, 02, 0))) {
-            LOG_WARNING(Render_Vulkan, "Disabling broken VK_EXT_vertex_input_dynamic_state");
-            RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
-        }
+    if (extensions.vertex_input_dynamic_state &&
+        HasBrokenVertexInputDynamicState(driver_id, properties.properties.driverVersion)) {
+        LOG_WARNING(Render_Vulkan, "Disabling broken VK_EXT_vertex_input_dynamic_state");
+        RemoveExtensionFeature(extensions.vertex_input_dynamic_state,
+                               features.vertex_input_dynamic_state,
+                               VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
     }
 
     if (u32(Settings::values.dyna_state.GetValue()) == 0) {
@@ -1471,6 +1515,13 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.depth_clip_control = features.depth_clip_control.depthClipControl;
     RemoveExtensionFeatureIfUnsuitable(extensions.depth_clip_control, features.depth_clip_control,
                                        VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
+
+    // VK_KHR_buffer_device_address
+    extensions.buffer_device_address =
+        features.buffer_device_address.bufferDeviceAddress != VK_FALSE;
+    RemoveExtensionFeatureIfUnsuitable(extensions.buffer_device_address,
+                                       features.buffer_device_address,
+                                       VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
 
     // VK_EXT_descriptor_buffer (EDEN_NX2_NO_DESCRIPTOR_BUFFER=1 falls back to descriptor sets, for A/B
     // tests of GPU faults)
@@ -1649,20 +1700,70 @@ void Device::RemoveUnsuitableExtensions() {
     // 32-lane warp. The matrices hold 16-bit floats, so the device needs shaderFloat16. Shaders
     // with them use the Vulkan memory model and run with full subgroups.
     {
-        const bool has_shape = std::ranges::any_of(
-            physical.GetCooperativeMatrixPropertiesKHR(),
-            [](const VkCooperativeMatrixPropertiesKHR& shape) {
-                return shape.MSize == 16 && shape.NSize == 8 && shape.KSize == 16 &&
-                       shape.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
-                       shape.saturatingAccumulation == VK_FALSE &&
-                       shape.scope == VK_SCOPE_SUBGROUP_KHR;
+        const auto raw_shapes = physical.GetCooperativeMatrixPropertiesKHR();
+        coop_matrix_capabilities = {};
+        coop_matrix_capabilities.extension_supported = extensions.cooperative_matrix;
+        coop_matrix_capabilities.feature_enabled =
+            features.cooperative_matrix.cooperativeMatrix != VK_FALSE;
+        coop_matrix_capabilities.supported_stages =
+            properties.cooperative_matrix.cooperativeMatrixSupportedStages;
+        coop_matrix_capabilities.compute_stage_supported =
+            (coop_matrix_capabilities.supported_stages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+        coop_matrix_capabilities.subgroup_size = properties.subgroup_properties.subgroupSize;
+        coop_matrix_capabilities.min_subgroup_size =
+            extensions.subgroup_size_control ? properties.subgroup_size_control.minSubgroupSize
+                                             : properties.subgroup_properties.subgroupSize;
+        coop_matrix_capabilities.max_subgroup_size =
+            extensions.subgroup_size_control ? properties.subgroup_size_control.maxSubgroupSize
+                                             : properties.subgroup_properties.subgroupSize;
+        coop_matrix_capabilities.shapes.reserve(raw_shapes.size());
+        for (const VkCooperativeMatrixPropertiesKHR& shape : raw_shapes) {
+            coop_matrix_capabilities.shapes.push_back(CoopMatrixShape{
+                .m = shape.MSize,
+                .n = shape.NSize,
+                .k = shape.KSize,
+                .a_type = shape.AType,
+                .b_type = shape.BType,
+                .c_type = shape.CType,
+                .result_type = shape.ResultType,
+                .saturating_accumulation = shape.saturatingAccumulation != VK_FALSE,
+                .scope = shape.scope,
             });
+            const bool is_fp16_subgroup = shape.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                          shape.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                          shape.CType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                          shape.ResultType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                                          shape.saturatingAccumulation == VK_FALSE &&
+                                          shape.scope == VK_SCOPE_SUBGROUP_KHR;
+            if (!is_fp16_subgroup) {
+                continue;
+            }
+            if (shape.MSize == 16 && shape.NSize == 8 && shape.KSize == 16) {
+                coop_matrix_capabilities.has_fp16_16x8x16 = true;
+            } else if (shape.MSize == 16 && shape.NSize == 16 && shape.KSize == 16) {
+                coop_matrix_capabilities.has_fp16_16x16x16 = true;
+            } else if (shape.MSize == 8 && shape.NSize == 16 && shape.KSize == 16) {
+                coop_matrix_capabilities.has_fp16_8x16x16 = true;
+            }
+        }
+        if (coop_matrix_capabilities.has_fp16_16x8x16) {
+            coop_matrix_capabilities.preferred_m = 16;
+            coop_matrix_capabilities.preferred_n = 8;
+            coop_matrix_capabilities.preferred_k = 16;
+        } else if (coop_matrix_capabilities.has_fp16_16x16x16) {
+            coop_matrix_capabilities.preferred_m = 16;
+            coop_matrix_capabilities.preferred_n = 16;
+            coop_matrix_capabilities.preferred_k = 16;
+        } else if (coop_matrix_capabilities.has_fp16_8x16x16) {
+            coop_matrix_capabilities.preferred_m = 8;
+            coop_matrix_capabilities.preferred_n = 16;
+            coop_matrix_capabilities.preferred_k = 16;
+        }
+
+        const bool has_shape = coop_matrix_capabilities.has_fp16_16x8x16;
         extensions.cooperative_matrix =
-            extensions.cooperative_matrix && features.cooperative_matrix.cooperativeMatrix &&
-            has_shape &&
+            extensions.cooperative_matrix &&
+            features.cooperative_matrix.cooperativeMatrix != VK_FALSE && has_shape &&
             (properties.cooperative_matrix.cooperativeMatrixSupportedStages &
              VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
             (properties.subgroup_properties.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0 &&
@@ -1672,10 +1773,10 @@ void Device::RemoveUnsuitableExtensions() {
             extensions.subgroup_size_control &&
             properties.subgroup_size_control.minSubgroupSize == GuestWarpSize &&
             properties.subgroup_size_control.maxSubgroupSize == GuestWarpSize &&
-            features.subgroup_size_control.computeFullSubgroups &&
-            features.vulkan_memory_model.vulkanMemoryModel &&
-            features.vulkan_memory_model.vulkanMemoryModelDeviceScope &&
-            features.shader_float16_int8.shaderFloat16;
+            features.subgroup_size_control.computeFullSubgroups != VK_FALSE &&
+            features.vulkan_memory_model.vulkanMemoryModel != VK_FALSE &&
+            features.vulkan_memory_model.vulkanMemoryModelDeviceScope != VK_FALSE &&
+            features.shader_float16_int8.shaderFloat16 != VK_FALSE;
         features.cooperative_matrix.cooperativeMatrixRobustBufferAccess = VK_FALSE;
         RemoveExtensionFeatureIfUnsuitable(extensions.cooperative_matrix,
                                            features.cooperative_matrix,
@@ -1726,9 +1827,26 @@ void Device::RemoveUnsuitableExtensions() {
     RemoveExtensionIfUnsuitable(extensions.maintenance8, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
 
     // VK_KHR_synchronization2
-    extensions.synchronization2 = features.synchronization2.synchronization2;
+    extensions.synchronization2 = features.synchronization2.synchronization2 != VK_FALSE;
     RemoveExtensionFeatureIfUnsuitable(extensions.synchronization2, features.synchronization2,
                                        VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+
+    // Optional VK_KHR_video_queue / VK_KHR_video_decode_queue / VK_KHR_video_decode_h264
+    {
+        const bool has_video_sync2 =
+            instance_version >= VK_API_VERSION_1_3 || extensions.synchronization2;
+        extensions.video_queue = extensions.video_queue && has_video_sync2;
+        RemoveExtensionIfUnsuitable(extensions.video_queue, VK_KHR_VIDEO_QUEUE_EXTENSION_NAME);
+
+        extensions.video_decode_queue = extensions.video_decode_queue && extensions.video_queue;
+        RemoveExtensionIfUnsuitable(extensions.video_decode_queue,
+                                    VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME);
+
+        extensions.video_decode_h264 =
+            extensions.video_decode_h264 && extensions.video_decode_queue;
+        RemoveExtensionIfUnsuitable(extensions.video_decode_h264,
+                                    VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME);
+    }
 }
 
 void Device::SetupFamilies(VkSurfaceKHR surface) {
@@ -1765,6 +1883,27 @@ void Device::SetupFamilies(VkSurfaceKHR surface) {
     }
     if (present) {
         present_family = *present;
+    }
+
+    video_decode_family.reset();
+    if (extensions.video_decode_queue) {
+        for (u32 index = 0; index < static_cast<u32>(queue_family_properties.size()); ++index) {
+            const VkQueueFamilyProperties& queue_family = queue_family_properties[index];
+            if (queue_family.queueCount == 0) {
+                continue;
+            }
+            if ((queue_family.queueFlags & VK_QUEUE_VIDEO_DECODE_BIT_KHR) != 0) {
+                video_decode_family = index;
+                break;
+            }
+        }
+        if (!video_decode_family) {
+            LOG_INFO(Render_Vulkan,
+                     "VK_KHR_video_decode_queue supported without video decode queue family; disabling");
+            RemoveExtension(extensions.video_decode_h264, VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME);
+            RemoveExtension(extensions.video_decode_queue,
+                            VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME);
+        }
     }
 }
 
@@ -1938,6 +2077,9 @@ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
     static constexpr float QUEUE_PRIORITY = 1.0f;
 
     ::Common::unordered_set<u32> unique_queue_families{graphics_family, present_family};
+    if (video_decode_family) {
+        unique_queue_families.insert(*video_decode_family);
+    }
     std::vector<VkDeviceQueueCreateInfo> queue_cis;
     queue_cis.reserve(unique_queue_families.size());
 
@@ -1985,7 +2127,7 @@ void Device::InitializeGPULogging() {
     GPU::Logging::GPULogger::GetInstance().EnableDriverDebugInfo(
         Settings::values.gpu_log_driver_debug.GetValue());
     GPU::Logging::GPULogger::GetInstance().SetRingBufferSize(
-        Settings::values.gpu_log_ring_buffer_size.GetValue());
+        static_cast<size_t>((std::max)(Settings::values.gpu_log_ring_buffer_size.GetValue(), 1)));
 
     // Log comprehensive driver and extension information
     if (Settings::values.gpu_log_driver_debug.GetValue()) {

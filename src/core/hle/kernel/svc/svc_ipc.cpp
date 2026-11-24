@@ -179,16 +179,29 @@ Result SendSyncRequestWithUserBuffer(Core::System& system, uint64_t message, uin
 Result SendAsyncRequestWithUserBuffer(Core::System& system, Handle* out_event_handle,
                                       uint64_t message, uint64_t buffer_size,
                                       Handle session_handle) {
-    // Get the process and handle table.
+    // Validate that the message buffer is page aligned and does not overflow.
+    R_UNLESS(Common::IsAligned(message, PageSize), ResultInvalidAddress);
+    R_UNLESS(buffer_size > 0, ResultInvalidSize);
+    R_UNLESS(Common::IsAligned(buffer_size, PageSize), ResultInvalidSize);
+    R_UNLESS(message < message + buffer_size, ResultInvalidCurrentMemory);
+
+    // Get the process, handle table, and page table.
     auto& process = GetCurrentProcess(system.Kernel());
     auto& handle_table = process.GetHandleTable();
+    auto& page_table = process.GetPageTable();
+
+    // Lock the message buffer before allocating kernel objects or handles.
+    R_TRY(page_table.LockForIpcUserBuffer(nullptr, message, buffer_size));
+    ON_RESULT_FAILURE {
+        page_table.UnlockForIpcUserBuffer(message, buffer_size);
+    };
 
     // Reserve a new event from the process resource limit.
     KScopedResourceReservation event_reservation(system.Kernel(), std::addressof(process), Svc::LimitableResource::EventCountMax);
     R_UNLESS(event_reservation.Succeeded(), ResultLimitReached);
 
     // Get the client session.
-    KScopedAutoObject session = process.GetHandleTable().GetObject<KClientSession>(system.Kernel(), session_handle);
+    KScopedAutoObject session = handle_table.GetObject<KClientSession>(system.Kernel(), session_handle);
     R_UNLESS(session.IsNotNull(), ResultInvalidHandle);
 
     // Get the parent, and persist a reference to it until we're done.
@@ -217,13 +230,12 @@ Result SendAsyncRequestWithUserBuffer(Core::System& system, Handle* out_event_ha
     // Add the readable event to the handle table.
     R_TRY(handle_table.Add(system.Kernel(), out_event_handle, std::addressof(event->GetReadableEvent())));
 
-    // Ensure that if we fail to send the request, we close the readable handle.
-    ON_RESULT_FAILURE {
-        handle_table.Remove(system.Kernel(), *out_event_handle);
-    };
-
     // Send the async request.
-    R_RETURN(session->SendAsyncRequest(system.Kernel(), event, message, buffer_size));
+    const Result res = session->SendAsyncRequest(system.Kernel(), event, message, buffer_size);
+    if (res.IsFailure()) {
+        handle_table.Remove(system.Kernel(), *out_event_handle);
+    }
+    R_RETURN(res);
 }
 
 Result ReplyAndReceive(Core::System& system, s32* out_index, uint64_t handles, s32 num_handles,

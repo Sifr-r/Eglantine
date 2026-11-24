@@ -93,8 +93,15 @@ AppLoader_XCI::LoadResult AppLoader_XCI::Load(Kernel::KProcess& process, Core::S
 }
 
 ResultStatus AppLoader_XCI::VerifyIntegrity(std::function<bool(size_t, size_t)> progress_callback) {
+    if (xci->GetStatus() != ResultStatus::Success) {
+        return xci->GetStatus();
+    }
+
     // Verify secure partition, as it is the only thing we can process.
     auto secure_partition = xci->GetSecurePartitionNSP();
+    if (secure_partition == nullptr) {
+        return ResultStatus::ErrorXCIMissingPartition;
+    }
 
     // Get list of all NCAs.
     const auto ncas = secure_partition->GetNCAsCollapsed();
@@ -131,13 +138,22 @@ ResultStatus AppLoader_XCI::ReadRomFS(FileSys::VirtualFile& out_file) {
 }
 
 ResultStatus AppLoader_XCI::ReadUpdateRaw(FileSys::VirtualFile& out_file) {
+    if (xci->GetStatus() != ResultStatus::Success) {
+        return xci->GetStatus();
+    }
+
     u64 program_id{};
     nca_loader->ReadProgramId(program_id);
     if (program_id == 0) {
         return ResultStatus::ErrorXCIMissingProgramNCA;
     }
 
-    const auto read = xci->GetSecurePartitionNSP()->GetNCAFile(
+    const auto secure_partition = xci->GetSecurePartitionNSP();
+    if (secure_partition == nullptr) {
+        return ResultStatus::ErrorXCIMissingPartition;
+    }
+
+    const auto read = secure_partition->GetNCAFile(
         FileSys::GetUpdateTitleID(program_id), FileSys::ContentRecordType::Program);
     if (read == nullptr) {
         return ResultStatus::ErrorNoPackedUpdate;
@@ -157,6 +173,9 @@ ResultStatus AppLoader_XCI::ReadProgramId(u64& out_program_id) {
 }
 
 ResultStatus AppLoader_XCI::ReadProgramIds(std::vector<u64>& out_program_ids) {
+    if (xci->GetStatus() != ResultStatus::Success) {
+        return xci->GetStatus();
+    }
     out_program_ids = xci->GetProgramTitleIDs();
     return ResultStatus::Success;
 }
@@ -189,10 +208,18 @@ ResultStatus AppLoader_XCI::ReadControlData(FileSys::NACP& control) {
 }
 
 ResultStatus AppLoader_XCI::ReadManualRomFS(FileSys::VirtualFile& out_file) {
-    const auto nca =
-        xci->GetSecurePartitionNSP()->GetNCA(xci->GetSecurePartitionNSP()->GetProgramTitleID(),
-                                             FileSys::ContentRecordType::HtmlDocument);
-    if (xci->GetStatus() != ResultStatus::Success || nca == nullptr) {
+    if (xci->GetStatus() != ResultStatus::Success) {
+        return ResultStatus::ErrorXCIMissingPartition;
+    }
+
+    const auto secure_partition = xci->GetSecurePartitionNSP();
+    if (secure_partition == nullptr) {
+        return ResultStatus::ErrorXCIMissingPartition;
+    }
+
+    const auto nca = secure_partition->GetNCA(secure_partition->GetProgramTitleID(),
+                                              FileSys::ContentRecordType::HtmlDocument);
+    if (nca == nullptr) {
         return ResultStatus::ErrorXCIMissingPartition;
     }
 
@@ -210,6 +237,23 @@ ResultStatus AppLoader_XCI::ReadLogo(std::vector<u8>& buffer) {
 
 ResultStatus AppLoader_XCI::ReadNSOModules(Modules& modules) {
     return nca_loader->ReadNSOModules(modules);
+}
+
+ResultStatus AppLoader_XCI::ReadProgramMetadata(Core::System& system,
+                                                FileSys::ProgramMetadata& out_metadata) {
+    if (xci->GetStatus() != ResultStatus::Success) {
+        return xci->GetStatus();
+    }
+
+    if (xci->GetProgramNCAStatus() != ResultStatus::Success) {
+        return xci->GetProgramNCAStatus();
+    }
+
+    if (nca_loader == nullptr) {
+        return ResultStatus::ErrorNotInitialized;
+    }
+
+    return nca_loader->ReadProgramMetadata(system, out_metadata);
 }
 
 } // namespace Loader

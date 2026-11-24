@@ -147,6 +147,9 @@ class SettingsActivity : AppCompatActivity() {
                 NativeLibrary.logSettings()
                 NativeConfig.savePerGameConfig()
                 NativeConfig.unloadPerGameConfig()
+                if (!NativeLibrary.isRunning()) {
+                    NativeConfig.reloadGlobalConfig()
+                }
             }
 
             if (settingsViewModel.shouldRecreateForLanguageChange.value) {
@@ -166,15 +169,18 @@ class SettingsActivity : AppCompatActivity() {
         if (args.game == null) {
             NativeConfig.unloadGlobalConfig()
             val settingsFile = SettingsFile.getSettingsFile(SettingsFile.FILE_NAME_CONFIG)
-            if (!settingsFile.delete()) {
+            if (settingsFile.exists() && !settingsFile.delete()) {
                 throw IOException("Failed to delete $settingsFile")
             }
             NativeConfig.initializeGlobalConfig()
         } else {
             NativeConfig.unloadPerGameConfig()
             val settingsFile = SettingsFile.getCustomSettingsFile(args.game!!)
-            if (!settingsFile.delete()) {
+            if (settingsFile.exists() && !settingsFile.delete()) {
                 throw IOException("Failed to delete $settingsFile")
+            }
+            if (!NativeLibrary.isRunning()) {
+                NativeConfig.reloadGlobalConfig()
             }
         }
 

@@ -10,13 +10,16 @@
 namespace Common {
 
 std::vector<u8> HexStringToVector(std::string_view str, bool little_endian) {
-    std::vector<u8> out(str.size() / 2);
-    if (little_endian) {
-        for (std::size_t i = str.size() - 2; i <= str.size(); i -= 2)
-            out[i / 2] = (ToHexNibble(str[i]) << 4) | ToHexNibble(str[i + 1]);
-    } else {
-        for (std::size_t i = 0; i + 1 < str.size(); i += 2)
-            out[i / 2] = (ToHexNibble(str[i]) << 4) | ToHexNibble(str[i + 1]);
+    const std::size_t count = str.size() / 2;
+    std::vector<u8> out(count);
+    if (count == 0) {
+        return out;
+    }
+    for (std::size_t idx = 0; idx < count; ++idx) {
+        const std::size_t str_idx = idx * 2;
+        const u8 byte =
+            static_cast<u8>((ToHexNibble(str[str_idx]) << 4) | ToHexNibble(str[str_idx + 1]));
+        out[little_endian ? (count - 1 - idx) : idx] = byte;
     }
     return out;
 }

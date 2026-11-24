@@ -48,7 +48,7 @@ Result FlushProcessDataCache(Core::System& system, Handle process_handle, u64 ad
     R_UNLESS(page_table.Contains(address, size), ResultInvalidCurrentMemory);
 
     // Perform the operation.
-    R_RETURN(GetCurrentMemory(system.Kernel()).FlushDataCache(address, size));
+    R_RETURN(process->GetMemory().FlushDataCache(address, size));
 }
 
 void FlushEntireDataCache64(Core::System& system) {

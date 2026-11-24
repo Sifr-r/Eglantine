@@ -87,6 +87,7 @@ public:
 
     Result Enable(Kernel::KernelCore& kernel, Alarm& alarm, s64 time);
     void Disable(Kernel::KernelCore& kernel, Alarm& alarm);
+    bool IsEnabled(const Alarm& alarm);
     void CheckAndSignal(Kernel::KernelCore& kernel);
     bool GetClosestAlarm(Alarm** out_alarm);
 
@@ -114,13 +115,15 @@ public:
 private:
     void CreateWakeupAlarm(HLERequestContext& ctx);
     void CreateBackgroundTaskAlarm(HLERequestContext& ctx);
+    std::shared_ptr<TimeManager> m_manager;
     Alarms& m_alarms;
 };
 
 class ISteadyClockAlarm final : public ServiceFramework<ISteadyClockAlarm> {
 public:
-    explicit ISteadyClockAlarm(Core::System& system, Alarms& alarms, AlarmType type);
-    ~ISteadyClockAlarm() override = default;
+    explicit ISteadyClockAlarm(Core::System& system, std::shared_ptr<TimeManager> manager,
+                               AlarmType type);
+    ~ISteadyClockAlarm() override;
 
 private:
     void GetAlarmEvent(HLERequestContext& ctx);
@@ -130,6 +133,7 @@ private:
 
     KernelHelpers::ServiceContext m_ctx;
 
+    std::shared_ptr<TimeManager> m_manager;
     Alarms& m_alarms;
     Alarm m_alarm;
 };

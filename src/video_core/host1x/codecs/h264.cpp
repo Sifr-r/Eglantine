@@ -6,7 +6,9 @@
 
 #include <array>
 #include <bit>
+#include <limits>
 
+#include "common/logging.h"
 #include "common/scratch_buffer.h"
 #include "common/settings.h"
 #include "video_core/host1x/codecs/h264.h"
@@ -24,7 +26,12 @@ H264::H264(Host1x::Host1x& host1x_, const Host1x::NvdecCommon::NvdecRegisters& r
 H264::~H264() = default;
 
 std::tuple<u64, u64> H264::GetProgressiveOffsets() {
-    auto pic_idx{current_context.h264_parameter_set.curr_pic_idx};
+    const auto pic_idx = static_cast<size_t>(current_context.h264_parameter_set.curr_pic_idx.Value());
+    if (pic_idx >= regs.surface_luma_offsets.size() ||
+        pic_idx >= regs.surface_chroma_offsets.size()) {
+        LOG_ERROR(HW_GPU, "Invalid H264 curr_pic_idx {}", pic_idx);
+        return {0, 0};
+    }
     auto luma{regs.surface_luma_offsets[pic_idx].Address() +
               current_context.h264_parameter_set.luma_frame_offset.Address()};
     auto chroma{regs.surface_chroma_offsets[pic_idx].Address() +
@@ -33,7 +40,12 @@ std::tuple<u64, u64> H264::GetProgressiveOffsets() {
 }
 
 std::tuple<u64, u64, u64, u64> H264::GetInterlacedOffsets() {
-    auto pic_idx{current_context.h264_parameter_set.curr_pic_idx};
+    const auto pic_idx = static_cast<size_t>(current_context.h264_parameter_set.curr_pic_idx.Value());
+    if (pic_idx >= regs.surface_luma_offsets.size() ||
+        pic_idx >= regs.surface_chroma_offsets.size()) {
+        LOG_ERROR(HW_GPU, "Invalid H264 curr_pic_idx {}", pic_idx);
+        return {0, 0, 0, 0};
+    }
     auto luma_top{regs.surface_luma_offsets[pic_idx].Address() +
                   current_context.h264_parameter_set.luma_top_offset.Address()};
     auto luma_bottom{regs.surface_luma_offsets[pic_idx].Address() +
@@ -286,10 +298,19 @@ void H264BitWriter::WriteExpGolombCodedInt(s32 value) {
 }
 
 void H264BitWriter::WriteExpGolombCodedUInt(u32 value) {
+    if (value == (std::numeric_limits<u32>::max)()) {
+        WriteBits(0, 32);
+        WriteBits(1, 1);
+        WriteBits(0, 32);
+        return;
+    }
     const s32 size = 32 - std::countl_zero(value + 1);
+    if (size <= 0) {
+        return;
+    }
     WriteBits(1, size);
     value -= (1U << (size - 1)) - 1;
-    WriteBits(s32(value), size - 1);
+    WriteBits(static_cast<s32>(value), size - 1);
 }
 
 s32 H264BitWriter::GetFreeBufferBits() {

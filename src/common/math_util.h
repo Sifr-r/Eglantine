@@ -8,8 +8,6 @@
 #pragma once
 
 #include <algorithm>
-#include <cstdlib>
-#include <type_traits>
 
 namespace Common {
 
@@ -44,23 +42,15 @@ struct Rectangle {
     }
 
     [[nodiscard]] constexpr bool IsEmpty() const {
-        return (GetWidth() <= 0) || (GetHeight() <= 0);
+        return !(right > left) || !(bottom > top);
     }
 
     [[nodiscard]] constexpr T GetWidth() const {
-        if constexpr (std::is_floating_point_v<T>) {
-            return std::abs(right - left);
-        } else {
-            return static_cast<T>(std::abs(static_cast<std::make_signed_t<T>>(right - left)));
-        }
+        return (right > left) ? static_cast<T>(right - left) : T{};
     }
 
     [[nodiscard]] constexpr T GetHeight() const {
-        if constexpr (std::is_floating_point_v<T>) {
-            return std::abs(bottom - top);
-        } else {
-            return static_cast<T>(std::abs(static_cast<std::make_signed_t<T>>(bottom - top)));
-        }
+        return (bottom > top) ? static_cast<T>(bottom - top) : T{};
     }
 
     [[nodiscard]] constexpr Rectangle<T> TranslateX(const T x) const {

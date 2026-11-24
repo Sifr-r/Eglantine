@@ -7,6 +7,8 @@
 
 namespace AudioCore {
 
+constexpr u64 MaxDeviceBufferSize = 16ULL * 1024 * 1024;
+
 struct AudioBuffer {
     /// Timestamp this buffer started playing.
     u64 start_timestamp;

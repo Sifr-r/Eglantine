@@ -122,7 +122,7 @@ enum class SpecialRegister : u64 {
         const IR::Value tid{ir.LocalInvocationId()};
         return ir.BitFieldInsert(ir.BitFieldInsert(IR::U32{ir.CompositeExtract(tid, 0)},
                                                    IR::U32{ir.CompositeExtract(tid, 1)},
-                                                   ir.Imm32(16), ir.Imm32(8)),
+                                                   ir.Imm32(16), ir.Imm32(10)),
                                  IR::U32{ir.CompositeExtract(tid, 2)}, ir.Imm32(26), ir.Imm32(6));
     }
     case SpecialRegister::SR_TID_X:

@@ -13,54 +13,71 @@
 ,
 }:
 pkgs.mkShellNoCC {
-  packages = with pkgs; [
-    # essential programs
-    git
-    cmake
-    clang
-    gnumake
-    ninja
-    patch
-    jq
-    pkg-config
-    # libraries
-    openssl
-    boost
-    fmt_11
-    nlohmann_json
-    lz4
-    zlib
-    zstd
-    enet
-    libopus
-    vulkan-headers
-    vulkan-utility-libraries
-    spirv-tools
-    spirv-headers
-    vulkan-loader
-    mesa
-    unzip
-    glslang
-    python3
-    httplib
-    cpp-jwt
-    ffmpeg-headless
-    libusb1
-    cubeb
-    # eden
-    qt6.qtbase
-    qt6.qtmultimedia
-    qt6.qtwayland
-    qt6.qttools
-    qt6.qtcharts
-    qt6.qtwebengine
-    qt6.qt5compat
-    # eden-cli
-    sdl3
-    # optional components
-    discord-rpc
-    gamemode
-  ];
+  packages =
+    (with pkgs; [
+      # essential programs
+      git
+      cmake
+      clang
+      gnumake
+      ninja
+      patch
+      jq
+      pkg-config
+      # rust & polyglot tooling
+      cargo
+      rustc
+      rustfmt
+      clippy
+      rust-analyzer
+      # libraries
+      openssl
+      boost
+      fmt_11
+      nlohmann_json
+      lz4
+      zlib
+      zstd
+      enet
+      libopus
+      vulkan-headers
+      vulkan-utility-libraries
+      spirv-tools
+      spirv-headers
+      vulkan-loader
+      mesa
+      unzip
+      glslang
+      python3
+      httplib
+      cpp-jwt
+      ffmpeg-headless
+      libusb1
+      cubeb
+      # eden
+      qt6.qtbase
+      qt6.qtmultimedia
+      qt6.qtwayland
+      qt6.qttools
+      qt6.qtcharts
+      qt6.qtwebengine
+      qt6.qt5compat
+      # eden-cli
+      sdl3
+      # optional components
+      discord-rpc
+      gamemode
+    ])
+    ++ pkgs.lib.optional (
+      pkgs ? shader-slang
+      && pkgs.lib.meta.availableOn pkgs.stdenv.hostPlatform pkgs.shader-slang
+      && !(pkgs.shader-slang.meta.broken or false)
+    ) pkgs.shader-slang
+    ++ pkgs.lib.optional (
+      pkgs ? ispc
+      && pkgs.lib.meta.availableOn pkgs.stdenv.hostPlatform pkgs.ispc
+      && !(pkgs.ispc.meta.broken or false)
+    ) pkgs.ispc;
   # Host /usr Vulkan drivers can't load inside the Nix shell (their libdrm/libz deps
   # aren't visible to the Nix dynamic linker), so point the loader at Nix's RADV.
   VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/radeon_icd.x86_64.json";

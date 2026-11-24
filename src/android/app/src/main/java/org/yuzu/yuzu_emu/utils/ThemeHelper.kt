@@ -65,7 +65,7 @@ object ThemeHelper {
             R.style.Theme_Yuzu_Main_Pink,
             R.style.Theme_Yuzu_Main_Gray
         )
-        return themes[themeIndex]
+        return themes.getOrElse(themeIndex) { R.style.Theme_Eden_Main }
     }
 
     @ColorInt

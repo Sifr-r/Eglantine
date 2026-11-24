@@ -1,16 +1,14 @@
 # Visual bugs on NX2 titles (tint, black scene, missing effect)
 
-Use when every program lowers and builds but the image is wrong. Goal: find the first program
-or stage where the image goes bad, with runs the agent drives itself.
+Use when the scene renders incorrectly and the relevant programs and pipelines build. Find the
+first program or stage that produces the wrong image. Start with a screenshot and one frame
+capture if the user is already in the scene. [NX2 debug server](../../nx2-debug-server/SKILL.md)
 
 ## Tooling
 
-- Shader lab (browser) + diagnostics: `tools/nx2/shader_lab.py`, `src/video_core/nx2_diag.h`,
-  from `fix/missing-mkw-effects` (commits a659d78bb1..ec65ee9c6e). Cherry-pick onto a scratch
-  branch; the two conflicts (kepler_compute.cpp, vk_rasterizer.cpp) are additive, keep both, with
-  the diag zero-block `}` and ablation check before the DLSS-chain code.
-- `tools/nx2/lab_ctl.py` (scratch/oot-shader-lab): CLI over the same diag folder. Subcommands:
-  `launch`, `press`, `capture`, `stats`, `drawlist`, `state`, `ablate`, `bisect`, `stop`.
+- The checked-in `tools/nx2/shader_lab.py` and `tools/nx2/lab_ctl.py` share the diagnostics
+  folder. Follow the lab prerequisites before launching your own session.
+  [Lab automation](../../nx2-lab-automation/SKILL.md)
 - `eden-cli` reads `<EDEN_NX2_DIAG_DIR>/keys.txt` live (`<code> <ms>` lines; SDL scancodes,
   A=4 B=22 +=16, arrows 79-82). `EDEN_NX2_HIDE_WINDOW=1` hides the window, `EDEN_NX2_KEY_SCRIPT`
   is the timed version.
@@ -21,24 +19,28 @@ or stage where the image goes bad, with runs the agent drives itself.
    app's (async shaders, accuracy, docked). Copy `qt-config.ini` to scratch and merge the SDL
    file's `player_0_button_*`/`lstick`/`rstick` lines into it. The Qt bindings are usually a
    gamepad, so key presses do nothing. Pass it with `launch --config`.
-2. **Launch and reach the scene.** `lab_ctl -d $D launch --hidden --config ... --game <nup>
-   [--tensor] [--env NAME=VALUE] --max-seconds 300`. Title appears after ~90 s; `press a`
-   (hold >= 200 ms) through title, load screen and save. Gameplay programs differ from title ones;
-   test where the user saw the bug.
+2. **Reach the scene.** Use the bounded lab launcher only for your own run and stop it on every
+   exit path. Test where the user saw the bug. The title and gameplay can use different shaders.
+   [Ocarina of Time timing](../../nx2-lab-automation/references/ocarina-of-time.md)
 3. **Measure.** `capture --settle N --out x.png` prints mean r/g/b (whole and central half). A
    tint is a channel ratio (`b < 0.3*g`). Look at the PNG with vision too.
-4. **A/B ladder before any bisect.** Compare the same scene across: stand-in (TENSOR unset),
-   TENSOR=1, TENSOR=stub, and the user's reference screenshot. Each removes a suspect class.
+4. **A/B ladder before any bisect.** Compare the same scene with `EDEN_NX2_TENSOR` unset,
+   `=1`, and `=stub`, then compare the user's reference screenshot. Confirm which path the title
+   default selected. Depending on the title and GPU it can already emulate HMMA.
 5. **Dump images, don't only ablate.** `--env EDEN_NX2_FRAME_CAPTURE=<dir>
    --env EDEN_NX2_DUMP=<present>:<addr>:<size>,...` writes raw guest bytes at that present.
    Addresses come from `drawlist` (`rt` column) and the `Upscale fallback ... ->` log lines.
    Decode per format (A8B8G8R8, A2B10G10R10, B10G11R11) and compare channel means stage by stage.
    An all-zero dump of a host-written image means it wasn't flushed back or isn't at that address.
    It doesn't mean the image is empty.
-6. **Narrow to instructions.** Disassemble with `tools/nx2/nvd_cubin.py <dump>`. Trace the bad
-   channel's register chain back from the final store. Then run `scripts/lowered_for.cpp` on
-   those offsets and decode each Maxwell word against `frontend/maxwell/translate/impl/*.cpp`
-   bitfields.
+6. **Narrow to instructions.** Use `python3 -I tools/nx2/nvd_cubin.py <dump>` where its NVIDIA
+   disassembler prerequisite is installed. Trace the bad channel back from the final store.
+   Build `scripts/lowered_for.cpp` using the compiler and fmt setup in the skill, then run the
+   resulting executable with the dump path and the Ampere byte offsets in hex.
+   [Shader triage](../SKILL.md)
+7. Record the first bad pass, the native key and build-specific shader hash, and evidence from
+   the same scene before and after the change. Confirm the original live rejection set is
+   restored before leaving the session.
 
 ## Pitfalls
 

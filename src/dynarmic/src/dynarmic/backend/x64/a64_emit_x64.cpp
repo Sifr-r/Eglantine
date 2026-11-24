@@ -471,6 +471,7 @@ void A64EmitX64::EmitA64SetFPCR(A64EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
     ctx.reg_alloc.HostCall(code, nullptr, {}, args[0]);
     code.mov(code.ABI_PARAM1, code.ABI_JIT_PTR);
+    code.stmxcsr(code.dword[code.ABI_JIT_PTR + offsetof(A64JitState, guest_MXCSR)]);
     code.CallFunction(SetFPCRImpl);
     code.ldmxcsr(code.dword[code.ABI_JIT_PTR + offsetof(A64JitState, guest_MXCSR)]);
 }

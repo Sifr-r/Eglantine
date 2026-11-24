@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <memory>
+#include <mutex>
 #include <set>
 #include <common/threadsafe_queue.h>
 #include <jni.h>
@@ -90,7 +92,9 @@ public:
     Common::Input::ButtonNames GetUIName(const Common::ParamPackage& params) const override;
 
 private:
-    ::Common::unordered_map<PadIdentifier, jobject> input_devices;
+    struct GlobalDeviceRef;
+    mutable std::mutex input_devices_mutex;
+    ::Common::unordered_map<PadIdentifier, std::shared_ptr<const GlobalDeviceRef>> input_devices;
 
     /// Returns the correct identifier corresponding to the player index
     PadIdentifier GetIdentifier(const std::string& guid, size_t port) const;
@@ -144,7 +148,7 @@ private:
                                                    backbone_labs_vid, xbox_vid};
 
     /// Queue of vibration request to controllers
-    Common::SPSCQueue<VibrationRequest> vibration_queue;
+    Common::MPSCQueue<VibrationRequest, true> vibration_queue;
     std::jthread vibration_thread;
 };
 

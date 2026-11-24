@@ -136,7 +136,7 @@ public:
         shared_data->connection_count--;
         if (fd_to_close.has_value()) {
             const s32 fd = *fd_to_close;
-            if (!do_not_close_socket) {
+            if (do_not_close_socket) {
                 LOG_ERROR(Service_SSL,
                           "do_not_close_socket was changed after setting socket; is this right?");
             } else {
@@ -243,7 +243,8 @@ private:
 
     Result GetSocketDescriptor(Out<u32> out_fd) {
         LOG_WARNING(Service_SSL, "(STUBBED)");
-        *out_fd = uint32_t(socket->GetFD());
+        R_UNLESS(socket, ResultNoSocket);
+        *out_fd = static_cast<u32>(socket->GetFD());
         R_SUCCEED();
     }
 
@@ -523,12 +524,15 @@ private:
 
         std::unique_ptr<SSLConnectionBackend> backend;
         const Result res = CreateSSLConnectionBackend(&backend);
+        if (res != ResultSuccess) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(res);
+            return;
+        }
 
         IPC::ResponseBuilder rb{ctx, 2, 0, 1};
         rb.Push(res);
-        if (res == ResultSuccess) {
-            rb.PushIpcInterface<ISslConnection>(ctx, system, ssl_version, shared_data, std::move(backend));
-        }
+        rb.PushIpcInterface<ISslConnection>(ctx, system, ssl_version, shared_data, std::move(backend));
     }
 
     void GetConnectionCount(HLERequestContext& ctx) {

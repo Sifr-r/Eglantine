@@ -16,6 +16,9 @@ namespace Service::VI {
 
 void LoopProcess(Core::System& system, std::stop_token token) {
     const auto container = std::make_shared<Container>(system);
+    if (token.stop_requested()) {
+        return;
+    }
 
     auto server_manager = std::make_unique<ServerManager>(system);
 

@@ -4,6 +4,8 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <memory>
 #include <vector>
 
 #include "audio_core/common/common.h"
@@ -71,17 +73,30 @@ public:
     };
 
     struct State {
-        /* 0x000 */ std::array<s32, 8> unk_000;
-        /* 0x020 */ std::array<DelayLine, MaxChannels> delay_lines;
-        /* 0x0B0 */ Common::FixedPoint<18, 14> feedback_gain;
-        /* 0x0B4 */ Common::FixedPoint<18, 14> delay_feedback_gain;
-        /* 0x0B8 */ Common::FixedPoint<18, 14> delay_feedback_cross_gain;
-        /* 0x0BC */ Common::FixedPoint<18, 14> lowpass_gain;
-        /* 0x0C0 */ Common::FixedPoint<18, 14> lowpass_feedback_gain;
-        /* 0x0C4 */ std::array<Common::FixedPoint<50, 14>, MaxChannels> lowpass_z;
+        /* 0x000 */ std::array<s32, 8> unk_000{};
+        /* 0x020 */ std::array<DelayLine, MaxChannels> delay_lines{};
+        /* 0x0B0 */ Common::FixedPoint<18, 14> feedback_gain{};
+        /* 0x0B4 */ Common::FixedPoint<18, 14> delay_feedback_gain{};
+        /* 0x0B8 */ Common::FixedPoint<18, 14> delay_feedback_cross_gain{};
+        /* 0x0BC */ Common::FixedPoint<18, 14> lowpass_gain{};
+        /* 0x0C0 */ Common::FixedPoint<18, 14> lowpass_feedback_gain{};
+        /* 0x0C4 */ std::array<Common::FixedPoint<50, 14>, MaxChannels> lowpass_z{};
     };
     static_assert(sizeof(State) <= sizeof(EffectInfoBase::State),
                   "DelayInfo::State has the wrong size!");
+    static_assert(alignof(State) <= alignof(std::max_align_t),
+                  "DelayInfo::State alignment exceeds EffectInfoBase::state!");
+
+    DelayInfo() {
+        std::construct_at(reinterpret_cast<State*>(state.data()));
+    }
+
+    DelayInfo(const DelayInfo&) = delete;
+    DelayInfo& operator=(const DelayInfo&) = delete;
+
+    ~DelayInfo() override {
+        std::destroy_at(reinterpret_cast<State*>(state.data()));
+    }
 
     /**
      * Update the info with new parameters, version 1.

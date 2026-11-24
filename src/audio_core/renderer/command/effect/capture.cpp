@@ -71,10 +71,24 @@ static u32 WriteAuxBufferDsp(Core::Memory::Memory& memory, const CpuAddr send_in
         return 0;
     }
 
-    AuxInfo::AuxBufferInfo send_info{};
-    memory.ReadBlockUnsafe(send_info_, &send_info, sizeof(AuxInfo::AuxBufferInfo));
+    if (write_count_ > input.size()) {
+        LOG_ERROR(Service_Audio, "write_count exceeds input buffer size! write_count {}, size {}",
+                  write_count_, input.size());
+        return 0;
+    }
 
-    u32 target_write_offset{send_info.dsp_info.write_offset + write_offset};
+    if (send_info_ < sizeof(AuxInfo::AuxInfoDsp)) {
+        return 0;
+    }
+
+    // send_info_ points to AuxBufferInfo::dsp_info (offset 0x40); cpu_info sits immediately before it.
+    AuxInfo::AuxInfoDsp cpu_info{};
+    AuxInfo::AuxInfoDsp dsp_info{};
+    memory.ReadBlockUnsafe(send_info_ - sizeof(AuxInfo::AuxInfoDsp), &cpu_info,
+                           sizeof(AuxInfo::AuxInfoDsp));
+    memory.ReadBlockUnsafe(send_info_, &dsp_info, sizeof(AuxInfo::AuxInfoDsp));
+
+    u32 target_write_offset{dsp_info.write_offset + write_offset};
     if (target_write_offset > count_max || write_count_ == 0) {
         return 0;
     }
@@ -95,28 +109,26 @@ static u32 WriteAuxBufferDsp(Core::Memory::Memory& memory, const CpuAddr send_in
     }
 
     if (update_count) {
-        const auto count_diff{send_info.dsp_info.total_sample_count -
-                              send_info.cpu_info.total_sample_count};
+        const auto count_diff{dsp_info.total_sample_count - cpu_info.total_sample_count};
         if (count_diff >= count_max) {
-            auto dsp_lost_count{send_info.dsp_info.lost_sample_count + update_count};
-            if (dsp_lost_count - send_info.cpu_info.lost_sample_count <
-                send_info.dsp_info.lost_sample_count - send_info.cpu_info.lost_sample_count) {
-                dsp_lost_count = send_info.cpu_info.lost_sample_count - 1;
+            auto dsp_lost_count{dsp_info.lost_sample_count + update_count};
+            if (dsp_lost_count - cpu_info.lost_sample_count <
+                dsp_info.lost_sample_count - cpu_info.lost_sample_count) {
+                dsp_lost_count = cpu_info.lost_sample_count - 1;
             }
-            send_info.dsp_info.lost_sample_count = dsp_lost_count;
+            dsp_info.lost_sample_count = dsp_lost_count;
         }
 
-        send_info.dsp_info.write_offset =
-            (send_info.dsp_info.write_offset + update_count + count_max) % count_max;
+        dsp_info.write_offset = (dsp_info.write_offset + update_count + count_max) % count_max;
 
-        auto new_sample_count{send_info.dsp_info.total_sample_count + update_count};
-        if (new_sample_count - send_info.cpu_info.total_sample_count < count_diff) {
-            new_sample_count = send_info.cpu_info.total_sample_count - 1;
+        auto new_sample_count{dsp_info.total_sample_count + update_count};
+        if (new_sample_count - cpu_info.total_sample_count < count_diff) {
+            new_sample_count = cpu_info.total_sample_count - 1;
         }
-        send_info.dsp_info.total_sample_count = new_sample_count;
+        dsp_info.total_sample_count = new_sample_count;
     }
 
-    memory.WriteBlockUnsafe(send_info_, &send_info, sizeof(AuxInfo::AuxBufferInfo));
+    memory.WriteBlockUnsafe(send_info_, &dsp_info, sizeof(AuxInfo::AuxInfoDsp));
 
     return write_count_;
 }

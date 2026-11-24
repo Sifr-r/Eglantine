@@ -16,6 +16,7 @@
 #include "common/assert.h"
 #include "common/logging.h"
 #include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "core/hle/kernel/k_page_table.h"
 #include "core/hle/kernel/k_process.h"
 #include "memory_manager.h"
@@ -85,6 +86,10 @@ void MergeSegments(DeviceMemory& memory, boost::container::small_vector<MappedSe
 
 bool MemoryManager::IsShuttingDown() const {
     return system.IsShuttingDown();
+}
+
+const Core::PlatformProfile& MemoryManager::Platform() const {
+    return system.Platform();
 }
 
 using Tegra::Memory::GuestMemoryFlags;
@@ -393,7 +398,8 @@ std::optional<DAddr> MemoryManager::GpuToCpuAddress(GPUVAddr gpu_addr) const {
             result = dev_addr_base + (gpu_addr & big_page_mask);
         }
     }
-    if ((*result >> MaxwellDeviceMemoryManager::AS_BITS) != 0) {
+    const size_t device_address_bits = memory.DeviceAddressBits();
+    if (device_address_bits < 64 && (*result >> device_address_bits) != 0) {
         LOG_ERROR(HW_GPU, "GPU address {:#x} maps outside the device space, to {:#x}", gpu_addr,
                   *result);
         return std::nullopt;
@@ -473,7 +479,9 @@ void MemoryManager::Write(GPUVAddr addr, T data) {
         return;
     }
     // A Switch 2 sparse block nobody wrote yet gets its memory now.
-    Tegra::Nx2BackSparseWrite(addr, sizeof(T), &data);
+    if (const auto nx2_session = system.Nx2Session()) {
+        nx2_session->SparseState().BackWrite(addr, sizeof(T), &data);
+    }
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         std::memcpy(page_pointer, &data, sizeof(T));
         return;
@@ -715,7 +723,9 @@ void MemoryManager::RunRasterizerWork(std::vector<std::pair<DAddr, u64>> regions
 
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) {
     // Give Switch 2 sparse pages the write lands on their memory first (otherwise it is dropped).
-    Tegra::Nx2BackSparseWrite(gpu_dest_addr, size, src_buffer);
+    if (const auto nx2_session = system.Nx2Session()) {
+        nx2_session->SparseState().BackWrite(gpu_dest_addr, size, src_buffer);
+    }
     // The page table is read under its lock; the copies and the cache calls run without it: the
     // rasterizer takes the cache mutexes the GPU thread holds while it reads the page table.
     boost::container::small_vector<MappedSegment, 32> segments;
@@ -810,9 +820,9 @@ void MemoryManager::WriteBlockCached(GPUVAddr gpu_dest_addr, const void* src_buf
 
 void MemoryManager::WriteWordsCached(GPUVAddr gpu_dest_addr, const u32* words, std::size_t count) {
     const std::size_t size = count * sizeof(u32);
-    // Words on Switch 2 sparse memory go one at a time, as Nx2BackSparseWrite saw them.
-    if (gpu_dest_addr + size > Tegra::g_nx2_sparse_low.load(std::memory_order_relaxed) &&
-        gpu_dest_addr < Tegra::g_nx2_sparse_high.load(std::memory_order_relaxed)) {
+    // Words on Switch 2 sparse memory go one at a time, as BackWrite saw them.
+    if (const auto nx2_session = system.Nx2Session();
+        nx2_session && nx2_session->SparseState().OverlapsSpan(gpu_dest_addr, size)) {
         for (std::size_t i = 0; i < count; ++i) {
             WriteBlockCached(gpu_dest_addr + i * sizeof(u32), words + i, sizeof(u32));
         }
@@ -1204,7 +1214,7 @@ bool MemoryManager::IsGranularRange(GPUVAddr gpu_addr, std::size_t size) const {
     if (GetEntry(gpu_addr, true) == EntryType::Mapped) [[likely]] {
         size_t page_index = gpu_addr >> big_page_bits;
         if (IsBigPageContinuous(page_index)) [[likely]] {
-            const std::size_t page{(page_index & big_page_mask) + size};
+            const std::size_t page{(gpu_addr & big_page_mask) + size};
             return page <= big_page_size;
         }
         const std::size_t page{(gpu_addr & Core::DEVICE_PAGEMASK) + size};

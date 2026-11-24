@@ -9,10 +9,12 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -49,11 +51,24 @@ class DeviceMemoryManager {
     using DeviceMethods = typename Traits::DeviceMethods;
 
 public:
-    DeviceMemoryManager(const DeviceMemory& device_memory);
+    explicit DeviceMemoryManager(const DeviceMemory& device_memory,
+                                 size_t device_virtual_bits_ = Traits::device_virtual_bits);
     ~DeviceMemoryManager();
 
     static constexpr bool HAS_FLUSH_INVALIDATION = true;
     static constexpr size_t AS_BITS = Traits::device_virtual_bits;
+
+    void SetDeviceAddressBits(size_t device_virtual_bits_);
+
+    [[nodiscard]] size_t DeviceAddressBits() const noexcept {
+        return device_virtual_bits.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] DAddr MaxDeviceArea() const noexcept {
+        return device_as_size.load(std::memory_order_acquire);
+    }
+
+    [[nodiscard]] bool IsInBounds(DAddr addr, u64 size) const noexcept;
 
     void BindInterface(DeviceInterface* device_inter);
 
@@ -63,6 +78,7 @@ public:
 
     DAddr Allocate(size_t size);
     void AllocateFixed(DAddr start, size_t size);
+    [[nodiscard]] bool TryAllocateFixed(DAddr start, size_t size);
     void Free(DAddr start, size_t size);
 
     void Map(DAddr address, VAddr virtual_address, size_t size, Asid asid, bool track = false);
@@ -84,28 +100,46 @@ public:
 
     template <typename Func>
     void ApplyOpOnPAddr(PAddr address, Common::ScratchBuffer<u32>& buffer, Func&& operation) {
-        DAddr subbits = DAddr(address & page_mask);
-        const u32 base = compressed_device_addr[(address >> page_bits)];
-        if ((base >> MULTI_FLAG_BITS) == 0) [[likely]] {
+        const size_t phys_page = address >> page_bits;
+        if (phys_page >= compressed_device_addr.size()) {
+            return;
+        }
+        const DAddr subbits = DAddr(address & page_mask);
+        const u32 base = compressed_device_addr[phys_page];
+        const DAddr max_area = device_as_size.load(std::memory_order_acquire);
+        if ((base >> MULTI_FLAG_BITS) == 0) {
             const DAddr d_address = (DAddr(base) << page_bits) + subbits;
-            operation(d_address);
+            if (d_address < max_area) {
+                operation(d_address);
+            }
             return;
         }
         InnerGatherDeviceAddresses(buffer, address);
         for (u32 value : buffer) {
-            operation((DAddr(value) << page_bits) + subbits);
+            const DAddr d_address = (DAddr(value) << page_bits) + subbits;
+            if (d_address < max_area) {
+                operation(d_address);
+            }
         }
     }
 
     template <typename Func>
     void ApplyOpOnPointer(const u8* p, Common::ScratchBuffer<u32>& buffer, Func&& operation) {
+        if (p == nullptr || reinterpret_cast<uintptr_t>(p) < physical_base) {
+            return;
+        }
         PAddr address = GetRawPhysicalAddr<u8>(p);
         ApplyOpOnPAddr(address, buffer, operation);
     }
 
     PAddr GetPhysicalRawAddressFromDAddr(DAddr address) const {
+        const size_t page_index = address >> page_bits;
+        if (address >= device_as_size.load(std::memory_order_acquire) ||
+            page_index >= tracked_entries.size()) {
+            return 0;
+        }
         PAddr subbits = PAddr(address & page_mask);
-        auto paddr = tracked_entries[(address >> page_bits)].compressed_physical_ptr;
+        auto paddr = tracked_entries[page_index].compressed_physical_ptr;
         if (paddr == 0) {
             return 0;
         }
@@ -133,6 +167,8 @@ public:
 
     // New batch API to update multiple ranges with a single lock acquisition.
     void UpdatePagesCachedBatch(std::span<const std::pair<DAddr, size_t>> ranges, s32 delta);
+
+    [[nodiscard]] u8 GetPageCachedCount(DAddr addr) const noexcept;
 
     /// Traps the next guest CPU read of these pages, to learn which GPU writes the CPU reads.
     void ArmReadTraps(DAddr addr, size_t size);
@@ -170,8 +206,7 @@ private:
     void UpdatePagesCachedCountNoLock(DAddr addr, size_t size, s32 delta);
 
 private:
-    static constexpr size_t device_virtual_bits = Traits::device_virtual_bits;
-    static constexpr size_t device_as_size = 1ULL << device_virtual_bits;
+    static constexpr size_t max_device_virtual_bits = Traits::device_virtual_bits;
     static constexpr size_t physical_min_bits = 32;
     static constexpr size_t physical_max_bits = 35; // covers the 12 GiB layout plus nx2 graphics server memory
     static constexpr size_t page_bits = 12;
@@ -181,6 +216,16 @@ private:
     static constexpr u32 MULTI_FLAG_BITS = 31;
     static constexpr u32 MULTI_FLAG = 1U << MULTI_FLAG_BITS;
     static constexpr u32 MULTI_MASK = ~MULTI_FLAG;
+    using CounterType = u8;
+    using CounterAtomicType = std::atomic_uint8_t;
+    static constexpr size_t subentries = 8 / sizeof(CounterType);
+    static constexpr size_t subentries_mask = subentries - 1;
+    static constexpr size_t subentries_shift =
+        std::countr_zero(sizeof(u64)) - std::countr_zero(sizeof(CounterType));
+    static constexpr size_t min_device_virtual_bits = page_bits + subentries_shift;
+
+    std::atomic<size_t> device_virtual_bits{max_device_virtual_bits};
+    std::atomic<DAddr> device_as_size{DAddr{1} << max_device_virtual_bits};
 
     template <typename T>
     T* GetPointerFromRaw(PAddr addr) {
@@ -243,12 +288,6 @@ private:
     }
 
     std::atomic<u64> translation_generation{1}; ///< Bumped by Map and Unmap
-    using CounterType = u8;
-    using CounterAtomicType = std::atomic_uint8_t;
-    static constexpr size_t subentries = 8 / sizeof(CounterType);
-    static constexpr size_t subentries_mask = subentries - 1;
-    static constexpr size_t subentries_shift =
-        std::countr_zero(sizeof(u64)) - std::countr_zero(sizeof(CounterType));
     class CounterEntry final {
     public:
         CounterEntry() = default;
@@ -267,14 +306,12 @@ private:
     static_assert(sizeof(CounterEntry) == subentries * sizeof(CounterType),
                   "CounterEntry should be 8 bytes!");
 
-    static constexpr size_t num_counter_entries =
-        (1ULL << (device_virtual_bits - page_bits)) / subentries;
-    using CachedPages = std::array<CounterEntry, num_counter_entries>;
-    std::unique_ptr<CachedPages> cached_pages;
+    size_t num_counter_entries{(1ULL << (max_device_virtual_bits - page_bits)) / subentries};
+    std::unique_ptr<CounterEntry[]> cached_pages;
     void UpdateHasFastmemArenaLocked();
 
     std::atomic<bool> has_fastmem_arena{false};
-    Common::RangeMutex counter_guard;
+    mutable Common::RangeMutex counter_guard;
     std::mutex mapping_guard;
 
 

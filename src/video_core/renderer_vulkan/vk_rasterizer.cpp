@@ -42,6 +42,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/control/channel_state_bridge.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/indirect_reset.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -232,7 +233,8 @@ DrawParams MakeDrawParams(const Tegra::Engines::Maxwell3D::DrawManager::State& d
         params.base_vertex = 0;
         params.is_indexed = true;
     } else if (draw_state.topology == Maxwell::PrimitiveTopology::QuadStrip) {
-        params.num_vertices = (params.num_vertices - 2) / 2 * 6;
+        params.num_vertices =
+            params.num_vertices >= 4 ? ((params.num_vertices - 2) / 2) * 6 : 0;
         params.base_vertex = 0;
         params.is_indexed = true;
     }
@@ -423,6 +425,7 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
       frame_dump(device, memory_allocator, scheduler),
       wfi_event(device.GetLogical().CreateEvent()) {
+    texture_cache_runtime.SetSystem(&gpu.System());
     scheduler.SetQueryCache(query_cache);
     buffer_cache.SetPendingCpuWrites(
         [this](const std::function<void(DAddr, size_t)>& callback) {
@@ -1720,7 +1723,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     UpdateViewportsState(regs);
 
     const u32 color_attachment = regs.clear_surface.RT;
-    if (use_color && framebuffer->HasAspectColorBit(color_attachment)) {
+    if (use_color && color_attachment < VideoCommon::NUM_RT &&
+        framebuffer->HasAspectColorBit(color_attachment)) {
         const auto format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[color_attachment].format);
         bool is_integer = IsPixelFormatInteger(format);
         bool is_signed = IsPixelFormatSignedInteger(format);
@@ -1853,6 +1857,8 @@ void RasterizerVulkan::DispatchCompute() {
         if (kepler_compute->IsNativeMode()) throw Shader::RuntimeError("Native compute resources unavailable");
         return;
     }
+    // Compute dispatches may swap descriptor buffer chunks or bind descriptor sets.
+    descriptor_buffer_ring.InvalidateDrawOffsetCache();
     const auto& qmd{kepler_compute->launch_description};
     const auto publish_collision_map = [&] {
         if (native_key != 0x6e0ae200ee9aa220ULL ||
@@ -2206,11 +2212,12 @@ VideoCore::RasterizerDownloadArea RasterizerVulkan::GetFlushArea(DAddr addr, u64
         buffer_cache.ForgetReadTraps(addr, size);
         return *texture_area;
     }
-    if (buffer_cache.FlushesOnCpuRead()) {
+    {
         std::scoped_lock lock{buffer_cache.mutex};
-        auto area = buffer_cache.GetFlushArea(addr, size);
-        if (area) {
-            return *area;
+        if (buffer_cache.FlushesOnCpuRead()) {
+            if (auto area = buffer_cache.GetFlushArea(addr, size)) {
+                return *area;
+            }
         }
     }
     VideoCore::RasterizerDownloadArea new_area{
@@ -2508,6 +2515,7 @@ void RasterizerVulkan::FlushCommands() {
         return;
     }
     draw_counter = 0;
+    descriptor_buffer_ring.InvalidateDrawBindCache();
     // Fences with downloads or queries come here right after queueing: ~9,400 a second in
     // Hyrule Warriors: Age of Imprisonment fights. Batched like the fences themselves.
     if (!scheduler.DeferFlush()) {
@@ -3889,8 +3897,11 @@ void RasterizerVulkan::UpdateDepthBiasEnable(Tegra::Engines::Maxwell3D::Regs& re
         regs.polygon_offset_line_enable,
         regs.polygon_offset_fill_enable,
     };
-    const u32 topology_index = u32(maxwell3d->draw_manager.draw_state.topology);
-    const u32 enable = enabled_lut[POLYGON_OFFSET_ENABLE_LUT[topology_index]];
+    const size_t topology_index = static_cast<size_t>(maxwell3d->draw_manager.draw_state.topology);
+    const size_t offset_kind = topology_index < POLYGON_OFFSET_ENABLE_LUT.size()
+                                   ? POLYGON_OFFSET_ENABLE_LUT[topology_index]
+                                   : POINT;
+    const u32 enable = enabled_lut[offset_kind];
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthBiasEnableEXT(enable != 0); });
 }
 
@@ -4214,7 +4225,8 @@ void RasterizerVulkan::InitializeChannel(Tegra::Control::ChannelState& channel) 
     }
     pipeline_cache.CreateChannel(channel);
     query_cache.CreateChannel(channel);
-    state_tracker.SetupTables(channel);
+    const Tegra::Control::ChannelStateBridge bridge{channel};
+    state_tracker.SetupTables(bridge);
 }
 
 void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
@@ -4227,7 +4239,8 @@ void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
     }
     pipeline_cache.BindToChannel(channel_id);
     query_cache.BindToChannel(channel_id);
-    state_tracker.ChangeChannel(channel);
+    const Tegra::Control::ChannelStateBridge bridge{channel};
+    state_tracker.ChangeChannel(bridge);
     state_tracker.InvalidateState();
     bound_channel_id = channel_id;
 }
@@ -4235,6 +4248,7 @@ void RasterizerVulkan::BindChannel(Tegra::Control::ChannelState& channel) {
 void RasterizerVulkan::ReleaseChannel(s32 channel_id) {
     if (channel_id == bound_channel_id) {
         state_tracker.ClearChannel();
+        bound_channel_id = -1;
     }
     EraseChannel(channel_id);
     {

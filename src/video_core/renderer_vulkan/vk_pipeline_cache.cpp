@@ -44,6 +44,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_spikes.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
@@ -73,7 +74,47 @@
 #include "../../android/app/src/main/jni/android_settings.h"
 #endif
 
+#ifdef EGLANTINE_ENABLE_RUST_AMP_SPIRV
+#include "eglantine_ampere_spirv.h"
+#endif
+
 namespace Vulkan {
+
+namespace {
+std::atomic<s8> g_direct_sm86_override{-1};
+} // namespace
+
+void SetDirectSm86EnabledOverride(std::optional<bool> enabled) noexcept {
+    if (!enabled.has_value()) {
+        g_direct_sm86_override.store(-1, std::memory_order_relaxed);
+    } else {
+        g_direct_sm86_override.store(*enabled ? 1 : 0, std::memory_order_relaxed);
+    }
+}
+
+bool IsDirectSm86Enabled() noexcept {
+#ifdef EGLANTINE_ENABLE_RUST_AMP_SPIRV
+    const s8 override_val = g_direct_sm86_override.load(std::memory_order_relaxed);
+    if (override_val >= 0) {
+        return override_val != 0;
+    }
+    static const bool env_default = [] {
+        const char* const value = std::getenv("EDEN_NX2_DIRECT_SM86");
+        return value != nullptr && value[0] == '1';
+    }();
+    return env_default;
+#else
+    return false;
+#endif
+}
+
+bool DirectSm86SupportsStage(Shader::Stage stage) noexcept {
+#ifdef EGLANTINE_ENABLE_RUST_AMP_SPIRV
+    return stage == Shader::Stage::Compute;
+#else
+    return false;
+#endif
+}
 
 namespace {
 using Shader::Backend::SPIRV::EmitSPIRV;
@@ -90,10 +131,517 @@ using VideoCommon::GraphicsEnvironment;
 // translated again at boot and written back under the new one. Bump MIN_COMPATIBLE_CACHE_VERSION
 // too only when the record layout (environment or key serialization) changes, which deletes older
 // caches. 20 changed the environment layout; the keys last changed before it.
-constexpr u32 CACHE_VERSION = 34;
+constexpr u32 CACHE_VERSION = 36;
 static_assert(CACHE_VERSION == VideoCommon::ShaderWarm::WarmCacheVersion,
               "Shader precache files use the pipeline cache version");
+
+void EnsureEnvironmentLowered(Shader::Environment& env, bool has_generic_envs) {
+    if (has_generic_envs) {
+        static_cast<GenericEnvironment&>(env).EnsureLoweredNative();
+    } else {
+        static_cast<FileEnvironment&>(env).EnsureLoweredNative();
+    }
+}
+
+bool DirectSm86Enabled() noexcept {
+    return IsDirectSm86Enabled();
+}
+
+#ifdef EGLANTINE_ENABLE_RUST_AMP_SPIRV
+struct ScopedDirectSpirvOutput {
+    EglSpirvCompileOutput output{};
+    ~ScopedDirectSpirvOutput() {
+        egl_ampere_spirv_free(&output);
+    }
+};
+
+EglSpirvStage ToEglStage(Shader::Stage stage) noexcept {
+    switch (stage) {
+    case Shader::Stage::VertexB:
+        return EGL_SPIRV_STAGE_VERTEX_B;
+    case Shader::Stage::TessellationControl:
+        return EGL_SPIRV_STAGE_TESS_CONTROL;
+    case Shader::Stage::TessellationEval:
+        return EGL_SPIRV_STAGE_TESS_EVAL;
+    case Shader::Stage::Geometry:
+        return EGL_SPIRV_STAGE_GEOMETRY;
+    case Shader::Stage::Fragment:
+        return EGL_SPIRV_STAGE_FRAGMENT;
+    case Shader::Stage::Compute:
+        return EGL_SPIRV_STAGE_COMPUTE;
+    case Shader::Stage::VertexA:
+        return EGL_SPIRV_STAGE_VERTEX_A;
+    case Shader::Stage::Task:
+        return EGL_SPIRV_STAGE_TASK;
+    case Shader::Stage::Mesh:
+        return EGL_SPIRV_STAGE_MESH;
+    }
+    return EGL_SPIRV_STAGE_COMPUTE;
+}
+
+EglSpirvProfile BuildEglSpirvProfile(const Shader::Profile& profile,
+                                     const Shader::HostTranslateInfo& host_info) noexcept {
+    const auto flag = [](bool value) -> u8 { return value ? 1U : 0U; };
+    const bool coop_ok = profile.support_cooperative_hmma && profile.coop_tile_m == 16 &&
+                         profile.coop_tile_n == 8 && profile.coop_tile_k == 16;
+    return EglSpirvProfile{
+        .supported_spirv = profile.supported_spirv,
+        .max_subgroup_size = profile.max_subgroup_size,
+        .supported_subgroup_stages = profile.supported_subgroup_stages,
+        .max_user_clip_distances = profile.max_user_clip_distances,
+        .min_ssbo_alignment = profile.min_ssbo_alignment,
+        .unified_descriptor_binding = flag(profile.unified_descriptor_binding),
+        .support_descriptor_aliasing = flag(profile.support_descriptor_aliasing),
+        .support_int8 = flag(profile.support_int8),
+        .support_uniform_and_storage_buffer_8bit =
+            flag(profile.support_uniform_and_storage_buffer_8bit),
+        .support_storage_buffer_8bit = flag(profile.support_storage_buffer_8bit),
+        .support_int16 = flag(profile.support_int16),
+        .support_uniform_and_storage_buffer_16bit =
+            flag(profile.support_uniform_and_storage_buffer_16bit),
+        .support_storage_buffer_16bit = flag(profile.support_storage_buffer_16bit),
+        .support_int64 = flag(profile.support_int64),
+        .support_float16 = flag(host_info.support_float16),
+        .support_float64 = flag(host_info.support_float64),
+        .support_float_controls = flag(profile.support_float_controls),
+        .support_explicit_workgroup_layout = flag(profile.support_explicit_workgroup_layout),
+        .support_workgroup_layout_8bit_access = flag(profile.support_workgroup_layout_8bit_access),
+        .support_workgroup_layout_16bit_access = flag(profile.support_workgroup_layout_16bit_access),
+        .support_vote = flag(profile.support_vote),
+        .support_shuffle_relative = flag(profile.support_shuffle_relative),
+        .support_quad_shuffles = flag(profile.support_quad_shuffles),
+        .support_demote_to_helper_invocation = flag(profile.support_demote_to_helper_invocation),
+        .support_int64_atomics = flag(profile.support_int64_atomics),
+        .support_shared_int64_atomics = flag(profile.support_shared_int64_atomics),
+        .support_typeless_image_loads = flag(profile.support_typeless_image_loads),
+        .warp_size_potentially_larger_than_guest =
+            flag(profile.warp_size_potentially_larger_than_guest),
+        .lower_left_origin_mode = flag(profile.lower_left_origin_mode),
+        .has_broken_spirv_clamp = flag(profile.has_broken_spirv_clamp),
+        .has_broken_fp16_float_controls = flag(profile.has_broken_fp16_float_controls),
+        .has_broken_fp32_denorm_flush = flag(profile.has_broken_fp32_denorm_flush),
+        ._pad{},
+        .coop_layout =
+            EglSpirvCoopLayout{
+                .supported = flag(coop_ok),
+                .use_fp16_accum = 1U,
+                ._pad{},
+                .tile_m = profile.coop_tile_m,
+                .tile_n = profile.coop_tile_n,
+                .tile_k = profile.coop_tile_k,
+                .subgroup_size = 32U,
+                .a_word_map =
+                    {
+                        profile.coop_a_word_map[0],
+                        profile.coop_a_word_map[1],
+                        profile.coop_a_word_map[2],
+                        profile.coop_a_word_map[3],
+                    },
+                .b_word_map = {0U, 1U},
+                .c_word_map = {0U, 1U},
+                .d_word_map = {0U, 1U},
+            },
+        ._pad_end{},
+    };
+}
+
+void SyncShaderInfoFromSummary(const EglShaderInfoSummary& summary, Shader::Info& info,
+                               bool replace_full_info) {
+    if (replace_full_info) {
+        info = Shader::Info{};
+    }
+    info.is_task = summary.is_task != 0;
+    info.is_mesh = summary.is_mesh != 0;
+    info.uses_workgroup_id = summary.uses_workgroup_id != 0;
+    info.uses_local_invocation_id = summary.uses_local_invocation_id != 0;
+    info.uses_invocation_id = summary.uses_invocation_id != 0;
+    info.uses_invocation_info = summary.uses_invocation_info != 0;
+    info.uses_sample_id = summary.uses_sample_id != 0;
+    info.uses_is_helper_invocation = summary.uses_is_helper_invocation != 0;
+    info.uses_subgroup_invocation_id = summary.uses_subgroup_invocation_id != 0;
+    info.uses_subgroup_shuffles = summary.uses_subgroup_shuffles != 0;
+    info.uses_quad_shuffles = summary.uses_quad_shuffles != 0;
+    info.uses_subgroup_vote = summary.uses_subgroup_vote != 0;
+    info.uses_subgroup_mask = summary.uses_subgroup_mask != 0;
+    info.uses_fswzadd = summary.uses_fswzadd != 0;
+    info.uses_fp16 = summary.uses_fp16 != 0;
+    info.uses_fp64 = summary.uses_fp64 != 0;
+    info.uses_fp16_denorms_flush = summary.uses_fp16_denorms_flush != 0;
+    info.uses_fp16_denorms_preserve = summary.uses_fp16_denorms_preserve != 0;
+    info.uses_fp32_denorms_flush = summary.uses_fp32_denorms_flush != 0;
+    info.uses_fp32_denorms_preserve = summary.uses_fp32_denorms_preserve != 0;
+    info.uses_int8 = summary.uses_int8 != 0;
+    info.uses_int16 = summary.uses_int16 != 0;
+    info.uses_int64 = summary.uses_int64 != 0;
+    info.uses_local_memory = summary.uses_local_memory != 0;
+    info.uses_global_memory = summary.uses_global_memory != 0;
+    info.stores_global_memory = summary.stores_global_memory != 0;
+    info.requires_coherent_global_memory = summary.requires_coherent_global_memory != 0;
+    info.requires_coherent_image_memory = summary.requires_coherent_image_memory != 0;
+    info.uses_cooperative_matrix = summary.uses_cooperative_matrix != 0;
+    info.native_global_bounds = summary.native_global_bounds != 0;
+    info.uses_cbuf_indirect = summary.uses_cbuf_indirect != 0;
+    info.uses_rescaling_uniform = summary.uses_rescaling_uniform != 0;
+    info.uses_render_area = summary.uses_render_area != 0;
+    info.stores_frag_depth = summary.stores_frag_depth != 0;
+    info.stores_sample_mask = summary.stores_sample_mask != 0;
+    info.uses_demote_to_helper_invocation = summary.uses_demote_to_helper_invocation != 0;
+    info.uses_derivatives = summary.uses_derivatives != 0;
+    info.uses_typeless_image_reads = summary.uses_typeless_image_reads != 0;
+    info.uses_typeless_image_writes = summary.uses_typeless_image_writes != 0;
+    info.uses_shared_increment = summary.uses_shared_increment != 0;
+    info.uses_shared_decrement = summary.uses_shared_decrement != 0;
+    info.uses_global_increment = summary.uses_global_increment != 0;
+    info.uses_global_decrement = summary.uses_global_decrement != 0;
+    info.uses_atomic_f32_add = summary.uses_atomic_f32_add != 0;
+    info.uses_atomic_s32_min = summary.uses_atomic_s32_min != 0;
+    info.uses_atomic_s32_max = summary.uses_atomic_s32_max != 0;
+    info.uses_int64_bit_atomics = summary.uses_int64_bit_atomics != 0;
+    info.uses_image_1d = summary.uses_image_1d != 0;
+    info.uses_sampled_1d = summary.uses_sampled_1d != 0;
+    info.uses_image_buffers = summary.uses_image_buffers != 0;
+    info.uses_atomic_image_u32 = summary.uses_atomic_image_u32 != 0;
+    info.removed_conditional_barrier = summary.removed_conditional_barrier != 0;
+    info.uses_shadow_lod = summary.uses_shadow_lod != 0;
+
+    for (u32 rt = 0; rt < 8; ++rt) {
+        info.stores_frag_color[rt] = (summary.stores_frag_color_mask & (1U << rt)) != 0;
+        info.frag_color_components[rt] = summary.frag_color_components[rt];
+    }
+    info.used_clip_distances = summary.used_clip_distances;
+    info.constant_buffer_mask = summary.constant_buffer_mask;
+    for (size_t i = 0; i < Shader::Info::MAX_CBUFS; ++i) {
+        info.constant_buffer_used_sizes[i] = summary.constant_buffer_used_sizes[i];
+    }
+    info.used_constant_buffer_types =
+        static_cast<Shader::IR::Type>(summary.used_constant_buffer_types);
+    info.used_storage_buffer_types =
+        static_cast<Shader::IR::Type>(summary.used_storage_buffer_types);
+    info.used_indirect_cbuf_types =
+        static_cast<Shader::IR::Type>(summary.used_indirect_cbuf_types);
+    info.nvn_buffer_base = summary.nvn_buffer_base;
+    info.nvn_buffer_used = std::bitset<16>(summary.nvn_buffer_used_mask);
+
+    info.constant_buffer_descriptors.clear();
+    const size_t cbuf_count =
+        (std::min<size_t>)(summary.constant_buffer_descriptor_count, Shader::Info::MAX_CBUFS);
+    for (size_t i = 0; i < cbuf_count; ++i) {
+        const auto& desc = summary.constant_buffer_descriptors[i];
+        info.constant_buffer_descriptors.push_back(Shader::ConstantBufferDescriptor{
+            .index = desc.index,
+            .count = desc.count,
+        });
+    }
+
+    info.storage_buffers_descriptors.clear();
+    const size_t ssbo_count =
+        (std::min<size_t>)(summary.storage_buffer_descriptor_count, Shader::Info::MAX_SSBOS);
+    for (size_t i = 0; i < ssbo_count; ++i) {
+        const auto& desc = summary.storage_buffer_descriptors[i];
+        info.storage_buffers_descriptors.push_back(Shader::StorageBufferDescriptor{
+            .cbuf_index = desc.cbuf_index,
+            .cbuf_offset = desc.cbuf_offset,
+            .count = desc.count,
+            .is_written = desc.is_written != 0,
+            .indirect_offset = desc.indirect_offset,
+        });
+    }
+
+    info.texture_buffer_descriptors.clear();
+    if (summary.texture_buffer_descriptors != nullptr) {
+        for (size_t i = 0; i < summary.texture_buffer_descriptor_count; ++i) {
+            const auto& d = summary.texture_buffer_descriptors[i];
+            info.texture_buffer_descriptors.push_back(Shader::TextureBufferDescriptor{
+                .has_secondary = d.has_secondary != 0,
+                .cbuf_index = d.cbuf_index,
+                .cbuf_offset = d.cbuf_offset,
+                .shift_left = d.shift_left,
+                .secondary_cbuf_index = d.secondary_cbuf_index,
+                .secondary_cbuf_offset = d.secondary_cbuf_offset,
+                .secondary_shift_left = d.secondary_shift_left,
+                .count = d.count,
+                .size_shift = d.size_shift,
+                .handle_program = d.handle_program,
+            });
+        }
+    }
+
+    info.image_buffer_descriptors.clear();
+    if (summary.image_buffer_descriptors != nullptr) {
+        for (size_t i = 0; i < summary.image_buffer_descriptor_count; ++i) {
+            const auto& d = summary.image_buffer_descriptors[i];
+            info.image_buffer_descriptors.push_back(Shader::ImageBufferDescriptor{
+                .format = static_cast<Shader::ImageFormat>(d.format),
+                .is_written = d.is_written != 0,
+                .is_read = d.is_read != 0,
+                .is_integer = d.is_integer != 0,
+                .cbuf_index = d.cbuf_index,
+                .cbuf_offset = d.cbuf_offset,
+                .count = d.count,
+                .size_shift = d.size_shift,
+                .handle_program = d.handle_program,
+            });
+        }
+    }
+
+    info.texture_descriptors.clear();
+    if (summary.texture_descriptors != nullptr) {
+        for (size_t i = 0; i < summary.texture_descriptor_count; ++i) {
+            const auto& d = summary.texture_descriptors[i];
+            info.texture_descriptors.push_back(Shader::TextureDescriptor{
+                .type = static_cast<Shader::TextureType>(d.type),
+                .is_depth = d.is_depth != 0,
+                .is_multisample = d.is_multisample != 0,
+                .is_integer = d.is_integer != 0,
+                .has_secondary = d.has_secondary != 0,
+                .cbuf_index = d.cbuf_index,
+                .cbuf_offset = d.cbuf_offset,
+                .shift_left = d.shift_left,
+                .secondary_cbuf_index = d.secondary_cbuf_index,
+                .secondary_cbuf_offset = d.secondary_cbuf_offset,
+                .secondary_shift_left = d.secondary_shift_left,
+                .count = d.count,
+                .size_shift = d.size_shift,
+                .handle_program = d.handle_program,
+            });
+        }
+    }
+
+    info.image_descriptors.clear();
+    if (summary.image_descriptors != nullptr) {
+        for (size_t i = 0; i < summary.image_descriptor_count; ++i) {
+            const auto& d = summary.image_descriptors[i];
+            info.image_descriptors.push_back(Shader::ImageDescriptor{
+                .type = static_cast<Shader::TextureType>(d.type),
+                .format = static_cast<Shader::ImageFormat>(d.format),
+                .is_written = d.is_written != 0,
+                .is_read = d.is_read != 0,
+                .is_integer = d.is_integer != 0,
+                .cbuf_index = d.cbuf_index,
+                .cbuf_offset = d.cbuf_offset,
+                .count = d.count,
+                .size_shift = d.size_shift,
+                .handle_program = d.handle_program,
+            });
+        }
+    }
+}
+
+bool TryCompileDirectSm86Snapshot(const VideoCommon::NativeShaderSnapshot& snap,
+                                  const Shader::Profile& profile,
+                                  const Shader::HostTranslateInfo& host_info,
+                                  Shader::Backend::Bindings& io_bindings, Shader::Info& io_info,
+                                  std::vector<u32>& out_code, bool replace_full_info,
+                                  u32 max_shared_memory = 0) {
+    if (snap.native_code.empty()) {
+        return false;
+    }
+
+    static_assert(sizeof(Shader::Ampere::Instruction) == sizeof(EglAmpereInstruction));
+
+    std::vector<EglSpirvCbufEntry> cbufs;
+    cbufs.reserve(snap.cbuf_values.size());
+    for (const auto& [packed_key, val] : snap.cbuf_values) {
+        cbufs.push_back(EglSpirvCbufEntry{
+            .index = static_cast<u32>(packed_key >> 32),
+            .offset = static_cast<u32>(packed_key & 0xFFFFFFFFULL),
+            .value = val,
+        });
+    }
+
+    std::vector<EglSpirvTextureTypeEntry> tex_types;
+    tex_types.reserve(snap.texture_types.size());
+    for (const auto& [handle, type] : snap.texture_types) {
+        tex_types.push_back(EglSpirvTextureTypeEntry{
+            .handle = handle,
+            .texture_type = static_cast<u32>(type),
+        });
+    }
+
+    std::vector<EglSpirvTextureFormatEntry> tex_formats;
+    tex_formats.reserve(snap.texture_pixel_formats.size());
+    for (const auto& [handle, fmt] : snap.texture_pixel_formats) {
+        tex_formats.push_back(EglSpirvTextureFormatEntry{
+            .handle = handle,
+            .pixel_format = static_cast<u32>(fmt),
+        });
+    }
+
+    std::vector<EglSpirvStoragePtrEntry> storage_ptrs;
+    storage_ptrs.reserve(snap.storage_pointer_types.size());
+    for (const auto& [ptr_key, mapped] : snap.storage_pointer_types) {
+        storage_ptrs.push_back(EglSpirvStoragePtrEntry{
+            .key = ptr_key,
+            .is_mapped = static_cast<u8>(mapped != 0 ? 1U : 0U),
+            ._pad{},
+        });
+    }
+
+    std::vector<EglSpirvCbufReplaceEntry> replacements;
+    replacements.reserve(snap.cbuf_replacements.size());
+    for (const auto& [packed_key, rc] : snap.cbuf_replacements) {
+        replacements.push_back(EglSpirvCbufReplaceEntry{
+            .bank = static_cast<u32>(packed_key >> 32),
+            .offset = static_cast<u32>(packed_key & 0xFFFFFFFFULL),
+            .replace_constant = static_cast<u32>(rc),
+        });
+    }
+
+    u32 shared_mem_size = snap.shared_memory_size;
+    if (max_shared_memory != 0 && shared_mem_size > max_shared_memory) {
+        shared_mem_size = max_shared_memory;
+    }
+
+    EglSpirvCompileInput input{};
+    input.stage = static_cast<u32>(ToEglStage(snap.stage));
+    input.texture_bound = snap.texture_bound;
+    input.program_key = snap.program_key;
+    std::memcpy(input.program_header, snap.header.data(), sizeof(input.program_header));
+    input.code = reinterpret_cast<const EglAmpereInstruction*>(snap.native_code.data());
+    input.code_count = snap.native_code.size();
+    input.workgroup_size[0] = snap.workgroup_size[0];
+    input.workgroup_size[1] = snap.workgroup_size[1];
+    input.workgroup_size[2] = snap.workgroup_size[2];
+    input.local_memory_size = snap.local_memory_size;
+    input.shared_memory_size = shared_mem_size;
+    input.is_task_shader = snap.stage == Shader::Stage::Task ? 1U : 0U;
+    input.is_mesh_shader = snap.stage == Shader::Stage::Mesh ? 1U : 0U;
+    input.native_tensor = snap.native_tensor ? 1U : 0U;
+    input.native_compact_tensor = snap.native_compact_tensor ? 1U : 0U;
+    input.has_hle_engine_state = snap.has_hle_engine_state ? 1U : 0U;
+    input.mesh_as_compute = 0U;
+    input.viewport_transform_state = snap.viewport_transform_state;
+    input.cbufs = cbufs.data();
+    input.cbuf_count = cbufs.size();
+    input.texture_types = tex_types.data();
+    input.texture_type_count = tex_types.size();
+    input.texture_formats = tex_formats.data();
+    input.texture_format_count = tex_formats.size();
+    input.storage_ptrs = storage_ptrs.data();
+    input.storage_ptr_count = storage_ptrs.size();
+    input.replacements = replacements.data();
+    input.replacement_count = replacements.size();
+    input.profile = BuildEglSpirvProfile(profile, host_info);
+    input.bindings = EglSpirvBindings{
+        .unified = io_bindings.unified,
+        .uniform_buffer = io_bindings.uniform_buffer,
+        .storage_buffer = io_bindings.storage_buffer,
+        .texture = io_bindings.texture,
+        .image = io_bindings.image,
+        .texture_scaling_index = io_bindings.texture_scaling_index,
+        .image_scaling_index = io_bindings.image_scaling_index,
+    };
+
+    ScopedDirectSpirvOutput scoped;
+    const s32 rc = egl_ampere_spirv_compile(&input, &scoped.output);
+    const EglSpirvCompileOutput& out = scoped.output;
+    if (rc != 0 || out.fallback_to_maxwell != 0 || out.word_count == 0 ||
+        out.spirv_words == nullptr) {
+        LOG_DEBUG(Render_Vulkan,
+                  "Direct SM86 SPIR-V fallback for key {:#018x} (rc={}, offset={:#x}, op={:#x}): {}",
+                  snap.program_key, rc, out.fallback_offset, out.fallback_opcode,
+                  out.error != nullptr ? std::string_view(out.error, out.error_len)
+                                       : std::string_view{});
+        return false;
+    }
+
+    out_code.assign(out.spirv_words, out.spirv_words + out.word_count);
+    io_bindings = Shader::Backend::Bindings{
+        .unified = out.updated_bindings.unified,
+        .uniform_buffer = out.updated_bindings.uniform_buffer,
+        .storage_buffer = out.updated_bindings.storage_buffer,
+        .texture = out.updated_bindings.texture,
+        .image = out.updated_bindings.image,
+        .texture_scaling_index = out.updated_bindings.texture_scaling_index,
+        .image_scaling_index = out.updated_bindings.image_scaling_index,
+    };
+    SyncShaderInfoFromSummary(out.info, io_info, replace_full_info);
+    return true;
+}
+
+bool TryCompileDirectSm86(GenericEnvironment& env, const Shader::Profile& profile,
+                          const Shader::HostTranslateInfo& host_info,
+                          Shader::Backend::Bindings& io_bindings, Shader::Info& io_info,
+                          std::vector<u32>& out_code, bool replace_full_info,
+                          u32 max_shared_memory = 0) {
+    if (!DirectSm86Enabled() || !DirectSm86SupportsStage(env.ShaderStage()) ||
+        !env.IsNativeProgram() || profile.supported_spirv < 0x00010600U) {
+        return false;
+    }
+    const VideoCommon::NativeShaderSnapshot snap = env.BuildNativeSnapshot();
+    return TryCompileDirectSm86Snapshot(snap, profile, host_info, io_bindings, io_info, out_code,
+                                        replace_full_info, max_shared_memory);
+}
+
+bool TryCompileDirectSm86(FileEnvironment& env, const Shader::Profile& profile,
+                          const Shader::HostTranslateInfo& host_info,
+                          Shader::Backend::Bindings& io_bindings, Shader::Info& io_info,
+                          std::vector<u32>& out_code, bool replace_full_info,
+                          u32 max_shared_memory = 0) {
+    if (!DirectSm86Enabled() || !DirectSm86SupportsStage(env.ShaderStage()) ||
+        !env.HasNativeInstructions() || profile.supported_spirv < 0x00010600U) {
+        return false;
+    }
+    const VideoCommon::NativeShaderSnapshot snap = env.BuildNativeSnapshot();
+    return TryCompileDirectSm86Snapshot(snap, profile, host_info, io_bindings, io_info, out_code,
+                                        replace_full_info, max_shared_memory);
+}
+#else
+bool TryCompileDirectSm86(GenericEnvironment&, const Shader::Profile&,
+                          const Shader::HostTranslateInfo&, Shader::Backend::Bindings&,
+                          Shader::Info&, std::vector<u32>&, bool, u32 = 0) {
+    return false;
+}
+
+bool TryCompileDirectSm86(FileEnvironment&, const Shader::Profile&,
+                          const Shader::HostTranslateInfo&, Shader::Backend::Bindings&,
+                          Shader::Info&, std::vector<u32>&, bool, u32 = 0) {
+    return false;
+}
+#endif
+
+template <typename Env>
+DirectSm86CompileResult CompileComputeStageImpl(
+    ShaderPools& pools, Env& env, const Shader::Profile& profile,
+    const Shader::HostTranslateInfo& host_info, u32 max_shared_memory, u64 unique_hash) {
+    DirectSm86CompileResult result;
+    result.compiled_direct = TryCompileDirectSm86(
+        env, profile, host_info, result.bindings, result.info, result.spirv, true,
+        max_shared_memory);
+    if (!result.compiled_direct) {
+        env.EnsureLoweredNative();
+        Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
+        auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+        if (max_shared_memory != 0 && program.shared_memory_size > max_shared_memory) {
+            LOG_WARNING(
+                Render_Vulkan,
+                "Compute shader {:#016x} requests {}KB shared memory but device max is {}KB - "
+                "clamping",
+                unique_hash, program.shared_memory_size / 1024, max_shared_memory / 1024);
+            program.shared_memory_size = max_shared_memory;
+        }
+        result.spirv = EmitSPIRV(profile, program);
+        result.info = std::move(program.info);
+    }
+    return result;
+}
+} // namespace
+
+DirectSm86CompileResult CompileComputeStageWithLazyFallback(
+    ShaderPools& pools, GenericEnvironment& env, const Shader::Profile& profile,
+    const Shader::HostTranslateInfo& host_info, u32 max_shared_memory, u64 unique_hash) {
+    return CompileComputeStageImpl(pools, env, profile, host_info, max_shared_memory, unique_hash);
+}
+
+DirectSm86CompileResult CompileComputeStageWithLazyFallback(
+    ShaderPools& pools, FileEnvironment& env, const Shader::Profile& profile,
+    const Shader::HostTranslateInfo& host_info, u32 max_shared_memory, u64 unique_hash) {
+    return CompileComputeStageImpl(pools, env, profile, host_info, max_shared_memory, unique_hash);
+}
+
+namespace {
 constexpr u32 MIN_COMPATIBLE_CACHE_VERSION = 20;
+constexpr u32 MIN_COMPATIBLE_NX2_CACHE_VERSION = 36;
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
@@ -623,8 +1171,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_user_clip_distances = device.GetMaxUserClipDistances()};
-    profile.support_cooperative_hmma =
-        device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
+    const CoopHmmaProfile coop_profile = ProbeCooperativeHmma(device);
+    profile.support_cooperative_hmma = coop_profile.supported;
+    profile.coop_tile_m = coop_profile.tile_m;
+    profile.coop_tile_n = coop_profile.tile_n;
+    profile.coop_tile_k = coop_profile.tile_k;
+    profile.coop_a_word_map = coop_profile.a_word_map;
 
     host_info = Shader::HostTranslateInfo{
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
@@ -1075,6 +1627,12 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
             ClaimPrecacheProgram(key);
         }
         entry = CreateComputePipeline(key, shader);
+        if (!entry.pipeline && shader->lowered_native &&
+            shader->lowered_native->HasFailedLowering()) {
+            EvictFailedLazyShader(shader);
+            compute_cache.erase(pair);
+            return nullptr;
+        }
     } else if (!entry.pending && !entry.null_pointer_slots.empty() &&
                entry.rebuilds < MaxComputeRebuilds && StaleNullPointerSlot(entry)) {
         bool swapped_alternate = false;
@@ -1121,6 +1679,9 @@ ComputePipeline* PipelineCache::CurrentComputePipeline(u64& native_key) {
                 entry.rebuilds = MaxComputeRebuilds;
             }
         }
+    }
+    if (entry.pipeline && native_key == 0) {
+        native_key = entry.pipeline->NativeKey();
     }
     if (entry.pipeline && !entry.pending &&
         (entry.null_pointer_slots.empty() || entry.rebuilds >= MaxComputeRebuilds)) {
@@ -1364,12 +1925,15 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         });
         ++state.total;
     }};
+    const u32 min_compatible_version = Settings::CurrentProgramIsSwitch2()
+                                           ? MIN_COMPATIBLE_NX2_CACHE_VERSION
+                                           : MIN_COMPATIBLE_CACHE_VERSION;
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
-                               load_graphics, false, MIN_COMPATIBLE_CACHE_VERSION, &main_upgrade);
+                               load_graphics, false, min_compatible_version, &main_upgrade);
     if (device.IsExtMeshShaderSupported()) {
         loading_mesh_file = true;
         VideoCommon::LoadPipelines(stop_loading, mesh_pipeline_cache_filename, CACHE_VERSION,
-                                   load_compute, load_graphics, true, MIN_COMPATIBLE_CACHE_VERSION,
+                                   load_compute, load_graphics, true, min_compatible_version,
                                    &mesh_upgrade);
     }
     if (driver_updated && !used_pipelines_filename.empty()) {
@@ -2113,6 +2677,105 @@ void PipelineCache::EvictUnusedPipelines() {
              EvictAfterFrames, graphics_cache.size());
 }
 
+void PipelineCache::OnDebugRejectionsRefreshed(bool unrejected,
+                                               std::span<const u64> dropped_hashes) {
+    std::unordered_set<u64> dropped(dropped_hashes.begin(), dropped_hashes.end());
+    const auto is_rejected_hash = [&dropped](u64 hash) {
+        return hash != 0 && (dropped.contains(hash) || VideoCore::Nx2Debug::IsRejected(hash));
+    };
+    const auto any_stage_rejected = [&is_rejected_hash](const GraphicsPipelineCacheKey& key) {
+        return std::ranges::any_of(key.unique_hashes, is_rejected_hash);
+    };
+
+    const u64 tick = scheduler.CurrentTick();
+    size_t evicted_graphics = 0;
+    size_t erased_invalid_graphics = 0;
+    for (auto it = graphics_cache.begin(); it != graphics_cache.end();) {
+        const bool is_null = !it->second;
+        if (!is_null && !any_stage_rejected(it->first)) {
+            ++it;
+            continue;
+        }
+        if (it->second) {
+            used_this_session.erase(it->second.get());
+            if (current_pipeline == it->second.get()) {
+                current_pipeline = nullptr;
+            }
+            evicted_pipelines.emplace_back(tick, std::move(it->second));
+            ++evicted_graphics;
+        } else {
+            ++erased_invalid_graphics;
+        }
+        it = graphics_cache.erase(it);
+    }
+    for (auto& [key, pipeline] : graphics_cache) {
+        if (pipeline) {
+            pipeline->ClearTransitions();
+        }
+    }
+    graphics_fast_cache.fill(nullptr);
+    current_pipeline = nullptr;
+    skipped_geometry = {};
+    last_skipped_geometry_frame = ~u64{};
+
+    {
+        std::scoped_lock lock{background_mutex};
+        for (auto it = background_ready.begin(); it != background_ready.end();) {
+            if (!it->second || any_stage_rejected(it->first)) {
+                if (it->second) {
+                    evicted_pipelines.emplace_back(tick, std::move(it->second));
+                }
+                it = background_ready.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto it = skipped_disk_envs.begin(); it != skipped_disk_envs.end();) {
+        if (any_stage_rejected(it->first)) {
+            it = skipped_disk_envs.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    size_t evicted_compute = 0;
+    size_t erased_invalid_compute = 0;
+    for (auto it = compute_cache.begin(); it != compute_cache.end();) {
+        const bool is_invalid = !it->second.pipeline && !it->second.pending;
+        const bool matches_rejected =
+            is_rejected_hash(it->first.unique_hash) ||
+            (it->second.pipeline && is_rejected_hash(it->second.pipeline->NativeKey()));
+        if (!is_invalid && !matches_rejected) {
+            ++it;
+            continue;
+        }
+        if (it->second.pipeline) {
+            retired_compute_pipelines.emplace_back(tick, std::move(it->second.pipeline));
+            ++evicted_compute;
+        }
+        if (it->second.pending) {
+            retired_compute_pipelines.emplace_back(tick, std::move(it->second.pending));
+        }
+        for (auto& alt : it->second.alternates) {
+            if (alt.pipeline) {
+                retired_compute_pipelines.emplace_back(tick, std::move(alt.pipeline));
+            }
+        }
+        if (is_invalid) {
+            ++erased_invalid_compute;
+        }
+        it = compute_cache.erase(it);
+    }
+    compute_fast_cache.fill({});
+
+    LOG_INFO(Render_Vulkan,
+             "Pipeline cache debug rejection sync{}: evicted {} graphics ({} invalid) and {} "
+             "compute ({} invalid) entries",
+             unrejected ? " (unrejected)" : "", evicted_graphics, erased_invalid_graphics,
+             evicted_compute, erased_invalid_compute);
+}
+
 std::unique_ptr<GraphicsPipeline> PipelineCache::TakeBackgroundPipeline(
     const GraphicsPipelineCacheKey& key) {
     std::scoped_lock lock{background_mutex};
@@ -2162,14 +2825,16 @@ void PipelineCache::StartShaderPrecache(u64 title_id) {
         file.read(magic.data(), magic.size())
             .read(reinterpret_cast<char*>(&version), sizeof(version));
         constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
+        const u32 min_compatible_version = Settings::CurrentProgramIsSwitch2()
+                                               ? MIN_COMPATIBLE_NX2_CACHE_VERSION
+                                               : MIN_COMPATIBLE_CACHE_VERSION;
         // The file holds environments only, which read the same in every compatible version: one
         // from an older version is built again under this one (the marker carries the version).
-        if (magic != expected_magic || version < MIN_COMPATIBLE_CACHE_VERSION ||
-            version > CACHE_VERSION) {
+        if (magic != expected_magic || version < min_compatible_version || version > CACHE_VERSION) {
             LOG_WARNING(Render_Vulkan,
                         "Shader precache: {} is a version {} file, not {} to {}; pre-compile the "
                         "game's shaders again",
-                        path, version, MIN_COMPATIBLE_CACHE_VERSION, CACHE_VERSION);
+                        path, version, min_compatible_version, CACHE_VERSION);
             return;
         }
         while (file.tellg() != end) {
@@ -2441,6 +3106,10 @@ bool PipelineCache::BuildNewGraphicsPipeline(bool is_indexed) {
     if (!pipeline) {
         pipeline = CreateGraphicsPipeline();
     }
+    if (!pipeline && EvictFailedLazyShaders() > 0) {
+        graphics_miss = "creation-failed";
+        return false;
+    }
     graphics_cache.emplace(graphics_key, std::move(pipeline));
     return true;
 }
@@ -2469,13 +3138,22 @@ struct PhaseTimer {
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     ShaderPools& pools, const GraphicsPipelineCacheKey& key,
     std::span<Shader::Environment* const> envs, PipelineStatistics* statistics,
-    bool build_in_parallel, bool native_turing, bool parallel_stages) try {
+    bool build_in_parallel, bool native_turing, bool parallel_stages,
+    bool has_generic_envs) try {
     auto hash = key.Hash();
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
     size_t env_index{0};
     std::array<Shader::IR::Program, Maxwell::MaxShaderProgram> programs;
     const bool uses_vertex_a{key.unique_hashes[0] != 0};
     const bool uses_vertex_b{key.unique_hashes[1] != 0};
+    const bool has_geometry{
+        key.unique_hashes[static_cast<size_t>(Maxwell::ShaderType::Geometry)] != 0};
+    const bool pipeline_mesh_unsupported{
+        !device.IsExtMeshShaderSupported() &&
+        std::ranges::any_of(envs, [](const Shader::Environment* stage_env) {
+            return stage_env->ShaderStage() == Shader::Stage::Task ||
+                   stage_env->ShaderStage() == Shader::Stage::Mesh;
+        })};
 
     // Native stages translated before for other pipelines (VideoCommon::StageCache). A merged
     // VertexA/VertexB pair is always translated.
@@ -2506,6 +3184,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             if (!env.IsNativeProgram()) {
                 continue;
             }
+            EnsureEnvironmentLowered(env, has_generic_envs);
             signatures[index] = StageCache::Signature(env, key.unique_hashes[index], index);
             reused[index] = stage_cache.Find(signatures[index], env);
             if (reused[index] && reused[index]->program.info.requires_layer_emulation) {
@@ -2544,6 +3223,70 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // Layer passthrough generation for devices without VK_EXT_shader_viewport_index_layer
     Shader::IR::Program* layer_source_program{};
     bool mesh_unsupported{};
+
+    const auto translate_fallback_stage = [&](size_t index, Shader::Environment& stage_env,
+                                              bool allow_precomputed_sig) -> bool {
+        if (stage_env.IsNativeProgram()) {
+            EnsureEnvironmentLowered(stage_env, has_generic_envs);
+        }
+        const u32 cfg_offset{
+            static_cast<u32>(stage_env.StartAddress() + sizeof(Shader::ProgramHeader))};
+        const bool cacheable{cache_stages && stage_env.IsNativeProgram()};
+        std::vector<u8> signature;
+        if (cacheable && allow_precomputed_sig) {
+            signature = std::move(signatures[index]);
+        } else if (cacheable) {
+            signature = StageCache::Signature(stage_env, key.unique_hashes[index], index);
+            reused[index] = stage_cache.Find(signature, stage_env);
+            // A layer emulation source is needed with its IR (GenerateGeometryPassthrough).
+            if (reused[index] && reused[index]->program.info.requires_layer_emulation) {
+                reused[index] = nullptr;
+            }
+        }
+        if (reused[index]) {
+            programs[index] = reused[index]->program;
+        } else if (translated_ahead[index]) {
+            // programs[index] and recorded[index] came from the parallel translation above.
+        } else if (cacheable) {
+            StageCache::Recorder recorder{stage_env};
+            Shader::Maxwell::Flow::CFG cfg(recorder, pools.flow_block, cfg_offset, index == 0);
+            programs[index] = TranslateProgram(pools.inst, pools.block, recorder, cfg, host_info);
+            auto translation = std::make_shared<StageCache::Translation>();
+            translation->signature = std::move(signature);
+            translation->reads = recorder.TakeReads();
+            translation->program = StageCache::Summary(programs[index]);
+            recorded[index] = std::move(translation);
+        } else if (!uses_vertex_a || index != 1) {
+            // Normal path
+            Shader::Maxwell::Flow::CFG cfg(stage_env, pools.flow_block, cfg_offset, index == 0);
+            programs[index] =
+                TranslateProgram(pools.inst, pools.block, stage_env, cfg, host_info);
+        } else {
+            Shader::Maxwell::Flow::CFG cfg(stage_env, pools.flow_block, cfg_offset, index == 0);
+            // VertexB path when VertexA is present.
+            auto& program_va{programs[0]};
+            auto program_vb{
+                TranslateProgram(pools.inst, pools.block, stage_env, cfg, host_info)};
+            programs[index] =
+                MergeDualVertexPrograms(program_va, program_vb, stage_env, host_info);
+        }
+
+        if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
+            Shader::Optimization::HasBrokenPattern(programs[index])) {
+            LOG_WARNING(Render_Vulkan, "0x{:016x}: Skipping shader with known issues",
+                        key.unique_hashes[index]);
+            return false;
+        }
+
+        if (Settings::values.dump_guest_shaders) {
+            stage_env.Dump(hash, key.unique_hashes[index]);
+        }
+
+        if (programs[index].info.requires_layer_emulation) {
+            layer_source_program = &programs[index];
+        }
+        return true;
+    };
 
     std::optional<PhaseTimer> translate_timer{std::in_place, BuildPhase::Translate,
                                               build_in_parallel};
@@ -2590,58 +3333,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             mesh_unsupported = true;
         }
 
-        const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
         stage_envs[index] = &env;
-        const bool cacheable{cache_stages && env.IsNativeProgram()};
-        std::vector<u8> signature;
-        if (cacheable && looked_up[index]) {
-            signature = std::move(signatures[index]);
-        } else if (cacheable) {
-            signature = StageCache::Signature(env, key.unique_hashes[index], index);
-            reused[index] = stage_cache.Find(signature, env);
-            // A layer emulation source is needed with its IR (GenerateGeometryPassthrough).
-            if (reused[index] && reused[index]->program.info.requires_layer_emulation) {
-                reused[index] = nullptr;
-            }
-        }
-        if (reused[index]) {
-            programs[index] = reused[index]->program;
-        } else if (translated_ahead[index]) {
-            // programs[index] and recorded[index] came from the parallel translation above.
-        } else if (cacheable) {
-            StageCache::Recorder recorder{env};
-            Shader::Maxwell::Flow::CFG cfg(recorder, pools.flow_block, cfg_offset, index == 0);
-            programs[index] = TranslateProgram(pools.inst, pools.block, recorder, cfg, host_info);
-            auto translation = std::make_shared<StageCache::Translation>();
-            translation->signature = std::move(signature);
-            translation->reads = recorder.TakeReads();
-            translation->program = StageCache::Summary(programs[index]);
-            recorded[index] = std::move(translation);
-        } else if (!uses_vertex_a || index != 1) {
-            // Normal path
-            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
-            programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
-        } else {
-            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
-            // VertexB path when VertexA is present.
-            auto& program_va{programs[0]};
-            auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
-            programs[index] = MergeDualVertexPrograms(program_va, program_vb, env, host_info);
-        }
-
-        if (device.GetDriverID() != VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
-            Shader::Optimization::HasBrokenPattern(programs[index])) {
-            LOG_WARNING(Render_Vulkan, "0x{:016x}: Skipping shader with known issues",
-                        key.unique_hashes[index]);
+        if (!translate_fallback_stage(index, env, looked_up[index])) {
             return nullptr;
-        }
-
-        if (Settings::values.dump_guest_shaders) {
-            env.Dump(hash, key.unique_hashes[index]);
-        }
-
-        if (programs[index].info.requires_layer_emulation) {
-            layer_source_program = &programs[index];
         }
     }
     translate_timer.reset();
@@ -2827,9 +3521,10 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         infos[stage_index] = &program.info;
 
         std::optional<PhaseTimer> emit_timer{std::in_place, BuildPhase::Emit, build_in_parallel};
+        std::vector<u32> code;
         auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
-        // Mesh emulation and geometry output pruning shape the stage per pipeline beyond what the
-        // runtime key covers: those are emitted again every time.
+        // Mesh emulation and geometry output pruning shape the stage per pipeline beyond what
+        // the runtime key covers: those are emitted again every time.
         const bool emulated_mesh_stage =
             mesh_emulation &&
             (program.stage == Shader::Stage::Mesh || program.stage == Shader::Stage::Task);
@@ -2846,7 +3541,6 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 emitted = stage_cache.FindEmitted(*reused[index], runtime_key);
             }
         }
-        std::vector<u32> code;
         if (emitted && !stage_cache.Verify()) {
             code = emitted->spirv;
             program = emitted->program;
@@ -2872,14 +3566,16 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                     runtime_info.mesh_task_payload_stride = mesh_emulation->payload_stride;
                 }
                 if (program.stage == Shader::Stage::Mesh) {
-                    mesh_emulation->vertex_spirv = Shader::Backend::SPIRV::EmitMeshEmulationVertex(
-                        profile, program.mesh, mesh_emulation->output_binding,
-                        mesh_emulation->has_task ? mesh_emulation->args_binding : ~0U,
-                        runtime_info.convert_depth_mode && !profile.support_native_ndc);
+                    mesh_emulation->vertex_spirv =
+                        Shader::Backend::SPIRV::EmitMeshEmulationVertex(
+                            profile, program.mesh, mesh_emulation->output_binding,
+                            mesh_emulation->has_task ? mesh_emulation->args_binding : ~0U,
+                            runtime_info.convert_depth_mode && !profile.support_native_ndc);
                 }
             }
             ConvertLegacyToGeneric(program, runtime_info);
-            // EDEN_NX2_MESH_EMULATION_DUMP=<dir>: write the emulation's vertex shader for spirv-val.
+            // EDEN_NX2_MESH_EMULATION_DUMP=<dir>: write the emulation's vertex shader for
+            // spirv-val.
             if (mesh_emulation && program.stage == Shader::Stage::Mesh) {
                 if (const char* const dump{std::getenv("EDEN_NX2_MESH_EMULATION_DUMP")}) {
                     const auto& vertex_code{mesh_emulation->vertex_spirv};
@@ -2889,10 +3585,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                                static_cast<std::streamsize>(vertex_code.size() * sizeof(u32)));
                 }
             }
+            constexpr size_t pixel_index = static_cast<size_t>(Maxwell::ShaderType::Pixel);
             if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry)) {
-                PruneUnreadGeometryOutputs(program,
-                                           programs[static_cast<size_t>(Maxwell::ShaderType::Pixel)],
-                                           key, device.IsNvGeometryShaderPassthroughSupported());
+                PruneUnreadGeometryOutputs(
+                    program, programs[pixel_index], key,
+                    device.IsNvGeometryShaderPassthroughSupported());
             }
             code = EmitSPIRV(profile, runtime_info, program, binding);
             if (emitted) {
@@ -2972,18 +3669,27 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         if (key.unique_hashes[index] == 0) {
             continue;
         }
+        if (env_index >= envs.size() || envs[env_index] == nullptr) {
+            break;
+        }
         Shader::Environment& env{*envs[env_index]};
         ++env_index;
 
-        const u32 cfg_offset{static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-        try {
-            // Walks the program for the dump; the one that failed may fail here again, and an
-            // exception leaving this handler would end the process.
-            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
-        } catch (const Shader::Exception&) {
+        if (!env.IsNativeProgram()) {
+            const u32 cfg_offset{
+                static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
+            try {
+                // Walks the program for the dump; the one that failed may fail here again, and an
+                // exception leaving this handler would end the process.
+                Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
+            } catch (const Shader::Exception&) {
+            }
         }
         env.Dump(hash, key.unique_hashes[index]);
     }
+    LOG_ERROR(Render_Vulkan, "{}", exception.what());
+    return nullptr;
+} catch (const vk::Exception& exception) {
     LOG_ERROR(Render_Vulkan, "{}", exception.what());
     return nullptr;
 }
@@ -3081,7 +3787,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
 
     main_pools.ReleaseContents();
     auto pipeline{CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(), nullptr,
-                                         true, native_turing)};
+                                         true, native_turing, false, true)};
     if (pipeline) {
         StoreGraphicsPipeline(graphics_key, std::move(environments.envs),
                               pipeline->IsMeshPipeline());
@@ -3361,7 +4067,7 @@ void PipelineCache::TranslateGraphicsPipeline(const GraphicsPipelineCacheKey& ke
         }
         try {
             pipeline = CreateGraphicsPipeline(pools, key, MakeSpan(env_ptrs), nullptr, true,
-                                              true, true);
+                                              true, true, true);
         } catch (const std::exception& exception) {
             // Shader errors are handled inside; nothing else may end the worker thread.
             LOG_ERROR(Render_Vulkan, "Graphics pipeline translation failed: {}", exception.what());
@@ -3411,6 +4117,9 @@ void PipelineCache::AdoptTranslatedGraphicsPipelines() {
         report.pool_pipelines_changed += changed != 0 ? 1 : 0;
         const bool is_mesh{translated.pipeline && translated.pipeline->IsMeshPipeline()};
         const bool built{static_cast<bool>(translated.pipeline)};
+        if (!built && EvictFailedLazyShaders() > 0) {
+            continue;
+        }
         const auto [it, inserted]{graphics_cache.try_emplace(translated.key)};
         if (!inserted) {
             // Unreachable: a key being translated is never built elsewhere. Its driver compile
@@ -3445,7 +4154,7 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(const ComputePipe
     env.KeepStoragePointers(keep_pointers);
 
     main_pools.ReleaseContents();
-    auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true)};
+    auto entry{CreateComputePipeline(main_pools, key, env, nullptr, true, true)};
     if (!entry.pipeline || pipeline_cache_filename.empty()) {
         return entry;
     }
@@ -3461,7 +4170,8 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
                                                                const ComputePipelineCacheKey& key,
                                                                Shader::Environment& env,
                                                                PipelineStatistics* statistics,
-                                                               bool build_in_parallel) try {
+                                                               bool build_in_parallel,
+                                                               bool is_generic_env) try {
     auto hash = key.Hash();
     if (device.HasBrokenCompute()) {
         LOG_ERROR(Render_Vulkan, "Skipping {:#016x}", hash);
@@ -3470,27 +4180,24 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
 
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
 
-    Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
-
-    // Dump it before error.
-    if (Settings::values.dump_guest_shaders) {
-        env.Dump(hash, key.unique_hash);
-    }
-
-    auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool needs_shared_mem_clamp = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
                                         driver_id == VK_DRIVER_ID_ARM_PROPRIETARY ||
                                         driver_id == VK_DRIVER_ID_MOLTENVK;
     const u32 max_shared_memory = device.GetMaxComputeSharedMemorySize();
-    if (needs_shared_mem_clamp && program.shared_memory_size > max_shared_memory) {
-        LOG_WARNING(
-            Render_Vulkan,
-            "Compute shader {:#016x} requests {}KB shared memory but device max is {}KB - clamping",
-            key.unique_hash, program.shared_memory_size / 1024, max_shared_memory / 1024);
-        program.shared_memory_size = max_shared_memory;
+
+    const u32 clamp_limit = needs_shared_mem_clamp ? max_shared_memory : 0U;
+    auto compiled =
+        is_generic_env
+            ? CompileComputeStageWithLazyFallback(pools, static_cast<GenericEnvironment&>(env),
+                                                  profile, host_info, clamp_limit, key.unique_hash)
+            : CompileComputeStageWithLazyFallback(pools, static_cast<FileEnvironment&>(env),
+                                                  profile, host_info, clamp_limit, key.unique_hash);
+    if (Settings::values.dump_guest_shaders) {
+        env.Dump(hash, key.unique_hash);
     }
-    const std::vector<u32> code{EmitSPIRV(profile, program)};
+    std::vector<u32> code = std::move(compiled.spirv);
+    Shader::Info direct_info = std::move(compiled.info);
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
 
@@ -3515,16 +4222,28 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
         spv_module.SetObjectNameEXT(name.c_str());
     }
     Common::ThreadWorker* const thread_worker{build_in_parallel ? &workers : nullptr};
+    const u64 native_key = is_generic_env
+                               ? static_cast<const GenericEnvironment&>(env).NativeProgramKey()
+                               : static_cast<const FileEnvironment&>(env).NativeProgramKey();
     return {.pipeline = std::make_unique<ComputePipeline>(
                 device, scheduler, vulkan_pipeline_cache, descriptor_pool, guest_descriptor_queue,
-                descriptor_buffer_ring, thread_worker, statistics, &shader_notify, program.info,
-                std::move(spv_module), key.unique_hash),
+                descriptor_buffer_ring, thread_worker, statistics, &shader_notify, direct_info,
+                std::move(spv_module), key.unique_hash, native_key),
             .null_pointer_slots = env.IsNativeProgram() ? env.NullStoragePointerSlots()
                                                         : std::vector<std::pair<u32, u32>>{},
             .mapped_pointers =
                 env.IsNativeProgram() ? env.MappedStoragePointerKeys() : std::vector<u64>{}};
 
 } catch (const Shader::Exception& exception) {
+    if (Settings::values.dump_guest_shaders) {
+        env.Dump(key.Hash(), key.unique_hash);
+    }
+    LOG_ERROR(Render_Vulkan, "{}", exception.what());
+    return {.failure = exception.what()};
+} catch (const vk::Exception& exception) {
+    if (Settings::values.dump_guest_shaders) {
+        env.Dump(key.Hash(), key.unique_hash);
+    }
     LOG_ERROR(Render_Vulkan, "{}", exception.what());
     return {.failure = exception.what()};
 }

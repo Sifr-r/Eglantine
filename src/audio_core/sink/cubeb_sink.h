@@ -6,7 +6,9 @@
 
 #pragma once
 
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <cubeb/cubeb.h>
@@ -85,11 +87,13 @@ private:
     cubeb_devid input_device{};
     /// Vector of streams managed by this sink
     std::vector<SinkStreamPtr> sink_streams{};
+    mutable std::mutex streams_mutex;
 
 #ifdef _WIN32
     /// Cubeb required COM to be initialized multi-threaded on Windows
     u32 com_init_result = 0;
 #endif
+    std::jthread watchdog;
 };
 
 /**

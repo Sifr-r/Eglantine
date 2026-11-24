@@ -44,9 +44,7 @@ public:
      */
     static FileType IdentifyType(const FileSys::VirtualFile& dir_file);
 
-    FileType GetFileType() const override {
-        return IdentifyType(file);
-    }
+    FileType GetFileType() const override;
 
     LoadResult Load(Kernel::KProcess& process, Core::System& system) override;
 
@@ -59,6 +57,8 @@ public:
     bool IsRomFSUpdatable() const override;
 
     ResultStatus ReadNSOModules(Modules& out_modules) override;
+    ResultStatus ReadProgramMetadata(Core::System& system,
+                                     FileSys::ProgramMetadata& out_metadata) override;
 
 private:
     /// The loose RomFS next to the ExeFS, found (and built) on first use.

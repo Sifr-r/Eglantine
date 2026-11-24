@@ -253,7 +253,11 @@ function(apply_patches patches dir)
         execute_process(
             COMMAND ${PATCH_EXE} -p1
             INPUT_FILE ${patch}
-            WORKING_DIRECTORY ${dir})
+            WORKING_DIRECTORY ${dir}
+            RESULT_VARIABLE patch_result)
+        if (NOT "${patch_result}" STREQUAL "0")
+            fatal("Failed to apply patch ${patch_name} (result: ${patch_result})")
+        endif()
     endforeach()
 endfunction()
 
@@ -945,7 +949,7 @@ function(AddPackage)
     Propagate(${PKG_ARGS_NAME}_BINARY_DIR)
 
     if (PKG_ARGS_MODULE_PATH)
-        list(PREPEND CMAKE_PREFIX_PATH "${${ARTIFACT_PACKAGE}_SOURCE_DIR}")
+        list(PREPEND CMAKE_PREFIX_PATH "${${PKG_ARGS_NAME}_SOURCE_DIR}")
         Propagate(CMAKE_PREFIX_PATH)
     endif()
 endfunction()

@@ -7,11 +7,11 @@
 #pragma once
 
 #include <atomic>
-#include <thread>
 
 #include <QObject>
 
 #ifdef YUZU_USE_QT_WEB_ENGINE
+#include <QTimer>
 #include <QWebEngineView>
 #endif
 
@@ -167,7 +167,6 @@ private:
     InputCommon::InputSubsystem* input_subsystem;
     std::unique_ptr<UrlRequestInterceptor> url_interceptor;
     std::unique_ptr<InputInterpreter> input_interpreter;
-    std::jthread input_thread;
     std::atomic<bool> finished{};
     Service::AM::Frontend::WebExitReason exit_reason{
         Service::AM::Frontend::WebExitReason::EndButtonPressed};
@@ -175,6 +174,9 @@ private:
     bool is_local{};
     QWebEngineProfile* default_profile;
     QWebEngineSettings* global_settings;
+    QTimer input_delay_timer;
+    QTimer input_poll_timer;
+    bool keyboard_grabbed{false};
 };
 
 #endif

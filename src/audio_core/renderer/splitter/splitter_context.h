@@ -102,10 +102,28 @@ public:
     /**
      * Update the context.
      *
-     * @param input         - Input buffer with the new info,
-     *                        expected to point to a InParameterHeader.
+     * @param input     - Splitter update section containing an InParameterHeader.
+     * @param mix_count - Number of valid destination mixes.
      */
-    bool Update(const u8* input);
+    bool Update(std::span<const u8> input, s32 mix_count);
+
+    /**
+     * Update the state of all destinations in all splitters.
+     */
+    void UpdateInternalState();
+
+    /**
+     * Calculate the size of the required workbuffer for splitters and destinations.
+     *
+     * @param behavior - Used to check splitter features.
+     * @param params    - Input parameters with splitter/destination counts.
+     * @return Required buffer size.
+     */
+    static u64 CalcWorkBufferSize(const BehaviorInfo& behavior,
+                                  const AudioRendererParameterInternal& params);
+
+private:
+    bool ValidateUpdate(std::span<const u8> input, s32 mix_count) const;
 
     /**
      * Update the splitters.
@@ -131,11 +149,6 @@ public:
     u32 UpdateData(const u8* input, u32 offset, u32 destination_count);
 
     /**
-     * Update the state of all destinations in all splitters.
-     */
-    void UpdateInternalState();
-
-    /**
      * Replace the given splitter's destinations with new ones.
      *
      * @param out_info    - Splitter to recompose.
@@ -151,17 +164,6 @@ public:
      */
     u32 GetDestCountPerInfoForCompat() const;
 
-    /**
-     * Calculate the size of the required workbuffer for splitters and destinations.
-     *
-     * @param behavior - Used to check splitter features.
-     * @param params    - Input parameters with splitter/destination counts.
-     * @return Required buffer size.
-     */
-    static u64 CalcWorkBufferSize(const BehaviorInfo& behavior,
-                                  const AudioRendererParameterInternal& params);
-
-private:
     /**
      * Setup the context.
      *

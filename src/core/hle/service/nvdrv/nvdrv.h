@@ -20,6 +20,7 @@
 #include "common/common_types.h"
 #include "core/hle/service/kernel_helpers.h"
 #include "core/hle/service/nvdrv/core/container.h"
+#include "core/hle/service/nvdrv/devices/nvdevice.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/hle/service/service.h"
 
@@ -29,6 +30,10 @@ class System;
 
 namespace Kernel {
 class KEvent;
+}
+
+namespace Tegra::Host1x {
+class Host1x;
 }
 
 namespace Service::Nvidia {
@@ -63,13 +68,14 @@ private:
 class Module final {
 public:
     explicit Module(Core::System& system_);
+    Module(Core::System& system_, Tegra::Host1x::Host1x& host1x_);
     ~Module();
 
     /// Returns a pointer to one of the available devices, identified by its name.
     template <typename T>
     std::shared_ptr<T> GetDevice(DeviceFD fd) {
         auto itr = open_files.find(fd);
-        if (itr == open_files.end())
+        if (itr == open_files.end() || itr->second->GetKind() != T::Kind)
             return nullptr;
         return std::static_pointer_cast<T>(itr->second);
     }

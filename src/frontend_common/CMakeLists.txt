@@ -13,9 +13,14 @@ add_library(frontend_common STATIC
     content_manager.h
     firmware_manager.h
     firmware_manager.cpp
+    game_list_discovery.h
+    game_list_metadata.cpp
+    game_list_metadata.h
     data_manager.h data_manager.cpp
     play_time_manager.cpp
     play_time_manager.h
+    sentry_crash_reporter.cpp
+    sentry_crash_reporter.h
     settings_generator.h settings_generator.cpp
     mod_manager.h mod_manager.cpp)
 
@@ -28,6 +33,11 @@ if (ENABLE_UPDATE_CHECKER)
         update_installer.cpp
         update_installer.h)
     target_link_libraries(frontend_common PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+endif()
+
+if (ENABLE_SENTRY)
+    target_compile_definitions(frontend_common PRIVATE EGLANTINE_ENABLE_SENTRY=1)
+    target_link_libraries(frontend_common PRIVATE sentry::sentry)
 endif()
 
 create_target_directory_groups(frontend_common)

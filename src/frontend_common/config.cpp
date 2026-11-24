@@ -9,6 +9,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstdio>
+#include <filesystem>
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
@@ -18,7 +21,12 @@
 #include "config.h"
 
 #ifdef _WIN32
+#include <io.h>
+#include <process.h>
 #include "common/string_util.h"
+#else
+#include <fcntl.h>
+#include <unistd.h>
 #endif
 
 #include <boost/algorithm/string/replace.hpp>
@@ -93,6 +101,15 @@ void Config::Initialize(const std::optional<std::string> config_path) {
     Reload();
 }
 
+bool Config::InitializeReadOnly(const std::string& config_path) {
+    config_loc = config_path;
+    if (!SetUpIni(false)) {
+        return false;
+    }
+    ReadValues();
+    return true;
+}
+
 void Config::WriteToIni() const {
     std::string config_type;
     switch (type) {
@@ -107,11 +124,38 @@ void Config::WriteToIni() const {
         break;
     }
     LOG_INFO(Config, "Writing {} configuration to: {}", config_type, config_loc);
+    std::error_code error;
+    const std::filesystem::path path{FS::ToU8String(config_loc)};
+    auto target = std::filesystem::weakly_canonical(path, error);
+    if (error) {
+        target = path;
+    }
+    static std::atomic<u32> save_count{};
+    auto temporary = target;
+#ifdef _WIN32
+    temporary += fmt::format(".tmp.{}.{}", _getpid(), save_count++);
+#else
+    temporary += fmt::format(".tmp.{}.{}", getpid(), save_count++);
+#endif
+
     FILE* fp = nullptr;
 #ifdef _WIN32
-    fp = _wfopen(Common::UTF8ToUTF16W(config_loc).data(), L"wb");
+    const bool target_writable = _waccess(target.c_str(), 0) != 0 || _waccess(target.c_str(), 2) == 0;
+    if (target_writable) {
+        fp = _wfopen(temporary.c_str(), L"wbx");
+    }
 #else
-    fp = fopen(config_loc.c_str(), "wb");
+    const bool target_writable = access(target.c_str(), F_OK) != 0 || access(target.c_str(), W_OK) == 0;
+    if (target_writable) {
+        const int fd = open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
+        if (fd >= 0) {
+            fp = fdopen(fd, "wb");
+            if (fp == nullptr) {
+                close(fd);
+                std::filesystem::remove(temporary, error);
+            }
+        }
+    }
 #endif
 
     if (fp == nullptr) {
@@ -120,14 +164,41 @@ void Config::WriteToIni() const {
     }
 
     CSimpleIniA::FileWriter writer(fp);
-    const SI_Error rc = config->Save(writer, false);
-    if (rc < 0) {
+    const bool written = config->Save(writer, false) >= 0 && !std::ferror(fp);
+#ifdef _WIN32
+    const bool synced = written && std::fflush(fp) == 0 && _commit(_fileno(fp)) == 0;
+#else
+    const bool synced = written && std::fflush(fp) == 0 && fsync(fileno(fp)) == 0;
+#endif
+    const bool closed = std::fclose(fp) == 0;
+    if (!synced || !closed) {
         LOG_ERROR(Frontend, "Config file could not be saved!");
+        std::filesystem::remove(temporary, error);
+        return;
     }
-    fclose(fp);
+
+    const auto status = std::filesystem::status(target, error);
+    if (!error && std::filesystem::exists(status)) {
+        std::filesystem::permissions(temporary, status.permissions(), error);
+    }
+    std::filesystem::rename(temporary, target, error);
+    if (error) {
+        LOG_ERROR(Frontend, "Config file could not be saved: {}", error.message());
+        std::filesystem::remove(temporary, error);
+        return;
+    }
+#ifndef _WIN32
+    const int folder_fd = open(target.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (folder_fd < 0 || fsync(folder_fd) != 0) {
+        LOG_WARNING(Frontend, "Config file saved, but its folder could not be synced");
+    }
+    if (folder_fd >= 0) {
+        close(folder_fd);
+    }
+#endif
 }
 
-void Config::SetUpIni() {
+bool Config::SetUpIni(bool create_missing) {
     config = std::make_unique<CSimpleIniA>();
     config->SetUnicode(true);
     config->SetSpaces(false);
@@ -135,25 +206,27 @@ void Config::SetUpIni() {
     FILE* fp = nullptr;
 #ifdef _WIN32
     _wfopen_s(&fp, Common::UTF8ToUTF16W(config_loc).data(), L"rb, ccs=UTF-8");
-    if (fp == nullptr) {
+    if (fp == nullptr && create_missing) {
         fp = _wfopen(Common::UTF8ToUTF16W(config_loc).data(), L"wb, ccs=UTF-8");
     }
 #else
     fp = fopen(config_loc.c_str(), "rb");
-    if (fp == nullptr) {
+    if (fp == nullptr && create_missing) {
         fp = fopen(config_loc.c_str(), "wb");
     }
 #endif
 
     if (fp == nullptr) {
         LOG_ERROR(Frontend, "Config file could not be loaded!");
-        return;
+        return false;
     }
 
-    if (SI_Error rc = config->LoadFile(fp); rc < 0) {
+    const SI_Error rc = config->LoadFile(fp);
+    if (rc < 0) {
         LOG_ERROR(Frontend, "Config file could not be loaded!");
     }
     fclose(fp);
+    return rc >= 0;
 }
 
 bool Config::IsCustomConfig() const {
@@ -881,9 +954,9 @@ void Config::WriteDoubleSetting(const std::string& key, const double& value,
 void Config::WriteStringSetting(const std::string& key, const std::string& value,
                                 const std::optional<std::string>& default_value,
                                 const std::optional<bool>& use_global) {
-    std::optional string_default = default_value;
+    std::optional<std::string> string_default = std::nullopt;
     if (default_value.has_value()) {
-        string_default.value().append(AdjustOutputString(default_value.value()));
+        string_default = AdjustOutputString(default_value.value());
     }
     WritePreparedSetting(key, AdjustOutputString(value), string_default, use_global);
 }
@@ -1128,7 +1201,7 @@ void Config::SetArrayIndex(const int index) {
     const int array_index = index + 1;
 
     // You can't exceed the known max size of the array by more than 1
-    ASSERT(array_stack.front().size + 1 >= array_index);
+    ASSERT(array_stack.back().size + 1 >= array_index);
 
     // Change the config array size to the current index since you may want
     // to reduce the number of elements that you read back from the config

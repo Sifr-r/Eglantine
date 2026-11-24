@@ -658,12 +658,12 @@ bool KPageTableBase::ContinueTraversal(const Common::PageTable &impl, TraversalE
             // Populate the results and return true
             out_entry->phys_addr = GetInteger(m_system.DeviceMemory().GetPhysicalAddr(paddr + context->next_offset));
             context->next_page += 1;
-            context->next_offset += PageSize;
+            context->next_offset = context->next_page * PageSize;
             return true;
         }
     }
     context->next_page += 1;
-    context->next_offset += PageSize;
+    context->next_offset = context->next_page * PageSize;
     // Otherwise return false
     return false;
 }
@@ -1537,7 +1537,8 @@ KProcessAddress KPageTableBase::FindFreeArea(KProcessAddress region_start, size_
                                              size_t guard_pages) const {
     KProcessAddress address = 0;
 
-    if (num_pages <= region_num_pages) {
+    if (num_pages > 0 && num_pages <= region_num_pages &&
+        guard_pages <= region_num_pages - num_pages) {
         if (this->IsAslrEnabled()) {
             // Try to directly find a free area up to 8 times.
             for (size_t i = 0; i < 8; i++) {
@@ -2376,7 +2377,7 @@ Result KPageTableBase::QueryPhysicalAddress(Svc::lp64::PhysicalMemoryInfo* out,
         phys_size = next_entry.block_size - (GetInteger(phys_addr) & (next_entry.block_size - 1));
 
         // Iterate.
-        while (true) {
+        while (virt_addr + phys_size < end_addr) {
             // Continue the traversal.
             traverse_valid =
                 ContinueTraversal(m_impl, std::addressof(next_entry), std::addressof(context));
@@ -2392,16 +2393,11 @@ Result KPageTableBase::QueryPhysicalAddress(Svc::lp64::PhysicalMemoryInfo* out,
 
                 // Advance.
                 phys_addr = next_entry.phys_addr;
-                virt_addr += next_entry.block_size;
+                virt_addr += phys_size;
                 phys_size =
                     next_entry.block_size - (GetInteger(phys_addr) & (next_entry.block_size - 1));
             } else {
                 phys_size += next_entry.block_size;
-            }
-
-            // Check if we're done.
-            if (end_addr < virt_addr + phys_size) {
-                break;
             }
         }
         ASSERT(virt_addr <= address && address <= virt_addr + phys_size - 1);
@@ -4184,8 +4180,9 @@ Result KPageTableBase::CopyMemoryFromHeapToHeap(
                 if (!updated_src && !updated_dst) {
                     skip_copy = true;
 
-                    // Update the source block address.
+                    // Extend both contiguous ranges.
                     cur_src_block_addr = src_next_entry.phys_addr;
+                    cur_dst_block_addr = dst_next_entry.phys_addr;
                 }
             }
 
@@ -4318,8 +4315,9 @@ Result KPageTableBase::CopyMemoryFromHeapToHeapWithoutCheckDestination(
                 if (!updated_src && !updated_dst) {
                     skip_copy = true;
 
-                    // Update the source block address.
+                    // Extend both contiguous ranges.
                     cur_src_block_addr = src_next_entry.phys_addr;
+                    cur_dst_block_addr = dst_next_entry.phys_addr;
                 }
             }
 

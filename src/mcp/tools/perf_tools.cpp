@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cmath>
 #include <map>
+#include <mutex>
 #include <string_view>
 #include <thread>
 
@@ -41,6 +42,8 @@ namespace Mcp {
 namespace {
 
 namespace Profile = VideoCommon::Nx2Profile;
+
+std::mutex g_profiler_config_mutex;
 
 /// One GPU thread's profiler report as JSON: zones sorted by cost (only the `top` costliest
 /// when non-zero), non-zero counters, and the report's age relative to `now` (ns).
@@ -81,6 +84,10 @@ json SnapshotJson(const Profile::Snapshot& snap, u64 now, size_t top) {
 /// call. Takes the profiler's snapshot mutex while reading.
 ToolResult GpuProfile(ToolContext& ctx, const json& args) {
     using namespace std::chrono;
+    std::unique_lock<std::mutex> config_lock;
+    if (args.contains("window_ms") || args.contains("enable")) {
+        config_lock = std::unique_lock<std::mutex>{g_profiler_config_mutex};
+    }
     const bool was_enabled = Profile::Enabled();
     if (args.contains("window_ms")) {
         Profile::g_window_ns.store(args["window_ms"].get<u64>() * 1'000'000ULL,
@@ -97,7 +104,7 @@ ToolResult GpuProfile(ToolContext& ctx, const json& args) {
     const u64 called = Profile::Now();
     if (fresh && enabled && ctx.GameRunning()) {
         const auto deadline = steady_clock::now() + milliseconds{2 * window_ms + 3000};
-        while (steady_clock::now() < deadline) {
+        while (steady_clock::now() < deadline && !ServerStopping()) {
             // The front ("GPU thread") always reports; the split's back thread too when active.
             size_t newer = 0;
             size_t total = 0;
@@ -106,7 +113,8 @@ ToolResult GpuProfile(ToolContext& ctx, const json& args) {
                 std::scoped_lock lock{Profile::SnapshotMutex()};
                 total = Profile::Snapshots().size();
                 for (const auto& [name, snap] : Profile::Snapshots()) {
-                    const bool is_fresh = snap.when_ns - snap.window_ns >= called;
+                    const bool is_fresh =
+                        snap.when_ns >= snap.window_ns && snap.when_ns - snap.window_ns >= called;
                     newer += is_fresh ? 1 : 0;
                     front_fresh |= is_fresh && name == "GPU thread";
                 }
@@ -116,6 +124,9 @@ ToolResult GpuProfile(ToolContext& ctx, const json& args) {
             }
             std::this_thread::sleep_for(milliseconds{50});
         }
+    }
+    if (config_lock.owns_lock()) {
+        config_lock.unlock();
     }
 
     const size_t top = args.value("top_zones", size_t{0});
@@ -219,9 +230,28 @@ ToolResult PerfSample(ToolContext& ctx, const json& args) {
     using namespace std::chrono;
     const int seconds = args.value("seconds", 10);
     const bool profile = args.value("profile", true);
-    const bool was_enabled = Profile::Enabled();
-    const u64 old_window = Profile::g_window_ns.load(std::memory_order_relaxed);
+    std::unique_lock<std::mutex> profile_lock;
+    struct ProfilerRestoreGuard {
+        bool active = false;
+        bool was_enabled = false;
+        u64 old_window = 0;
+        void Restore() {
+            if (active) {
+                Profile::g_window_ns.store(old_window, std::memory_order_relaxed);
+                Profile::SetEnabled(was_enabled);
+                active = false;
+            }
+        }
+        ~ProfilerRestoreGuard() {
+            Restore();
+        }
+    };
+    ProfilerRestoreGuard profiler_restore;
     if (profile) {
+        profile_lock = std::unique_lock<std::mutex>{g_profiler_config_mutex};
+        profiler_restore.was_enabled = Profile::Enabled();
+        profiler_restore.old_window = Profile::g_window_ns.load(std::memory_order_relaxed);
+        profiler_restore.active = true;
         // One report covering exactly this window (toggling restarts every thread's totals).
         Profile::g_window_ns.store(static_cast<u64>(seconds) * 1'000'000'000ULL,
                                    std::memory_order_relaxed);
@@ -348,8 +378,8 @@ ToolResult PerfSample(ToolContext& ctx, const json& args) {
             std::this_thread::sleep_for(milliseconds{100});
         }
         out["gpu_profile"] = std::move(gpu);
-        Profile::g_window_ns.store(old_window, std::memory_order_relaxed);
-        Profile::SetEnabled(was_enabled);
+        profiler_restore.Restore();
+        profile_lock.unlock();
     }
 
     ToolResult result;
@@ -447,6 +477,7 @@ ToolResult FrameSpikes(ToolContext&, const json& args) {
         Spikes::Configure(args.value("min_ms", current.min_ms), args.value("ratio", current.ratio));
     }
     if (args.contains("enable")) {
+        std::scoped_lock lock{g_profiler_config_mutex};
         Spikes::SetEnabled(args["enable"].get<bool>());
     }
     if (args.value("clear", false)) {

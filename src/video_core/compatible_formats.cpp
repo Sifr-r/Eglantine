@@ -265,7 +265,7 @@ constexpr Table MakeNativeBgrCopyTable() {
 
 constexpr Table MakeNonNativeBgrCopyTable() {
     Table copy = MakeCopyTable();
-    EnableRange(copy, VIEW_CLASS_32_BITS);
+    EnableRange(copy, VIEW_CLASS_32_BITS_NO_BGR);
     return copy;
 }
 } // Anonymous namespace

@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stop_token>
@@ -23,7 +24,9 @@
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "core/core.h"
+#include "core/nx2_session_state.h"
 #include "core/hle/service/nvdrv/core/container.h"
 #include "core/hle/service/nvdrv/core/heap_mapper.h"
 #include "core/hle/service/nvdrv/core/nvmap.h"
@@ -41,12 +44,15 @@
 namespace Service::Nvidia::Devices {
 
 nvhost_as_gpu::nvhost_as_gpu(Core::System& system_, Module& module_, NvCore::Container& core)
-    : nvdevice{system_}, module{module_}, container{core}, nvmap{core.GetNvMapFile()}, vm{},
+    : nvdevice{system_, Kind}, module{module_}, container{core}, nvmap{core.GetNvMapFile()}, vm{},
       gmmu{} {}
 
 nvhost_as_gpu::~nvhost_as_gpu() {
     // Unregister before draining so no new listener callbacks arrive on `this` mid-teardown.
-    Nx2GpuMemoryRegistry::Get().RemoveListener(this);
+    const auto session = nx2_session_state.lock();
+    if (session) {
+        session->GpuMemoryRegistry().RemoveListener(this);
+    }
     // The callbacks queued for the GPU thread below use this device's address space and the
     // session's heap mapper: let them run before those are gone. The drain is only skipped once
     // the core shutdown began: the GPU thread is stopped then, before the services are closed,
@@ -57,9 +63,11 @@ nvhost_as_gpu::~nvhost_as_gpu() {
     }
     // Leave shared ranges to the process's other address spaces; like this address space's own
     // ranges, one nobody else maps stays allocated.
-    for (const auto& [key, range] : nx2_device_ranges) {
-        if (range.shared) {
-            Nx2GpuMemoryRegistry::Get().ReleaseDeviceRange(range.asid, key.first, key.second);
+    if (session) {
+        for (const auto& [key, range] : nx2_device_ranges) {
+            if (range.shared) {
+                session->GpuMemoryRegistry().ReleaseDeviceRange(range.asid, key.first, key.second);
+            }
         }
     }
 }
@@ -119,28 +127,31 @@ NvResult nvhost_as_gpu::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> i
             return WrapFixed(this, &nvhost_as_gpu::GetVARegions1, input, output);
         case 0x9: {
             const auto result = WrapFixed(this, &nvhost_as_gpu::AllocAsEx, input, output);
-            if (result == NvResult::Success && g_nx2_driver) {
-                Nx2GpuMemoryRegistry::Get().AddListener(
-                    this,
-                    [this](u64 gpu_address, u64 cpu_address, u64 size) {
-                        Nx2Map(gpu_address, cpu_address, size);
-                    },
-                    [this](u64 gpu_address, u64 size) { Nx2Unmap(gpu_address, size); },
-                    [this](u64 cpu_address, u64 size) { Nx2Release(cpu_address, size); },
-                    [this](u64 gpu_address, u64 size, bool create) {
-                        Nx2Sparse(gpu_address, size, create);
-                    },
-                    [this](u64 gpu_address, u64 cpu_address, u64 size) {
-                        Nx2BackSparse(gpu_address, cpu_address, size);
-                    },
-                    [this](u64 gpu_address, u64 cpu_address, u64 size) {
-                        Nx2SparseTile(gpu_address, cpu_address, size);
-                    });
+            if (result == NvResult::Success) {
+                if (const auto session = system.Nx2Session()) {
+                    nx2_session_state = session;
+                    session->GpuMemoryRegistry().AddListener(
+                        this,
+                        [this](u64 gpu_address, u64 cpu_address, u64 size) {
+                            Nx2Map(gpu_address, cpu_address, size);
+                        },
+                        [this](u64 gpu_address, u64 size) { Nx2Unmap(gpu_address, size); },
+                        [this](u64 cpu_address, u64 size) { Nx2Release(cpu_address, size); },
+                        [this](u64 gpu_address, u64 size, bool create) {
+                            Nx2Sparse(gpu_address, size, create);
+                        },
+                        [this](u64 gpu_address, u64 cpu_address, u64 size) {
+                            Nx2BackSparse(gpu_address, cpu_address, size);
+                        },
+                        [this](u64 gpu_address, u64 cpu_address, u64 size) {
+                            Nx2SparseTile(gpu_address, cpu_address, size);
+                        });
+                }
             }
             return result;
         }
         case 0xb:
-            if (g_nx2_driver) {
+            if (const auto session = system.Nx2Session(); session && session->IsDriverActive()) {
                 return WrapFixed(this, &nvhost_as_gpu::GetSyncRoMap, input, output);
             }
             break;
@@ -232,12 +243,19 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
             }
             return address;
         };
+        auto session = nx2_session_state.lock();
+        if (!session) {
+            session = system.Nx2Session();
+        }
+        if (!session) {
+            return;
+        }
         // EDEN_NX2_PRIVATE_DEVICE_RANGES=1 (A/B aid): a range per address space.
         static const bool private_ranges = std::getenv("EDEN_NX2_PRIVATE_DEVICE_RANGES") != nullptr;
         if (private_ranges) {
             range = {allocate(), false};
         } else {
-            range = {Nx2GpuMemoryRegistry::Get().AcquireDeviceRange(session_asid->id, cpu_address,
+            range = {session->GpuMemoryRegistry().AcquireDeviceRange(session_asid->id, cpu_address,
                                                                     size, allocate),
                      false, true, session_asid->id};
         }
@@ -249,7 +267,11 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     }
     const DAddr device_address = range.address;
     nx2_device_ranges[{cpu_address, size}] = range;
-    Nx2GpuMemoryRegistry::Get().RecordDeviceRange(cpu_address, size, device_address);
+    if (auto session = nx2_session_state.lock()) {
+        session->GpuMemoryRegistry().RecordDeviceRange(cpu_address, size, device_address);
+    } else if (const auto active_session = system.Nx2Session()) {
+        active_session->GpuMemoryRegistry().RecordDeviceRange(cpu_address, size, device_address);
+    }
     // On the GPU thread, like unmaps: a GMMU map takes the texture cache lock, and the callers hold
     // nx2:gpu locks that the GPU thread takes under that lock (sparse blocks backed on write).
     // The callback holds a copy of the address space, so it stays alive until it ran.
@@ -295,8 +317,9 @@ void nvhost_as_gpu::Nx2Release(u64 cpu_address, u64 size) {
         }
         const Nx2DeviceRange range = it->second;
         it = nx2_device_ranges.erase(it);
-        if (range.shared &&
-            !Nx2GpuMemoryRegistry::Get().ReleaseDeviceRange(range.asid, entry_cpu, entry_size)) {
+        const auto session = nx2_session_state.lock();
+        if (range.shared && session &&
+            !session->GpuMemoryRegistry().ReleaseDeviceRange(range.asid, entry_cpu, entry_size)) {
             continue; // another address space of the process still maps it
         }
         released.push_back({entry_cpu, entry_size, range});
@@ -416,9 +439,19 @@ void nvhost_as_gpu::Nx2SparseTile(u64 gpu_address, u64 cpu_address, u64 size) {
     // In GPU-thread order: command lists submitted before the request still see the old tile.
     // Publish cached writes before changing either translation or its device backing.
     const DAddr device = device_address + (gpu_address - start);
-    const auto canonical = cpu_address != 0
-                               ? Nx2GpuMemoryRegistry::Get().DeviceAddressOf(cpu_address, size)
-                               : std::nullopt;
+    const auto canonical = [this, cpu_address, size]() -> std::optional<DAddr> {
+        if (cpu_address == 0) {
+            return std::nullopt;
+        }
+        auto session = nx2_session_state.lock();
+        if (!session) {
+            session = system.Nx2Session();
+        }
+        if (!session) {
+            return std::nullopt;
+        }
+        return session->GpuMemoryRegistry().DeviceAddressOf(cpu_address, size);
+    }();
     auto* const smmu = &system.Host1x().MemoryManager();
     auto gmmu_owner = gmmu;
     system.GPU().MapInOrder(
@@ -598,6 +631,7 @@ bool nvhost_as_gpu::FreeMappingLocked(u64 offset) noexcept {
             gmmu->Unmap(offset, mapping.size);
         }
         mapping_map.erase(offset);
+        map_buffer_offsets.erase(offset);
         return true;
     }
     return false;
@@ -635,6 +669,8 @@ NvResult nvhost_as_gpu::FreeSpace(IoctlFreeSpace& params) {
 NvResult nvhost_as_gpu::Remap(std::span<IoctlRemapEntry> entries) {
     LOG_DEBUG(Service_NVDRV, "called, num_entries={:#x}", entries.size());
 
+    std::scoped_lock lock(mutex);
+
     if (!vm.initialised) {
         return NvResult::BadValue;
     }
@@ -647,7 +683,8 @@ NvResult nvhost_as_gpu::Remap(std::span<IoctlRemapEntry> entries) {
         auto alloc{allocation_map.upper_bound(virtual_address)};
 
         if (alloc-- == allocation_map.begin() ||
-            (virtual_address - alloc->first) + size > alloc->second.size) {
+            size > alloc->second.size ||
+            (virtual_address - alloc->first) > alloc->second.size - size) {
             LOG_WARNING(Service_NVDRV, "Cannot remap into an unallocated region!");
             return NvResult::BadValue;
         }
@@ -721,6 +758,12 @@ NvResult nvhost_as_gpu::MapBufferEx(IoctlMapBufferEx& params) {
     if (base == 0) {
         return NvResult::BadValue;
     }
+    bool pinned = true;
+    SCOPE_EXIT {
+        if (pinned) {
+            nvmap.UnpinHandle(params.handle);
+        }
+    };
     DAddr device_address = DAddr(base + params.buffer_offset);
     u64 size{params.mapping_size ? params.mapping_size : handle->orig_size};
 
@@ -739,8 +782,9 @@ NvResult nvhost_as_gpu::MapBufferEx(IoctlMapBufferEx& params) {
         auto alloc{allocation_map.upper_bound(params.offset)};
 
         if (alloc-- == allocation_map.begin() ||
-            (params.offset - alloc->first) + size > alloc->second.size) {
-            ASSERT_MSG(false, "Cannot perform a fixed mapping into an unallocated region!");
+            size > alloc->second.size ||
+            (params.offset - alloc->first) > alloc->second.size - size) {
+            LOG_ERROR(Service_NVDRV, "Cannot perform a fixed mapping into an unallocated region!");
             return NvResult::BadValue;
         }
 
@@ -754,16 +798,24 @@ NvResult nvhost_as_gpu::MapBufferEx(IoctlMapBufferEx& params) {
         u32 page_size{big_page ? vm.big_page_size : VM::YUZU_PAGESIZE};
         u32 page_size_bits{big_page ? vm.big_page_size_bits : VM::PAGE_SIZE_BITS};
 
-        params.offset = u64(allocator.Allocate(u32(Common::AlignUp(size, page_size) >> page_size_bits))) << page_size_bits;
+        const u64 aligned_size = Common::AlignUp(size, page_size);
+        const u64 page_count = aligned_size >> page_size_bits;
+        if (aligned_size < size || page_count == 0 ||
+            page_count > std::numeric_limits<u32>::max()) {
+            return NvResult::BadValue;
+        }
+
+        params.offset = u64(allocator.Allocate(static_cast<u32>(page_count))) << page_size_bits;
         if (!params.offset) {
-            ASSERT_MSG(false, "Failed to allocate free space in the GPU AS!");
+            LOG_ERROR(Service_NVDRV, "Failed to allocate free space in the GPU AS!");
             return NvResult::InsufficientMemory;
         }
-        gmmu->Map(params.offset, device_address, Common::AlignUp(size, page_size), Tegra::PTEKind(params.kind), big_page);
+        gmmu->Map(params.offset, device_address, aligned_size, Tegra::PTEKind(params.kind), big_page);
         mapping_map.insert_or_assign(params.offset, Mapping(params.handle, device_address, params.offset, size, false, big_page, false));
     }
 
     map_buffer_offsets.insert(params.offset);
+    pinned = false;
 
     return NvResult::Success;
 }
@@ -777,6 +829,10 @@ NvResult nvhost_as_gpu::UnmapBuffer(IoctlUnmapBuffer& params) {
         }
 
         auto const it = mapping_map.find(params.offset);
+        if (it == mapping_map.end()) {
+            map_buffer_offsets.erase(offset_it);
+            return NvResult::BadValue;
+        }
         auto const mapping = it->second;
         if (!mapping.fixed) {
             auto& allocator{mapping.big_page ? *vm.big_page_allocator : *vm.small_page_allocator};
@@ -803,6 +859,9 @@ NvResult nvhost_as_gpu::BindChannel(IoctlBindChannel& params) {
     LOG_DEBUG(Service_NVDRV, "called, fd={:X}", params.fd);
 
     auto gpu_channel_device = module.GetDevice<nvhost_gpu>(params.fd);
+    if (gpu_channel_device == nullptr || gpu_channel_device->channel_state == nullptr) {
+        return NvResult::BadParameter;
+    }
     gpu_channel_device->channel_state->memory_manager = gmmu.get();
     return NvResult::Success;
 }

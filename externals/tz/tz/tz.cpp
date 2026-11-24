@@ -8,6 +8,7 @@
 #include <climits>
 #include <cstring>
 #include <ctime>
+#include <memory>
 
 #include "tz.h"
 
@@ -35,10 +36,9 @@ static_assert(sizeof(TzifHeader) == 0x2C, "TzifHeader has the wrong size!");
 struct local_storage {
     // Binary layout:
     // char buf[2 * sizeof(TzifHeader) + 2 * sizeof(Rule) + 4 * TZ_MAX_TIMES];
-    std::span<const u8> binary;
-    Rule state;
+    std::span<const u8> binary{};
+    Rule state{};
 };
-static local_storage tzloadbody_local_storage;
 
 enum rtype : s32 {
     JULIAN_DAY = 0,
@@ -183,7 +183,15 @@ constexpr void init_ttinfo(ttinfo* s, s64 utoff, bool isdst, int desigidx) {
 
 /* Return true if SP's time type I does not specify local time.  */
 bool ttunspecified(struct Rule const* sp, int i) {
-    char const* abbr = &sp->chars[sp->ttis[i].tt_desigidx];
+    if (sp == nullptr || sp->typecnt <= 0 || sp->typecnt > static_cast<s32>(TZ_MAX_TYPES) ||
+        i < 0 || i >= sp->typecnt) {
+        return false;
+    }
+    const s32 desigidx = sp->ttis[i].tt_desigidx;
+    if (desigidx < 0 || static_cast<size_t>(desigidx) + sizeof(UNSPEC) > sp->chars.size()) {
+        return false;
+    }
+    char const* abbr = &sp->chars[desigidx];
     /* memcmp is likely faster than strcmp, and is safe due to CHARS_EXTRA.  */
     return memcmp(abbr, UNSPEC, sizeof(UNSPEC)) == 0;
 }
@@ -191,7 +199,8 @@ bool ttunspecified(struct Rule const* sp, int i) {
 bool typesequiv(const Rule* sp, int a, int b) {
     bool result;
 
-    if (sp == nullptr || a < 0 || a >= sp->typecnt || b < 0 || b >= sp->typecnt) {
+    if (sp == nullptr || sp->typecnt <= 0 || sp->typecnt > static_cast<s32>(TZ_MAX_TYPES) ||
+        a < 0 || a >= sp->typecnt || b < 0 || b >= sp->typecnt) {
         result = false;
     }
     else {
@@ -201,8 +210,18 @@ bool typesequiv(const Rule* sp, int a, int b) {
         sp->goahead to mistakenly remain false.  */
         const ttinfo* ap = &sp->ttis[a];
         const ttinfo* bp = &sp->ttis[b];
+        if (ap->tt_desigidx < 0 || ap->tt_desigidx >= static_cast<s32>(sp->chars.size()) ||
+            bp->tt_desigidx < 0 || bp->tt_desigidx >= static_cast<s32>(sp->chars.size())) {
+            return false;
+        }
+        const size_t a_idx = static_cast<size_t>(ap->tt_desigidx);
+        const size_t b_idx = static_cast<size_t>(bp->tt_desigidx);
+        if (std::memchr(&sp->chars[a_idx], '\0', sp->chars.size() - a_idx) == nullptr ||
+            std::memchr(&sp->chars[b_idx], '\0', sp->chars.size() - b_idx) == nullptr) {
+            return false;
+        }
         result = (ap->tt_utoff == bp->tt_utoff && ap->tt_isdst == bp->tt_isdst &&
-            (strcmp(&sp->chars[ap->tt_desigidx], &sp->chars[bp->tt_desigidx]) == 0));
+            (strcmp(&sp->chars[a_idx], &sp->chars[b_idx]) == 0));
     }
     return result;
 }
@@ -522,29 +541,45 @@ CalendarTimeInternal* localsub(Rule const* sp, time_t const* timep, s64 setname,
         /* Don't bother to set tzname etc.; tzset has already done it.  */
         return gmtsub(gmtptr, timep, 0, tmp);
     }
-    if ((sp->goback && t < sp->ats[0]) || (sp->goahead && t > sp->ats[sp->timecnt - 1])) {
-        time_t newt;
-        time_t seconds;
-        time_t years;
-
-        if (t < sp->ats[0]) {
-            seconds = sp->ats[0] - t;
-        }
-        else {
-            seconds = t - sp->ats[sp->timecnt - 1];
-        }
-        --seconds;
+    if (sp->typecnt <= 0 || sp->typecnt > static_cast<s32>(TZ_MAX_TYPES) ||
+        sp->timecnt < 0 || sp->timecnt > static_cast<s32>(TZ_MAX_TIMES)) {
+        return nullptr;
+    }
+    if (sp->timecnt > 0 &&
+        ((sp->goback && t < sp->ats[0]) || (sp->goahead && t > sp->ats[sp->timecnt - 1]))) {
+        time_t newt{};
+        const bool before_first = t < sp->ats[0];
+        const u64 u_seconds =
+            (before_first ? (static_cast<u64>(sp->ats[0]) - static_cast<u64>(t))
+                          : (static_cast<u64>(t) - static_cast<u64>(sp->ats[sp->timecnt - 1]))) -
+            1ULL;
 
         /* Beware integer overflow, as SECONDS might
             be close to the maximum time_t.  */
-        years = seconds / SECSPERREPEAT * YEARSPERREPEAT;
-        seconds = years * AVGSECSPERYEAR;
-        years += YEARSPERREPEAT;
-        if (t < sp->ats[0]) {
-            newt = t + seconds + SECSPERREPEAT;
+        const u64 u_cycles = u_seconds / static_cast<u64>(SECSPERREPEAT);
+        const u64 step_secs = u_cycles * static_cast<u64>(SECSPERREPEAT);
+        const u64 u_years =
+            u_cycles * static_cast<u64>(YEARSPERREPEAT) + static_cast<u64>(YEARSPERREPEAT);
+        if (u_years > static_cast<u64>((std::numeric_limits<s64>::max)())) {
+            return nullptr;
+        }
+        const s64 years = static_cast<s64>(u_years);
+
+        if (before_first) {
+            const u64 rem_to_max = static_cast<u64>(TIME_T_MAX) - static_cast<u64>(t);
+            if (step_secs > rem_to_max || static_cast<u64>(SECSPERREPEAT) > rem_to_max - step_secs) {
+                return nullptr;
+            }
+            newt = static_cast<time_t>(static_cast<u64>(t) + step_secs +
+                                       static_cast<u64>(SECSPERREPEAT));
         }
         else {
-            newt = t - seconds - SECSPERREPEAT;
+            const u64 rem_to_min = static_cast<u64>(t) - static_cast<u64>(TIME_T_MIN);
+            if (step_secs > rem_to_min || static_cast<u64>(SECSPERREPEAT) > rem_to_min - step_secs) {
+                return nullptr;
+            }
+            newt = static_cast<time_t>(static_cast<u64>(t) - step_secs -
+                                       static_cast<u64>(SECSPERREPEAT));
         }
 
         if (newt < sp->ats[0] || newt > sp->ats[sp->timecnt - 1]) {
@@ -555,7 +590,7 @@ CalendarTimeInternal* localsub(Rule const* sp, time_t const* timep, s64 setname,
             int_fast64_t newy;
 
             newy = result->tm_year;
-            if (t < sp->ats[0]) {
+            if (before_first) {
                 newy -= years;
             }
             else {
@@ -586,6 +621,9 @@ CalendarTimeInternal* localsub(Rule const* sp, time_t const* timep, s64 setname,
         }
         i = sp->types[lo - 1];
     }
+    if (i < 0 || i >= sp->typecnt) {
+        return nullptr;
+    }
     ttisp = &sp->ttis[i];
     /*
     ** To get (wrong) behavior that's compatible with System V Release 2.0
@@ -597,19 +635,24 @@ CalendarTimeInternal* localsub(Rule const* sp, time_t const* timep, s64 setname,
     if (result) {
         result->tm_isdst = ttisp->tt_isdst;
 
-        if (ttisp->tt_desigidx > static_cast<s32>(sp->chars.size() - CHARS_EXTRA)) {
+        if (ttisp->tt_desigidx < 0 ||
+            ttisp->tt_desigidx >= static_cast<s32>(sp->chars.size())) {
             return nullptr;
         }
 
-        auto num_chars_to_copy{
-            std::min(sp->chars.size() - ttisp->tt_desigidx, result->tm_zone.size()) - 1 };
-        std::strncpy(result->tm_zone.data(), &sp->chars[ttisp->tt_desigidx], num_chars_to_copy);
-        result->tm_zone[num_chars_to_copy] = '\0';
-
-        auto original_size{ std::strlen(&sp->chars[ttisp->tt_desigidx]) };
-        if (original_size > num_chars_to_copy) {
+        const size_t desigidx = static_cast<size_t>(ttisp->tt_desigidx);
+        const size_t remaining = sp->chars.size() - desigidx;
+        const void* nul_ptr = std::memchr(&sp->chars[desigidx], '\0', remaining);
+        if (nul_ptr == nullptr) {
             return nullptr;
         }
+        const size_t original_size =
+            static_cast<size_t>(static_cast<const char*>(nul_ptr) - &sp->chars[desigidx]);
+        if (original_size >= result->tm_zone.size()) {
+            return nullptr;
+        }
+        std::memcpy(result->tm_zone.data(), &sp->chars[desigidx], original_size);
+        result->tm_zone[original_size] = '\0';
 
         result->tm_utoff = ttisp->tt_utoff;
         result->time_index = i;
@@ -994,8 +1037,13 @@ int tzloadbody(Rule* sp, local_storage& local_storage) {
     int tzheadsize = sizeof(struct TzifHeader);
     TzifHeader header{};
 
-    //ASSERT(local_storage.binary.size_bytes() >= sizeof(TzifHeader));
+    if (local_storage.binary.size_bytes() < sizeof(TzifHeader)) {
+        return EINVAL;
+    }
     std::memcpy(&header, local_storage.binary.data(), sizeof(TzifHeader));
+    if (std::memcmp(header.tzh_magic.data(), "TZif", 4) != 0) {
+        return EINVAL;
+    }
 
     sp->goback = sp->goahead = false;
 
@@ -1023,7 +1071,8 @@ int tzloadbody(Rule* sp, local_storage& local_storage) {
             + leapcnt * (stored + 4) /* lsinfos */
             + ttisstdcnt             /* ttisstds */
             + ttisutcnt);            /* ttisuts */
-        if (static_cast<s32>(local_storage.binary.size_bytes()) < tzheadsize + datablock_size) {
+        if (local_storage.binary.size_bytes() <
+            static_cast<size_t>(tzheadsize) + static_cast<size_t>(datablock_size)) {
             return EINVAL;
         }
         if (!((ttisstdcnt == typecnt || ttisstdcnt == 0) &&
@@ -1093,6 +1142,7 @@ int tzloadbody(Rule* sp, local_storage& local_storage) {
         /* Ensure '\0'-terminated, and make it safe to call
             ttunspecified later.  */
         memset(&sp->chars[i], 0, CHARS_EXTRA);
+        p += static_cast<size_t>(leapcnt) * static_cast<size_t>(stored + 4);
 
         for (i = 0; i < sp->typecnt; ++i) {
             struct ttinfo* ttisp;
@@ -1102,10 +1152,11 @@ int tzloadbody(Rule* sp, local_storage& local_storage) {
                 ttisp->tt_ttisstd = false;
             }
             else {
-                if (*(bool*)p != true && *(bool*)p != false) {
+                const unsigned char val = static_cast<unsigned char>(*p++);
+                if (val != 0 && val != 1) {
                     return EINVAL;
                 }
-                ttisp->tt_ttisstd = *(bool*)p++;
+                ttisp->tt_ttisstd = val != 0;
             }
         }
         for (i = 0; i < sp->typecnt; ++i) {
@@ -1116,17 +1167,20 @@ int tzloadbody(Rule* sp, local_storage& local_storage) {
                 ttisp->tt_ttisut = false;
             }
             else {
-                if (*(bool*)p != true && *(bool*)p != false) {
+                const unsigned char val = static_cast<unsigned char>(*p++);
+                if (val != 0 && val != 1) {
                     return EINVAL;
                 }
-                ttisp->tt_ttisut = *(bool*)p++;
+                ttisp->tt_ttisut = val != 0;
             }
         }
 
-        nread += (ptrdiff_t)local_storage.binary.data() - (ptrdiff_t)p;
-        if (nread < 0) {
+        const auto consumed = static_cast<size_t>(
+            p - reinterpret_cast<const char*>(local_storage.binary.data()));
+        if (consumed > nread) {
             return EINVAL;
         }
+        nread -= consumed;
     }
 
     std::array<char, 256> buf{};
@@ -1134,7 +1188,11 @@ int tzloadbody(Rule* sp, local_storage& local_storage) {
         //ASSERT(false);
         return EINVAL;
     }
-    memmove(buf.data(), &local_storage.binary[local_storage.binary.size_bytes() - nread], nread);
+    if (nread > 0) {
+        std::memmove(buf.data(),
+                     local_storage.binary.data() + (local_storage.binary.size_bytes() - nread),
+                     nread);
+    }
 
     if (nread > 2 && buf[0] == '\n' && buf[nread - 1] == '\n' && sp->typecnt + 2 <= TZ_MAX_TYPES) {
         Rule* ts = &local_storage.state;
@@ -1488,7 +1546,7 @@ int time2sub(time_t* out_time, CalendarTimeInternal* const tmp,
         ** It's okay to guess wrong since the guess
         ** gets checked.
         */
-        if (sp == nullptr) {
+        if (sp == nullptr || sp->typecnt <= 0 || sp->typecnt > static_cast<s32>(TZ_MAX_TYPES)) {
             return 2;
         }
         for (i = sp->typecnt - 1; i >= 0; --i) {
@@ -1502,7 +1560,12 @@ int time2sub(time_t* out_time, CalendarTimeInternal* const tmp,
                 if (ttunspecified(sp, j)) {
                     continue;
                 }
-                newt = (t + sp->ttis[j].tt_utoff - sp->ttis[i].tt_utoff);
+                const s64 utoff_diff =
+                    static_cast<s64>(sp->ttis[j].tt_utoff) - static_cast<s64>(sp->ttis[i].tt_utoff);
+                newt = t;
+                if (increment_overflow_time(&newt, utoff_diff)) {
+                    continue;
+                }
                 if (!funcp(sp, &newt, offset, &mytm)) {
                     continue;
                 }
@@ -1522,8 +1585,9 @@ int time2sub(time_t* out_time, CalendarTimeInternal* const tmp,
         return 2;
     }
 label:
-    newt = t + saved_seconds;
-    t = newt;
+    if (increment_overflow_time(&t, saved_seconds)) {
+        return 2;
+    }
     if (funcp(sp, &t, offset, tmp) || *okayp) {
         *okayp = true;
         *out_time = t;
@@ -1575,6 +1639,10 @@ int time1(time_t* out_time, CalendarTimeInternal* const tmp,
     ** We try to divine the type they started from and adjust to the
     ** type they need.
     */
+    if (sp == nullptr || sp->typecnt <= 0 || sp->typecnt > static_cast<s32>(TZ_MAX_TYPES) ||
+        sp->timecnt < 0 || sp->timecnt > static_cast<s32>(TZ_MAX_TIMES)) {
+        return 2;
+    }
     for (i = 0; i < sp->typecnt; ++i) {
         seen[i] = false;
     }
@@ -1585,9 +1653,13 @@ int time1(time_t* out_time, CalendarTimeInternal* const tmp,
 
     nseen = 0;
     for (i = sp->timecnt - 1; i >= 0; --i) {
-        if (!seen[sp->types[i]] && !ttunspecified(sp, sp->types[i])) {
-            seen[sp->types[i]] = true;
-            types[nseen++] = sp->types[i];
+        const u8 type_idx = sp->types[i];
+        if (static_cast<s32>(type_idx) >= sp->typecnt) {
+            return 2;
+        }
+        if (!seen[type_idx] && !ttunspecified(sp, type_idx)) {
+            seen[type_idx] = true;
+            types[nseen++] = type_idx;
         }
     }
 
@@ -1621,8 +1693,10 @@ int time1(time_t* out_time, CalendarTimeInternal* const tmp,
 } // namespace
 
 s32 ParseTimeZoneBinary(Rule& out_rule, std::span<const u8> binary) {
-    tzloadbody_local_storage.binary = binary;
-    if (tzloadbody(&out_rule, tzloadbody_local_storage)) {
+    out_rule = Rule{};
+    auto storage = std::make_unique<local_storage>();
+    storage->binary = binary;
+    if (tzloadbody(&out_rule, *storage)) {
         return 3;
     }
     return 0;

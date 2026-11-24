@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <queue>
 
 #include "core/core.h"
@@ -10,6 +11,27 @@
 #include "hid_core/irsensor/clustering_processor.h"
 
 namespace Service::IRS {
+namespace {
+Core::IrSensor::IrsRect ClampWindowOfInterest(const Core::IrSensor::IrsRect& rect,
+                                              std::size_t max_width, std::size_t max_height) {
+    const s32 max_w = static_cast<s32>(max_width);
+    const s32 max_h = static_cast<s32>(max_height);
+    const s32 start_x = std::clamp(static_cast<s32>(rect.x), s32{0}, max_w);
+    const s32 start_y = std::clamp(static_cast<s32>(rect.y), s32{0}, max_h);
+    const s32 end_x =
+        rect.width > 0 ? std::clamp(static_cast<s32>(rect.x) + rect.width, start_x, max_w)
+                       : start_x;
+    const s32 end_y =
+        rect.height > 0 ? std::clamp(static_cast<s32>(rect.y) + rect.height, start_y, max_h)
+                        : start_y;
+    return {
+        .x = static_cast<s16>(start_x),
+        .y = static_cast<s16>(start_y),
+        .width = static_cast<s16>(end_x - start_x),
+        .height = static_cast<s16>(end_y - start_y),
+    };
+}
+} // namespace
 ClusteringProcessor::ClusteringProcessor(Core::System& system_,
                                          Core::IrSensor::DeviceFormat& device_format,
                                          std::size_t npad_index)
@@ -36,6 +58,11 @@ ClusteringProcessor::~ClusteringProcessor() {
 };
 
 void ClusteringProcessor::StartProcessor() {
+    std::scoped_lock lock{mutex};
+    StartProcessorLocked();
+}
+
+void ClusteringProcessor::StartProcessorLocked() {
     device.camera_status = Core::IrSensor::IrCameraStatus::Available;
     device.camera_internal_status = Core::IrSensor::IrCameraInternalStatus::Ready;
 }
@@ -49,18 +76,19 @@ void ClusteringProcessor::OnControllerUpdate(Core::HID::ControllerTriggerType ty
         return;
     }
 
+    const auto camera_data = npad_device->GetCamera();
+
+    std::scoped_lock lock{mutex};
     next_state = {};
-    const auto& camera_data = npad_device->GetCamera();
     auto filtered_image = camera_data.data;
 
     RemoveLowIntensityData(filtered_image);
 
-    const auto window_start_x = static_cast<std::size_t>(current_config.window_of_interest.x);
-    const auto window_start_y = static_cast<std::size_t>(current_config.window_of_interest.y);
-    const auto window_end_x =
-        window_start_x + static_cast<std::size_t>(current_config.window_of_interest.width);
-    const auto window_end_y =
-        window_start_y + static_cast<std::size_t>(current_config.window_of_interest.height);
+    const auto window = ClampWindowOfInterest(current_config.window_of_interest, width, height);
+    const auto window_start_x = static_cast<std::size_t>(window.x);
+    const auto window_start_y = static_cast<std::size_t>(window.y);
+    const auto window_end_x = window_start_x + static_cast<std::size_t>(window.width);
+    const auto window_end_y = window_start_y + static_cast<std::size_t>(window.height);
 
     for (std::size_t y = window_start_y; y < window_end_y; y++) {
         for (std::size_t x = window_start_x; x < window_end_x; x++) {
@@ -84,19 +112,19 @@ void ClusteringProcessor::OnControllerUpdate(Core::HID::ControllerTriggerType ty
         }
     }
 
-    next_state.sampling_number = camera_data.sample;
+    next_state.sampling_number = static_cast<s64>(camera_data.sample);
     next_state.timestamp = system.CoreTiming().GetGlobalTimeNs().count();
     next_state.ambient_noise_level = Core::IrSensor::CameraAmbientNoiseLevel::Low;
     shared_memory->clustering_lifo.WriteNextEntry(next_state);
 
     if (!IsProcessorActive()) {
-        StartProcessor();
+        StartProcessorLocked();
     }
 }
 
 void ClusteringProcessor::RemoveLowIntensityData(std::vector<u8>& data) {
     for (u8& pixel : data) {
-        if (pixel < current_config.pixel_count_min) {
+        if (static_cast<u32>(pixel) < current_config.object_intensity_min) {
             pixel = 0;
         }
     }
@@ -238,28 +266,32 @@ void ClusteringProcessor::SetDefaultConfig() {
 }
 
 void ClusteringProcessor::SetConfig(Core::IrSensor::PackedClusteringProcessorConfig config) {
-    current_config.camera_config.exposure_time = config.camera_config.exposure_time;
-    current_config.camera_config.gain = config.camera_config.gain;
-    current_config.camera_config.is_negative_used = config.camera_config.is_negative_used;
-    current_config.camera_config.light_target =
-        static_cast<Core::IrSensor::CameraLightTarget>(config.camera_config.light_target);
-    current_config.window_of_interest = config.window_of_interest;
-    current_config.pixel_count_min = config.pixel_count_min;
-    current_config.pixel_count_max = config.pixel_count_max;
-    current_config.is_external_light_filter_enabled = config.is_external_light_filter_enabled;
-    current_config.object_intensity_min = config.object_intensity_min;
+    {
+        std::scoped_lock lock{mutex};
+        current_config.camera_config.exposure_time = config.camera_config.exposure_time;
+        current_config.camera_config.gain = config.camera_config.gain;
+        current_config.camera_config.is_negative_used = config.camera_config.is_negative_used;
+        current_config.camera_config.light_target =
+            static_cast<Core::IrSensor::CameraLightTarget>(config.camera_config.light_target);
+        current_config.window_of_interest =
+            ClampWindowOfInterest(config.window_of_interest, width, height);
+        current_config.pixel_count_min = config.pixel_count_min;
+        current_config.pixel_count_max = config.pixel_count_max;
+        current_config.is_external_light_filter_enabled = config.is_external_light_filter_enabled;
+        current_config.object_intensity_min = config.object_intensity_min;
 
-    LOG_INFO(Service_IRS,
-             "Processor config, exposure_time={}, gain={}, is_negative_used={}, "
-             "light_target={}, window_of_interest=({}, {}, {}, {}), pixel_count_min={}, "
-             "pixel_count_max={}, is_external_light_filter_enabled={}, object_intensity_min={}",
-             current_config.camera_config.exposure_time, current_config.camera_config.gain,
-             current_config.camera_config.is_negative_used,
-             current_config.camera_config.light_target, current_config.window_of_interest.x,
-             current_config.window_of_interest.y, current_config.window_of_interest.width,
-             current_config.window_of_interest.height, current_config.pixel_count_min,
-             current_config.pixel_count_max, current_config.is_external_light_filter_enabled,
-             current_config.object_intensity_min);
+        LOG_INFO(Service_IRS,
+                 "Processor config, exposure_time={}, gain={}, is_negative_used={}, "
+                 "light_target={}, window_of_interest=({}, {}, {}, {}), pixel_count_min={}, "
+                 "pixel_count_max={}, is_external_light_filter_enabled={}, object_intensity_min={}",
+                 current_config.camera_config.exposure_time, current_config.camera_config.gain,
+                 current_config.camera_config.is_negative_used,
+                 current_config.camera_config.light_target, current_config.window_of_interest.x,
+                 current_config.window_of_interest.y, current_config.window_of_interest.width,
+                 current_config.window_of_interest.height, current_config.pixel_count_min,
+                 current_config.pixel_count_max, current_config.is_external_light_filter_enabled,
+                 current_config.object_intensity_min);
+    }
 
     npad_device->SetCameraFormat(format);
 }

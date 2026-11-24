@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -105,6 +108,15 @@ public:
     /// Sets if emulation is multicore or single core, must be set before Initialize
     void SetMulticore(bool is_multicore);
 
+    /// Sets the active CPU core count (clamped to [1, NUM_CPU_CORES]), must be set before Initialize
+    void SetActiveCoreCount(u32 core_count);
+
+    /// Gets the active CPU core count for the current session
+    [[nodiscard]] u32 ActiveCoreCount() const;
+
+    /// Returns true after Initialize() completes and false before Initialize() or after Shutdown().
+    [[nodiscard]] bool IsInitialized() const;
+
     /// Resets the kernel to a clean slate for use.
     void Initialize();
 
@@ -113,6 +125,9 @@ public:
 
     /// Close all active services in use by the kernel instance.
     void CloseServices();
+
+    /// Destroy all stopped service server managers in use by the kernel instance.
+    void DestroyServices();
 
     /// Retrieves a shared pointer to the system resource limit instance.
     const KResourceLimit* GetSystemResourceLimit() const;

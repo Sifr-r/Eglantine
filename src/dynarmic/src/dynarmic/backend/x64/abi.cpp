@@ -10,6 +10,7 @@
 
 #include <algorithm>
 
+#include "common/assert.h"
 #include "common/common_types.h"
 #include "dynarmic/backend/x64/xbyak.h"
 
@@ -40,18 +41,47 @@ static FrameInfo CalculateFrameInfo(const size_t num_gprs, const size_t num_xmms
     };
 }
 
-static void ABI_PushRegistersAndAdjustStack(BlockOfCode& code, const size_t frame_size, std::bitset<32> regs) noexcept {
+static void ABI_PushRegistersAndAdjustStack(BlockOfCode& code, const size_t frame_size, std::bitset<32> regs
+#ifdef _WIN32
+    , PrologueInfo* prologue_info = nullptr
+#endif
+) noexcept {
     using namespace Xbyak::util;
 
     const size_t num_gprs = (ABI_ALL_GPRS & regs).count();
     const size_t num_xmms = (ABI_ALL_XMMS & regs).count();
     const FrameInfo frame_info = CalculateFrameInfo(num_gprs, num_xmms, frame_size);
 
-    for (size_t i = 0; i < regs.size(); ++i)
-        if (regs[i] && HostLocIsGPR(HostLoc(i)))
+#ifdef _WIN32
+    const u8* const prologue_start = code.getCurr<const u8*>();
+    if (prologue_info) {
+        prologue_info->begin = prologue_start;
+        prologue_info->ops.clear();
+    }
+    const auto record_op = [&](PrologueInfo::OpKind kind, u8 reg, size_t offset_or_size) {
+        if (!prologue_info) {
+            return;
+        }
+        const size_t code_offset = static_cast<size_t>(code.getCurr<const u8*>() - prologue_start);
+        ASSERT(code_offset <= 255);
+        prologue_info->ops.push_back({kind, static_cast<u8>(code_offset), reg, offset_or_size});
+    };
+#endif
+
+    for (size_t i = 0; i < regs.size(); ++i) {
+        if (regs[i] && HostLocIsGPR(HostLoc(i))) {
             code.push(HostLocToReg64(HostLoc(i)));
-    if (frame_info.stack_subtraction != 0)
+#ifdef _WIN32
+            record_op(PrologueInfo::OpKind::PushNonVol, static_cast<u8>(i), 0);
+#endif
+        }
+    }
+    if (frame_info.stack_subtraction != 0) {
         code.sub(rsp, u32(frame_info.stack_subtraction));
+#ifdef _WIN32
+        record_op(PrologueInfo::OpKind::AllocStack, 0, frame_info.stack_subtraction);
+#endif
+    }
     size_t xmm_offset = frame_info.xmm_offset;
     for (size_t i = 0; i < regs.size(); ++i) {
         if (regs[i] && HostLocIsXMM(HostLoc(i))) {
@@ -60,9 +90,20 @@ static void ABI_PushRegistersAndAdjustStack(BlockOfCode& code, const size_t fram
             } else {
                 code.movaps(code.xword[rsp + xmm_offset], HostLocToXmm(HostLoc(i)));
             }
+#ifdef _WIN32
+            record_op(PrologueInfo::OpKind::SaveXmm128, static_cast<u8>(i - size_t(HostLoc::XMM0)), xmm_offset);
+#endif
             xmm_offset += XMM_SIZE;
         }
     }
+
+#ifdef _WIN32
+    if (prologue_info) {
+        const size_t total_size = static_cast<size_t>(code.getCurr<const u8*>() - prologue_start);
+        ASSERT(total_size <= 255);
+        prologue_info->prolog_size = static_cast<u8>(total_size);
+    }
+#endif
 }
 
 static void ABI_PopRegistersAndAdjustStack(BlockOfCode& code, const size_t frame_size, std::bitset<32> regs) noexcept {
@@ -89,9 +130,15 @@ static void ABI_PopRegistersAndAdjustStack(BlockOfCode& code, const size_t frame
             code.pop(HostLocToReg64(HostLoc(i)));
 }
 
+#ifdef _WIN32
+void ABI_PushCalleeSaveRegistersAndAdjustStack(BlockOfCode& code, const std::size_t frame_size, PrologueInfo* prologue_info) {
+    ABI_PushRegistersAndAdjustStack(code, frame_size, ABI_ALL_CALLEE_SAVE, prologue_info);
+}
+#else
 void ABI_PushCalleeSaveRegistersAndAdjustStack(BlockOfCode& code, const std::size_t frame_size) {
     ABI_PushRegistersAndAdjustStack(code, frame_size, ABI_ALL_CALLEE_SAVE);
 }
+#endif
 
 void ABI_PopCalleeSaveRegistersAndAdjustStack(BlockOfCode& code, const std::size_t frame_size) {
     ABI_PopRegistersAndAdjustStack(code, frame_size, ABI_ALL_CALLEE_SAVE);

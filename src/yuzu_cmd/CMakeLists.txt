@@ -34,6 +34,12 @@ add_executable(yuzu-cmd
     emu_window/emu_window_sdl3_null.h
     emu_window/emu_window_sdl3_vk.cpp
     emu_window/emu_window_sdl3_vk.h
+    gpui_content.cpp
+    gpui_content.h
+    gpui_library.cpp
+    gpui_library.h
+    gpui_session.cpp
+    gpui_session.h
     sdl_config.cpp
     sdl_config.h
     yuzu.cpp
@@ -41,7 +47,8 @@ add_executable(yuzu-cmd
     ${OPENGL_SOURCES}
 )
 
-target_link_libraries(yuzu-cmd PRIVATE common core input_common frontend_common video_core)
+target_link_libraries(yuzu-cmd PRIVATE common core input_common frontend_common video_core
+    nlohmann_json::nlohmann_json)
 
 if (ENABLE_MCP_SERVER)
     target_sources(yuzu-cmd PRIVATE mcp_host_cli.cpp mcp_host_cli.h)

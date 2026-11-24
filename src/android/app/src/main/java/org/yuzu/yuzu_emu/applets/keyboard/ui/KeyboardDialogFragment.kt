@@ -19,6 +19,7 @@ import org.yuzu.yuzu_emu.utils.SerializableHelper.serializable
 class KeyboardDialogFragment : DialogFragment() {
     private lateinit var binding: DialogEditTextBinding
     private lateinit var config: KeyboardConfig
+    private var completed = false
 
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
         binding = DialogEditTextBinding.inflate(layoutInflater)
@@ -61,27 +62,40 @@ class KeyboardDialogFragment : DialogFragment() {
         binding.editText.inputType = inputType
 
         val headerText =
-            config.header_text!!.ifEmpty { resources.getString(R.string.software_keyboard) }
+            config.header_text.orEmpty().ifEmpty { resources.getString(R.string.software_keyboard) }
         val okText =
-            config.ok_text!!.ifEmpty { resources.getString(R.string.submit) }
+            config.ok_text.orEmpty().ifEmpty { resources.getString(R.string.submit) }
 
         return MaterialAlertDialogBuilder(requireContext())
             .setTitle(headerText)
             .setView(binding.root)
             .setPositiveButton(okText) { _, _ ->
-                SoftwareKeyboard.data.result = SoftwareKeyboard.SwkbdResult.Ok.ordinal
-                SoftwareKeyboard.data.text = binding.editText.text.toString()
+                synchronized(SoftwareKeyboard.dataLock) {
+                    SoftwareKeyboard.data.result = SoftwareKeyboard.SwkbdResult.Ok.ordinal
+                    SoftwareKeyboard.data.text = binding.editText.text.toString()
+                }
             }
             .setNegativeButton(resources.getString(android.R.string.cancel)) { _, _ ->
-                SoftwareKeyboard.data.result = SoftwareKeyboard.SwkbdResult.Cancel.ordinal
+                synchronized(SoftwareKeyboard.dataLock) {
+                    SoftwareKeyboard.data.result = SoftwareKeyboard.SwkbdResult.Cancel.ordinal
+                }
             }
             .create()
     }
 
     override fun onDismiss(dialog: DialogInterface) {
         super.onDismiss(dialog)
-        synchronized(SoftwareKeyboard.dataLock) {
-            SoftwareKeyboard.dataLock.notifyAll()
+        if (!completed) {
+            completed = true
+            SoftwareKeyboard.notifyNormalCompleted()
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        if (!completed && activity?.isChangingConfigurations != true) {
+            completed = true
+            SoftwareKeyboard.notifyNormalCompleted()
         }
     }
 

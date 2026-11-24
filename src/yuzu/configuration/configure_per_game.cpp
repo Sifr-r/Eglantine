@@ -236,13 +236,15 @@ void ConfigurePerGame::LoadConfiguration() {
         ui->display_name->setText(QString::fromStdString(control.first->GetApplicationName()));
         ui->display_developer->setText(QString::fromStdString(control.first->GetDeveloperName()));
     } else {
-        std::string title;
-        if (loader->ReadTitle(title) == Loader::ResultStatus::Success)
-            ui->display_name->setText(QString::fromStdString(title));
+        if (loader != nullptr) {
+            std::string title;
+            if (loader->ReadTitle(title) == Loader::ResultStatus::Success)
+                ui->display_name->setText(QString::fromStdString(title));
 
-        FileSys::NACP nacp;
-        if (loader->ReadControlData(nacp) == Loader::ResultStatus::Success)
-            ui->display_developer->setText(QString::fromStdString(nacp.GetDeveloperName()));
+            FileSys::NACP nacp;
+            if (loader->ReadControlData(nacp) == Loader::ResultStatus::Success)
+                ui->display_developer->setText(QString::fromStdString(nacp.GetDeveloperName()));
+        }
 
         ui->display_version->setText(QStringLiteral("1.0.0"));
     }
@@ -256,7 +258,7 @@ void ConfigurePerGame::LoadConfiguration() {
 
         scene->addPixmap(map.scaled(ui->icon_view->width(), ui->icon_view->height(),
                                     Qt::IgnoreAspectRatio, Qt::SmoothTransformation));
-    } else {
+    } else if (loader != nullptr) {
         std::vector<u8> bytes;
         if (loader->ReadIcon(bytes) == Loader::ResultStatus::Success) {
             scene->clear();
@@ -271,8 +273,8 @@ void ConfigurePerGame::LoadConfiguration() {
 
     ui->display_filename->setText(QString::fromStdString(file->GetName()));
 
-    ui->display_format->setText(
-        QString::fromStdString(Loader::GetFileTypeString(loader->GetFileType())));
+    ui->display_format->setText(QString::fromStdString(Loader::GetFileTypeString(
+        loader != nullptr ? loader->GetFileType() : Loader::FileType::Unknown)));
 
     const auto valueText = QtCommon::ReadableByteSize(file->GetSize());
     ui->display_size->setText(valueText);

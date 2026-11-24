@@ -513,7 +513,7 @@ void EmitX64::EmitLogicalShiftRight64(EmitContext& ctx, IR::Inst* inst) {
 
         code.shrx(result, operand, shift);
         code.xor_(zero.cvt32(), zero.cvt32());
-        code.cmp(shift.cvt8(), 63);
+        code.cmp(shift.cvt8(), 64);
         code.cmovnb(result, zero);
 
         ctx.reg_alloc.DefineValue(code, inst, result);
@@ -952,11 +952,11 @@ static void EmitAdd(BlockOfCode& code, EmitContext& ctx, IR::Inst* inst, size_t 
             if (carry_in.GetImmediateU1()) {
                 // In range for a valid LEA materialisation
                 auto const in_range = s32(op_arg) >= -0x7ffffffe && s32(op_arg) <= 0x7ffffffe;
-                if (in_range && (carry_inst || nzcv_inst || overflow_inst)) {
+                if (in_range && !carry_inst && !nzcv_inst && !overflow_inst) {
+                    code.lea(result, code.ptr[result + (s32(op_arg) + 1)]);
+                } else {
                     code.stc();
                     code.adc(result, op_arg);
-                } else {
-                    code.lea(result, code.ptr[result + op_arg + 1]);
                 }
             } else {
                 code.add(result, op_arg);
@@ -1199,12 +1199,15 @@ void EmitX64::EmitUnsignedDiv64(EmitContext& ctx, IR::Inst* inst) {
 
 void EmitX64::EmitSignedDiv32(EmitContext& ctx, IR::Inst* inst) {
     auto args = ctx.reg_alloc.GetArgumentInfo(inst);
+    ctx.reg_alloc.ScratchGpr(code, HostLoc::RAX);
     ctx.reg_alloc.ScratchGpr(code, HostLoc::RDX);
-    ctx.reg_alloc.UseScratch(code, args[0], HostLoc::RAX);
+    auto const dividend = ctx.reg_alloc.UseGpr(code, args[0]).cvt32();
     auto const divisor = ctx.reg_alloc.UseGpr(code, args[1]).cvt32();
     Xbyak::Label end, ok;
+    code.xor_(eax, eax);
     code.test(divisor, divisor);
     code.jz(end, code.T_NEAR);
+    code.mov(eax, dividend);
     code.cmp(divisor, u32(-1)); // is sign extended
     code.jne(ok, code.T_NEAR);
     code.cmp(eax, u32(1ULL << 31));

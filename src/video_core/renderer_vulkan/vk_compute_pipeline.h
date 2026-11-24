@@ -48,7 +48,7 @@ public:
                              Common::ThreadWorker* thread_worker,
                              PipelineStatistics* pipeline_statistics,
                              VideoCore::ShaderNotify* shader_notify, const Shader::Info& info,
-                             vk::ShaderModule spv_module, u64 shader_hash);
+                             vk::ShaderModule spv_module, u64 shader_hash, u64 native_key = 0);
 
     ComputePipeline& operator=(ComputePipeline&&) noexcept = delete;
     ComputePipeline(ComputePipeline&&) noexcept = delete;
@@ -75,6 +75,10 @@ public:
 
     [[nodiscard]] u64 ShaderHash() const noexcept {
         return shader_hash;
+    }
+
+    [[nodiscard]] u64 NativeKey() const noexcept {
+        return native_key;
     }
 
     /// Storage images written by the last configured dispatch, kept while a frame dump runs.
@@ -118,6 +122,7 @@ private:
     DescriptorBufferRing& descriptor_buffer_ring;
     Shader::Info info;
     u64 shader_hash{};
+    u64 native_key{};
     u32 num_descriptor_entries{};
     bool has_image_resources{false};
     bool has_rescaling_push_constants{false};

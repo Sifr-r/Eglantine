@@ -11,6 +11,10 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <type_traits>
 #include <vector>
 
 #include <boost/icl/interval_set.hpp>
@@ -19,6 +23,19 @@
 #include "dynarmic/ir/location_descriptor.h"
 
 namespace Dynarmic::Backend {
+
+template<typename P>
+[[nodiscard]] boost::icl::discrete_interval<P> MakeClosedCacheRange(P start_address, std::size_t length) {
+    static_assert(std::is_unsigned_v<P>);
+    if (length == 0) {
+        return {};
+    }
+    const std::uint64_t offset = static_cast<std::uint64_t>(length) - 1;
+    const P max_addr = (std::numeric_limits<P>::max)();
+    const std::uint64_t max_offset = static_cast<std::uint64_t>(max_addr - start_address);
+    const P end_address = offset > max_offset ? max_addr : static_cast<P>(start_address + offset);
+    return boost::icl::discrete_interval<P>::closed(start_address, end_address);
+}
 
 template<typename P>
 class BlockRangeInformation {

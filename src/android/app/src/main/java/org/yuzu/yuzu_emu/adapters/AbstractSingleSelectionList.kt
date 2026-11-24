@@ -65,9 +65,13 @@ abstract class AbstractSingleSelectionList<
     ) {
         removeItem(position)
         if (position == selectedItem) {
-            selectedItem = getDefaultSelection()
-            currentList[selectedItem].onSelectionStateChanged(true)
-            onItemChanged(selectedItem)
+            if (currentList.isNotEmpty()) {
+                selectedItem = getDefaultSelection()
+                currentList[selectedItem].onSelectionStateChanged(true)
+                onItemChanged(selectedItem)
+            } else {
+                selectedItem = -1
+            }
         } else if (position < selectedItem) {
             selectedItem--
         }
@@ -96,9 +100,13 @@ abstract class AbstractSingleSelectionList<
     }
 
     private fun getDefaultSelection(): Int =
-        when (defaultSelection) {
-            DefaultSelection.Start -> currentList.indices.first
-            DefaultSelection.End -> currentList.indices.last
+        if (currentList.isEmpty()) {
+            -1
+        } else {
+            when (defaultSelection) {
+                DefaultSelection.Start -> currentList.indices.first
+                DefaultSelection.End -> currentList.indices.last
+            }
         }
 
     enum class DefaultSelection { Start, End }

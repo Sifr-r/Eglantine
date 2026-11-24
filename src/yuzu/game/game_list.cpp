@@ -251,16 +251,26 @@ void GameList::ResetViewMode() {
         if (!UISettings::values.game_dirs.empty()) {
             item_model->PopulateAsync(UISettings::values.game_dirs);
         }
+    } else if (!newTreeMode && search_field) {
+        OnTextChanged(search_field->filterText());
     }
 }
 
 void GameList::OnTextChanged(const QString& new_text) {
     const QString edit_filter_text = new_text.toLower();
 
-    if (m_isTreeMode) {
+    switch (game_list_mode) {
+    case Settings::GameListMode::TreeView:
         tree_view->ApplyFilter(edit_filter_text, item_model);
-    } else {
+        break;
+    case Settings::GameListMode::GridView:
         grid_view->ApplyFilter(edit_filter_text, item_model);
+        break;
+    case Settings::GameListMode::CarouselView:
+        carousel_view->ApplyFilter(edit_filter_text, item_model);
+        break;
+    default:
+        UNREACHABLE();
     }
 }
 

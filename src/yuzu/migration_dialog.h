@@ -22,9 +22,9 @@ public:
     QAbstractButton* clickedButton() const;
 
 private:
-    QLabel* m_text;
-    QVBoxLayout* m_boxes;
-    QHBoxLayout* m_buttons;
+    QLabel* m_text{nullptr};
+    QVBoxLayout* m_boxes{nullptr};
+    QHBoxLayout* m_buttons{nullptr};
 
-    QAbstractButton* m_clickedButton;
+    QAbstractButton* m_clickedButton{nullptr};
 };

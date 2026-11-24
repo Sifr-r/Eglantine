@@ -7,6 +7,7 @@
 // SPDX-FileCopyrightText: Copyright yuzu/Citra Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iostream>
@@ -14,6 +15,7 @@
 #include <regex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 // windows.h needs to be included before shellapi.h
@@ -82,32 +84,70 @@ static constexpr char BanListMagic[] = "YuzuRoom-BanList-1";
 static constexpr char token_delimiter{':'};
 
 static void PadToken(std::string& token) {
-    std::array<unsigned char, 512> output{};
-    std::array<unsigned char, 2048> roundtrip{};
-    for (size_t i = 0; i < 3; i++) {
-        EVP_DecodeBlock(output.data(), reinterpret_cast<const unsigned char*>(token.c_str()), token.size());
-        EVP_EncodeBlock(output.data(), roundtrip.data(), roundtrip.size());
-        if (memcmp(roundtrip.data(), token.data(), token.size()) == 0) {
-            break;
-        }
-        token.push_back('=');
+    if (const std::size_t rem = token.size() % 4; rem == 2 || rem == 3) {
+        token.append(4 - rem, '=');
     }
 }
 
+static std::string DecodeDisplayToken(const std::string& display_token) {
+    constexpr std::size_t MaxDisplayTokenLength = 65536;
+    if (display_token.empty() || display_token.size() > MaxDisplayTokenLength ||
+        display_token.size() % 4 != 0) {
+        LOG_ERROR(Network, "Invalid display token length");
+        return {};
+    }
+    const bool has_whitespace = std::any_of(display_token.begin(), display_token.end(), [](char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+    });
+    if (has_whitespace) {
+        LOG_ERROR(Network, "Display token contains unexpected whitespace");
+        return {};
+    }
+
+    std::vector<unsigned char> output(3 * (display_token.size() / 4));
+    const int decoded_len =
+        EVP_DecodeBlock(output.data(), reinterpret_cast<const unsigned char*>(display_token.data()),
+                        static_cast<int>(display_token.size()));
+    if (decoded_len < 0) {
+        LOG_ERROR(Network, "Failed to base64-decode display token");
+        return {};
+    }
+
+    std::size_t out_len = static_cast<std::size_t>(decoded_len);
+    if (out_len > output.size()) {
+        return {};
+    }
+
+    std::size_t padding = 0;
+    if (display_token.back() == '=') {
+        ++padding;
+        if (display_token.size() >= 2 && display_token[display_token.size() - 2] == '=') {
+            ++padding;
+        }
+    }
+    if (out_len < padding) {
+        return {};
+    }
+    out_len -= padding;
+    return std::string(reinterpret_cast<const char*>(output.data()), out_len);
+}
+
 static std::string UsernameFromDisplayToken(const std::string& display_token) {
-    std::size_t outlen = 4 * ((display_token.length() + 2) / 3);
-    std::array<unsigned char, 512> output{};
-    EVP_DecodeBlock(output.data(), reinterpret_cast<const unsigned char*>(display_token.c_str()), display_token.length());
-    std::string decoded_display_token(reinterpret_cast<char*>(&output), outlen);
-    return decoded_display_token.substr(0, decoded_display_token.find(token_delimiter));
+    const std::string decoded_display_token = DecodeDisplayToken(display_token);
+    const std::size_t delimiter_pos = decoded_display_token.find(token_delimiter);
+    if (delimiter_pos == std::string::npos) {
+        return {};
+    }
+    return decoded_display_token.substr(0, delimiter_pos);
 }
 
 static std::string TokenFromDisplayToken(const std::string& display_token) {
-    std::size_t outlen = 4 * ((display_token.length() + 2) / 3);
-    std::array<unsigned char, 512> output{};
-    EVP_DecodeBlock(output.data(), reinterpret_cast<const unsigned char*>(display_token.c_str()), display_token.length());
-    std::string decoded_display_token(reinterpret_cast<char*>(&output), outlen);
-    return decoded_display_token.substr(decoded_display_token.find(token_delimiter) + 1);
+    const std::string decoded_display_token = DecodeDisplayToken(display_token);
+    const std::size_t delimiter_pos = decoded_display_token.find(token_delimiter);
+    if (delimiter_pos == std::string::npos) {
+        return {};
+    }
+    return decoded_display_token.substr(delimiter_pos + 1);
 }
 
 static Network::Room::BanList LoadBanList(const std::string& path) {
@@ -175,9 +215,10 @@ void LaunchRoom(int argc, char** argv, bool called_by_option) {
     int option_index = 0;
     char* endarg;
 
-    char* new_argv0 = argv[0];
+    std::string program_name =
+        (argc > 0 && argv != nullptr && argv[0] != nullptr) ? argv[0] : "eden-room";
     if (called_by_option) {
-        strncat(new_argv0, " --room", 8);
+        program_name += " --room";
     }
 
     std::string room_name;
@@ -220,70 +261,73 @@ void LaunchRoom(int argc, char** argv, bool called_by_option) {
     Common::Log::Start();
 
     while (optind < argc) {
-        int arg = getopt_long(argc, argv, "n:d:s:p:m:w:g:u:t:a:i:l:hv", long_options, &option_index);
-        if (arg != -1) {
-            char carg = static_cast<char>(arg);
+        int arg = getopt_long(argc, argv, "n:d:s:p:m:w:g:u:t:a:b:i:l:hv", long_options, &option_index);
+        if (arg == -1) {
+            break;
+        }
+        char carg = static_cast<char>(arg);
 
-            switch (carg) {
-            case 'n':
-                room_name.assign(optarg);
-                break;
-            case 'd':
-                room_description.assign(optarg);
-                break;
-            case 's':
-                bind_address.assign(optarg);
-                break;
-            case 'p':
-                port = strtoul(optarg, &endarg, 0);
-                break;
-            case 'm':
-                max_members = strtoul(optarg, &endarg, 0);
-                break;
-            case 'w':
-                password.assign(optarg);
-                break;
-            case 'g':
-                preferred_game.assign(optarg);
-                break;
-            case 'i':
-                preferred_game_id = strtoull(optarg, &endarg, 16);
-                break;
-            case 'u':
+        switch (carg) {
+        case 'n':
+            room_name.assign(optarg);
+            break;
+        case 'd':
+            room_description.assign(optarg);
+            break;
+        case 's':
+            bind_address.assign(optarg);
+            break;
+        case 'p':
+            port = strtoul(optarg, &endarg, 0);
+            break;
+        case 'm':
+            max_members = strtoul(optarg, &endarg, 0);
+            break;
+        case 'w':
+            password.assign(optarg);
+            break;
+        case 'g':
+            preferred_game.assign(optarg);
+            break;
+        case 'i':
+            preferred_game_id = strtoull(optarg, &endarg, 16);
+            break;
+        case 'u':
+            if (optarg != nullptr) {
                 username.assign(optarg);
-                break;
-            case 't':
-                token.assign(optarg);
-                break;
-            case 'a':
-                web_api_url.assign(optarg);
-                break;
-            case 'b':
-                ban_list_file.assign(optarg);
-                break;
-            case 'l':
-                log_file.assign(optarg);
-                break;
-            case 'h':
-                PrintHelp(argv[0]);
-                std::exit(0);
-            case 'v':
-                PrintVersion();
-                std::exit(0);
-            default:
-                break;
             }
+            break;
+        case 't':
+            token.assign(optarg);
+            break;
+        case 'a':
+            web_api_url.assign(optarg);
+            break;
+        case 'b':
+            ban_list_file.assign(optarg);
+            break;
+        case 'l':
+            log_file.assign(optarg);
+            break;
+        case 'h':
+            PrintHelp(program_name.c_str());
+            std::exit(0);
+        case 'v':
+            PrintVersion();
+            std::exit(0);
+        default:
+            break;
         }
     }
 
     if (room_name.empty()) {
         LOG_ERROR(Network, "Room name is empty!");
-        PrintHelp(argv[0]);
+        PrintHelp(program_name.c_str());
         std::exit(-1);
     }
     if (preferred_game.empty()) {
         LOG_ERROR(Network, "Preferred game is empty!");
-        PrintHelp(argv[0]);
+        PrintHelp(program_name.c_str());
         std::exit(-1);
     }
     if (preferred_game_id == 0) {
@@ -295,7 +339,7 @@ void LaunchRoom(int argc, char** argv, bool called_by_option) {
         LOG_ERROR(Network,
                   "max_members needs to be in the range 2 - {}!",
                   Network::MaxConcurrentConnections);
-        PrintHelp(argv[0]);
+        PrintHelp(program_name.c_str());
         std::exit(-1);
     }
     if (bind_address.empty()) {
@@ -303,7 +347,7 @@ void LaunchRoom(int argc, char** argv, bool called_by_option) {
     }
     if (port > UINT16_MAX) {
         LOG_ERROR(Network, "Port needs to be in the range 0 - 65535!");
-        PrintHelp(argv[0]);
+        PrintHelp(program_name.c_str());
         std::exit(-1);
     }
     if (ban_list_file.empty()) {

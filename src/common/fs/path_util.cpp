@@ -238,16 +238,28 @@ bool ValidatePath(const fs::path& path) {
 }
 
 fs::path ConcatPath(const fs::path& first, const fs::path& second) {
-    const bool second_has_dir_sep = IsDirSeparator(second.u8string().front());
-
-    if (!second_has_dir_sep) {
-        return (first / second).lexically_normal();
+    if (second.empty()) {
+        return first.lexically_normal();
+    }
+    if (first.empty()) {
+        return second.lexically_normal();
     }
 
-    fs::path concat_path = first;
-    concat_path += second;
+    auto second_str = second.u8string();
+    std::size_t prefix_len = 0;
+    while (prefix_len < second_str.size() && IsDirSeparator(second_str[prefix_len])) {
+        ++prefix_len;
+    }
 
-    return concat_path.lexically_normal();
+    if (prefix_len > 0) {
+        second_str.erase(0, prefix_len);
+        if (second_str.empty()) {
+            return first.lexically_normal();
+        }
+        return (first / fs::path{second_str}).lexically_normal();
+    }
+
+    return (first / second).lexically_normal();
 }
 
 fs::path ConcatPathSafe(const fs::path& base, const fs::path& offset) {
@@ -261,14 +273,25 @@ fs::path ConcatPathSafe(const fs::path& base, const fs::path& offset) {
 }
 
 bool IsPathSandboxed(const fs::path& base, const fs::path& path) {
-    const auto base_string = RemoveTrailingSeparators(base.lexically_normal()).u8string();
-    const auto path_string = RemoveTrailingSeparators(path.lexically_normal()).u8string();
+    const auto norm_base = RemoveTrailingSeparators(base.lexically_normal());
+    const auto norm_path = RemoveTrailingSeparators(path.lexically_normal());
 
-    if (path_string.size() < base_string.size()) {
+    if (norm_base.empty() || norm_path.empty()) {
         return false;
     }
 
-    return base_string.compare(0, base_string.size(), path_string, 0, base_string.size()) == 0;
+    const auto relative = norm_path.lexically_relative(norm_base);
+    if (relative.empty()) {
+        return false;
+    }
+
+    for (const auto& component : relative) {
+        if (component == fs::path{".."}) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool IsDirSeparator(char character) {
@@ -284,9 +307,10 @@ fs::path RemoveTrailingSeparators(const fs::path& path) {
         return path;
     }
 
+    const std::size_t root_size = path.root_path().u8string().size();
     auto string_path = path.u8string();
 
-    while (IsDirSeparator(string_path.back())) {
+    while (string_path.size() > root_size && IsDirSeparator(string_path.back())) {
         string_path.pop_back();
     }
 
@@ -350,10 +374,13 @@ fs::path GetExeDirectory() {
 
 fs::path GetAppDataRoamingDirectory() {
     PWSTR appdata_roaming_path = nullptr;
+    const HRESULT hr =
+        SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata_roaming_path);
 
-    SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &appdata_roaming_path);
-
-    auto fs_appdata_roaming_path = fs::path{appdata_roaming_path};
+    fs::path fs_appdata_roaming_path;
+    if (SUCCEEDED(hr) && appdata_roaming_path != nullptr) {
+        fs_appdata_roaming_path = fs::path{appdata_roaming_path};
+    }
 
     CoTaskMemFree(appdata_roaming_path);
 
@@ -410,16 +437,31 @@ fs::path GetDataDirectory(const std::string& env_name) {
 #ifdef __APPLE__
 
 fs::path GetBundleDirectory() {
-    char app_bundle_path[MAXPATHLEN];
-
     // Get the main bundle for the app
-    CFURLRef bundle_ref = CFBundleCopyBundleURL(CFBundleGetMainBundle());
+    CFBundleRef main_bundle = CFBundleGetMainBundle();
+    if (main_bundle == nullptr) {
+        return {};
+    }
+
+    CFURLRef bundle_ref = CFBundleCopyBundleURL(main_bundle);
+    if (bundle_ref == nullptr) {
+        return {};
+    }
+
     CFStringRef bundle_path = CFURLCopyFileSystemPath(bundle_ref, kCFURLPOSIXPathStyle);
-
-    CFStringGetFileSystemRepresentation(bundle_path, app_bundle_path, sizeof(app_bundle_path));
-
     CFRelease(bundle_ref);
+    if (bundle_path == nullptr) {
+        return {};
+    }
+
+    char app_bundle_path[MAXPATHLEN]{};
+    const Boolean converted = CFStringGetFileSystemRepresentation(
+        bundle_path, app_bundle_path, static_cast<CFIndex>(sizeof(app_bundle_path)));
     CFRelease(bundle_path);
+
+    if (!converted) {
+        return {};
+    }
 
     return fs::path{app_bundle_path};
 }

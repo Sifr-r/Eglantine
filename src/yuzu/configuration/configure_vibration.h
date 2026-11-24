@@ -28,10 +28,14 @@ public:
 
     void ApplyConfiguration();
 
+signals:
+    void VibrationUpdateRequested(Core::HID::ControllerTriggerType type, int player_index);
+
 private:
     void changeEvent(QEvent* event) override;
     void RetranslateUI();
-    void VibrateController(Core::HID::ControllerTriggerType type, std::size_t player_index);
+    void VibrateController(Core::HID::ControllerTriggerType type, int player_index);
+    void StopVibration(std::size_t player_index);
     void StopVibrations();
 
     std::unique_ptr<Ui::ConfigureVibration> ui;
@@ -46,6 +50,9 @@ private:
 
     /// Callback index to stop the controllers events
     std::array<int, NUM_PLAYERS> controller_callback_key;
+
+    /// Tracks whether each player's test vibration is currently active
+    std::array<bool, NUM_PLAYERS> is_vibrating{};
 
     Core::HID::HIDCore& hid_core;
 };

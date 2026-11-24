@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -37,7 +40,8 @@ void HandleInterrupt(KernelCore& kernel, s32 core_id) {
 }
 
 void SendInterProcessorInterrupt(KernelCore& kernel, u64 core_mask) {
-    for (std::size_t core_id = 0; core_id < Core::Hardware::NUM_CPU_CORES; ++core_id) {
+    const std::size_t active_cores = kernel.ActiveCoreCount();
+    for (std::size_t core_id = 0; core_id < active_cores; ++core_id) {
         if (core_mask & (1ULL << core_id)) {
             kernel.PhysicalCore(core_id).Interrupt();
         }

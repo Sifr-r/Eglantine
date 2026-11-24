@@ -10,6 +10,7 @@
 #pragma once
 
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -70,6 +71,7 @@ public:
                            u32 max_sessions, SessionRequestHandlerFactory handler_factory);
     Result UnregisterService(const std::string& name);
     Result GetServicePort(Kernel::KClientPort** out_client_port, const std::string& name);
+    void CancelBlockingGets();
 
     template <std::derived_from<SessionRequestHandler> T>
     std::shared_ptr<T> GetService(const std::string& name, bool block = false) const {
@@ -78,15 +80,25 @@ public:
         if (it == registered_services.end() && !block) {
             LOG_DEBUG(Service, "Can't find service: {}", name);
             return nullptr;
-        } else if (block) {
-            using namespace std::literals::chrono_literals;
-            while (it == registered_services.end()) {
-                l.unlock();
-                Kernel::Svc::SleepThread(
-                    kernel.System(),
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(100ms).count());
-                l.lock();
-                it = registered_services.find(name);
+        } else if (block && it == registered_services.end()) {
+            if (!IsGuestServiceThread()) {
+                service_registered_cv.wait(l, [&] {
+                    it = registered_services.find(name);
+                    return it != registered_services.end() || is_shutting_down;
+                });
+                if (it == registered_services.end()) {
+                    return nullptr;
+                }
+            } else {
+                using namespace std::literals::chrono_literals;
+                while (it == registered_services.end()) {
+                    l.unlock();
+                    Kernel::Svc::SleepThread(
+                        kernel.System(),
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(100ms).count());
+                    l.lock();
+                    it = registered_services.find(name);
+                }
             }
         }
         return std::static_pointer_cast<T>(it->second());
@@ -110,11 +122,15 @@ public:
     }
 
 private:
+    bool IsGuestServiceThread() const;
+
     std::shared_ptr<SM> sm_interface;
     std::unique_ptr<Controller> controller_interface;
 
     /// Map of registered services, retrieved using GetServicePort.
     mutable std::mutex lock;
+    mutable std::condition_variable service_registered_cv;
+    bool is_shutting_down{false};
     ::Common::unordered_map<std::string, SessionRequestHandlerFactory> registered_services;
     ::Common::unordered_map<std::string, Kernel::KClientPort*> service_ports;
 

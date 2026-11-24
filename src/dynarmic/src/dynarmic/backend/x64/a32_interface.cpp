@@ -17,6 +17,7 @@
 #include "common/common_types.h"
 #include "dynarmic/common/llvm_disassemble.h"
 
+#include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/backend/x64/a32_emit_x64.h"
 #include "dynarmic/backend/x64/a32_jitstate.h"
 #include "dynarmic/backend/x64/block_of_code.h"
@@ -110,8 +111,11 @@ struct Jit::Impl {
     }
 
     void InvalidateCacheRange(std::uint32_t start_address, std::size_t length) {
+        if (length == 0) {
+            return;
+        }
         std::unique_lock lock{invalidation_mutex};
-        invalid_cache_ranges.add(boost::icl::discrete_interval<u32>::closed(start_address, static_cast<u32>(start_address + length - 1)));
+        invalid_cache_ranges.add(Backend::MakeClosedCacheRange<u32>(start_address, length));
         HaltExecution(HaltReason::CacheInvalidation);
     }
 

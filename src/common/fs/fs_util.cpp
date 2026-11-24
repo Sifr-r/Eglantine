@@ -11,6 +11,12 @@
 
 namespace Common::FS {
 
+namespace {
+std::size_t BufferStringLength(std::span<const u8> buffer) {
+    return static_cast<std::size_t>(std::ranges::find(buffer, u8{0}) - buffer.begin());
+}
+} // namespace
+
 std::u8string ToU8String(std::string_view utf8_string) {
     return std::u8string{utf8_string.begin(), utf8_string.end()};
 }
@@ -20,7 +26,11 @@ std::u8string BufferToU8String(std::span<const u8> buffer) {
 }
 
 std::u8string_view BufferToU8StringView(std::span<const u8> buffer) {
-    return std::u8string_view{reinterpret_cast<const char8_t*>(buffer.data())};
+    if (buffer.empty()) {
+        return {};
+    }
+    return std::u8string_view{reinterpret_cast<const char8_t*>(buffer.data()),
+                            BufferStringLength(buffer)};
 }
 
 std::string ToUTF8String(std::u8string_view u8_string) {
@@ -32,7 +42,11 @@ std::string BufferToUTF8String(std::span<const u8> buffer) {
 }
 
 std::string_view BufferToUTF8StringView(std::span<const u8> buffer) {
-    return std::string_view{reinterpret_cast<const char*>(buffer.data())};
+    if (buffer.empty()) {
+        return {};
+    }
+    return std::string_view{reinterpret_cast<const char*>(buffer.data()),
+                            BufferStringLength(buffer)};
 }
 
 std::string PathToUTF8String(const std::filesystem::path& path) {

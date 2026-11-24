@@ -7,6 +7,8 @@
 // SPDX-FileCopyrightText: 2018 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <optional>
 #include <string>
@@ -73,14 +75,17 @@ void DiscordImpl::Pause() {
 
 std::string DiscordImpl::GetGameString(const std::string& title) {
     // Convert to lowercase
-    std::string icon_name = Common::ToLower(title);
+    std::string icon_name{title};
+    std::transform(icon_name.begin(), icon_name.end(), icon_name.begin(),
+                   [](char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); });
 
     // Replace spaces with dashes
     std::replace(icon_name.begin(), icon_name.end(), ' ', '-');
     boost::replace_all(icon_name, "é", "e");
 
     // Remove non-alphanumeric characters but keep dashes
-    std::erase_if(icon_name, [](char c) { return !std::isalnum(c) && c != '-'; });
+    std::erase_if(icon_name,
+                  [](char c) { return !std::isalnum(static_cast<unsigned char>(c)) && c != '-'; });
 
     // Remove dashes from the start and end of the string
     icon_name.erase(icon_name.begin(), std::find_if(icon_name.begin(), icon_name.end(),
@@ -150,12 +155,13 @@ void DiscordImpl::Update() {
         }
 
         // Used to format Icon URL for yuzu website game compatibility page
-        std::string icon_name = GetGameString(game_title);
-        auto const game_url = fmt::format(
-            "https://raw.githubusercontent.com/eden-emulator/boxart/refs/heads/master/img/{}.png",
-            icon_name);
+        const std::string icon_name = GetGameString(game_title);
+        const std::string boxart_path =
+            fmt::format("/eden-emulator/boxart/refs/heads/master/img/{}.png", icon_name);
+        const std::string game_url =
+            fmt::format("https://raw.githubusercontent.com{}", boxart_path);
 
-        httplib::SSLClient client(game_url);
+        httplib::SSLClient client("raw.githubusercontent.com");
         client.set_connection_timeout(3);
         client.set_read_timeout(3);
         client.set_follow_location(true);
@@ -164,7 +170,7 @@ void DiscordImpl::Update() {
 
         httplib::Request request{
             .method = "HEAD",
-            .path = game_url,
+            .path = boxart_path,
         };
 
         auto res = client.send(request);

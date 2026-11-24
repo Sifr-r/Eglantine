@@ -30,7 +30,7 @@ Id Clamp(EmitContext& ctx, Id type, Id value, Id zero, Id one) {
 
 Id FPOrdNotEqual(EmitContext& ctx, Id lhs, Id rhs) {
     if (ctx.profile.ignore_nan_fp_comparisons) {
-        const Id comp{ctx.OpFOrdEqual(ctx.U1, lhs, rhs)};
+        const Id comp{ctx.OpFOrdNotEqual(ctx.U1, lhs, rhs)};
         const Id lhs_not_nan{ctx.OpLogicalNot(ctx.U1, ctx.OpIsNan(ctx.U1, lhs))};
         const Id rhs_not_nan{ctx.OpLogicalNot(ctx.U1, ctx.OpIsNan(ctx.U1, rhs))};
         return ctx.OpLogicalAnd(ctx.U1, ctx.OpLogicalAnd(ctx.U1, comp, lhs_not_nan), rhs_not_nan);

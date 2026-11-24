@@ -17,6 +17,7 @@ class InputSubsystem;
 
 namespace InputCommon::CemuhookUDP {
 class CalibrationConfigurationJob;
+class CommunicationTestJob;
 }
 
 namespace Ui {
@@ -69,6 +70,7 @@ private slots:
 
 private:
     void closeEvent(QCloseEvent* event) override;
+    void reject() override;
     Q_INVOKABLE void ShowUDPTestResult(bool result);
     void SetConfiguration();
     void UpdateUiDisplay();
@@ -88,6 +90,7 @@ private:
     int max_y{};
 
     bool udp_test_in_progress{};
+    std::unique_ptr<InputCommon::CemuhookUDP::CommunicationTestJob> udp_test_job;
 
     std::vector<Settings::TouchFromButtonMap> touch_from_button_maps;
 };
