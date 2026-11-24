@@ -103,7 +103,10 @@ void EmulatedController::ReloadFromSettings() {
         motion_params[index] = Common::ParamPackage(player.motions[index]);
     }
 
-    controller.color_values = {};
+    {
+        std::scoped_lock lock{controller_mutex};
+        controller.color_values = {};
+    }
     ReloadColorsFromSettings();
 
     ring_params[0] = Common::ParamPackage(Settings::values.ringcon_analogs);
@@ -118,7 +121,7 @@ void EmulatedController::ReloadFromSettings() {
     }
 
     // Disable special features before disconnecting
-    if (controller.right_polling_mode != Common::Input::PollingMode::Active) {
+    if (GetPollingMode(EmulatedDeviceIndex::RightIndex) != Common::Input::PollingMode::Active) {
         SetPollingMode(EmulatedDeviceIndex::RightIndex, Common::Input::PollingMode::Active);
     }
 
@@ -134,6 +137,7 @@ void EmulatedController::ReloadColorsFromSettings() {
     const auto player_index = Service::HID::NpadIdTypeToIndex(npad_id_type);
     const auto& player = Settings::values.players.GetValue()[player_index];
 
+    std::scoped_lock lock{controller_mutex};
     // Avoid updating colors if overridden by physical controller
     if (controller.color_values[LeftIndex].body != 0 &&
         controller.color_values[RightIndex].body != 0) {
@@ -420,16 +424,19 @@ void EmulatedController::ReloadInput() {
         });
 
         // Restore motion state
-        auto& emulated_motion = controller.motion_values[index].emulated;
-        auto& motion = controller.motion_state[index];
-        emulated_motion.ResetRotations();
-        emulated_motion.ResetQuaternion();
-        motion.accel = emulated_motion.GetAcceleration();
-        motion.gyro = emulated_motion.GetGyroscope();
-        motion.rotation = emulated_motion.GetRotations();
-        motion.euler = emulated_motion.GetEulerAngles();
-        motion.orientation = emulated_motion.GetOrientation();
-        motion.is_at_rest = !emulated_motion.IsMoving(motion_sensitivity);
+        {
+            std::scoped_lock lock{controller_mutex};
+            auto& emulated_motion = controller.motion_values[index].emulated;
+            auto& motion = controller.motion_state[index];
+            emulated_motion.ResetRotations();
+            emulated_motion.ResetQuaternion();
+            motion.accel = emulated_motion.GetAcceleration();
+            motion.gyro = emulated_motion.GetGyroscope();
+            motion.rotation = emulated_motion.GetRotations();
+            motion.euler = emulated_motion.GetEulerAngles();
+            motion.orientation = emulated_motion.GetOrientation();
+            motion.is_at_rest = !emulated_motion.IsMoving(motion_sensitivity);
+        }
     }
 
     for (std::size_t index = 0; index < camera_devices.size(); ++index) {
@@ -526,7 +533,7 @@ void EmulatedController::ReloadInput() {
                 },
         });
     }
-    turbo_button_state = 0;
+    turbo_button_state.store(0);
     is_initialized = true;
 }
 
@@ -621,11 +628,13 @@ void EmulatedController::EnableSystemButtons() {
 
 void EmulatedController::DisableSystemButtons() {
     system_buttons_enabled = false;
+    std::scoped_lock lock{controller_mutex};
     controller.home_button_state.raw = 0;
     controller.capture_button_state.raw = 0;
 }
 
 void EmulatedController::ResetSystemButtons() {
+    std::scoped_lock lock{controller_mutex};
     controller.home_button_state.home.Assign(false);
     controller.capture_button_state.capture.Assign(false);
 }
@@ -757,162 +766,171 @@ void EmulatedController::SetMotionParam(std::size_t index, Common::ParamPackage 
 }
 
 void EmulatedController::StartMotionCalibration() {
+    std::scoped_lock lock{controller_mutex};
     for (ControllerMotionInfo& motion : controller.motion_values) {
         motion.emulated.Calibrate();
     }
 }
 
 void EmulatedController::SetButton(const Common::Input::CallbackStatus& callback, std::size_t index, Common::UUID uuid) {
-    if (index >= controller.button_values.size()) {
-        return;
-    }
-
-    bool value_changed = false;
     const auto new_status = TransformToButton(callback);
-    auto& current_status = controller.button_values[index];
-
-    // Only read button values that have the same uuid or are pressed once
-    if (current_status.uuid != uuid) {
-        if (!new_status.value) {
+    bool configuring = false;
+    {
+        std::scoped_lock lock{controller_mutex};
+        if (index >= controller.button_values.size()) {
             return;
         }
-    }
 
-    current_status.toggle = new_status.toggle;
-    current_status.turbo = new_status.turbo;
-    current_status.uuid = uuid;
+        bool value_changed = false;
+        auto& current_status = controller.button_values[index];
 
-    // Update button status with current
-    if (!current_status.toggle) {
-        current_status.locked = false;
-        if (current_status.value != new_status.value) {
-            current_status.value = new_status.value;
-            value_changed = true;
-        }
-    } else {
-        // Toggle button and lock status
-        if (new_status.value && !current_status.locked) {
-            current_status.locked = true;
-            current_status.value = !current_status.value;
-            value_changed = true;
+        // Only read button values that have the same uuid or are pressed once
+        if (current_status.uuid != uuid) {
+            if (!new_status.value) {
+                return;
+            }
         }
 
-        // Unlock button ready for next press
-        if (!new_status.value && current_status.locked) {
+        current_status.toggle = new_status.toggle;
+        current_status.turbo = new_status.turbo;
+        current_status.uuid = uuid;
+
+        // Update button status with current
+        if (!current_status.toggle) {
             current_status.locked = false;
+            if (current_status.value != new_status.value) {
+                current_status.value = new_status.value;
+                value_changed = true;
+            }
+        } else {
+            // Toggle button and lock status
+            if (new_status.value && !current_status.locked) {
+                current_status.locked = true;
+                current_status.value = !current_status.value;
+                value_changed = true;
+            }
+
+            // Unlock button ready for next press
+            if (!new_status.value && current_status.locked) {
+                current_status.locked = false;
+            }
+        }
+
+        if (!value_changed) {
+            return;
+        }
+
+        configuring = is_configuring.load();
+        if (configuring) {
+            controller.npad_button_state.raw = NpadButton::None;
+            controller.debug_pad_button_state.raw = 0;
+            controller.home_button_state.raw = 0;
+            controller.capture_button_state.raw = 0;
+        } else {
+            // GC controllers have triggers not buttons
+            if (npad_type == NpadStyleIndex::GameCube) {
+                if (index == Settings::NativeButton::ZR) {
+                    return;
+                }
+                if (index == Settings::NativeButton::ZL) {
+                    return;
+                }
+            }
+
+            switch (index) {
+            case Settings::NativeButton::A:
+                controller.npad_button_state.a.Assign(current_status.value);
+                controller.debug_pad_button_state.a.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::B:
+                controller.npad_button_state.b.Assign(current_status.value);
+                controller.debug_pad_button_state.b.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::X:
+                controller.npad_button_state.x.Assign(current_status.value);
+                controller.debug_pad_button_state.x.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::Y:
+                controller.npad_button_state.y.Assign(current_status.value);
+                controller.debug_pad_button_state.y.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::LStick:
+                controller.npad_button_state.stick_l.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::RStick:
+                controller.npad_button_state.stick_r.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::L:
+                controller.npad_button_state.l.Assign(current_status.value);
+                controller.debug_pad_button_state.l.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::R:
+                controller.npad_button_state.r.Assign(current_status.value);
+                controller.debug_pad_button_state.r.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::ZL:
+                controller.npad_button_state.zl.Assign(current_status.value);
+                controller.debug_pad_button_state.zl.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::ZR:
+                controller.npad_button_state.zr.Assign(current_status.value);
+                controller.debug_pad_button_state.zr.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::Plus:
+                controller.npad_button_state.plus.Assign(current_status.value);
+                controller.debug_pad_button_state.plus.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::Minus:
+                controller.npad_button_state.minus.Assign(current_status.value);
+                controller.debug_pad_button_state.minus.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::DLeft:
+                controller.npad_button_state.left.Assign(current_status.value);
+                controller.debug_pad_button_state.d_left.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::DUp:
+                controller.npad_button_state.up.Assign(current_status.value);
+                controller.debug_pad_button_state.d_up.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::DRight:
+                controller.npad_button_state.right.Assign(current_status.value);
+                controller.debug_pad_button_state.d_right.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::DDown:
+                controller.npad_button_state.down.Assign(current_status.value);
+                controller.debug_pad_button_state.d_down.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::SLLeft:
+                controller.npad_button_state.left_sl.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::SLRight:
+                controller.npad_button_state.right_sl.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::SRLeft:
+                controller.npad_button_state.left_sr.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::SRRight:
+                controller.npad_button_state.right_sr.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::Home:
+                if (!system_buttons_enabled) {
+                    break;
+                }
+                controller.home_button_state.home.Assign(current_status.value);
+                break;
+            case Settings::NativeButton::Screenshot:
+                if (!system_buttons_enabled) {
+                    break;
+                }
+                controller.capture_button_state.capture.Assign(current_status.value);
+                break;
+            }
         }
     }
 
-    if (!value_changed) {
-        return;
-    }
-
-    if (is_configuring) {
-        controller.npad_button_state.raw = NpadButton::None;
-        controller.debug_pad_button_state.raw = 0;
-        controller.home_button_state.raw = 0;
-        controller.capture_button_state.raw = 0;
+    if (configuring) {
         TriggerOnChange(ControllerTriggerType::Button, false);
         return;
-    }
-
-    // GC controllers have triggers not buttons
-    if (npad_type == NpadStyleIndex::GameCube) {
-        if (index == Settings::NativeButton::ZR) {
-            return;
-        }
-        if (index == Settings::NativeButton::ZL) {
-            return;
-        }
-    }
-
-    switch (index) {
-    case Settings::NativeButton::A:
-        controller.npad_button_state.a.Assign(current_status.value);
-        controller.debug_pad_button_state.a.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::B:
-        controller.npad_button_state.b.Assign(current_status.value);
-        controller.debug_pad_button_state.b.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::X:
-        controller.npad_button_state.x.Assign(current_status.value);
-        controller.debug_pad_button_state.x.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::Y:
-        controller.npad_button_state.y.Assign(current_status.value);
-        controller.debug_pad_button_state.y.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::LStick:
-        controller.npad_button_state.stick_l.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::RStick:
-        controller.npad_button_state.stick_r.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::L:
-        controller.npad_button_state.l.Assign(current_status.value);
-        controller.debug_pad_button_state.l.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::R:
-        controller.npad_button_state.r.Assign(current_status.value);
-        controller.debug_pad_button_state.r.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::ZL:
-        controller.npad_button_state.zl.Assign(current_status.value);
-        controller.debug_pad_button_state.zl.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::ZR:
-        controller.npad_button_state.zr.Assign(current_status.value);
-        controller.debug_pad_button_state.zr.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::Plus:
-        controller.npad_button_state.plus.Assign(current_status.value);
-        controller.debug_pad_button_state.plus.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::Minus:
-        controller.npad_button_state.minus.Assign(current_status.value);
-        controller.debug_pad_button_state.minus.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::DLeft:
-        controller.npad_button_state.left.Assign(current_status.value);
-        controller.debug_pad_button_state.d_left.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::DUp:
-        controller.npad_button_state.up.Assign(current_status.value);
-        controller.debug_pad_button_state.d_up.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::DRight:
-        controller.npad_button_state.right.Assign(current_status.value);
-        controller.debug_pad_button_state.d_right.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::DDown:
-        controller.npad_button_state.down.Assign(current_status.value);
-        controller.debug_pad_button_state.d_down.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::SLLeft:
-        controller.npad_button_state.left_sl.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::SLRight:
-        controller.npad_button_state.right_sl.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::SRLeft:
-        controller.npad_button_state.left_sr.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::SRRight:
-        controller.npad_button_state.right_sr.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::Home:
-        if (!system_buttons_enabled) {
-            break;
-        }
-        controller.home_button_state.home.Assign(current_status.value);
-        break;
-    case Settings::NativeButton::Screenshot:
-        if (!system_buttons_enabled) {
-            break;
-        }
-        controller.capture_button_state.capture.Assign(current_status.value);
-        break;
     }
 
     const auto player_index = Service::HID::NpadIdTypeToIndex(npad_id_type);
@@ -926,7 +944,7 @@ void EmulatedController::SetButton(const Common::Input::CallbackStatus& callback
 
 void EmulatedController::SetStick(const Common::Input::CallbackStatus& callback, std::size_t index,
                                   Common::UUID uuid) {
-    if (index >= controller.stick_values.size()) {
+    if (index >= Settings::NativeAnalog::NumAnalogs) {
         return;
     }
     auto trigger_guard = SCOPE_GUARD {
@@ -934,55 +952,63 @@ void EmulatedController::SetStick(const Common::Input::CallbackStatus& callback,
     };
     const auto stick_value = TransformToStick(callback);
 
-    // Only read stick values that have the same uuid or are over the threshold to avoid flapping
-    if (controller.stick_values[index].uuid != uuid) {
-        const bool is_tas = uuid == TAS_UUID;
-        if (is_tas && stick_value.x.value == 0 && stick_value.y.value == 0) {
+    {
+        std::scoped_lock lock{controller_mutex};
+        if (index >= controller.stick_values.size()) {
             trigger_guard.Cancel();
             return;
         }
-        if (!is_tas && !stick_value.down && !stick_value.up && !stick_value.left &&
-            !stick_value.right) {
-            trigger_guard.Cancel();
+
+        // Only read stick values that have the same uuid or are over the threshold to avoid flapping
+        if (controller.stick_values[index].uuid != uuid) {
+            const bool is_tas = uuid == TAS_UUID;
+            if (is_tas && stick_value.x.value == 0 && stick_value.y.value == 0) {
+                trigger_guard.Cancel();
+                return;
+            }
+            if (!is_tas && !stick_value.down && !stick_value.up && !stick_value.left &&
+                !stick_value.right) {
+                trigger_guard.Cancel();
+                return;
+            }
+        }
+
+        controller.stick_values[index] = stick_value;
+        controller.stick_values[index].uuid = uuid;
+
+        if (is_configuring) {
+            controller.analog_stick_state.left = {};
+            controller.analog_stick_state.right = {};
             return;
         }
-    }
 
-    controller.stick_values[index] = stick_value;
-    controller.stick_values[index].uuid = uuid;
+        const AnalogStickState stick{
+            .x = static_cast<s32>(controller.stick_values[index].x.value * HID_JOYSTICK_MAX),
+            .y = static_cast<s32>(controller.stick_values[index].y.value * HID_JOYSTICK_MAX),
+        };
 
-    if (is_configuring) {
-        controller.analog_stick_state.left = {};
-        controller.analog_stick_state.right = {};
-        return;
-    }
-
-    const AnalogStickState stick{
-        .x = static_cast<s32>(controller.stick_values[index].x.value * HID_JOYSTICK_MAX),
-        .y = static_cast<s32>(controller.stick_values[index].y.value * HID_JOYSTICK_MAX),
-    };
-
-    switch (index) {
-    case Settings::NativeAnalog::LStick:
-        controller.analog_stick_state.left = stick;
-        controller.npad_button_state.stick_l_left.Assign(controller.stick_values[index].left);
-        controller.npad_button_state.stick_l_up.Assign(controller.stick_values[index].up);
-        controller.npad_button_state.stick_l_right.Assign(controller.stick_values[index].right);
-        controller.npad_button_state.stick_l_down.Assign(controller.stick_values[index].down);
-        break;
-    case Settings::NativeAnalog::RStick:
-        controller.analog_stick_state.right = stick;
-        controller.npad_button_state.stick_r_left.Assign(controller.stick_values[index].left);
-        controller.npad_button_state.stick_r_up.Assign(controller.stick_values[index].up);
-        controller.npad_button_state.stick_r_right.Assign(controller.stick_values[index].right);
-        controller.npad_button_state.stick_r_down.Assign(controller.stick_values[index].down);
-        break;
+        switch (index) {
+        case Settings::NativeAnalog::LStick:
+            controller.analog_stick_state.left = stick;
+            controller.npad_button_state.stick_l_left.Assign(controller.stick_values[index].left);
+            controller.npad_button_state.stick_l_up.Assign(controller.stick_values[index].up);
+            controller.npad_button_state.stick_l_right.Assign(controller.stick_values[index].right);
+            controller.npad_button_state.stick_l_down.Assign(controller.stick_values[index].down);
+            break;
+        case Settings::NativeAnalog::RStick:
+            controller.analog_stick_state.right = stick;
+            controller.npad_button_state.stick_r_left.Assign(controller.stick_values[index].left);
+            controller.npad_button_state.stick_r_up.Assign(controller.stick_values[index].up);
+            controller.npad_button_state.stick_r_right.Assign(controller.stick_values[index].right);
+            controller.npad_button_state.stick_r_down.Assign(controller.stick_values[index].down);
+            break;
+        }
     }
 }
 
 void EmulatedController::SetTrigger(const Common::Input::CallbackStatus& callback,
                                     std::size_t index, Common::UUID uuid) {
-    if (index >= controller.trigger_values.size()) {
+    if (index >= Settings::NativeTrigger::NumTriggers) {
         return;
     }
     auto trigger_guard = SCOPE_GUARD {
@@ -990,226 +1016,258 @@ void EmulatedController::SetTrigger(const Common::Input::CallbackStatus& callbac
     };
     const auto trigger_value = TransformToTrigger(callback);
 
-    // Only read trigger values that have the same uuid or are pressed once
-    if (controller.trigger_values[index].uuid != uuid) {
-        if (!trigger_value.pressed.value) {
+    {
+        std::scoped_lock lock{controller_mutex};
+        if (index >= controller.trigger_values.size()) {
+            trigger_guard.Cancel();
             return;
         }
-    }
 
-    controller.trigger_values[index] = trigger_value;
-    controller.trigger_values[index].uuid = uuid;
+        // Only read trigger values that have the same uuid or are pressed once
+        if (controller.trigger_values[index].uuid != uuid) {
+            if (!trigger_value.pressed.value) {
+                return;
+            }
+        }
 
-    if (is_configuring) {
-        controller.gc_trigger_state.left = 0;
-        controller.gc_trigger_state.right = 0;
-        return;
-    }
+        controller.trigger_values[index] = trigger_value;
+        controller.trigger_values[index].uuid = uuid;
 
-    // Only GC controllers have analog triggers
-    if (npad_type != NpadStyleIndex::GameCube) {
-        trigger_guard.Cancel();
-        return;
-    }
+        if (is_configuring) {
+            controller.gc_trigger_state.left = 0;
+            controller.gc_trigger_state.right = 0;
+            return;
+        }
 
-    const auto& trigger = controller.trigger_values[index];
+        // Only GC controllers have analog triggers
+        if (npad_type != NpadStyleIndex::GameCube) {
+            trigger_guard.Cancel();
+            return;
+        }
 
-    switch (index) {
-    case Settings::NativeTrigger::LTrigger:
-        controller.gc_trigger_state.left = static_cast<s32>(trigger.analog.value * HID_TRIGGER_MAX);
-        controller.npad_button_state.zl.Assign(trigger.pressed.value);
-        break;
-    case Settings::NativeTrigger::RTrigger:
-        controller.gc_trigger_state.right =
-            static_cast<s32>(trigger.analog.value * HID_TRIGGER_MAX);
-        controller.npad_button_state.zr.Assign(trigger.pressed.value);
-        break;
+        const auto& trigger = controller.trigger_values[index];
+
+        switch (index) {
+        case Settings::NativeTrigger::LTrigger:
+            controller.gc_trigger_state.left =
+                static_cast<s32>(trigger.analog.value * HID_TRIGGER_MAX);
+            controller.npad_button_state.zl.Assign(trigger.pressed.value);
+            break;
+        case Settings::NativeTrigger::RTrigger:
+            controller.gc_trigger_state.right =
+                static_cast<s32>(trigger.analog.value * HID_TRIGGER_MAX);
+            controller.npad_button_state.zr.Assign(trigger.pressed.value);
+            break;
+        }
     }
 }
 
 void EmulatedController::SetMotion(const Common::Input::CallbackStatus& callback,
                                    std::size_t index) {
-    if (index >= controller.motion_values.size()) {
+    if (index >= Settings::NativeMotion::NumMotions) {
         return;
     }
-    SCOPE_EXIT {
-        TriggerOnChange(ControllerTriggerType::Motion, !is_configuring);
-    };
-    auto& raw_status = controller.motion_values[index].raw_status;
-    auto& emulated = controller.motion_values[index].emulated;
+    const auto motion_status = TransformToMotion(callback);
+    {
+        std::scoped_lock lock{controller_mutex};
+        if (index >= controller.motion_values.size()) {
+            return;
+        }
+        auto& raw_status = controller.motion_values[index].raw_status;
+        auto& emulated = controller.motion_values[index].emulated;
 
-    raw_status = TransformToMotion(callback);
-    emulated.SetAcceleration(Common::Vec<f32, 3>{
-        raw_status.accel.x.value,
-        raw_status.accel.y.value,
-        raw_status.accel.z.value,
-    });
-    emulated.SetGyroscope(Common::Vec<f32, 3>{
-        raw_status.gyro.x.value,
-        raw_status.gyro.y.value,
-        raw_status.gyro.z.value,
-    });
-    emulated.SetUserGyroThreshold(raw_status.gyro.x.properties.threshold);
-    emulated.UpdateRotation(raw_status.delta_timestamp);
-    emulated.UpdateOrientation(raw_status.delta_timestamp);
+        raw_status = motion_status;
+        emulated.SetAcceleration(Common::Vec<f32, 3>{
+            raw_status.accel.x.value,
+            raw_status.accel.y.value,
+            raw_status.accel.z.value,
+        });
+        emulated.SetGyroscope(Common::Vec<f32, 3>{
+            raw_status.gyro.x.value,
+            raw_status.gyro.y.value,
+            raw_status.gyro.z.value,
+        });
+        emulated.SetUserGyroThreshold(raw_status.gyro.x.properties.threshold);
+        emulated.UpdateRotation(raw_status.delta_timestamp);
+        emulated.UpdateOrientation(raw_status.delta_timestamp);
 
-    auto& motion = controller.motion_state[index];
-    motion.accel = emulated.GetAcceleration();
-    motion.gyro = emulated.GetGyroscope();
-    motion.rotation = emulated.GetRotations();
-    motion.euler = emulated.GetEulerAngles();
-    motion.orientation = emulated.GetOrientation();
-    motion.is_at_rest = !emulated.IsMoving(motion_sensitivity);
+        auto& motion = controller.motion_state[index];
+        motion.accel = emulated.GetAcceleration();
+        motion.gyro = emulated.GetGyroscope();
+        motion.rotation = emulated.GetRotations();
+        motion.euler = emulated.GetEulerAngles();
+        motion.orientation = emulated.GetOrientation();
+        motion.is_at_rest = !emulated.IsMoving(motion_sensitivity);
+    }
+    TriggerOnChange(ControllerTriggerType::Motion, !is_configuring);
 }
 
 void EmulatedController::SetColors(const Common::Input::CallbackStatus& callback,
                                    std::size_t index) {
-    if (index >= controller.color_values.size()) {
+    if (index >= max_emulated_controllers) {
         return;
     }
     auto trigger_guard = SCOPE_GUARD {
         TriggerOnChange(ControllerTriggerType::Color, !is_configuring);
     };
-    controller.color_values[index] = TransformToColor(callback);
+    const auto color_value = TransformToColor(callback);
 
-    if (is_configuring) {
-        return;
-    }
+    {
+        std::scoped_lock lock{controller_mutex};
+        if (index >= controller.color_values.size()) {
+            trigger_guard.Cancel();
+            return;
+        }
+        controller.color_values[index] = color_value;
 
-    if (controller.color_values[index].body == 0) {
-        trigger_guard.Cancel();
-        return;
-    }
+        if (is_configuring) {
+            return;
+        }
 
-    controller.colors_state.fullkey = {
-        .body = GetNpadColor(controller.color_values[index].body),
-        .button = GetNpadColor(controller.color_values[index].buttons),
-    };
-    if (npad_type == NpadStyleIndex::Fullkey) {
-        controller.colors_state.left = {
-            .body = GetNpadColor(controller.color_values[index].left_grip),
+        if (controller.color_values[index].body == 0) {
+            trigger_guard.Cancel();
+            return;
+        }
+
+        controller.colors_state.fullkey = {
+            .body = GetNpadColor(controller.color_values[index].body),
             .button = GetNpadColor(controller.color_values[index].buttons),
         };
-        controller.colors_state.right = {
-            .body = GetNpadColor(controller.color_values[index].right_grip),
-            .button = GetNpadColor(controller.color_values[index].buttons),
-        };
-    } else {
-        switch (index) {
-        case LeftIndex:
+        if (npad_type == NpadStyleIndex::Fullkey) {
             controller.colors_state.left = {
-                .body = GetNpadColor(controller.color_values[index].body),
+                .body = GetNpadColor(controller.color_values[index].left_grip),
                 .button = GetNpadColor(controller.color_values[index].buttons),
             };
-            break;
-        case RightIndex:
             controller.colors_state.right = {
-                .body = GetNpadColor(controller.color_values[index].body),
+                .body = GetNpadColor(controller.color_values[index].right_grip),
                 .button = GetNpadColor(controller.color_values[index].buttons),
             };
-            break;
+        } else {
+            switch (index) {
+            case LeftIndex:
+                controller.colors_state.left = {
+                    .body = GetNpadColor(controller.color_values[index].body),
+                    .button = GetNpadColor(controller.color_values[index].buttons),
+                };
+                break;
+            case RightIndex:
+                controller.colors_state.right = {
+                    .body = GetNpadColor(controller.color_values[index].body),
+                    .button = GetNpadColor(controller.color_values[index].buttons),
+                };
+                break;
+            }
         }
     }
 }
 
 void EmulatedController::SetBattery(const Common::Input::CallbackStatus& callback, std::size_t index) {
-    if (index >= controller.battery_values.size()) {
+    if (index >= max_emulated_controllers) {
         return;
     }
-    SCOPE_EXIT {
-        TriggerOnChange(ControllerTriggerType::Battery, !is_configuring);
-    };
-    controller.battery_values[index] = TransformToBattery(callback);
+    const auto battery_value = TransformToBattery(callback);
+    {
+        std::scoped_lock lock{controller_mutex};
+        if (index >= controller.battery_values.size()) {
+            return;
+        }
+        controller.battery_values[index] = battery_value;
 
-    if (is_configuring) {
-        return;
-    }
+        if (!is_configuring) {
+            bool is_charging = false;
+            bool is_powered = false;
+            NpadBatteryLevel battery_level = NpadBatteryLevel::Empty;
+            switch (controller.battery_values[index]) {
+            case Common::Input::BatteryLevel::Charging:
+                is_charging = true;
+                is_powered = true;
+                battery_level = NpadBatteryLevel::Full;
+                break;
+            case Common::Input::BatteryLevel::Medium:
+                battery_level = NpadBatteryLevel::High;
+                break;
+            case Common::Input::BatteryLevel::Low:
+                battery_level = NpadBatteryLevel::Low;
+                break;
+            case Common::Input::BatteryLevel::Critical:
+                battery_level = NpadBatteryLevel::Critical;
+                break;
+            case Common::Input::BatteryLevel::Empty:
+                battery_level = NpadBatteryLevel::Empty;
+                break;
+            case Common::Input::BatteryLevel::None:
+            case Common::Input::BatteryLevel::Full:
+            default:
+                is_powered = true;
+                battery_level = NpadBatteryLevel::Full;
+                break;
+            }
 
-    bool is_charging = false;
-    bool is_powered = false;
-    NpadBatteryLevel battery_level = NpadBatteryLevel::Empty;
-    switch (controller.battery_values[index]) {
-    case Common::Input::BatteryLevel::Charging:
-        is_charging = true;
-        is_powered = true;
-        battery_level = NpadBatteryLevel::Full;
-        break;
-    case Common::Input::BatteryLevel::Medium:
-        battery_level = NpadBatteryLevel::High;
-        break;
-    case Common::Input::BatteryLevel::Low:
-        battery_level = NpadBatteryLevel::Low;
-        break;
-    case Common::Input::BatteryLevel::Critical:
-        battery_level = NpadBatteryLevel::Critical;
-        break;
-    case Common::Input::BatteryLevel::Empty:
-        battery_level = NpadBatteryLevel::Empty;
-        break;
-    case Common::Input::BatteryLevel::None:
-    case Common::Input::BatteryLevel::Full:
-    default:
-        is_powered = true;
-        battery_level = NpadBatteryLevel::Full;
-        break;
+            switch (index) {
+            case LeftIndex:
+                controller.battery_state.left = {
+                    .is_powered = is_powered,
+                    .is_charging = is_charging,
+                    .battery_level = battery_level,
+                };
+                break;
+            case RightIndex:
+                controller.battery_state.right = {
+                    .is_powered = is_powered,
+                    .is_charging = is_charging,
+                    .battery_level = battery_level,
+                };
+                break;
+            case DualIndex:
+                controller.battery_state.dual = {
+                    .is_powered = is_powered,
+                    .is_charging = is_charging,
+                    .battery_level = battery_level,
+                };
+                break;
+            }
+        }
     }
-
-    switch (index) {
-    case LeftIndex:
-        controller.battery_state.left = {
-            .is_powered = is_powered,
-            .is_charging = is_charging,
-            .battery_level = battery_level,
-        };
-        break;
-    case RightIndex:
-        controller.battery_state.right = {
-            .is_powered = is_powered,
-            .is_charging = is_charging,
-            .battery_level = battery_level,
-        };
-        break;
-    case DualIndex:
-        controller.battery_state.dual = {
-            .is_powered = is_powered,
-            .is_charging = is_charging,
-            .battery_level = battery_level,
-        };
-        break;
-    }
+    TriggerOnChange(ControllerTriggerType::Battery, !is_configuring);
 }
 
 void EmulatedController::SetCamera(const Common::Input::CallbackStatus& callback) {
-    SCOPE_EXIT {
-        TriggerOnChange(ControllerTriggerType::IrSensor, !is_configuring);
-    };
-    controller.camera_values = TransformToCamera(callback);
-    if (!is_configuring) {
-        controller.camera_state.sample++;
-        controller.camera_state.format = Core::IrSensor::ImageTransferProcessorFormat(controller.camera_values.format);
-        controller.camera_state.data = controller.camera_values.data;
+    const auto camera_values = TransformToCamera(callback);
+    {
+        std::scoped_lock lock{controller_mutex};
+        controller.camera_values = camera_values;
+        if (!is_configuring) {
+            controller.camera_state.sample++;
+            controller.camera_state.format =
+                Core::IrSensor::ImageTransferProcessorFormat(controller.camera_values.format);
+            controller.camera_state.data = controller.camera_values.data;
+        }
     }
+    TriggerOnChange(ControllerTriggerType::IrSensor, !is_configuring);
 }
 
 void EmulatedController::SetRingAnalog(const Common::Input::CallbackStatus& callback) {
-    SCOPE_EXIT {
-        TriggerOnChange(ControllerTriggerType::RingController, !is_configuring);
-    };
     const auto force_value = TransformToStick(callback);
-    controller.ring_analog_value = force_value.x;
-    if (!is_configuring) {
-        controller.ring_analog_state.force = force_value.x.value;
+    {
+        std::scoped_lock lock{controller_mutex};
+        controller.ring_analog_value = force_value.x;
+        if (!is_configuring) {
+            controller.ring_analog_state.force = force_value.x.value;
+        }
     }
+    TriggerOnChange(ControllerTriggerType::RingController, !is_configuring);
 }
 
 void EmulatedController::SetNfc(const Common::Input::CallbackStatus& callback) {
-    SCOPE_EXIT {
-        TriggerOnChange(ControllerTriggerType::Nfc, !is_configuring);
-    };
-    controller.nfc_values = TransformToNfc(callback);
-    if (!is_configuring) {
-        controller.nfc_state = controller.nfc_values;
+    const auto nfc_values = TransformToNfc(callback);
+    {
+        std::scoped_lock lock{controller_mutex};
+        controller.nfc_values = nfc_values;
+        if (!is_configuring) {
+            controller.nfc_state = controller.nfc_values;
+        }
     }
+    TriggerOnChange(ControllerTriggerType::Nfc, !is_configuring);
 }
 
 bool EmulatedController::SetVibration(bool should_vibrate) {
@@ -1340,12 +1398,18 @@ Common::Input::DriverResult EmulatedController::SetPollingMode(
     auto& nfc_output_device = output_devices[3];
 
     if (device_index == EmulatedDeviceIndex::LeftIndex) {
-        controller.left_polling_mode = polling_mode;
+        {
+            std::scoped_lock lock{controller_mutex};
+            controller.left_polling_mode = polling_mode;
+        }
         return left_output_device->SetPollingMode(polling_mode);
     }
 
     if (device_index == EmulatedDeviceIndex::RightIndex) {
-        controller.right_polling_mode = polling_mode;
+        {
+            std::scoped_lock lock{controller_mutex};
+            controller.right_polling_mode = polling_mode;
+        }
         const auto virtual_nfc_result = nfc_output_device->SetPollingMode(polling_mode);
         const auto mapped_nfc_result = right_output_device->SetPollingMode(polling_mode);
 
@@ -1360,8 +1424,11 @@ Common::Input::DriverResult EmulatedController::SetPollingMode(
         return mapped_nfc_result;
     }
 
-    controller.left_polling_mode = polling_mode;
-    controller.right_polling_mode = polling_mode;
+    {
+        std::scoped_lock lock{controller_mutex};
+        controller.left_polling_mode = polling_mode;
+        controller.right_polling_mode = polling_mode;
+    }
     left_output_device->SetPollingMode(polling_mode);
     right_output_device->SetPollingMode(polling_mode);
     nfc_output_device->SetPollingMode(polling_mode);
@@ -1370,6 +1437,7 @@ Common::Input::DriverResult EmulatedController::SetPollingMode(
 
 Common::Input::PollingMode EmulatedController::GetPollingMode(
     EmulatedDeviceIndex device_index) const {
+    std::scoped_lock lock{controller_mutex};
     if (device_index == EmulatedDeviceIndex::LeftIndex) {
         return controller.left_polling_mode;
     }
@@ -1433,14 +1501,25 @@ bool EmulatedController::HasNfc() const {
 }
 
 bool EmulatedController::AddNfcHandle() {
-    nfc_handles++;
+    {
+        std::scoped_lock lock{controller_mutex};
+        nfc_handles++;
+    }
     return SetPollingMode(EmulatedDeviceIndex::RightIndex, Common::Input::PollingMode::NFC) ==
            Common::Input::DriverResult::Success;
 }
 
 bool EmulatedController::RemoveNfcHandle() {
-    nfc_handles--;
-    if (nfc_handles <= 0) {
+    bool should_reset_polling = false;
+    {
+        std::scoped_lock lock{controller_mutex};
+        if (nfc_handles == 0) {
+            return true;
+        }
+        nfc_handles--;
+        should_reset_polling = (nfc_handles == 0);
+    }
+    if (should_reset_polling) {
         return SetPollingMode(EmulatedDeviceIndex::RightIndex,
                               Common::Input::PollingMode::Active) ==
                Common::Input::DriverResult::Success;
@@ -1562,6 +1641,7 @@ void EmulatedController::SetLedPattern() {
 }
 
 void EmulatedController::SetGyroscopeZeroDriftMode(GyroscopeZeroDriftMode mode) {
+    std::scoped_lock lock{controller_mutex};
     for (auto& motion : controller.motion_values) {
         switch (mode) {
         case GyroscopeZeroDriftMode::Loose:
@@ -1763,53 +1843,67 @@ LedPattern EmulatedController::GetLedPattern() const {
 }
 
 ButtonValues EmulatedController::GetButtonsValues() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.button_values;
 }
 
 SticksValues EmulatedController::GetSticksValues() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.stick_values;
 }
 
 TriggerValues EmulatedController::GetTriggersValues() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.trigger_values;
 }
 
 ControllerMotionValues EmulatedController::GetMotionValues() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.motion_values;
 }
 
 ColorValues EmulatedController::GetColorsValues() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.color_values;
 }
 
 BatteryValues EmulatedController::GetBatteryValues() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.battery_values;
 }
 
 CameraValues EmulatedController::GetCameraValues() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.camera_values;
 }
 
 RingAnalogValue EmulatedController::GetRingSensorValues() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.ring_analog_value;
 }
 
 HomeButtonState EmulatedController::GetHomeButtons() const {
     if (is_configuring)
         return {};
+    std::scoped_lock lock{controller_mutex};
     return controller.home_button_state;
 }
 
 CaptureButtonState EmulatedController::GetCaptureButtons() const {
     if (is_configuring)
         return {};
+    std::scoped_lock lock{controller_mutex};
     return controller.capture_button_state;
 }
 
 NpadButtonState EmulatedController::GetNpadButtons() const {
     if (is_configuring)
         return {};
-    NpadButtonState state{controller.npad_button_state.raw & GetTurboButtonMask()};
+    NpadButtonState state{};
+    {
+        std::scoped_lock lock{controller_mutex};
+        state.raw = controller.npad_button_state.raw & GetTurboButtonMask();
+    }
     const auto injected = Injected();
     if (!injected) {
         return state;
@@ -1838,13 +1932,18 @@ NpadButtonState EmulatedController::GetNpadButtons() const {
 DebugPadButton EmulatedController::GetDebugPadButtons() const {
     if (is_configuring)
         return {};
+    std::scoped_lock lock{controller_mutex};
     return controller.debug_pad_button_state;
 }
 
 AnalogSticks EmulatedController::GetSticks() const {
     if (is_configuring)
         return {};
-    AnalogSticks sticks = controller.analog_stick_state;
+    AnalogSticks sticks{};
+    {
+        std::scoped_lock lock{controller_mutex};
+        sticks = controller.analog_stick_state;
+    }
     if (const auto injected = Injected()) {
         sticks.left = injected->left.value_or(sticks.left);
         sticks.right = injected->right.value_or(sticks.right);
@@ -1869,30 +1968,37 @@ std::optional<InjectedInput> EmulatedController::Injected() const {
 NpadGcTriggerState EmulatedController::GetTriggers() const {
     if (is_configuring)
         return {};
+    std::scoped_lock lock{controller_mutex};
     return controller.gc_trigger_state;
 }
 
 MotionState EmulatedController::GetMotions() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.motion_state;
 }
 
 ControllerColors EmulatedController::GetColors() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.colors_state;
 }
 
 BatteryLevelState EmulatedController::GetBattery() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.battery_state;
 }
 
-const CameraState& EmulatedController::GetCamera() const {
+CameraState EmulatedController::GetCamera() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.camera_state;
 }
 
 RingSensorForce EmulatedController::GetRingSensorForce() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.ring_analog_state;
 }
 
-const NfcState& EmulatedController::GetNfc() const {
+NfcState EmulatedController::GetNfc() const {
+    std::scoped_lock lock{controller_mutex};
     return controller.nfc_state;
 }
 
@@ -1906,12 +2012,34 @@ NpadColor EmulatedController::GetNpadColor(u32 color) {
 }
 
 void EmulatedController::TriggerOnChange(ControllerTriggerType type, bool is_npad_service_update) {
-    std::unique_lock lock{callback_mutex};
-    for (auto const& p : callback_list) {
-        auto const& poller = p.second;
-        if (is_npad_service_update || !poller.is_npad_service) {
-            poller.on_change(type);
+    std::vector<std::function<void(ControllerTriggerType)>> callbacks;
+    const auto this_thread = std::this_thread::get_id();
+    {
+        std::unique_lock lock{callback_mutex};
+        callbacks.reserve(callback_list.size());
+        for (auto const& p : callback_list) {
+            auto const& poller = p.second;
+            if (is_npad_service_update || !poller.is_npad_service) {
+                callbacks.push_back(poller.on_change);
+            }
         }
+        if (callbacks.empty()) {
+            return;
+        }
+        active_callback_threads.push_back(this_thread);
+    }
+
+    SCOPE_EXIT {
+        std::unique_lock lock{callback_mutex};
+        const auto it = std::ranges::find(active_callback_threads, this_thread);
+        if (it != active_callback_threads.end()) {
+            active_callback_threads.erase(it);
+        }
+        callback_cv.notify_all();
+    };
+
+    for (const auto& callback : callbacks) {
+        callback(type);
     }
 }
 
@@ -1927,19 +2055,28 @@ void EmulatedController::DeleteCallback(int key) {
     auto const it = callback_list.find(key);
     ASSERT_MSG(it != callback_list.end(), "Tried to delete non-existent callback {}", key);
     callback_list.erase(it);
+    const auto this_thread = std::this_thread::get_id();
+    callback_cv.wait(lock, [this, this_thread] {
+        return std::ranges::none_of(active_callback_threads,
+                                    [this_thread](std::thread::id id) { return id != this_thread; });
+    });
 }
 
 void EmulatedController::StatusUpdate() {
-    turbo_button_state = (turbo_button_state + 1) % (TURBO_BUTTON_DELAY * 2);
+    turbo_button_state.store((turbo_button_state.load() + 1) % (TURBO_BUTTON_DELAY * 2));
 
     // Some drivers like key motion need constant refreshing
-    for (std::size_t index = 0; index < motion_devices.size(); ++index) {
-        const auto& raw_status = controller.motion_values[index].raw_status;
-        auto& device = motion_devices[index];
-        if (!raw_status.force_update) {
-            continue;
+    std::array<bool, Settings::NativeMotion::NumMotions> force_updates{};
+    {
+        std::scoped_lock lock{controller_mutex};
+        for (std::size_t index = 0; index < motion_devices.size(); ++index) {
+            force_updates[index] = controller.motion_values[index].raw_status.force_update;
         }
-        if (!device) {
+    }
+
+    for (std::size_t index = 0; index < motion_devices.size(); ++index) {
+        auto& device = motion_devices[index];
+        if (!force_updates[index] || !device) {
             continue;
         }
         device->ForceUpdate();
@@ -1948,7 +2085,7 @@ void EmulatedController::StatusUpdate() {
 
 NpadButton EmulatedController::GetTurboButtonMask() const {
     // Apply no mask when disabled
-    if (turbo_button_state < TURBO_BUTTON_DELAY) {
+    if (turbo_button_state.load() < TURBO_BUTTON_DELAY) {
         return {NpadButton::All};
     }
 

@@ -61,9 +61,20 @@ struct ThreadLocalData {
     std::optional<KThread> raw_thread;
     KThread* current_thread = nullptr;
     KThread* thread = nullptr;
+    u64 kernel_instance_id = 0;
     u8 host_thread_id = UINT8_MAX;
     bool is_phantom_mode_for_singlecore = false;
     bool lock = false;
+
+    void Reset() {
+        current_thread = nullptr;
+        thread = nullptr;
+        raw_thread.reset();
+        kernel_instance_id = 0;
+        host_thread_id = UINT8_MAX;
+        is_phantom_mode_for_singlecore = false;
+        lock = false;
+    }
 };
 
 struct KernelCore::Impl {
@@ -86,7 +97,26 @@ struct KernelCore::Impl {
     static thread_local ThreadLocalData tls_data;
 
     explicit Impl(Core::System& system_, KernelCore& kernel_) : system{system_} {
-        tls_data.lock = true;
+        EnsureCurrentTls(tls_data);
+    }
+
+    ~Impl() {
+        ResetOwnedTls(tls_data);
+    }
+
+    void EnsureCurrentTls(ThreadLocalData& t) const {
+        const u64 current_id = instance_id.load(std::memory_order_acquire);
+        if (t.kernel_instance_id != current_id) {
+            t.Reset();
+            t.kernel_instance_id = current_id;
+            t.lock = true;
+        }
+    }
+
+    void ResetOwnedTls(ThreadLocalData& t) const {
+        if (t.kernel_instance_id == instance_id.load(std::memory_order_acquire)) {
+            t.Reset();
+        }
     }
 
     void SetMulticore(bool is_multi) {
@@ -138,6 +168,7 @@ struct KernelCore::Impl {
         }
 
         InitializeHackSharedMemory(kernel);
+        EnsureCurrentTls(tls_data);
         RegisterHostThread(nullptr);
         is_initialized.store(true, std::memory_order_release);
     }
@@ -247,6 +278,10 @@ struct KernelCore::Impl {
             hardware_timer->Finalize();
             hardware_timer.reset();
         }
+
+        ResetOwnedTls(tls_data);
+        instance_id.store(next_instance_id.fetch_add(1, std::memory_order_relaxed),
+                          std::memory_order_release);
 
         is_initialized.store(false, std::memory_order_release);
     }
@@ -412,6 +447,8 @@ struct KernelCore::Impl {
 
     /// Sets the host thread ID for the caller.
     u32 SetHostThreadId(std::size_t core_id) {
+        EnsureCurrentTls(tls_data);
+
         // This should only be called during core init.
         ASSERT(tls_data.host_thread_id == UINT8_MAX);
 
@@ -423,18 +460,21 @@ struct KernelCore::Impl {
 
     /// Gets the host thread ID for the caller
     u32 GetHostThreadId() const {
+        EnsureCurrentTls(tls_data);
         return tls_data.host_thread_id;
     }
 
     // Gets the dummy KThread for the caller, allocating a new one if this is the first time
     KThread* GetHostDummyThread(ThreadLocalData& t, KThread* existing_thread) {
+        EnsureCurrentTls(t);
         if (t.thread == nullptr) {
-            auto const initialize = [this](KThread* thread) {
-                ASSERT(KThread::InitializeDummyThread(system, thread, nullptr).IsSuccess());
-                return thread;
-            };
-            t.raw_thread.emplace(system.Kernel());
-            t.thread = existing_thread ? existing_thread : initialize(&*t.raw_thread);
+            if (existing_thread != nullptr) {
+                t.thread = existing_thread;
+            } else {
+                t.raw_thread.emplace(system.Kernel());
+                ASSERT(KThread::InitializeDummyThread(system, &*t.raw_thread, nullptr).IsSuccess());
+                t.thread = &*t.raw_thread;
+            }
             ASSERT(t.thread != nullptr);
         }
         return t.thread;
@@ -462,10 +502,12 @@ struct KernelCore::Impl {
 
     // Forces singlecore
     bool IsPhantomModeForSingleCore() const {
+        EnsureCurrentTls(tls_data);
         return tls_data.is_phantom_mode_for_singlecore;
     }
     void SetIsPhantomModeForSingleCore(bool value) {
         ASSERT(!is_multicore);
+        EnsureCurrentTls(tls_data);
         tls_data.is_phantom_mode_for_singlecore = value;
     }
 
@@ -474,10 +516,12 @@ struct KernelCore::Impl {
     }
 
     KThread* GetCurrentEmuThread(ThreadLocalData& t) {
+        EnsureCurrentTls(t);
         return t.current_thread ? t.current_thread : (t.current_thread = GetHostDummyThread(t, nullptr));
     }
 
     void SetCurrentEmuThread(KThread* thread) {
+        EnsureCurrentTls(tls_data);
         tls_data.current_thread = thread;
     }
 
@@ -890,6 +934,9 @@ struct KernelCore::Impl {
     std::array<u64, Core::Hardware::NUM_CPU_CORES> svc_ticks{};
 
     KWorkerTaskManager worker_task_manager;
+
+    inline static std::atomic<u64> next_instance_id{1};
+    std::atomic<u64> instance_id{next_instance_id.fetch_add(1, std::memory_order_relaxed)};
 
     // System context
     Core::System& system;

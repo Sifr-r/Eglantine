@@ -287,7 +287,7 @@ endmacro()
 function(CPMRegisterPackage PACKAGE VERSION)
   list(APPEND CPM_PACKAGES ${PACKAGE})
   set(CPM_PACKAGES ${CPM_PACKAGES} CACHE INTERNAL "")
-  set("CPM_PACKAGE_${PACKAGE}_VERSION" ${VERSION}CACHE INTERNAL "")
+  set("CPM_PACKAGE_${PACKAGE}_VERSION" "${VERSION}" CACHE INTERNAL "")
 endfunction()
 
 # retrieve the current version of the package to ${OUTPUT}

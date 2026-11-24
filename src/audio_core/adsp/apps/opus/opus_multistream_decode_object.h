@@ -35,7 +35,7 @@ public:
     }
 
 private:
-    LibOpusMSDecoder* GetDecoder() const;
+    LibOpusMSDecoder* GetDecoder(u32* channel_count = nullptr) const;
 
     u32 magic;
     bool initialized;

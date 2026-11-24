@@ -4,7 +4,11 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstring>
+#include <limits>
+#include <new>
+#include <optional>
 #include "common/settings.h"
 #include "common/random.h"
 #include "core/file_sys/kernel_executable.h"
@@ -72,28 +76,86 @@ AppLoader::LoadResult AppLoader_KIP::Load(Kernel::KProcess& process,
     FileSys::ProgramMetadata metadata;
     metadata.LoadManual(kip->Is64Bit(), address_space, kip->GetMainThreadPriority(),
                         kip->GetMainThreadCpuCore(), kip->GetMainThreadStackSize(),
-                        kip->GetTitleID(), 0xFFFFFFFFFFFFFFFF, 0x1FE00000,
-                        kip->GetKernelCapabilities());
+                        kip->GetTitleID(), 0xFFFFFFFFFFFFFFFF, 0, kip->GetKernelCapabilities());
 
     Kernel::CodeSet codeset;
-    codeset.memory.resize(PageAlignSize(kip->GetBSSOffset()) + kip->GetBSSSize());
-    const auto load_segment = [&codeset](Kernel::CodeSet::Segment& segment, std::span<const u8> data, u32 offset) {
-        segment.addr = offset;
-        segment.offset = offset;
-        segment.size = PageAlignSize(u32(data.size()));
-        std::memcpy(codeset.memory.data() + offset, data.data(), data.size());
+    constexpr u64 max_u32_aligned =
+        (std::numeric_limits<u32>::max)() & ~Core::Memory::YUZU_PAGEMASK;
+    const auto page_align_u64 = [max_u32_aligned](u64 sz) -> std::optional<u64> {
+        if (sz > max_u32_aligned) {
+            return std::nullopt;
+        }
+        return (sz + Core::Memory::YUZU_PAGEMASK) & ~Core::Memory::YUZU_PAGEMASK;
     };
-    load_segment(codeset.CodeSegment(), kip->GetTextSection(), kip->GetTextOffset());
-    load_segment(codeset.RODataSegment(), kip->GetRODataSection(), kip->GetRODataOffset());
-    load_segment(codeset.DataSegment(), kip->GetDataSection(), kip->GetDataOffset());
-    codeset.DataSegment().size += kip->GetBSSSize();
+    const auto segment_end = [&](u32 seg_offset, u64 raw_size,
+                                 u64 extra_size = 0) -> std::optional<u64> {
+        const auto aligned = page_align_u64(raw_size);
+        if (!aligned || *aligned > max_u32_aligned - extra_size) {
+            return std::nullopt;
+        }
+        const u64 total_seg_size = *aligned + extra_size;
+        if (u64{seg_offset} > max_u32_aligned - total_seg_size) {
+            return std::nullopt;
+        }
+        return u64{seg_offset} + total_seg_size;
+    };
+
+    const auto text = kip->GetTextSection();
+    const auto rodata = kip->GetRODataSection();
+    const auto data = kip->GetDataSection();
+    const u32 text_offset = kip->GetTextOffset();
+    const u32 rodata_offset = kip->GetRODataOffset();
+    const u32 data_offset = kip->GetDataOffset();
+    const u32 bss_offset = kip->GetBSSOffset();
+    const u32 bss_size = kip->GetBSSSize();
+
+    const auto text_end = segment_end(text_offset, text.size());
+    const auto rodata_end = segment_end(rodata_offset, rodata.size());
+    const auto data_end = segment_end(data_offset, data.size(), bss_size);
+    const auto bss_aligned = page_align_u64(bss_offset);
+    if (!text_end || !rodata_end || !data_end || !bss_aligned ||
+        *bss_aligned > max_u32_aligned - bss_size) {
+        return {ResultStatus::ErrorBadKIPHeader, {}};
+    }
+
+    const u64 memory_size =
+        (std::max)({*text_end, *rodata_end, *data_end, *bss_aligned + bss_size});
+    if (memory_size > codeset.memory.max_size()) {
+        return {ResultStatus::ErrorBadKIPHeader, {}};
+    }
+    try {
+        codeset.memory.resize(static_cast<std::size_t>(memory_size));
+    } catch (const std::bad_alloc&) {
+        return {ResultStatus::ErrorNotInitialized, {}};
+    }
+
+    const auto load_segment = [&codeset](Kernel::CodeSet::Segment& segment,
+                                         std::span<const u8> seg_data, u32 seg_offset) -> bool {
+        if (seg_offset > codeset.memory.size() ||
+            seg_data.size() > codeset.memory.size() - seg_offset) {
+            return false;
+        }
+        segment.addr = seg_offset;
+        segment.offset = seg_offset;
+        segment.size = PageAlignSize(static_cast<u32>(seg_data.size()));
+        if (!seg_data.empty()) {
+            std::memcpy(codeset.memory.data() + seg_offset, seg_data.data(), seg_data.size());
+        }
+        return true;
+    };
+    if (!load_segment(codeset.CodeSegment(), text, text_offset) ||
+        !load_segment(codeset.RODataSegment(), rodata, rodata_offset) ||
+        !load_segment(codeset.DataSegment(), data, data_offset)) {
+        return {ResultStatus::ErrorBadKIPHeader, {}};
+    }
+    codeset.DataSegment().size += bss_size;
 
     // TODO: this is bad form of ASLR, it sucks
     std::uintptr_t aslr_offset = ((::Settings::values.rng_seed_enabled.GetValue()
         ? ::Settings::values.rng_seed.GetValue() : Common::Random::Random64(0)) << 12) & 0xfff000;
 
     // Setup the process code layout
-    if (process.LoadFromMetadata(system.Kernel(), FileSys::ProgramMetadata::GetDefault(), codeset.memory.size(), 0, aslr_offset).IsError()) {
+    if (process.LoadFromMetadata(system.Kernel(), metadata, codeset.memory.size(), 0, aslr_offset).IsError()) {
         return {ResultStatus::ErrorNotInitialized, {}};
     }
     const VAddr base_address = GetInteger(process.GetEntryPoint());

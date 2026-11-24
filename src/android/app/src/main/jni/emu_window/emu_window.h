@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <span>
 
 #include "core/frontend/emu_window.h"
@@ -57,12 +58,15 @@ public:
 private:
     using Clock = std::chrono::steady_clock;
 
+    void ResetSurfaceState();
     void UpdateFrameRateHint();
     void UpdateObservedFrameRate();
     [[nodiscard]] float GetFrameRateHint() const;
     [[nodiscard]] float GetFrameTimeVerifiedHint() const;
     [[nodiscard]] static float GetPresentedFrameMultiplier();
     [[nodiscard]] static float QuantizeFrameRateHint(float frame_rate);
+
+    mutable std::mutex m_surface_mutex;
 
     float m_window_width{};
     float m_window_height{};

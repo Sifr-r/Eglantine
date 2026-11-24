@@ -7,7 +7,9 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstring>
+#include <limits>
 
 #include "common/algorithm.h"
 #include "common/assert.h"
@@ -31,22 +33,35 @@ void State::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
 void State::ProcessExec(const bool is_linear_) {
     write_offset = 0;
     flushed_offset = 0;
-    copy_size = regs.line_length_in * regs.line_count;
+    const u64 total_size = static_cast<u64>(regs.line_length_in) * regs.line_count;
+    if (total_size > (std::numeric_limits<u32>::max)()) {
+        copy_size = 0;
+    } else {
+        copy_size = static_cast<u32>(total_size);
+    }
     inner_buffer.resize_destructive(copy_size);
     is_linear = is_linear_;
 }
 
 void State::ProcessData(const u32 data, const bool is_last_call) {
-    const u32 sub_copy_size = (std::min)(4U, copy_size - write_offset);
-    std::memcpy(&inner_buffer[write_offset], &data, sub_copy_size);
-    write_offset += sub_copy_size;
+    if (write_offset < copy_size && write_offset < inner_buffer.size()) {
+        const u32 remaining = (std::min)(copy_size - write_offset,
+                                         static_cast<u32>(inner_buffer.size() - write_offset));
+        const u32 sub_copy_size = (std::min)(4U, remaining);
+        std::memcpy(inner_buffer.data() + write_offset, &data, sub_copy_size);
+        write_offset += sub_copy_size;
+    }
     if (!is_last_call) {
         return;
     }
     if (native_partial && is_linear && regs.line_count == 1) {
+        if (write_offset <= flushed_offset || write_offset > inner_buffer.size()) {
+            return;
+        }
         const u32 count = write_offset - flushed_offset;
-        if (count) {
-            rasterizer->AccelerateInlineToMemory(regs.dest.Address() + flushed_offset, count,
+        if (count > 0) {
+            rasterizer->AccelerateInlineToMemory(
+                regs.dest.Address() + flushed_offset, count,
                 std::span<const u8>{inner_buffer.data() + flushed_offset, count});
             flushed_offset = write_offset;
         }
@@ -56,10 +71,21 @@ void State::ProcessData(const u32 data, const bool is_last_call) {
 }
 
 void State::ProcessData(const u32* data, size_t num_data) {
+    if (data == nullptr || num_data == 0) {
+        return;
+    }
+    if (num_data > (std::numeric_limits<size_t>::max)() / sizeof(u32)) {
+        return;
+    }
     if (native_partial && is_linear && regs.line_count == 1) {
-        const auto count = std::min<size_t>(num_data * sizeof(u32), copy_size - write_offset);
-        if (count) {
-            rasterizer->AccelerateInlineToMemory(regs.dest.Address() + write_offset, count,
+        if (write_offset >= copy_size) {
+            return;
+        }
+        const size_t count =
+            (std::min)(num_data * sizeof(u32), static_cast<size_t>(copy_size - write_offset));
+        if (count > 0) {
+            rasterizer->AccelerateInlineToMemory(
+                regs.dest.Address() + write_offset, count,
                 std::span<const u8>{reinterpret_cast<const u8*>(data), count});
             write_offset += static_cast<u32>(count);
             flushed_offset = write_offset;
@@ -71,12 +97,20 @@ void State::ProcessData(const u32* data, size_t num_data) {
 }
 
 void State::ProcessData(std::span<const u8> read_buffer) {
+    if (regs.line_length_in == 0 || regs.line_count == 0) {
+        return;
+    }
+    const u64 required_bytes = static_cast<u64>(regs.line_length_in) * regs.line_count;
+    if (read_buffer.size() < required_bytes) {
+        return;
+    }
     const GPUVAddr address{regs.dest.Address()};
     if (is_linear) {
         for (size_t line = 0; line < regs.line_count; ++line) {
             const GPUVAddr dest_line = address + line * regs.dest.pitch;
-            std::span<const u8> buffer(read_buffer.data() + line * regs.line_length_in,
-                                       regs.line_length_in);
+            std::span<const u8> buffer(
+                read_buffer.data() + line * static_cast<size_t>(regs.line_length_in),
+                regs.line_length_in);
             rasterizer->AccelerateInlineToMemory(dest_line, regs.line_length_in, buffer);
         }
     } else {
@@ -93,6 +127,9 @@ void State::ProcessData(std::span<const u8> read_buffer) {
         const std::size_t dst_size = Tegra::Texture::CalculateSize(
             true, bytes_per_pixel, width, regs.dest.height, regs.dest.depth,
             regs.dest.BlockHeight(), regs.dest.BlockDepth());
+        if (dst_size == 0) {
+            return;
+        }
 
         Tegra::Memory::GpuGuestMemoryScoped<u8,
                                             Tegra::Memory::GuestMemoryFlags::SafeReadCachedWrite>

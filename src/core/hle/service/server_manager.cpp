@@ -376,6 +376,12 @@ Result ServerManager::OnSessionEvent(Session* session) {
         R_SUCCEED();
     }
 
+    if (res == Kernel::ResultNotFound) {
+        // A failed receive has already returned its error to the client.
+        this->LinkToDeferredList(session);
+        R_SUCCEED();
+    }
+
     R_ASSERT(res);
 
     // Complete the sync request with deferral handling.

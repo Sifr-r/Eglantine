@@ -56,6 +56,8 @@ DECLARE_ENUM_FLAG_OPERATORS(MappingFlags);
 
 class nvhost_as_gpu final : public nvdevice {
 public:
+    static constexpr DeviceKind Kind = DeviceKind::NvHostAsGpu;
+
     explicit nvhost_as_gpu(Core::System& system_, Module& module, NvCore::Container& core);
     ~nvhost_as_gpu() override;
 

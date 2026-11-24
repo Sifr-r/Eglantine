@@ -4,8 +4,10 @@
 // SPDX-FileCopyrightText: 2024 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <common/fs/fs.h>
 #include <common/fs/path_util.h>
+#include <common/scope_exit.h>
 #include <common/settings.h>
 #include <hid_core/hid_types.h>
 #include <jni.h>
@@ -216,9 +218,22 @@ void Java_org_yuzu_yuzu_1emu_features_input_NativeInput_onGamePadMotionEvent(
 
 void Java_org_yuzu_yuzu_1emu_features_input_NativeInput_onReadNfcTag(JNIEnv* env, jobject j_obj,
                                                                      jbyteArray j_data) {
-    jboolean isCopy{false};
-    std::span<u8> data(reinterpret_cast<u8*>(env->GetByteArrayElements(j_data, &isCopy)),
-                       static_cast<size_t>(env->GetArrayLength(j_data)));
+    if (j_data == nullptr) {
+        return;
+    }
+    const jsize data_size = env->GetArrayLength(j_data);
+    if (data_size < 0) {
+        return;
+    }
+    jbyte* data_elements = env->GetByteArrayElements(j_data, nullptr);
+    if (data_elements == nullptr) {
+        return;
+    }
+    SCOPE_EXIT {
+        env->ReleaseByteArrayElements(j_data, data_elements, JNI_ABORT);
+    };
+
+    std::span<u8> data(reinterpret_cast<u8*>(data_elements), static_cast<size_t>(data_size));
 
     if (EmulationSession::GetInstance().IsRunning()) {
         EmulationSession::GetInstance().GetInputSubsystem().GetVirtualAmiibo()->LoadAmiibo(data);
@@ -419,36 +434,44 @@ void Java_org_yuzu_yuzu_1emu_features_input_NativeInput_loadPerGameConfiguration
     jstring j_selected_profile_name) {
     static constexpr size_t HANDHELD_INDEX = 8;
 
+    if (j_player_index < 0 || static_cast<size_t>(j_player_index) >= HANDHELD_INDEX) {
+        return;
+    }
+
+    const auto player_index = static_cast<size_t>(j_player_index);
     auto& hid_core = EmulationSession::GetInstance().System().HIDCore();
     Settings::values.players.SetGlobal(false);
 
     auto profile_name = Common::Android::GetJString(env, j_selected_profile_name);
-    auto* emulated_controller = hid_core.GetEmulatedControllerByIndex(j_player_index);
+    auto* emulated_controller = hid_core.GetEmulatedControllerByIndex(player_index);
 
     if (j_selected_index == 0) {
-        Settings::values.players.GetValue()[j_player_index].profile_name = "";
-        if (j_player_index == 0) {
-            Settings::values.players.GetValue()[HANDHELD_INDEX] = {};
-        }
-        Settings::values.players.SetGlobal(true);
+        auto& custom_player = Settings::values.players.GetValue()[player_index];
+        custom_player = Settings::values.players.GetValue(true)[player_index];
+        custom_player.profile_name = "";
         emulated_controller->ReloadFromSettings();
+
+        if (player_index == 0) {
+            auto& custom_handheld = Settings::values.players.GetValue()[HANDHELD_INDEX];
+            custom_handheld = Settings::values.players.GetValue(true)[HANDHELD_INDEX];
+            custom_handheld.profile_name = "";
+            hid_core.GetEmulatedController(Core::HID::NpadIdType::Handheld)->ReloadFromSettings();
+        }
         return;
     }
     if (profile_name.empty()) {
         return;
     }
-    auto& player = Settings::values.players.GetValue()[j_player_index];
-    auto& global_player = Settings::values.players.GetValue(true)[j_player_index];
+    auto& player = Settings::values.players.GetValue()[player_index];
     player.profile_name = profile_name;
-    global_player.profile_name = profile_name;
     // Read from the profile into the custom player settings
-    LoadProfile(profile_name, j_player_index);
+    LoadProfile(profile_name, player_index);
     // Make sure the controller is connected
     player.connected = true;
 
     emulated_controller->ReloadFromSettings();
 
-    if (j_player_index > 0) {
+    if (player_index > 0) {
         return;
     }
     // Handle Handheld cases
@@ -457,7 +480,7 @@ void Java_org_yuzu_yuzu_1emu_features_input_NativeInput_loadPerGameConfiguration
     if (player.controller_type == Settings::ControllerType::Handheld) {
         handheld_player = player;
     } else {
-        handheld_player = {};
+        handheld_player = Settings::PlayerInput{};
     }
     handheld_controller->ReloadFromSettings();
 }
@@ -622,11 +645,23 @@ jboolean Java_org_yuzu_yuzu_1emu_features_input_NativeInput_getIsConnected(JNIEn
 
 void Java_org_yuzu_yuzu_1emu_features_input_NativeInput_connectControllersImpl(
     JNIEnv* env, jobject j_obj, jbooleanArray j_connected) {
-    jboolean isCopy = false;
-    auto j_connected_array_size = env->GetArrayLength(j_connected);
-    jboolean* j_connected_array = env->GetBooleanArrayElements(j_connected, &isCopy);
-    for (int i = 0; i < j_connected_array_size; ++i) {
-        ConnectController(i, j_connected_array[i]);
+    if (j_connected == nullptr) {
+        return;
+    }
+    const jsize j_connected_array_size = env->GetArrayLength(j_connected);
+    if (j_connected_array_size <= 0) {
+        return;
+    }
+    jboolean* j_connected_array = env->GetBooleanArrayElements(j_connected, nullptr);
+    if (j_connected_array == nullptr) {
+        return;
+    }
+    SCOPE_EXIT {
+        env->ReleaseBooleanArrayElements(j_connected, j_connected_array, JNI_ABORT);
+    };
+    const int count = (std::min)(static_cast<int>(j_connected_array_size), 8);
+    for (int i = 0; i < count; ++i) {
+        ConnectController(static_cast<size_t>(i), j_connected_array[i] != JNI_FALSE);
     }
 }
 

@@ -309,6 +309,28 @@ cmake_dependent_option(YUZU_ROOM_STANDALONE "Enable standalone room executable" 
 cmake_dependent_option(YUZU_CMD "Compile the eden-cli executable" ON "NOT ANDROID" OFF)
 
 cmake_dependent_option(YUZU_CRASH_DUMPS "Compile crash dump (Minidump) support" OFF "WIN32 OR LINUX" OFF)
+option(ENABLE_SENTRY "Enable Sentry crash reporting in the desktop frontends" OFF)
+
+if (ENABLE_SENTRY)
+    if (ANDROID OR YUZU_STATIC_ROOM OR NOT (ENABLE_QT OR YUZU_CMD) OR
+        NOT (WIN32 OR LINUX OR CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
+        message(FATAL_ERROR "ENABLE_SENTRY requires a Qt or SDL frontend on Windows, Linux, or macOS.")
+    endif()
+
+    find_package(sentry 0.17.5 CONFIG QUIET)
+    if (NOT TARGET sentry::sentry)
+        message(FATAL_ERROR "ENABLE_SENTRY requires an installed Sentry Native 0.17.5-compatible SDK built with "
+            "SENTRY_BACKEND=inproc and SENTRY_BUILD_SHARED_LIBS=OFF. Set CMAKE_PREFIX_PATH to its install prefix.")
+    endif()
+    get_target_property(SENTRY_LIBRARY_TYPE sentry::sentry TYPE)
+    if (NOT SENTRY_LIBRARY_TYPE STREQUAL "STATIC_LIBRARY" OR NOT SENTRY_BACKEND STREQUAL "inproc")
+        message(FATAL_ERROR "ENABLE_SENTRY requires Sentry Native built with "
+            "SENTRY_BACKEND=inproc and SENTRY_BUILD_SHARED_LIBS=OFF.")
+    endif()
+    if (NOT SENTRY_TRANSPORT MATCHES "^(curl|winhttp)$")
+        message(FATAL_ERROR "ENABLE_SENTRY requires Sentry Native built with its curl or WinHTTP transport.")
+    endif()
+endif()
 
 option(YUZU_DOWNLOAD_TIME_ZONE_DATA "Always download time zone binaries" ON)
 set(YUZU_TZDB_PATH "" CACHE STRING "Path to a pre-downloaded timezone database")

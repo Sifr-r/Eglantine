@@ -12,12 +12,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::format::{ReadAt, ZstdCodec};
 use crate::journal::has_resumable_journal;
 use crate::metadata::{
-    edit_nup_metadata, probe_dump_metadata, probe_nup_metadata, EditResult, Metadata, MetadataEdit,
+    edit_nup_metadata_with_cancel_poll, probe_dump_metadata, probe_nup_metadata, EditResult,
+    Metadata, MetadataEdit,
 };
-use crate::reader::{extract_nup, read_extent, verify_integrity, ExtractResult, NupContainer};
+use crate::reader::{
+    extract_nup_with_cancel_poll, read_extent, verify_integrity, ExtractResult, NupContainer,
+};
 use crate::writer::{
-    default_archive_path, default_extract_path, dump_root_from_main, is_loose_dump, pack_dump,
-    PackOptions, PackProgress, PackResult,
+    default_archive_path, default_extract_path, dump_root_from_main, is_loose_dump,
+    pack_dump_with_cancel_poll, PackOptions, PackProgress, PackResult,
 };
 
 pub type EglNupProgressCallback =
@@ -317,10 +320,12 @@ unsafe fn slice_from_raw_checked<'a, T>(ptr: *const T, len: usize) -> Result<&'a
     if !ptr_valid(ptr) {
         return Err(());
     }
-    if len.checked_mul(std::mem::size_of::<T>()).is_none() {
+    let elem_size = std::mem::size_of::<T>();
+    if elem_size > 0 && len > (isize::MAX as usize) / elem_size {
         return Err(());
     }
-    // SAFETY: Caller guarantees `[ptr, ptr + len)` is valid for reads across `'a`.
+    // SAFETY: Caller guarantees `[ptr, ptr + len)` is valid for reads across `'a`
+    // and total byte size fits within `isize::MAX`.
     Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
 }
 
@@ -446,19 +451,19 @@ fn free_localized_bytes_pairs(
 
 fn write_error_string(out_error: *mut EglNupOwnedString, msg: String) {
     if mut_ptr_valid(out_error) {
-        // SAFETY: `out_error` validated non-null and aligned.
+        let owned = alloc_owned_string(msg);
+        // SAFETY: `out_error` validated non-null and aligned; write-only output.
         unsafe {
-            free_owned_string_inner(&mut *out_error);
-            *out_error = alloc_owned_string(msg);
+            ptr::write(out_error, owned);
         }
     }
 }
 
 fn clear_error_string(out_error: *mut EglNupOwnedString) {
     if mut_ptr_valid(out_error) {
-        // SAFETY: `out_error` validated non-null and aligned.
+        // SAFETY: `out_error` validated non-null and aligned; write-only output.
         unsafe {
-            free_owned_string_inner(&mut *out_error);
+            ptr::write(out_error, EglNupOwnedString::default());
         }
     }
 }
@@ -672,8 +677,9 @@ pub unsafe extern "C" fn egl_nup_container_parse(
     if !mut_ptr_valid(out_container) {
         return -1;
     }
+    // SAFETY: `out_container` validated non-null and aligned; write-only output.
+    unsafe { ptr::write(out_container, EglNupParsedContainer::default()) };
     let res = catch_unwind(AssertUnwindSafe(|| {
-        egl_nup_container_free(out_container);
         let Ok(reader) = FfiVfsReader::from_raw(vfs) else {
             return -1;
         };
@@ -751,20 +757,26 @@ pub unsafe extern "C" fn egl_nup_container_parse(
         let (files, file_count) = owned_from_vec(c_files);
         let (children, child_count) = owned_from_vec(parsed.children);
 
-        *out_container = EglNupParsedContainer {
-            toc_offset: parsed.toc_offset,
-            toc_size: parsed.toc_size,
-            blob_offset: parsed.blob_offset,
-            file_size: parsed.file_size,
-            packages,
-            package_count,
-            dirs,
-            dir_count,
-            files,
-            file_count,
-            children,
-            child_count,
-        };
+        // SAFETY: `out_container` validated non-null and aligned; write-only output.
+        unsafe {
+            ptr::write(
+                out_container,
+                EglNupParsedContainer {
+                    toc_offset: parsed.toc_offset,
+                    toc_size: parsed.toc_size,
+                    blob_offset: parsed.blob_offset,
+                    file_size: parsed.file_size,
+                    packages,
+                    package_count,
+                    dirs,
+                    dir_count,
+                    files,
+                    file_count,
+                    children,
+                    child_count,
+                },
+            );
+        }
         0
     }));
     match res {
@@ -853,8 +865,9 @@ pub unsafe extern "C" fn egl_nup_read_extent(
     if !mut_ptr_valid(out_bytes) {
         return -1;
     }
+    // SAFETY: `out_bytes` validated non-null and aligned; write-only output.
+    unsafe { ptr::write(out_bytes, EglNupOwnedBytes::default()) };
     catch_unwind(AssertUnwindSafe(|| {
-        free_owned_bytes_inner(&mut *out_bytes);
         let Ok(reader) = FfiVfsReader::from_raw(vfs) else {
             return -1;
         };
@@ -870,7 +883,8 @@ pub unsafe extern "C" fn egl_nup_read_extent(
             codec,
         ) {
             Ok(bytes) => {
-                *out_bytes = alloc_owned_bytes(bytes);
+                // SAFETY: `out_bytes` validated non-null and aligned; write-only output.
+                unsafe { ptr::write(out_bytes, alloc_owned_bytes(bytes)) };
                 0
             }
             Err(_) => -1,
@@ -931,8 +945,9 @@ pub unsafe extern "C" fn egl_nup_dump_root_from_main(
     if !mut_ptr_valid(out_root) {
         return 0;
     }
+    // SAFETY: `out_root` validated non-null and aligned; write-only output.
+    unsafe { ptr::write(out_root, EglNupOwnedString::default()) };
     catch_unwind(AssertUnwindSafe(|| {
-        free_owned_string_inner(&mut *out_root);
         let Ok(main_path) = path_from_raw_checked(main_utf8, main_len) else {
             return 0;
         };
@@ -942,7 +957,8 @@ pub unsafe extern "C" fn egl_nup_dump_root_from_main(
         let Some(root_str) = root.to_str() else {
             return 0;
         };
-        *out_root = alloc_owned_string(root_str.to_owned());
+        // SAFETY: `out_root` validated non-null and aligned; write-only output.
+        unsafe { ptr::write(out_root, alloc_owned_string(root_str.to_owned())) };
         1
     }))
     .unwrap_or(0)
@@ -958,13 +974,15 @@ pub unsafe extern "C" fn egl_nup_probe_metadata(
     if !mut_ptr_valid(out_meta) {
         return -1;
     }
+    // SAFETY: `out_meta` validated non-null and aligned; write-only output.
+    unsafe { ptr::write(out_meta, EglNupOwnedMetadata::default()) };
     catch_unwind(AssertUnwindSafe(|| {
-        free_owned_metadata_inner(&mut *out_meta);
         let Ok(root) = path_from_raw_checked(dump_root_utf8, dump_root_len) else {
             return -1;
         };
         let meta = probe_dump_metadata(&root, nacp_language_index);
-        *out_meta = alloc_owned_metadata(meta);
+        // SAFETY: `out_meta` validated non-null and aligned; write-only output.
+        unsafe { ptr::write(out_meta, alloc_owned_metadata(meta)) };
         0
     }))
     .unwrap_or(-1)
@@ -979,13 +997,15 @@ pub unsafe extern "C" fn egl_nup_probe_nup_metadata(
     if !mut_ptr_valid(out_meta) {
         return -1;
     }
+    // SAFETY: `out_meta` validated non-null and aligned; write-only output.
+    unsafe { ptr::write(out_meta, EglNupOwnedMetadata::default()) };
     catch_unwind(AssertUnwindSafe(|| {
-        free_owned_metadata_inner(&mut *out_meta);
         let Ok(archive) = path_from_raw_checked(archive_utf8, archive_len) else {
             return -1;
         };
         let meta = probe_nup_metadata(&archive);
-        *out_meta = alloc_owned_metadata(meta);
+        // SAFETY: `out_meta` validated non-null and aligned; write-only output.
+        unsafe { ptr::write(out_meta, alloc_owned_metadata(meta)) };
         0
     }))
     .unwrap_or(-1)
@@ -1000,8 +1020,9 @@ pub unsafe extern "C" fn egl_nup_default_archive_path(
     if !mut_ptr_valid(out_path) {
         return -1;
     }
+    // SAFETY: `out_path` validated non-null and aligned; write-only output.
+    unsafe { ptr::write(out_path, EglNupOwnedString::default()) };
     catch_unwind(AssertUnwindSafe(|| {
-        free_owned_string_inner(&mut *out_path);
         let Ok(root) = path_from_raw_checked(dump_root_utf8, dump_root_len) else {
             return -1;
         };
@@ -1009,7 +1030,8 @@ pub unsafe extern "C" fn egl_nup_default_archive_path(
         let Some(s) = p.to_str() else {
             return -1;
         };
-        *out_path = alloc_owned_string(s.to_owned());
+        // SAFETY: `out_path` validated non-null and aligned; write-only output.
+        unsafe { ptr::write(out_path, alloc_owned_string(s.to_owned())) };
         0
     }))
     .unwrap_or(-1)
@@ -1024,8 +1046,9 @@ pub unsafe extern "C" fn egl_nup_default_extract_path(
     if !mut_ptr_valid(out_path) {
         return -1;
     }
+    // SAFETY: `out_path` validated non-null and aligned; write-only output.
+    unsafe { ptr::write(out_path, EglNupOwnedString::default()) };
     catch_unwind(AssertUnwindSafe(|| {
-        free_owned_string_inner(&mut *out_path);
         let Ok(archive) = path_from_raw_checked(archive_utf8, archive_len) else {
             return -1;
         };
@@ -1033,7 +1056,8 @@ pub unsafe extern "C" fn egl_nup_default_extract_path(
         let Some(s) = p.to_str() else {
             return -1;
         };
-        *out_path = alloc_owned_string(s.to_owned());
+        // SAFETY: `out_path` validated non-null and aligned; write-only output.
+        unsafe { ptr::write(out_path, alloc_owned_string(s.to_owned())) };
         0
     }))
     .unwrap_or(-1)
@@ -1053,6 +1077,49 @@ pub unsafe extern "C" fn egl_nup_has_resumable_journal(
     .unwrap_or(0)
 }
 
+unsafe fn with_progress_and_cancel<R>(
+    progress_cb: EglNupProgressCallback,
+    progress_ctx: *mut c_void,
+    cancel_cb: EglNupCancelCallback,
+    cancel_ctx: *mut c_void,
+    f: impl FnOnce(&AtomicBool, Option<&dyn Fn() -> bool>, Option<&mut dyn FnMut(&PackProgress)>) -> R,
+) -> R {
+    let cancel_flag = AtomicBool::new(false);
+    let poll_cancel = || -> bool {
+        if let Some(ccb) = cancel_cb {
+            // SAFETY: Caller guarantees `ccb` and `cancel_ctx` remain valid during the call.
+            if unsafe { ccb(cancel_ctx) } != 0 {
+                cancel_flag.store(true, Ordering::Relaxed);
+                return true;
+            }
+        }
+        false
+    };
+    let mut bridge = |p: &PackProgress| {
+        if let Some(pcb) = progress_cb {
+            let cp = EglNupPackProgress {
+                bytes_done: p.bytes_done,
+                bytes_total: p.bytes_total,
+                files_done: p.files_done,
+                files_total: p.files_total,
+            };
+            // SAFETY: Caller guarantees `pcb` and `progress_ctx` remain valid during the call.
+            unsafe { pcb(progress_ctx, &cp) };
+        }
+    };
+    let cb_opt: Option<&mut dyn FnMut(&PackProgress)> = if progress_cb.is_some() {
+        Some(&mut bridge as &mut dyn FnMut(&PackProgress))
+    } else {
+        None
+    };
+    let poll_opt: Option<&dyn Fn() -> bool> = if cancel_cb.is_some() {
+        Some(&poll_cancel as &dyn Fn() -> bool)
+    } else {
+        None
+    };
+    f(&cancel_flag, poll_opt, cb_opt)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_pack_dump(
     dump_root_utf8: *const c_char,
@@ -1067,8 +1134,8 @@ pub unsafe extern "C" fn egl_nup_pack_dump(
     cancel_ctx: *mut c_void,
     out_error: *mut EglNupOwnedString,
 ) -> EglNupPackResult {
+    clear_error_string(out_error);
     catch_unwind(AssertUnwindSafe(|| {
-        clear_error_string(out_error);
         let Ok(dump_root) = path_from_raw_checked(dump_root_utf8, dump_root_len) else {
             write_error_string(out_error, "invalid dump root path".to_string());
             return EglNupPackResult::InvalidSource;
@@ -1103,43 +1170,25 @@ pub unsafe extern "C" fn egl_nup_pack_dump(
             }
         };
 
-        let cancel_flag = AtomicBool::new(false);
-        if let Some(ccb) = cancel_cb {
-            if ccb(cancel_ctx) != 0 {
-                cancel_flag.store(true, Ordering::Relaxed);
-            }
-        }
-        let mut bridge = |p: &PackProgress| {
-            if let Some(pcb) = progress_cb {
-                let cp = EglNupPackProgress {
-                    bytes_done: p.bytes_done,
-                    bytes_total: p.bytes_total,
-                    files_done: p.files_done,
-                    files_total: p.files_total,
-                };
-                pcb(progress_ctx, &cp);
-            }
-            if let Some(ccb) = cancel_cb {
-                if ccb(cancel_ctx) != 0 {
-                    cancel_flag.store(true, Ordering::Relaxed);
-                }
-            }
-        };
-        let cb_opt: Option<&mut dyn FnMut(&PackProgress)> =
-            if progress_cb.is_some() || cancel_cb.is_some() {
-                Some(&mut bridge as &mut dyn FnMut(&PackProgress))
-            } else {
-                None
-            };
+        let res = with_progress_and_cancel(
+            progress_cb,
+            progress_ctx,
+            cancel_cb,
+            cancel_ctx,
+            |cancel_flag, cancel_poll, cb_opt| {
+                pack_dump_with_cancel_poll(
+                    &dump_root,
+                    &archive,
+                    &opts,
+                    &codec_ops,
+                    Some(cancel_flag),
+                    cancel_poll,
+                    cb_opt,
+                )
+            },
+        );
 
-        match pack_dump(
-            &dump_root,
-            &archive,
-            &opts,
-            &codec_ops,
-            Some(&cancel_flag),
-            cb_opt,
-        ) {
+        match res {
             Ok(()) => EglNupPackResult::Success,
             Err((code, msg)) => {
                 write_error_string(out_error, msg);
@@ -1171,8 +1220,8 @@ pub unsafe extern "C" fn egl_nup_extract(
     cancel_ctx: *mut c_void,
     out_error: *mut EglNupOwnedString,
 ) -> EglNupExtractResult {
+    clear_error_string(out_error);
     catch_unwind(AssertUnwindSafe(|| {
-        clear_error_string(out_error);
         let Ok(archive) = path_from_raw_checked(archive_utf8, archive_len) else {
             write_error_string(out_error, "invalid archive path".to_string());
             return EglNupExtractResult::InvalidSource;
@@ -1186,36 +1235,24 @@ pub unsafe extern "C" fn egl_nup_extract(
             return EglNupExtractResult::InvalidSource;
         };
 
-        let cancel_flag = AtomicBool::new(false);
-        if let Some(ccb) = cancel_cb {
-            if ccb(cancel_ctx) != 0 {
-                cancel_flag.store(true, Ordering::Relaxed);
-            }
-        }
-        let mut bridge = |p: &PackProgress| {
-            if let Some(pcb) = progress_cb {
-                let cp = EglNupPackProgress {
-                    bytes_done: p.bytes_done,
-                    bytes_total: p.bytes_total,
-                    files_done: p.files_done,
-                    files_total: p.files_total,
-                };
-                pcb(progress_ctx, &cp);
-            }
-            if let Some(ccb) = cancel_cb {
-                if ccb(cancel_ctx) != 0 {
-                    cancel_flag.store(true, Ordering::Relaxed);
-                }
-            }
-        };
-        let cb_opt: Option<&mut dyn FnMut(&PackProgress)> =
-            if progress_cb.is_some() || cancel_cb.is_some() {
-                Some(&mut bridge as &mut dyn FnMut(&PackProgress))
-            } else {
-                None
-            };
+        let res = with_progress_and_cancel(
+            progress_cb,
+            progress_ctx,
+            cancel_cb,
+            cancel_ctx,
+            |cancel_flag, cancel_poll, cb_opt| {
+                extract_nup_with_cancel_poll(
+                    &archive,
+                    &out_dir,
+                    &codec_ops,
+                    cb_opt,
+                    Some(cancel_flag),
+                    cancel_poll,
+                )
+            },
+        );
 
-        match extract_nup(&archive, &out_dir, &codec_ops, cb_opt, Some(&cancel_flag)) {
+        match res {
             Ok(()) => EglNupExtractResult::Success,
             Err((code, msg)) => {
                 write_error_string(out_error, msg);
@@ -1245,8 +1282,8 @@ pub unsafe extern "C" fn egl_nup_edit_metadata(
     cancel_ctx: *mut c_void,
     out_error: *mut EglNupOwnedString,
 ) -> EglNupEditResult {
+    clear_error_string(out_error);
     catch_unwind(AssertUnwindSafe(|| {
-        clear_error_string(out_error);
         let Ok(archive) = path_from_raw_checked(archive_utf8, archive_len) else {
             write_error_string(out_error, "invalid archive path".to_string());
             return EglNupEditResult::InvalidSource;
@@ -1268,36 +1305,23 @@ pub unsafe extern "C" fn egl_nup_edit_metadata(
             localized_titles: (raw_edit.has_localized_titles != 0).then_some(vals.localized_titles),
         };
 
-        let cancel_flag = AtomicBool::new(false);
-        if let Some(ccb) = cancel_cb {
-            if ccb(cancel_ctx) != 0 {
-                cancel_flag.store(true, Ordering::Relaxed);
-            }
-        }
-        let mut bridge = |p: &PackProgress| {
-            if let Some(pcb) = progress_cb {
-                let cp = EglNupPackProgress {
-                    bytes_done: p.bytes_done,
-                    bytes_total: p.bytes_total,
-                    files_done: p.files_done,
-                    files_total: p.files_total,
-                };
-                pcb(progress_ctx, &cp);
-            }
-            if let Some(ccb) = cancel_cb {
-                if ccb(cancel_ctx) != 0 {
-                    cancel_flag.store(true, Ordering::Relaxed);
-                }
-            }
-        };
-        let cb_opt: Option<&mut dyn FnMut(&PackProgress)> =
-            if progress_cb.is_some() || cancel_cb.is_some() {
-                Some(&mut bridge as &mut dyn FnMut(&PackProgress))
-            } else {
-                None
-            };
+        let res = with_progress_and_cancel(
+            progress_cb,
+            progress_ctx,
+            cancel_cb,
+            cancel_ctx,
+            |cancel_flag, cancel_poll, cb_opt| {
+                edit_nup_metadata_with_cancel_poll(
+                    &archive,
+                    &rust_edit,
+                    Some(cancel_flag),
+                    cancel_poll,
+                    cb_opt,
+                )
+            },
+        );
 
-        match edit_nup_metadata(&archive, &rust_edit, Some(&cancel_flag), cb_opt) {
+        match res {
             Ok(code) => match code {
                 EditResult::Success => EglNupEditResult::Success,
                 EditResult::NoChange => EglNupEditResult::NoChange,

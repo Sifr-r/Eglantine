@@ -42,18 +42,21 @@ void CheckVulkan() {
 bool CheckEnvVars(bool* is_child) {
 #ifdef _WIN32
     // Check environment variable to see if we are the child
-    char variable_contents[8];
-    const DWORD startup_check_var =
-        GetEnvironmentVariableA(STARTUP_CHECK_ENV_VAR, variable_contents, 8);
-    if (startup_check_var > 0 && std::strncmp(variable_contents, ENV_VAR_ENABLED_TEXT, 8) == 0) {
+    char variable_contents[8]{};
+    const DWORD startup_check_var = GetEnvironmentVariableA(
+        STARTUP_CHECK_ENV_VAR, variable_contents, static_cast<DWORD>(sizeof(variable_contents)));
+    if (startup_check_var > 0 && startup_check_var < sizeof(variable_contents) &&
+        std::strncmp(variable_contents, ENV_VAR_ENABLED_TEXT, sizeof(variable_contents)) == 0) {
         CheckVulkan();
         return true;
     }
 
     // Don't perform startup checks if we are a child process
-    char is_child_s[8];
-    const DWORD is_child_len = GetEnvironmentVariableA(IS_CHILD_ENV_VAR, is_child_s, 8);
-    if (is_child_len > 0 && std::strncmp(is_child_s, ENV_VAR_ENABLED_TEXT, 8) == 0) {
+    char is_child_s[8]{};
+    const DWORD is_child_len = GetEnvironmentVariableA(IS_CHILD_ENV_VAR, is_child_s,
+                                                       static_cast<DWORD>(sizeof(is_child_s)));
+    if (is_child_len > 0 && is_child_len < sizeof(is_child_s) &&
+        std::strncmp(is_child_s, ENV_VAR_ENABLED_TEXT, sizeof(is_child_s)) == 0) {
         *is_child = true;
         return false;
     } else if (!SetEnvironmentVariableA(IS_CHILD_ENV_VAR, ENV_VAR_ENABLED_TEXT)) {

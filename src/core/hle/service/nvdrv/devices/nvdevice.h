@@ -23,12 +23,31 @@ class KEvent;
 
 namespace Service::Nvidia::Devices {
 
+enum class DeviceKind : u32 {
+    Unknown,
+    NvDispDisp0,
+    NvHostAsGpu,
+    NvHostCtrl,
+    NvHostCtrlGpu,
+    NvHostGpu,
+    NvHostNvdec,
+    NvHostNvjpg,
+    NvHostVic,
+    NvMap,
+    Nx2Stub,
+};
+
 /// Represents an abstract nvidia device node. It is to be subclassed by concrete device nodes to
 /// implement the ioctl interface.
 class nvdevice {
 public:
-    explicit nvdevice(Core::System& system_) : system{system_} {}
+    explicit nvdevice(Core::System& system_, DeviceKind kind_ = DeviceKind::Unknown)
+        : system{system_}, kind{kind_} {}
     virtual ~nvdevice() = default;
+
+    [[nodiscard]] DeviceKind GetKind() const noexcept {
+        return kind;
+    }
 
     /**
      * Handles an ioctl1 request.
@@ -80,6 +99,9 @@ public:
 
 protected:
     Core::System& system;
+
+private:
+    DeviceKind kind;
 };
 
 } // namespace Service::Nvidia::Devices

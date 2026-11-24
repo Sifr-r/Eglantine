@@ -9,7 +9,9 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <string>
 #include <thread>
 #include "common/announce_multiplayer_room.h"
 #include "common/common_types.h"
@@ -90,6 +92,10 @@ private:
     std::optional<std::jthread> announce_multiplayer_thread;
     /// Backend interface that logs fields
     std::unique_ptr<AnnounceMultiplayerRoom::Backend> backend;
+    std::string web_api_url;
+    std::string username;
+    std::string token;
+    std::mutex backend_mutex;
     std::mutex callback_mutex;
     std::atomic_bool registered = false; ///< Whether the room has been registered
 };

@@ -26,38 +26,54 @@ static MemoryInfo Detect() {
     MemoryInfo mem_info{};
 
 #ifdef _WIN32
-    MEMORYSTATUSEX memorystatus;
+    MEMORYSTATUSEX memorystatus{};
     memorystatus.dwLength = sizeof(memorystatus);
-    GlobalMemoryStatusEx(&memorystatus);
-    mem_info.TotalPhysicalMemory = memorystatus.ullTotalPhys;
-    mem_info.TotalSwapMemory = memorystatus.ullTotalPageFile - mem_info.TotalPhysicalMemory;
+    if (GlobalMemoryStatusEx(&memorystatus) != FALSE) {
+        mem_info.TotalPhysicalMemory = memorystatus.ullTotalPhys;
+        mem_info.TotalSwapMemory =
+            memorystatus.ullTotalPageFile > memorystatus.ullTotalPhys
+                ? memorystatus.ullTotalPageFile - memorystatus.ullTotalPhys
+                : 0;
+    }
 #elif defined(__APPLE__)
-    u64 ramsize;
-    struct xsw_usage vmusage;
+    u64 ramsize{};
+    struct xsw_usage vmusage{};
     std::size_t sizeof_ramsize = sizeof(ramsize);
     std::size_t sizeof_vmusage = sizeof(vmusage);
     // hw and vm are defined in sysctl.h
     // https://github.com/apple/darwin-xnu/blob/master/bsd/sys/sysctl.h#L471
     // sysctlbyname(const char *, void *, size_t *, void *, size_t);
-    sysctlbyname("hw.memsize", &ramsize, &sizeof_ramsize, nullptr, 0);
-    sysctlbyname("vm.swapusage", &vmusage, &sizeof_vmusage, nullptr, 0);
-    mem_info.TotalPhysicalMemory = ramsize;
-    mem_info.TotalSwapMemory = vmusage.xsu_total;
+    if (sysctlbyname("hw.memsize", &ramsize, &sizeof_ramsize, nullptr, 0) == 0) {
+        mem_info.TotalPhysicalMemory = ramsize;
+    }
+    if (sysctlbyname("vm.swapusage", &vmusage, &sizeof_vmusage, nullptr, 0) == 0) {
+        mem_info.TotalSwapMemory = vmusage.xsu_total;
+    }
 #elif defined(__FreeBSD__)
-    u_long physmem, swap_total;
-    std::size_t sizeof_u_long = sizeof(u_long);
+    u_long physmem{};
+    u_long swap_total{};
+    std::size_t sizeof_physmem = sizeof(physmem);
+    std::size_t sizeof_swap_total = sizeof(swap_total);
     // sysctlbyname(const char *, void *, size_t *, const void *, size_t);
-    sysctlbyname("hw.physmem", &physmem, &sizeof_u_long, nullptr, 0);
-    sysctlbyname("vm.swap_total", &swap_total, &sizeof_u_long, nullptr, 0);
-    mem_info.TotalPhysicalMemory = physmem;
-    mem_info.TotalSwapMemory = swap_total;
+    if (sysctlbyname("hw.physmem", &physmem, &sizeof_physmem, nullptr, 0) == 0) {
+        mem_info.TotalPhysicalMemory = physmem;
+    }
+    if (sysctlbyname("vm.swap_total", &swap_total, &sizeof_swap_total, nullptr, 0) == 0) {
+        mem_info.TotalSwapMemory = swap_total;
+    }
 #elif defined(__linux__)
-    struct sysinfo meminfo;
-    sysinfo(&meminfo);
-    mem_info.TotalPhysicalMemory = meminfo.totalram;
-    mem_info.TotalSwapMemory = meminfo.totalswap;
+    struct sysinfo meminfo{};
+    if (sysinfo(&meminfo) == 0) {
+        const u64 mem_unit = meminfo.mem_unit > 0 ? static_cast<u64>(meminfo.mem_unit) : 1ULL;
+        mem_info.TotalPhysicalMemory = static_cast<u64>(meminfo.totalram) * mem_unit;
+        mem_info.TotalSwapMemory = static_cast<u64>(meminfo.totalswap) * mem_unit;
+    }
 #else
-    mem_info.TotalPhysicalMemory = sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGE_SIZE);
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && page_size > 0) {
+        mem_info.TotalPhysicalMemory = static_cast<u64>(pages) * static_cast<u64>(page_size);
+    }
     mem_info.TotalSwapMemory = 0;
 #endif
 

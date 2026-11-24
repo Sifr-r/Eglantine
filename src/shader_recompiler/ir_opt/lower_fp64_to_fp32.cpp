@@ -12,8 +12,8 @@
 namespace Shader::Optimization {
 namespace {
 
-constexpr s32 F64ToF32Exp = +1023 - 127;
-constexpr s32 F32ToF64Exp = +127 - 1023;
+constexpr s32 F64ToF32Exp = +127 - 1023;
+constexpr s32 F32ToF64Exp = +1023 - 127;
 
 IR::F32 PackedF64ToF32(IR::IREmitter& ir, const IR::Value& packed) {
     const IR::U32 lo{ir.CompositeExtract(packed, 0)};
@@ -24,13 +24,18 @@ IR::F32 PackedF64ToF32(IR::IREmitter& ir, const IR::Value& packed) {
     const IR::U32 mantissa_lo{ir.BitFieldExtract(lo, ir.Imm32(29), ir.Imm32(3))};
     const IR::U32 mantissa{
         ir.BitwiseOr(ir.ShiftLeftLogical(mantissa_hi, ir.Imm32(3)), mantissa_lo)};
+    const IR::U1 is_underflow{ir.ILessThanEqual(exp, ir.Imm32(896), false)};
+    const IR::U1 is_inf_or_nan{ir.IEqual(exp, ir.Imm32(0x7ff))};
+    const IR::U1 is_overflow{ir.IGreaterThanEqual(exp, ir.Imm32(1151), false)};
     const IR::U32 exp_if_subnorm{
-        ir.Select(ir.IEqual(exp, ir.Imm32(0)), ir.Imm32(0), ir.IAdd(exp, ir.Imm32(F64ToF32Exp)))};
-    const IR::U32 exp_if_infnan{
-        ir.Select(ir.IEqual(exp, ir.Imm32(0x7ff)), ir.Imm32(0xff), exp_if_subnorm)};
+        ir.Select(is_underflow, ir.Imm32(0), ir.IAdd(exp, ir.Imm32(F64ToF32Exp)))};
+    const IR::U32 exp_if_infnan{ir.Select(is_overflow, ir.Imm32(0xff), exp_if_subnorm)};
+    const IR::U32 clamped_mantissa{
+        ir.Select(ir.LogicalOr(is_underflow, is_overflow), ir.Imm32(0), mantissa)};
+    const IR::U32 result_mantissa{ir.Select(is_inf_or_nan, mantissa, clamped_mantissa)};
     const IR::U32 result{
         ir.BitwiseOr(ir.ShiftLeftLogical(sign, ir.Imm32(31)),
-                     ir.BitwiseOr(ir.ShiftLeftLogical(exp_if_infnan, ir.Imm32(23)), mantissa))};
+                     ir.BitwiseOr(ir.ShiftLeftLogical(exp_if_infnan, ir.Imm32(23)), result_mantissa))};
     return ir.BitCast<IR::F32>(result);
 }
 
@@ -152,6 +157,16 @@ IR::Opcode Replace(IR::Opcode op) {
         return IR::Opcode::ConvertF32U32;
     case IR::Opcode::ConvertF64U64:
         return IR::Opcode::ConvertF32U64;
+    case IR::Opcode::SelectF64:
+        return IR::Opcode::SelectF32;
+    case IR::Opcode::FPMax64:
+        return IR::Opcode::FPMax32;
+    case IR::Opcode::FPMin64:
+        return IR::Opcode::FPMin32;
+    case IR::Opcode::FPRecip64:
+        return IR::Opcode::FPRecip32;
+    case IR::Opcode::FPRecipSqrt64:
+        return IR::Opcode::FPRecipSqrt32;
     default:
         return op;
     }

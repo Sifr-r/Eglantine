@@ -108,7 +108,11 @@ public:
 
     template <typename T>
     [[nodiscard]] inline const T* GetPointer(GPUVAddr addr) const noexcept {
-        return GetPointer<T*>(addr);
+        const auto address = GpuToCpuAddress(addr);
+        if (!address) {
+            return {};
+        }
+        return memory.GetPointer<T>(*address);
     }
 
     /**

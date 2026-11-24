@@ -292,7 +292,15 @@ std::vector<FileSys::VirtualDir> FindSidecarDirs(const FileSys::VirtualDir& exef
 AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys::VirtualFile file_,
                                                                          bool override_update_)
     : AppLoader(std::move(file_)), override_update(override_update_) {
+    if (file == nullptr) {
+        return;
+    }
+
     const auto file_dir = file->GetContainingDirectory();
+    if (file_dir == nullptr) {
+        return;
+    }
+
     const auto sidecar_dirs = FindSidecarDirs(file_dir);
 
     // Title ID
@@ -367,8 +375,8 @@ AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(FileSys
 
 AppLoader_DeconstructedRomDirectory::AppLoader_DeconstructedRomDirectory(
     FileSys::VirtualDir directory, bool override_update_)
-    : AppLoader(directory->GetFile("main")), dir(std::move(directory)),
-      override_update(override_update_) {
+    : AppLoader(directory != nullptr ? directory->GetFile("main") : nullptr),
+      dir(std::move(directory)), override_update(override_update_) {
     romfs_exefs_dir = dir;
 }
 
@@ -383,11 +391,28 @@ const FileSys::VirtualFile& AppLoader_DeconstructedRomDirectory::LooseRomFS() {
 }
 
 FileType AppLoader_DeconstructedRomDirectory::IdentifyType(const FileSys::VirtualFile& dir_file) {
-    if (FileSys::IsDirectoryExeFS(dir_file->GetContainingDirectory())) {
+    if (dir_file == nullptr) {
+        return FileType::Error;
+    }
+
+    const auto containing_dir = dir_file->GetContainingDirectory();
+    if (containing_dir == nullptr) {
+        return FileType::Error;
+    }
+
+    if (FileSys::IsDirectoryExeFS(containing_dir)) {
         return FileType::DeconstructedRomDirectory;
     }
 
     return FileType::Error;
+}
+
+FileType AppLoader_DeconstructedRomDirectory::GetFileType() const {
+    if (dir != nullptr) {
+        return FileSys::IsDirectoryExeFS(dir) ? FileType::DeconstructedRomDirectory
+                                              : FileType::Error;
+    }
+    return IdentifyType(file);
 }
 
 AppLoader_DeconstructedRomDirectory::LoadResult AppLoader_DeconstructedRomDirectory::Load(

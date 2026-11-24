@@ -90,8 +90,12 @@ ResourceManager::~ResourceManager() {
     system.CoreTiming().UnscheduleEvent(default_update_event);
     system.CoreTiming().UnscheduleEvent(mouse_keyboard_update_event);
     system.CoreTiming().UnscheduleEvent(motion_update_event);
-    system.CoreTiming().UnscheduleEvent(touch_update_event);
-    input_event->Finalize(system.Kernel());
+    if (touch_update_event != nullptr) {
+        system.CoreTiming().UnscheduleEvent(touch_update_event);
+    }
+    if (input_event != nullptr) {
+        input_event->Finalize(system.Kernel());
+    }
 };
 
 void ResourceManager::Initialize() {
@@ -439,8 +443,7 @@ Result ResourceManager::GetVibrationDeviceInfo(Core::HID::VibrationDeviceInfo& d
             break;
         case Core::HID::DeviceIndex::None:
         default:
-            ASSERT_MSG(false, "DeviceIndex should never be None!");
-            break;
+            return ResultVibrationDeviceIndexOutOfRange;
         }
     }
     return ResultSuccess;

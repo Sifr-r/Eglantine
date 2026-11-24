@@ -80,16 +80,16 @@ public:
         sync_values.clear();
         sync_values.reserve(pending_sync.size());
         for (size_t pending_id : pending_sync) {
-            auto& query = slot_queries[pending_id];
-            if (True(query.flags & QueryFlagBits::IsRewritten) ||
-                True(query.flags & QueryFlagBits::IsInvalidated)) {
+            auto* const query = this->GetQuery(pending_id);
+            if (!query || True(query->flags & QueryFlagBits::IsRewritten) ||
+                True(query->flags & QueryFlagBits::IsInvalidated)) {
                 continue;
             }
-            query.flags |= QueryFlagBits::IsHostSynced;
+            query->flags |= QueryFlagBits::IsHostSynced;
             sync_values.emplace_back(SyncValuesStruct{
-                .address = query.guest_address,
-                .value = query.value,
-                .size = static_cast<u64>(True(query.flags & QueryFlagBits::HasTimestamp) ? 8 : 4)});
+                .address = query->guest_address,
+                .value = query->value,
+                .size = static_cast<u64>(True(query->flags & QueryFlagBits::HasTimestamp) ? 8 : 4)});
         }
         pending_sync.clear();
         if (sync_values.size() > 0) {
@@ -186,6 +186,7 @@ struct QueryCacheBase<Traits>::QueryCacheBaseImpl {
     u64 streamer_mask;
     std::mutex flush_guard;
     std::deque<u64> flushes_pending;
+    std::mutex pending_unregister_guard;
     std::vector<QueryCacheBase<Traits>::QueryLocation> pending_unregister;
 };
 
@@ -337,6 +338,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         } const settle{Core::Nx2SessionState::Lock(op_meta.nx2_handle), op_meta.settle_slot};
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
             if (!op_meta.is_synced) {
+                std::scoped_lock lk{impl->pending_unregister_guard};
                 impl->pending_unregister.push_back(op_meta.location);
             }
             return;
@@ -345,6 +347,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             LOG_ERROR(HW_GPU,
                       "Query report value not synchronized. Consider increasing GPU accuracy.");
             if (!op_meta.is_synced) {
+                std::scoped_lock lk{impl->pending_unregister_guard};
                 impl->pending_unregister.push_back(op_meta.location);
             }
             return;
@@ -373,6 +376,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
                                                        static_cast<u32>(query_base->value));
         }
         if (!op_meta.is_synced) {
+            std::scoped_lock lk{impl->pending_unregister_guard};
             impl->pending_unregister.push_back(op_meta.location);
         }
     };
@@ -410,21 +414,29 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
 
 template <typename Traits>
 void QueryCacheBase<Traits>::UnregisterPending() {
-    if (impl->pending_unregister.empty()) {
-        return;
+    std::vector<QueryLocation> pending;
+    {
+        std::scoped_lock lk{impl->pending_unregister_guard};
+        if (impl->pending_unregister.empty()) {
+            return;
+        }
+        pending.swap(impl->pending_unregister);
     }
     const auto gen_caching_indexing = [](VAddr cur_addr) {
         return std::make_pair<u64, u32>(cur_addr >> Core::DEVICE_PAGEBITS,
                                         static_cast<u32>(cur_addr & Core::DEVICE_PAGEMASK));
     };
     std::scoped_lock lock(cache_mutex);
-    for (QueryLocation loc : impl->pending_unregister) {
+    for (QueryLocation loc : pending) {
         const auto [streamer_id, query_id] = loc.unpack();
         auto* streamer = impl->streamers[streamer_id];
         if (!streamer) [[unlikely]] {
             continue;
         }
         auto* query = streamer->GetQuery(query_id);
+        if (!query) {
+            continue;
+        }
         auto [cont_addr, base] = gen_caching_indexing(query->guest_address);
         auto it1 = cached_queries.find(cont_addr);
         if (it1 != cached_queries.end()) {
@@ -440,7 +452,6 @@ void QueryCacheBase<Traits>::UnregisterPending() {
         }
         streamer->Free(query_id);
     }
-    impl->pending_unregister.clear();
 }
 
 template <typename Traits>
@@ -662,13 +673,12 @@ bool QueryCacheBase<Traits>::SemiFlushQueryDirty(QueryCacheBase<Traits>::QueryLo
     }
     if (True(query_base->flags & QueryFlagBits::IsFinalValueSynced) &&
         False(query_base->flags & QueryFlagBits::IsGuestSynced)) {
-        auto* ptr = impl->device_memory.template GetPointer<u8>(query_base->guest_address);
         if (True(query_base->flags & QueryFlagBits::HasTimestamp)) {
-            std::memcpy(ptr, &query_base->value, sizeof(query_base->value));
-            return false;
+            impl->device_memory.template Write<u64>(query_base->guest_address, query_base->value);
+        } else {
+            impl->device_memory.template Write<u32>(query_base->guest_address,
+                                                    static_cast<u32>(query_base->value));
         }
-        u32 value_l = static_cast<u32>(query_base->value);
-        std::memcpy(ptr, &value_l, sizeof(value_l));
         return false;
     }
     return True(query_base->flags & QueryFlagBits::IsHostManaged) &&

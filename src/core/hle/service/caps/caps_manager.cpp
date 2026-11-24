@@ -405,6 +405,7 @@ Result AlbumManager::LoadImage(std::span<u8> out_image, const std::filesystem::p
 
     stbir_resize_uint8_srgb(dbi_image, original_width, original_height, 0, out_image.data(), width,
                             height, 0, STBI_rgb_alpha, 3, filter_flag);
+    stbi_image_free(dbi_image);
 
     return ResultSuccess;
 }
@@ -421,6 +422,16 @@ static void PNGToMemory(void* context, void* data, int len) {
 
 Result AlbumManager::SaveImage(ApplicationAlbumEntry& out_entry, std::span<const u8> image,
                                u64 title_id, const AlbumFileDateTime& date) const {
+    constexpr int screenshot_width = 1280;
+    constexpr int screenshot_height = 720;
+    constexpr std::size_t expected_image_size =
+        static_cast<std::size_t>(screenshot_width) * screenshot_height * STBI_rgb_alpha;
+    if (image.size() < expected_image_size) {
+        LOG_ERROR(Service_Capture, "Image buffer too small: {} < {}", image.size(),
+                  expected_image_size);
+        return ResultUnknown;
+    }
+
     const auto screenshot_path =
         Common::FS::GetEdenPathString(Common::FS::EdenPath::ScreenshotsDir);
     const std::string formatted_date =
@@ -433,8 +444,8 @@ Result AlbumManager::SaveImage(ApplicationAlbumEntry& out_entry, std::span<const
                                      Common::FS::FileType::BinaryFile};
 
     std::vector<u8> png_image;
-    if (!stbi_write_png_to_func(PNGToMemory, &png_image, 1280, 720, STBI_rgb_alpha, image.data(),
-                                0)) {
+    if (!stbi_write_png_to_func(PNGToMemory, &png_image, screenshot_width, screenshot_height,
+                                STBI_rgb_alpha, image.data(), 0)) {
         return ResultFileCountLimit;
     }
 

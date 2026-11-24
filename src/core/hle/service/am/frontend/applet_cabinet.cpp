@@ -106,11 +106,14 @@ void Cabinet::DisplayCompleted(bool apply_changes, std::string_view amiibo_name)
 
     if (!apply_changes) {
         Cancel();
+        return;
     }
 
-    if (nfp_device->GetCurrentState() != Service::NFC::DeviceState::TagFound &&
-        nfp_device->GetCurrentState() != Service::NFC::DeviceState::TagMounted) {
+    if (nfp_device == nullptr ||
+        (nfp_device->GetCurrentState() != Service::NFC::DeviceState::TagFound &&
+         nfp_device->GetCurrentState() != Service::NFC::DeviceState::TagMounted)) {
         Cancel();
+        return;
     }
 
     if (nfp_device->GetCurrentState() == Service::NFC::DeviceState::TagFound) {
@@ -142,7 +145,7 @@ void Cabinet::DisplayCompleted(bool apply_changes, std::string_view amiibo_name)
     }
 
     applet_output.device_handle = applet_input_common.device_handle;
-    applet_output.result = CabinetResult::Cancel;
+    applet_output.result = CabinetResult{};
     const auto reg_result = nfp_device->GetRegisterInfo(applet_output.register_info);
     const auto tag_result = nfp_device->GetTagInfo(applet_output.tag_info);
     nfp_device->Finalize();
@@ -168,7 +171,9 @@ void Cabinet::Cancel() {
     ReturnValueForAmiiboSettings applet_output{};
     applet_output.device_handle = applet_input_common.device_handle;
     applet_output.result = CabinetResult::Cancel;
-    nfp_device->Finalize();
+    if (nfp_device != nullptr) {
+        nfp_device->Finalize();
+    }
 
     std::vector<u8> out_data(sizeof(ReturnValueForAmiiboSettings));
     std::memcpy(out_data.data(), &applet_output, sizeof(ReturnValueForAmiiboSettings));

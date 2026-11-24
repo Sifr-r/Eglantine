@@ -1097,6 +1097,55 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         }
     } clearing_scope{clearing_render_targets};
     clearing_render_targets = is_clear;
+    const auto is_full_color_clear = [&](ImageViewId view_id, size_t slot_index) {
+        if (!is_clear || !view_id) {
+            return false;
+        }
+        const auto& regs = maxwell3d->regs;
+        const auto& clear = regs.clear_surface;
+        if (clear.layer != 0 || !clear.R || !clear.G || !clear.B || !clear.A ||
+            clear.RT != slot_index || slot_index >= regs.rt_control.count ||
+            regs.rt_control.Map(slot_index) != slot_index) {
+            return false;
+        }
+        return IsFullClear(view_id);
+    };
+    const auto is_full_depth_clear = [&](ImageViewId view_id) {
+        if (!is_clear || !view_id) {
+            return false;
+        }
+        const auto& regs = maxwell3d->regs;
+        const auto& clear = regs.clear_surface;
+        if (clear.layer != 0 || !regs.zeta_enable) {
+            return false;
+        }
+        const ImageViewBase& view = slot_image_views[view_id];
+        if (view.IsBuffer()) {
+            return false;
+        }
+        const ImageBase& image = slot_images[view.image_id];
+        const bool full_stencil = clear.S && regs.stencil_front_mask == 0xFF;
+        switch (VideoCore::Surface::GetFormatType(image.info.format)) {
+        case VideoCore::Surface::SurfaceType::Depth:
+            if (!clear.Z) {
+                return false;
+            }
+            break;
+        case VideoCore::Surface::SurfaceType::Stencil:
+            if (!full_stencil) {
+                return false;
+            }
+            break;
+        case VideoCore::Surface::SurfaceType::DepthStencil:
+            if (!clear.Z || !full_stencil) {
+                return false;
+            }
+            break;
+        default:
+            return false;
+        }
+        return IsFullClear(view_id);
+    };
     auto& flags = maxwell3d->dirty.flags;
     if (!flags[Dirty::RenderTargets]) {
         if (rt_active_mask == 0) {
@@ -1105,11 +1154,11 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         for (u32 mask = rt_active_mask & ((1u << NUM_RT) - 1); mask != 0; mask &= mask - 1) {
             const size_t index = static_cast<size_t>(std::countr_zero(mask));
             PrepareImage(rt_image_id[index], true,
-                         is_clear && IsFullClear(render_targets.color_buffer_ids[index]));
+                         is_full_color_clear(render_targets.color_buffer_ids[index], index));
         }
         if ((rt_active_mask & (1u << NUM_RT)) != 0) {
             PrepareImage(rt_depth_image_id, true,
-                         is_clear && IsFullClear(render_targets.depth_buffer_id));
+                         is_full_depth_clear(render_targets.depth_buffer_id));
         }
         return;
     }
@@ -1124,11 +1173,11 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
 
     for (size_t index = 0; index < NUM_RT; ++index) {
         ImageViewId& color_buffer_id = render_targets.color_buffer_ids[index];
-        PrepareImageView(color_buffer_id, true, is_clear && IsFullClear(color_buffer_id));
+        PrepareImageView(color_buffer_id, true, is_full_color_clear(color_buffer_id, index));
     }
     const ImageViewId depth_buffer_id = render_targets.depth_buffer_id;
 
-    PrepareImageView(depth_buffer_id, true, is_clear && IsFullClear(depth_buffer_id));
+    PrepareImageView(depth_buffer_id, true, is_full_depth_clear(depth_buffer_id));
 
     rt_active_mask = 0;
     rt_image_id = {};
@@ -4326,6 +4375,9 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
                 }
                 vector_it = image_map_ids.erase(vector_it);
             }
+            if (image_map_ids.empty()) {
+                page_table.erase(page_it);
+            }
         });
         slot_map_views.erase(map_view_id);
     }
@@ -4394,6 +4446,20 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         if (async_decode->image_id == image_id) {
             async_decode->cancelled = true;
         }
+    }
+    bool removed_unswizzle = false;
+    std::erase_if(unswizzle_queue, [this, image_id, &removed_unswizzle](PendingUnswizzle& task) {
+        if (task.image_id != image_id) {
+            return false;
+        }
+        if (task.initialized) {
+            runtime.FreeDeferredStagingBuffer(task.staging_buffer);
+        }
+        removed_unswizzle = true;
+        return true;
+    });
+    if (removed_unswizzle) {
+        image.flags &= ~ImageFlagBits::IsDecoding;
     }
     if (image.HasScaled()) {
         total_used_memory -= GetScaledImageSizeBytes(image);

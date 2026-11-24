@@ -85,7 +85,12 @@ u64 Freezer::Freeze(VAddr address, u32 width) {
     std::scoped_lock lock{entries_mutex};
 
     const auto current_value = MemoryReadWidth(memory, width, address);
-    entries.push_back({address, width, current_value});
+    if (const auto iter = FindEntry(address); iter != entries.end()) {
+        iter->width = width;
+        iter->value = current_value;
+    } else {
+        entries.push_back({address, width, current_value});
+    }
 
     LOG_DEBUG(Common_Memory,
               "Freezing memory for address={:016X}, width={:02X}, current_value={:016X}", address,

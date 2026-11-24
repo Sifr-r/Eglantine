@@ -7,6 +7,7 @@
 #pragma once
 
 #include <list>
+#include <mutex>
 
 #include "common/common_types.h"
 #include "core/hle/kernel/k_event.h"
@@ -28,11 +29,12 @@ private:
     using OperationEventList = Common::IntrusiveListBaseTraits<OperationEvent>::ListType;
 
 public:
-    virtual ~ContextWriter() = default;
+    virtual ~ContextWriter();
 
     virtual Result Write(const SystemClockContext& context) = 0;
     void SignalAllNodes(Kernel::KernelCore& kernel);
     void Link(OperationEvent& operation_event);
+    void Unlink(OperationEvent& operation_event);
 
 private:
     OperationEventList m_operation_events;

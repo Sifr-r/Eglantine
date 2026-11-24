@@ -14,6 +14,9 @@
 
 PlayerControlPreview::PlayerControlPreview(QWidget* parent) : QFrame(parent) {
     is_controller_set = false;
+    qRegisterMetaType<Core::HID::ControllerTriggerType>("Core::HID::ControllerTriggerType");
+    connect(this, &PlayerControlPreview::ControllerUpdateRequested, this,
+            &PlayerControlPreview::ControllerUpdate, Qt::QueuedConnection);
     QTimer* timer = new QTimer(this);
     connect(timer, &QTimer::timeout, this, QOverload<>::of(&PlayerControlPreview::UpdateInput));
 
@@ -27,10 +30,16 @@ PlayerControlPreview::~PlayerControlPreview() {
 
 void PlayerControlPreview::SetController(Core::HID::EmulatedController* controller_) {
     UnloadController();
+    if (controller_ == nullptr) {
+        return;
+    }
     is_controller_set = true;
     controller = controller_;
     Core::HID::ControllerUpdateCallback engine_callback{
-        .on_change = [this](Core::HID::ControllerTriggerType type) { ControllerUpdate(type); },
+        .on_change =
+            [this](Core::HID::ControllerTriggerType type) {
+                emit ControllerUpdateRequested(type);
+            },
         .is_npad_service = false,
     };
     callback_key = controller->SetCallback(engine_callback);
@@ -40,6 +49,7 @@ void PlayerControlPreview::SetController(Core::HID::EmulatedController* controll
 void PlayerControlPreview::UnloadController() {
     if (is_controller_set) {
         controller->DeleteCallback(callback_key);
+        controller = nullptr;
         is_controller_set = false;
     }
 }
@@ -131,6 +141,9 @@ void PlayerControlPreview::ResetInputs() {
 }
 
 void PlayerControlPreview::ControllerUpdate(Core::HID::ControllerTriggerType type) {
+    if (!is_controller_set || controller == nullptr) {
+        return;
+    }
     if (type == Core::HID::ControllerTriggerType::All) {
         ControllerUpdate(Core::HID::ControllerTriggerType::Color);
         ControllerUpdate(Core::HID::ControllerTriggerType::Type);

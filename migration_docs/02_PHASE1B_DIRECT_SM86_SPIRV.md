@@ -1,9 +1,9 @@
 # Phase 1B — Direct SM86 -> SSA IR -> SPIR-V 1.6 Compiler (`ampere_spirv`)
 
 > [!NOTE]
-> **Proposed after Phase 1A.** The current [workspace manifest](../rust/Cargo.toml) contains only the Ampere lowering crate. There is no direct compiler or runtime selector in the emulator. The design below targets SPIR-V 1.6 on devices whose Vulkan profile supports it.
+> **Integrated, runtime opt-in for eligible compute shaders.** The [Rust compiler](../rust/crates/ampere_spirv/) targets SPIR-V 1.6. The [Vulkan pipeline cache](../src/video_core/renderer_vulkan/vk_pipeline_cache.cpp) selects it with `EDEN_NX2_DIRECT_SM86=1` when the stage, shader and host capabilities qualify, with Maxwell lowering available as fallback. Run the [direct-path tests](../src/tests/video_core/ampere_direct_spirv.cpp) with `[ampere]` in a build with `ENABLE_RUST_AMP_SPIRV=ON`. See the [architecture ledger](../ARCHITECTURE.md#first-party-language-and-domain-ownership) for the build boundaries.
 >
-> The current translator can read live GPU state while compiling. Capture all inputs on the owning thread before queuing a worker. Keep the Maxwell path available when an input cannot be captured or a device lacks a required capability. See the [environment interface](../src/video_core/shader_environment.h) and the [Phase 1A parity gates](01_PHASE1A_RUST_AMPERE_PARITY.md).
+> The design below is the original proposal, including graphics routing, build targets and verification switches. Consult the [environment interface](../src/video_core/shader_environment.h) for current shader capture and the [Phase 0 procedure](00_PREREQUISITES_AND_BASELINE.md) for baseline measurements.
 
 ---
 

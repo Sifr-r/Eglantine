@@ -16,12 +16,31 @@
 #include "qt_common/abstract/progress.h"
 #include "qt_common/qt_common.h"
 
+#include <algorithm>
+#include <atomic>
 #include <JlCompress.h>
 #include <QFuture>
 #include <QFutureWatcher>
 #include <QtConcurrentRun>
 
 namespace QtCommon::Content {
+
+namespace {
+
+int CalculateProgressPercent(std::size_t total_size, std::size_t processed_size,
+                             int max_percent = 100) {
+    if (total_size == 0 || max_percent <= 0) {
+        return 0;
+    }
+    if (processed_size >= total_size) {
+        return max_percent;
+    }
+    return static_cast<int>(
+        (std::min)((processed_size * static_cast<std::size_t>(max_percent)) / total_size,
+                   static_cast<std::size_t>(max_percent)));
+}
+
+} // namespace
 
 bool CheckGameFirmware(u64 program_id) {
     if (FirmwareManager::GameRequiresFirmware(program_id) &&
@@ -49,7 +68,7 @@ void InstallFirmware(const QString& location, bool recursive) {
     // Declare progress callback.
     auto callback = [&](size_t total_size, size_t processed_size) {
         QGuiApplication::processEvents();
-        progress->setValue(static_cast<int>((processed_size * 100) / total_size));
+        progress->setValue(CalculateProgressPercent(total_size, processed_size));
         return progress->wasCanceled();
     };
 
@@ -150,7 +169,7 @@ void InstallFirmware(const QString& location, bool recursive) {
 
     auto VerifyFirmwareCallback = [&](size_t total_size, size_t processed_size) {
         QGuiApplication::processEvents();
-        progress->setValue(90 + static_cast<int>((processed_size * 10) / total_size));
+        progress->setValue(90 + CalculateProgressPercent(total_size, processed_size, 10));
         return progress->wasCanceled();
     };
 
@@ -211,7 +230,7 @@ void VerifyGameContents(const std::string& game_path) {
 
     const auto callback = [&](size_t total_size, size_t processed_size) {
         QGuiApplication::processEvents();
-        progress->setValue(static_cast<int>((processed_size * 100) / total_size));
+        progress->setValue(CalculateProgressPercent(total_size, processed_size));
         return progress->wasCanceled();
     };
 
@@ -268,7 +287,7 @@ void VerifyInstalledContents() {
     // Declare progress callback.
     auto QtProgressCallback = [&](size_t total_size, size_t processed_size) {
         QGuiApplication::processEvents();
-        progress->setValue(static_cast<int>((processed_size * 100) / total_size));
+        progress->setValue(CalculateProgressPercent(total_size, processed_size));
         return progress->wasCanceled();
     };
 
@@ -382,11 +401,18 @@ void ExportDataDir(FrontendCommon::DataManager::DataDir data_dir, const std::str
     progress->setTitle(tr("Exporting"));
     progress->show();
 
+    auto canceled = std::make_shared<std::atomic_bool>(false);
+    QObject::connect(progress, &QtProgressDialog::canceled, progress,
+                     [canceled] { canceled->store(true, std::memory_order_relaxed); });
+
+    auto last_percent = std::make_shared<std::atomic<int>>(-1);
     auto progress_callback = [=](size_t total_size, size_t processed_size) {
-        QMetaObject::invokeMethod(
-            progress, "setValue", Qt::DirectConnection,
-            Q_ARG(int, static_cast<int>((processed_size * 100) / total_size)));
-        return !progress->wasCanceled();
+        const int value = CalculateProgressPercent(total_size, processed_size);
+        if (last_percent->exchange(value, std::memory_order_relaxed) != value) {
+            QMetaObject::invokeMethod(progress, "setValue", Qt::QueuedConnection,
+                                      Q_ARG(int, value));
+        }
+        return !canceled->load(std::memory_order_relaxed);
     };
 
     QFuture<bool> future = QtConcurrent::run([=]() {
@@ -397,11 +423,12 @@ void ExportDataDir(FrontendCommon::DataManager::DataDir data_dir, const std::str
     QFutureWatcher<bool>* watcher = new QFutureWatcher<bool>(rootObject);
 
     QObject::connect(watcher, &QFutureWatcher<bool>::finished, rootObject, [=]() {
+        const bool was_canceled = canceled->load(std::memory_order_relaxed);
         progress->close();
 
         if (watcher->result()) {
             Information(tr("Exported Successfully"), tr("Data was exported successfully."));
-        } else if (progress->wasCanceled()) {
+        } else if (was_canceled) {
             Information(tr("Export Cancelled"), tr("Export was cancelled by the user."));
         } else {
             Critical(
@@ -445,21 +472,39 @@ void ImportDataDir(FrontendCommon::DataManager::DataDir data_dir, const std::str
     progress->setTitle(tr("Importing"));
     progress->show();
 
+    auto canceled = std::make_shared<std::atomic_bool>(false);
+    QObject::connect(progress, &QtProgressDialog::canceled, progress,
+                     [canceled] { canceled->store(true, std::memory_order_relaxed); });
+
     // to prevent GUI mangling we have to run this in a thread as well
     QFuture<bool> delete_future = QtConcurrent::run([=]() {
         FrontendCommon::DataManager::ClearDir(data_dir, user_id);
-        return !progress->wasCanceled();
+        return !canceled->load(std::memory_order_relaxed);
     });
 
     QFutureWatcher<bool>* delete_watcher = new QFutureWatcher<bool>(rootObject);
-    delete_watcher->setFuture(delete_future);
 
     QObject::connect(delete_watcher, &QFutureWatcher<bool>::finished, rootObject, [=]() {
+        const bool continue_import =
+            delete_watcher->result() && !canceled->load(std::memory_order_relaxed);
+        delete_watcher->deleteLater();
+        if (!continue_import) {
+            progress->close();
+            Information(tr("Import Cancelled"), tr("Import was cancelled by the user."));
+            progress->deleteLater();
+            if (callback)
+                callback();
+            return;
+        }
+
+        auto last_percent = std::make_shared<std::atomic<int>>(-1);
         auto progress_callback = [=](size_t total_size, size_t processed_size) {
-            QMetaObject::invokeMethod(
-                progress, "setValue", Qt::DirectConnection,
-                Q_ARG(int, static_cast<int>((processed_size * 100) / total_size)));
-            return !progress->wasCanceled();
+            const int value = CalculateProgressPercent(total_size, processed_size);
+            if (last_percent->exchange(value, std::memory_order_relaxed) != value) {
+                QMetaObject::invokeMethod(progress, "setValue", Qt::QueuedConnection,
+                                          Q_ARG(int, value));
+            }
+            return !canceled->load(std::memory_order_relaxed);
         };
 
         QFuture<bool> future = QtConcurrent::run([=]() {
@@ -471,12 +516,13 @@ void ImportDataDir(FrontendCommon::DataManager::DataDir data_dir, const std::str
         QFutureWatcher<bool>* watcher = new QFutureWatcher<bool>(rootObject);
 
         QObject::connect(watcher, &QFutureWatcher<bool>::finished, rootObject, [=]() {
+            const bool was_canceled = canceled->load(std::memory_order_relaxed);
             progress->close();
 
             // this sucks
             if (watcher->result()) {
                 Information(tr("Imported Successfully"), tr("Data was imported successfully."));
-            } else if (progress->wasCanceled()) {
+            } else if (was_canceled) {
                 Information(tr("Import Cancelled"), tr("Import was cancelled by the user."));
             } else {
                 Critical(tr("Import Failed"),
@@ -492,6 +538,8 @@ void ImportDataDir(FrontendCommon::DataManager::DataDir data_dir, const std::str
 
         watcher->setFuture(future);
     });
+
+    delete_watcher->setFuture(delete_future);
 }
 
 bool CheckKeys() {

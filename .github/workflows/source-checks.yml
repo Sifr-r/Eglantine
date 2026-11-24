@@ -42,7 +42,9 @@ jobs:
 
       - name: Verify modified file SPDX headers
         shell: bash
-        run: sh tools/ci/license-header.sh --base "origin/${{ github.base_ref }}"
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: sh tools/ci/license-header.sh --base "origin/$BASE_REF"
 
   tests:
     name: Linux tests

@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstring>
 #include <utility>
 #include "core/file_sys/vfs/vfs_vector.h"
 
@@ -40,17 +41,24 @@ bool VectorVfsFile::IsReadable() const {
 }
 
 std::size_t VectorVfsFile::Read(u8* data_, std::size_t length, std::size_t offset) const {
+    if (length == 0 || offset >= data.size()) {
+        return 0;
+    }
     const auto read = (std::min)(length, data.size() - offset);
     std::memcpy(data_, data.data() + offset, read);
     return read;
 }
 
 std::size_t VectorVfsFile::Write(const u8* data_, std::size_t length, std::size_t offset) {
-    if (offset + length > data.size())
-        data.resize(offset + length);
-    const auto write = (std::min)(length, data.size() - offset);
-    std::memcpy(data.data() + offset, data_, write);
-    return write;
+    if (length == 0 || offset > data.max_size() || length > data.max_size() - offset) {
+        return 0;
+    }
+    const auto end = offset + length;
+    if (end > data.size()) {
+        data.resize(end);
+    }
+    std::memcpy(data.data() + offset, data_, length);
+    return length;
 }
 
 bool VectorVfsFile::Rename(std::string_view name_) {

@@ -14,7 +14,7 @@
 namespace FileSys {
 
 CNMT::CNMT(VirtualFile file) {
-    if (file->ReadObject(&header) != sizeof(CNMTHeader))
+    if (file == nullptr || file->ReadObject(&header) != sizeof(CNMTHeader))
         return;
 
     // If type is {Application, Update, AOC} has opt-header.
@@ -24,20 +24,29 @@ CNMT::CNMT(VirtualFile file) {
         }
     }
 
+    const std::size_t content_base =
+        sizeof(CNMTHeader) + static_cast<std::size_t>(header.table_offset);
     for (u16 i = 0; i < header.number_content_entries; ++i) {
-        auto& next = content_records.emplace_back(ContentRecord{});
-        if (file->ReadObject(&next, sizeof(CNMTHeader) + i * sizeof(ContentRecord) +
-                                        header.table_offset) != sizeof(ContentRecord)) {
-            content_records.erase(content_records.end() - 1);
+        ContentRecord next{};
+        if (file->ReadObject(&next, content_base + static_cast<std::size_t>(i) *
+                                                       sizeof(ContentRecord)) !=
+            sizeof(ContentRecord)) {
+            break;
         }
+        content_records.emplace_back(next);
     }
 
+    const std::size_t meta_base =
+        content_base +
+        static_cast<std::size_t>(header.number_content_entries) * sizeof(ContentRecord);
     for (u16 i = 0; i < header.number_meta_entries; ++i) {
-        auto& next = meta_records.emplace_back(MetaRecord{});
-        if (file->ReadObject(&next, sizeof(CNMTHeader) + i * sizeof(MetaRecord) +
-                                        header.table_offset) != sizeof(MetaRecord)) {
-            meta_records.erase(meta_records.end() - 1);
+        MetaRecord next{};
+        if (file->ReadObject(&next,
+                             meta_base + static_cast<std::size_t>(i) * sizeof(MetaRecord)) !=
+            sizeof(MetaRecord)) {
+            break;
         }
+        meta_records.emplace_back(next);
     }
 }
 

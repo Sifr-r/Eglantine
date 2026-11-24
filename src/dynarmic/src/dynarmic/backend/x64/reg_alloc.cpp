@@ -102,12 +102,25 @@ void HostLocInfo::AddValue(HostLoc, IR::Inst* inst) noexcept {
 #ifndef NDEBUG
 void HostLocInfo::EmitVerboseDebuggingOutput(BlockOfCode& code, size_t host_loc_index) const noexcept {
     using namespace Xbyak::util;
+    if (values.empty()) {
+        return;
+    }
+    if constexpr (ABI_SHADOW_SPACE > 0) {
+        code.sub(rsp, u32(ABI_SHADOW_SPACE));
+    }
     for (auto const value : values) {
-        code.mov(code.ABI_PARAM1, rsp);
+        if constexpr (ABI_SHADOW_SPACE > 0) {
+            code.lea(code.ABI_PARAM1, ptr[rsp + ABI_SHADOW_SPACE]);
+        } else {
+            code.mov(code.ABI_PARAM1, rsp);
+        }
         code.mov(code.ABI_PARAM2, host_loc_index);
         code.mov(code.ABI_PARAM3, value->GetName());
         code.mov(code.ABI_PARAM4, GetBitWidth(value->GetType()));
         code.CallFunction(PrintVerboseDebuggingOutputLine);
+    }
+    if constexpr (ABI_SHADOW_SPACE > 0) {
+        code.add(rsp, u32(ABI_SHADOW_SPACE));
     }
 }
 #endif

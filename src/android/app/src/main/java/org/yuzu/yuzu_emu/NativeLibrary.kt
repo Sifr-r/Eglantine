@@ -441,19 +441,34 @@ object NativeLibrary {
     @Keep
     @JvmStatic
     fun onEmulationStarted() {
-        sEmulationActivity.get()!!.onEmulationStarted()
+        val emulationActivity = sEmulationActivity.get()
+        if (emulationActivity == null) {
+            Log.warning("[NativeLibrary] EmulationActivity not present in onEmulationStarted.")
+            return
+        }
+        emulationActivity.onEmulationStarted()
     }
 
     @Keep
     @JvmStatic
     fun onEmulationStopped(status: Int) {
-        sEmulationActivity.get()!!.onEmulationStopped(status)
+        val emulationActivity = sEmulationActivity.get()
+        if (emulationActivity == null) {
+            Log.warning("[NativeLibrary] EmulationActivity not present in onEmulationStopped.")
+            return
+        }
+        emulationActivity.onEmulationStopped(status)
     }
 
     @Keep
     @JvmStatic
     fun onProgramChanged(programIndex: Int) {
-        sEmulationActivity.get()!!.onProgramChanged(programIndex)
+        val emulationActivity = sEmulationActivity.get()
+        if (emulationActivity == null) {
+            Log.warning("[NativeLibrary] EmulationActivity not present in onProgramChanged.")
+            return
+        }
+        emulationActivity.onProgramChanged(programIndex)
     }
 
     /**

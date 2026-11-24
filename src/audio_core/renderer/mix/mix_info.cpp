@@ -57,8 +57,8 @@ bool MixInfo::Update(EdgeMatrix& edge_matrix, const InParameter& in_params,
         const auto& info{effect_context.GetInfo(i)};
         if (mix_id == info.GetMixId()) {
             const auto processing_order{info.GetProcessingOrder()};
-            if (processing_order > effect_count) {
-                break;
+            if (processing_order < 0 || processing_order >= effect_count) {
+                continue;
             }
             effect_order_buffer[processing_order] = i;
         }

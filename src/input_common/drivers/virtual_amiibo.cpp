@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <cstring>
 #include <fmt/ranges.h>
 
@@ -28,19 +29,30 @@ VirtualAmiibo::~VirtualAmiibo() = default;
 Common::Input::DriverResult VirtualAmiibo::SetPollingMode(
     [[maybe_unused]] const PadIdentifier& identifier_,
     const Common::Input::PollingMode polling_mode_) {
-    polling_mode = polling_mode_;
+    std::optional<Common::Input::NfcStatus> notify_status;
+    Common::Input::DriverResult result = Common::Input::DriverResult::NotSupported;
+    {
+        std::scoped_lock lock{state_mutex};
+        polling_mode = polling_mode_;
 
-    switch (polling_mode) {
-    case Common::Input::PollingMode::NFC:
-        state = State::Initialized;
-        return Common::Input::DriverResult::Success;
-    default:
-        if (state == State::TagNearby) {
-            CloseAmiibo();
+        switch (polling_mode) {
+        case Common::Input::PollingMode::NFC:
+            state = State::Initialized;
+            result = Common::Input::DriverResult::Success;
+            break;
+        default:
+            if (state == State::TagNearby) {
+                CloseAmiiboLocked(notify_status);
+            }
+            state = State::Disabled;
+            result = Common::Input::DriverResult::NotSupported;
+            break;
         }
-        state = State::Disabled;
-        return Common::Input::DriverResult::NotSupported;
     }
+    if (notify_status.has_value()) {
+        SetNfc(identifier, *notify_status);
+    }
+    return result;
 }
 
 Common::Input::NfcState VirtualAmiibo::SupportsNfc(
@@ -48,6 +60,7 @@ Common::Input::NfcState VirtualAmiibo::SupportsNfc(
     return Common::Input::NfcState::Success;
 }
 Common::Input::NfcState VirtualAmiibo::StartNfcPolling(const PadIdentifier& identifier_) {
+    std::scoped_lock lock{state_mutex};
     if (state != State::Initialized) {
         return Common::Input::NfcState::WrongDeviceState;
     }
@@ -56,18 +69,26 @@ Common::Input::NfcState VirtualAmiibo::StartNfcPolling(const PadIdentifier& iden
 }
 
 Common::Input::NfcState VirtualAmiibo::StopNfcPolling(const PadIdentifier& identifier_) {
-    if (state == State::Disabled) {
-        return Common::Input::NfcState::WrongDeviceState;
+    std::optional<Common::Input::NfcStatus> notify_status;
+    {
+        std::scoped_lock lock{state_mutex};
+        if (state == State::Disabled) {
+            return Common::Input::NfcState::WrongDeviceState;
+        }
+        if (state == State::TagNearby) {
+            CloseAmiiboLocked(notify_status);
+        }
+        state = State::Initialized;
     }
-    if (state == State::TagNearby) {
-        CloseAmiibo();
+    if (notify_status.has_value()) {
+        SetNfc(identifier, *notify_status);
     }
-    state = State::Initialized;
     return Common::Input::NfcState::Success;
 }
 
 Common::Input::NfcState VirtualAmiibo::ReadAmiiboData(const PadIdentifier& identifier_,
                                                       std::vector<u8>& out_data) {
+    std::scoped_lock lock{state_mutex};
     if (state != State::TagNearby) {
         return Common::Input::NfcState::WrongDeviceState;
     }
@@ -77,12 +98,13 @@ Common::Input::NfcState VirtualAmiibo::ReadAmiiboData(const PadIdentifier& ident
     }
 
     out_data.resize(nfc_data.size());
-    memcpy(out_data.data(), nfc_data.data(), nfc_data.size());
+    std::memcpy(out_data.data(), nfc_data.data(), nfc_data.size());
     return Common::Input::NfcState::Success;
 }
 
 Common::Input::NfcState VirtualAmiibo::WriteNfcData(
     [[maybe_unused]] const PadIdentifier& identifier_, const std::vector<u8>& data) {
+    std::scoped_lock lock{state_mutex};
     const Common::FS::IOFile nfc_file{file_path, Common::FS::FileAccessMode::ReadWrite,
                                       Common::FS::FileType::BinaryFile};
 
@@ -104,6 +126,7 @@ Common::Input::NfcState VirtualAmiibo::WriteNfcData(
 Common::Input::NfcState VirtualAmiibo::ReadMifareData(const PadIdentifier& identifier_,
                                                       const Common::Input::MifareRequest& request,
                                                       Common::Input::MifareRequest& out_data) {
+    std::scoped_lock lock{state_mutex};
     if (state != State::TagNearby) {
         return Common::Input::NfcState::WrongDeviceState;
     }
@@ -127,8 +150,8 @@ Common::Input::NfcState VirtualAmiibo::ReadMifareData(const PadIdentifier& ident
         }
 
         // Ignore the sector key as we don't support it
-        memcpy(out_data.data[i].data.data(), nfc_data.data() + sector_index,
-               sizeof(Common::Input::MifareData::data));
+        std::memcpy(out_data.data[i].data.data(), nfc_data.data() + sector_index,
+                    sizeof(Common::Input::MifareData::data));
     }
 
     return Common::Input::NfcState::Success;
@@ -136,6 +159,7 @@ Common::Input::NfcState VirtualAmiibo::ReadMifareData(const PadIdentifier& ident
 
 Common::Input::NfcState VirtualAmiibo::WriteMifareData(
     const PadIdentifier& identifier_, const Common::Input::MifareRequest& request) {
+    std::scoped_lock lock{state_mutex};
     if (state != State::TagNearby) {
         return Common::Input::NfcState::WrongDeviceState;
     }
@@ -157,14 +181,15 @@ Common::Input::NfcState VirtualAmiibo::WriteMifareData(
         }
 
         // Ignore the sector key as we don't support it
-        memcpy(nfc_data.data() + sector_index, request.data[i].data.data(),
-               sizeof(Common::Input::MifareData::data));
+        std::memcpy(nfc_data.data() + sector_index, request.data[i].data.data(),
+                    sizeof(Common::Input::MifareData::data));
     }
 
     return Common::Input::NfcState::Success;
 }
 
 VirtualAmiibo::State VirtualAmiibo::GetCurrentState() const {
+    std::scoped_lock lock{state_mutex};
     return state;
 }
 
@@ -196,11 +221,34 @@ VirtualAmiibo::Info VirtualAmiibo::LoadAmiibo(const std::string& filename) {
         return Info::NotAnAmiibo;
     }
 
-    file_path = filename;
-    return LoadAmiibo(data);
+    std::optional<Common::Input::NfcStatus> notify_status;
+    Info info = Info::Unknown;
+    {
+        std::scoped_lock lock{state_mutex};
+        file_path = filename;
+        info = LoadAmiiboLocked(data, notify_status);
+    }
+    if (notify_status.has_value()) {
+        SetNfc(identifier, *notify_status);
+    }
+    return info;
 }
 
 VirtualAmiibo::Info VirtualAmiibo::LoadAmiibo(std::span<u8> data) {
+    std::optional<Common::Input::NfcStatus> notify_status;
+    Info info = Info::Unknown;
+    {
+        std::scoped_lock lock{state_mutex};
+        info = LoadAmiiboLocked(data, notify_status);
+    }
+    if (notify_status.has_value()) {
+        SetNfc(identifier, *notify_status);
+    }
+    return info;
+}
+
+VirtualAmiibo::Info VirtualAmiibo::LoadAmiiboLocked(
+    std::span<u8> data, std::optional<Common::Input::NfcStatus>& out_status) {
     if (state != State::WaitingForAmiibo) {
         return Info::WrongDeviceState;
     }
@@ -209,12 +257,12 @@ VirtualAmiibo::Info VirtualAmiibo::LoadAmiibo(std::span<u8> data) {
     case AmiiboSize:
     case AmiiboSizeWithoutPassword:
     case AmiiboSizeWithSignature:
-        nfc_data.resize(AmiiboSize);
+        nfc_data.assign(AmiiboSize, 0);
         status.tag_type = 1U << 1;
         status.uuid_length = 7;
         break;
     case MifareSize:
-        nfc_data.resize(MifareSize);
+        nfc_data.assign(MifareSize, 0);
         status.tag_type = 1U << 6;
         status.uuid_length = 4;
         break;
@@ -225,35 +273,60 @@ VirtualAmiibo::Info VirtualAmiibo::LoadAmiibo(std::span<u8> data) {
     status.uuid = {};
     status.protocol = 1;
     state = State::TagNearby;
-    status.state = Common::Input::NfcState::NewAmiibo,
-    memcpy(nfc_data.data(), data.data(), data.size_bytes());
-    memcpy(status.uuid.data(), nfc_data.data(), status.uuid_length);
-    SetNfc(identifier, status);
+    status.state = Common::Input::NfcState::NewAmiibo;
+    const std::size_t copy_size = (std::min)(data.size_bytes(), nfc_data.size());
+    std::memcpy(nfc_data.data(), data.data(), copy_size);
+    std::memcpy(status.uuid.data(), nfc_data.data(), status.uuid_length);
+    out_status = status;
     return Info::Success;
 }
 
 VirtualAmiibo::Info VirtualAmiibo::ReloadAmiibo() {
-    if (state == State::TagNearby) {
-        SetNfc(identifier, status);
+    std::optional<Common::Input::NfcStatus> notify_status;
+    std::string path;
+    {
+        std::scoped_lock lock{state_mutex};
+        if (state == State::TagNearby) {
+            notify_status = status;
+        } else {
+            path = file_path;
+        }
+    }
+    if (notify_status.has_value()) {
+        SetNfc(identifier, *notify_status);
         return Info::Success;
     }
-
-    return LoadAmiibo(file_path);
+    return LoadAmiibo(path);
 }
 
 VirtualAmiibo::Info VirtualAmiibo::CloseAmiibo() {
+    std::optional<Common::Input::NfcStatus> notify_status;
+    Info info = Info::Success;
+    {
+        std::scoped_lock lock{state_mutex};
+        info = CloseAmiiboLocked(notify_status);
+    }
+    if (notify_status.has_value()) {
+        SetNfc(identifier, *notify_status);
+    }
+    return info;
+}
+
+VirtualAmiibo::Info VirtualAmiibo::CloseAmiiboLocked(
+    std::optional<Common::Input::NfcStatus>& out_status) {
     if (state != State::TagNearby) {
         return Info::Success;
     }
 
     state = State::WaitingForAmiibo;
     status.state = Common::Input::NfcState::AmiiboRemoved;
-    SetNfc(identifier, status);
+    out_status = status;
     status.tag_type = 0;
     return Info::Success;
 }
 
 std::string VirtualAmiibo::GetLastFilePath() const {
+    std::scoped_lock lock{state_mutex};
     return file_path;
 }
 

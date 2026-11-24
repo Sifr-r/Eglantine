@@ -15,6 +15,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <span>
 #include <vector>
 
@@ -573,9 +574,13 @@ static TexelWeightParams DecodeBlockInfo(InputBitStream& strm) {
     }
 
     default:
-        assert(false && "Don't know this layout...");
         params.m_bError = true;
-        break;
+        return params;
+    }
+
+    if (params.m_bError || R < 2 || R > 7) {
+        params.m_bError = true;
+        return params;
     }
 
     // Determine whether or not we're using dual planes
@@ -827,12 +832,15 @@ public:
     }
 };
 
-static void DecodeColorValues(u32* out, std::span<u8> data, const u32* modes, const u32 nPartitions,
+static bool DecodeColorValues(u32* out, std::span<u8> data, const u32* modes, const u32 nPartitions,
                               const u32 nBitsForColorData) {
     // First figure out how many color values we have
     u32 nValues = 0;
     for (u32 i = 0; i < nPartitions; i++) {
         nValues += ((modes[i] >> 2) + 1) << 1;
+    }
+    if (nValues == 0 || nValues > 18) {
+        return false;
     }
 
     // Then based on the number of values and the remaining number of bits,
@@ -855,6 +863,9 @@ static void DecodeColorValues(u32* out, std::span<u8> data, const u32* modes, co
             break;
         }
     }
+    if (range < 5) {
+        return false;
+    }
 
     // We now have enough to decode our integer sequence.
     IntegerEncodedVector decodedColorValues;
@@ -875,7 +886,9 @@ static void DecodeColorValues(u32* out, std::span<u8> data, const u32* modes, co
         u32 bitlen = val.num_bits;
         u32 bitval = val.bit_value;
 
-        assert(bitlen >= 1);
+        if (bitlen == 0) {
+            return false;
+        }
 
         u32 A = 0, B = 0, C = 0, D = 0;
         // A is just the lsb replicated 9 times.
@@ -933,8 +946,7 @@ static void DecodeColorValues(u32* out, std::span<u8> data, const u32* modes, co
             } break;
 
             default:
-                assert(false && "Unsupported trit encoding for color values!");
-                break;
+                return false;
             } // switch(bitlen)
         }     // case IntegerEncoding::Trit
         break;
@@ -977,8 +989,7 @@ static void DecodeColorValues(u32* out, std::span<u8> data, const u32* modes, co
             } break;
 
             default:
-                assert(false && "Unsupported quint encoding for color values!");
-                break;
+                return false;
             } // switch(bitlen)
         }     // case IntegerEncoding::Quint
         break;
@@ -992,10 +1003,17 @@ static void DecodeColorValues(u32* out, std::span<u8> data, const u32* modes, co
         }
     }
 
+    if (outIdx < nValues) {
+        return false;
+    }
+
     // Make sure that each of our values is in the proper range...
     for (u32 i = 0; i < nValues; i++) {
-        assert(out[i] <= 255);
+        if (out[i] > 255) {
+            return false;
+        }
     }
+    return true;
 }
 
 static u32 UnquantizeTexelWeight(const IntegerEncodedValue& val) {
@@ -1091,20 +1109,19 @@ static void UnquantizeTexelWeights(u32 out[2][144], const IntegerEncodedVector& 
                                    const TexelWeightParams& params, const u32 blockWidth,
                                    const u32 blockHeight) {
     u32 weightIdx = 0;
-    u32 unquantized[2][144];
+    u32 unquantized[2][144]{};
 
     for (auto itr = weights.begin(); itr != weights.end(); ++itr) {
         unquantized[0][weightIdx] = UnquantizeTexelWeight(*itr);
 
         if (params.m_bDualPlane) {
-            ++itr;
-            unquantized[1][weightIdx] = UnquantizeTexelWeight(*itr);
-            if (itr == weights.end()) {
+            if (++itr == weights.end()) {
                 break;
             }
+            unquantized[1][weightIdx] = UnquantizeTexelWeight(*itr);
         }
 
-        if (++weightIdx >= (params.m_Width * params.m_Height))
+        if (++weightIdx >= (params.m_Width * params.m_Height) || weightIdx >= 144)
             break;
     }
 
@@ -1750,7 +1767,6 @@ static void DecompressBlock(std::span<const u8, 16> inBuf, const u32 blockWidth,
 
     // Was there an error?
     if (weightParams.m_bError) {
-        assert(false && "Invalid block mode");
         FillError(outBuf, blockWidth, blockHeight);
         return;
     }
@@ -1761,35 +1777,29 @@ static void DecompressBlock(std::span<const u8, 16> inBuf, const u32 blockWidth,
     }
 
     if (weightParams.m_bVoidExtentHDR) {
-        assert(false && "HDR void extent blocks are unsupported!");
         FillError(outBuf, blockWidth, blockHeight);
         return;
     }
 
     if (weightParams.m_Width > blockWidth) {
-        assert(false && "Texel weight grid width should be smaller than block width");
         FillError(outBuf, blockWidth, blockHeight);
         return;
     }
 
     if (weightParams.m_Height > blockHeight) {
-        assert(false && "Texel weight grid height should be smaller than block height");
         FillError(outBuf, blockWidth, blockHeight);
         return;
     }
 
     if (weightParams.GetNumWeightValues() > 64) {
-        assert(false && "Too many weights in the weight grid");
         FillError(outBuf, blockWidth, blockHeight);
         return;
     }
 
     // Read num partitions
     u32 nPartitions = strm.ReadBits<2>() + 1;
-    assert(nPartitions <= 4);
 
     if (nPartitions == 4 && weightParams.m_bDualPlane) {
-        assert(false && "Dual plane mode is incompatible with four partition blocks");
         FillError(outBuf, blockWidth, blockHeight);
         return;
     }
@@ -1821,11 +1831,11 @@ static void DecompressBlock(std::span<const u8, 16> inBuf, const u32 blockWidth,
     // Remaining bits are color endpoint data...
     u32 nWeightBits = weightParams.GetPackedBitSize();
     if (nWeightBits < 24 || nWeightBits > 96) {
-        assert(false && "Invalid weight bit count");
         FillError(outBuf, blockWidth, blockHeight);
         return;
     }
-    s32 remainingBits = 128 - nWeightBits - static_cast<int>(strm.GetBitsRead());
+    s32 remainingBits =
+        128 - static_cast<s32>(nWeightBits) - static_cast<s32>(strm.GetBitsRead());
 
     // Consider extra bits prior to texel data...
     u32 extraCEMbits = 0;
@@ -1841,24 +1851,28 @@ static void DecompressBlock(std::span<const u8, 16> inBuf, const u32 blockWidth,
             extraCEMbits += 8;
             break;
         default:
-            assert(false);
-            break;
+            FillError(outBuf, blockWidth, blockHeight);
+            return;
         }
     }
-    remainingBits -= extraCEMbits;
+    remainingBits -= static_cast<s32>(extraCEMbits);
 
     // Do we have a dual plane situation?
     u32 planeSelectorBits = 0;
     if (weightParams.m_bDualPlane) {
         planeSelectorBits = 2;
     }
-    remainingBits -= planeSelectorBits;
+    remainingBits -= static_cast<s32>(planeSelectorBits);
+    if (remainingBits < 0) {
+        FillError(outBuf, blockWidth, blockHeight);
+        return;
+    }
 
     // Read color data...
-    u32 colorDataBits = remainingBits;
+    const u32 colorDataBits = static_cast<u32>(remainingBits);
     while (remainingBits > 0) {
-        u32 nb = (std::min)(remainingBits, 8);
-        u32 b = strm.ReadBits(nb);
+        const u32 nb = static_cast<u32>((std::min)(remainingBits, 8));
+        const u32 b = strm.ReadBits(nb);
         colorEndpointStream.WriteBits(b, nb);
         remainingBits -= 8;
     }
@@ -1901,14 +1915,23 @@ static void DecompressBlock(std::span<const u8, 16> inBuf, const u32 blockWidth,
 
     // Make sure everything up till here is sane.
     for (u32 i = 0; i < nPartitions; i++) {
-        assert(colorEndpointMode[i] < 16);
+        if (colorEndpointMode[i] >= 16) {
+            FillError(outBuf, blockWidth, blockHeight);
+            return;
+        }
     }
-    assert(strm.GetBitsRead() + weightParams.GetPackedBitSize() == 128);
+    if (strm.GetBitsRead() + weightParams.GetPackedBitSize() != 128) {
+        FillError(outBuf, blockWidth, blockHeight);
+        return;
+    }
 
     // Decode both color data and texel weight data
-    u32 colorValues[32]; // Four values, two endpoints, four maximum partitions
-    DecodeColorValues(colorValues, colorEndpointData, colorEndpointMode, nPartitions,
-                      colorDataBits);
+    u32 colorValues[32]{}; // Four values, two endpoints, four maximum partitions
+    if (!DecodeColorValues(colorValues, colorEndpointData, colorEndpointMode, nPartitions,
+                           colorDataBits)) {
+        FillError(outBuf, blockWidth, blockHeight);
+        return;
+    }
 
     Pixel endpoints[4][2];
     const u32* colorValuesPtr = colorValues;
@@ -2010,34 +2033,89 @@ static void DecompressBlock(std::span<const u8, 16> inBuf, const u32 blockWidth,
 
 void Decompress(std::span<const uint8_t> data, uint32_t width, uint32_t height, uint32_t depth,
                 uint32_t block_width, uint32_t block_height, std::span<uint8_t> output) {
-    const u32 rows = Common::DivideUp(height, block_height);
-    const u32 cols = Common::DivideUp(width, block_width);
+    if (width == 0 || height == 0 || depth == 0) {
+        return;
+    }
+    if (block_width == 0 || block_height == 0 || block_width > 12 || block_height > 12) {
+        LOG_ERROR(HW_GPU, "ASTC: invalid block dimensions {}x{}", block_width, block_height);
+        return;
+    }
+
+    const size_t rows = ((static_cast<size_t>(height) - 1) / block_height) + 1;
+    const size_t cols = ((static_cast<size_t>(width) - 1) / block_width) + 1;
+    if (cols != 0 && rows > (std::numeric_limits<size_t>::max)() / cols) {
+        LOG_ERROR(HW_GPU, "ASTC: block grid overflow for {}x{}", width, height);
+        return;
+    }
+    const size_t slice_blocks = rows * cols;
+    if (slice_blocks > (std::numeric_limits<size_t>::max)() / depth) {
+        LOG_ERROR(HW_GPU, "ASTC: block count overflow for {}x{}x{}", width, height, depth);
+        return;
+    }
+    const size_t total_blocks = slice_blocks * depth;
+    if (total_blocks > (std::numeric_limits<size_t>::max)() / 16) {
+        LOG_ERROR(HW_GPU, "ASTC: input byte count overflow");
+        return;
+    }
+    const size_t required_input = total_blocks * 16;
+    if (data.size() < required_input) {
+        LOG_ERROR(HW_GPU, "ASTC: truncated input, got {} bytes but need {}", data.size(),
+                  required_input);
+        return;
+    }
+
+    if (static_cast<size_t>(width) > (std::numeric_limits<size_t>::max)() / height) {
+        LOG_ERROR(HW_GPU, "ASTC: output dimensions overflow for {}x{}", width, height);
+        return;
+    }
+    const size_t slice_pixels = static_cast<size_t>(width) * height;
+    if (slice_pixels > (std::numeric_limits<size_t>::max)() / depth) {
+        LOG_ERROR(HW_GPU, "ASTC: output pixel count overflow for {}x{}x{}", width, height, depth);
+        return;
+    }
+    const size_t total_pixels = slice_pixels * depth;
+    if (total_pixels > (std::numeric_limits<size_t>::max)() / 4) {
+        LOG_ERROR(HW_GPU, "ASTC: output byte count overflow");
+        return;
+    }
+    const size_t required_output = total_pixels * 4;
+    if (output.size() < required_output) {
+        LOG_ERROR(HW_GPU, "ASTC: output buffer too small, got {} bytes but need {}", output.size(),
+                  required_output);
+        return;
+    }
+
+    const size_t row_stride = static_cast<size_t>(width) * 4;
+    const size_t slice_stride = static_cast<size_t>(height) * row_stride;
 
     Common::ThreadWorker& workers{GetThreadWorkers()};
 
     for (u32 z = 0; z < depth; ++z) {
-        const u32 depth_offset = z * height * width * 4;
-        for (u32 y_index = 0; y_index < rows; ++y_index) {
+        const size_t depth_offset = static_cast<size_t>(z) * slice_stride;
+        for (size_t y_index = 0; y_index < rows; ++y_index) {
             auto decompress_stride = [data, width, height, block_width, block_height, output, rows,
-                                      cols, z, depth_offset, y_index] {
-                const u32 y = y_index * block_height;
-                for (u32 x_index = 0; x_index < cols; ++x_index) {
-                    const u32 block_index = (z * rows * cols) + (y_index * cols) + x_index;
-                    const u32 x = x_index * block_width;
+                                      cols, z, depth_offset, row_stride, y_index] {
+                const u32 y = static_cast<u32>(y_index * block_height);
+                for (size_t x_index = 0; x_index < cols; ++x_index) {
+                    const size_t block_index =
+                        (static_cast<size_t>(z) * rows * cols) + (y_index * cols) + x_index;
+                    const u32 x = static_cast<u32>(x_index * block_width);
 
                     const std::span<const u8, 16> blockPtr{data.subspan(block_index * 16, 16)};
 
                     // Blocks can be at most 12x12
-                    std::array<u32, 12 * 12> uncompData;
+                    std::array<u32, 12 * 12> uncompData{};
                     DecompressBlock(blockPtr, block_width, block_height, uncompData);
 
-                    u32 decompWidth = (std::min)(block_width, width - x);
-                    u32 decompHeight = (std::min)(block_height, height - y);
+                    const u32 decompWidth = (std::min)(block_width, width - x);
+                    const u32 decompHeight = (std::min)(block_height, height - y);
 
-                    const std::span<u8> outRow = output.subspan(depth_offset + (y * width + x) * 4);
+                    const std::span<u8> outRow =
+                        output.subspan(depth_offset + (static_cast<size_t>(y) * width + x) * 4);
                     for (u32 h = 0; h < decompHeight; ++h) {
-                        std::memcpy(outRow.data() + h * width * 4,
-                                    uncompData.data() + h * block_width, decompWidth * 4);
+                        std::memcpy(outRow.data() + static_cast<size_t>(h) * row_stride,
+                                    uncompData.data() + static_cast<size_t>(h) * block_width,
+                                    static_cast<size_t>(decompWidth) * 4);
                     }
                 }
             };

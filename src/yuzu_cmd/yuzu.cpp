@@ -55,6 +55,7 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
+#include "frontend_common/sentry_crash_reporter.h"
 #include "hid_core/hid_core.h"
 #include "input_common/drivers/keyboard.h"
 #include "input_common/drivers/switch2_auto_pair.h"
@@ -261,6 +262,7 @@ static void OnStatusMessageReceived(const Network::StatusMessageEntry& msg) {
 }
 
 struct SdlState {
+    Frontend::SentryCrashReporter crash_reporter;
     Core::System system{};
     // Must outlive emu_window, which keeps a pointer to it.
     InputCommon::InputSubsystem input_subsystem{};
@@ -590,6 +592,10 @@ static bool BuildWarm(Core::System& system, int argc, char** argv, wchar_t** arg
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(WriteCrashDump);
+    const char* crash_dump_directory = std::getenv("EDEN_NX2_CRASH_DUMP");
+    const bool local_crash_dump = crash_dump_directory != nullptr && *crash_dump_directory != '\0';
+#else
+    constexpr bool local_crash_dump = false;
 #endif
     Nx2Sampler::StartFromEnvironment();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling
@@ -613,6 +619,10 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
         setrlimit(RLIMIT_NOFILE, &rl);
     }
 #endif
+
+    if (!local_crash_dump) {
+        state->crash_reporter.Start(Frontend::SentryFrontend::Sdl);
+    }
 
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(true);
@@ -825,7 +835,7 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 
     // QLaunch launched applications (should) now reload shader cache.
     static std::mutex shader_cache_reload_mutex;
-    state->system.RegisterApplicationChangedCallback([&state](u64 changed_program_id) {
+    state->system.RegisterApplicationChangedCallback([state](u64 changed_program_id) {
         if (!Settings::values.use_disk_shader_cache.GetValue()) {
             return;
         }

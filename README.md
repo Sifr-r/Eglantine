@@ -15,8 +15,8 @@
   <br>
 </h1>
 
-<h4 align="center"><b>Eglantine</b> is a free and opensource (FOSS) Switch 2 emulator, derived from Eden, Yuzu and Sudachi - started by developer Camille LaVey.
-It's written in C++ with portability in mind, with builds for Windows, Linux and macOS
+<h4 align="center"><b>Eglantine</b> is a free and open-source emulator for Nintendo Switch and Switch 2. Camille LaVey started the project using work from Eden, Yuzu, and Sudachi.
+It uses C++ and Rust, with desktop builds for Windows, Linux, and macOS.
 </h4>
 
 <p align="center">
@@ -39,9 +39,7 @@ It's written in C++ with portability in mind, with builds for Windows, Linux and
 
 ## Compatibility
 
-The emulator is capable of running Mario Kart World at full speed on most specs, Splatoon Raiders and OOT also run fine.
-
-A list of supported games will be available in future. Please be patient.
+Game compatibility and performance depend on the title version, build, driver, and settings. For a reproducible report, include those details and list the steps from launch to the issue. The [contribution guide](CONTRIBUTING.md#what-to-include-in-a-report) describes what to share.
 
 ## Development
 
@@ -51,13 +49,21 @@ See the [contribution guide](CONTRIBUTING.md) for how to get involved. You can a
 
 ## Documentation
 
-See the [User Handbook](https://github.com/Eglantine-Community/docs/blob/master/content/user/README.mdx) for setup, settings and troubleshooting.
+See the [User Handbook](docs/content/user/README.md) for setup, settings and troubleshooting.
+
+| If you are working on | Start here |
+| --- | --- |
+| A code or documentation change | [Repository instructions](AGENTS.md) and [contribution guide](CONTRIBUTING.md) |
+| A subsystem or test | [Architecture task map](ARCHITECTURE.md#task-map) |
+| A Switch 2 runtime or shader investigation | [Debugging and lab tools](tools/README.md#switch-2-and-emulator-debugging) |
+| The reasoning behind an earlier design | [Historical migration guide](POLYGLOT_IMPLEMENTATION_PLAN.md) and [Switch 2 development notes](NX2_NOTES.md) |
+| Release history or asset attribution | [Changelog](CHANGELOG.md) and [asset provenance](ASSET_PROVENANCE.md) |
 
 ## Building
 
-See the [General Build Guide](https://github.com/Eglantine-Community/docs/blob/master/content/Build.mdx).
+See the [General Build Guide](docs/content/Build.md).
 
-For development tooling, see the [tools guide](tools/README.md).
+From a configured desktop build directory, the main CMake targets are `yuzu` (Qt), `yuzu-cmd` (SDL), and `tests` (Catch2). See the [architecture task map](ARCHITECTURE.md#task-map) for targeted checks. The Android frontend lives in `src/android`. Check its [Gradle configuration](src/android/app/build.gradle.kts) for the SDK, NDK, and CMake pins.
 
 ## Download
 

@@ -71,23 +71,26 @@ void RefreshFromHost() {
         DWORD ver{};
         if (WlanOpenHandle(2, nullptr, &ver, &hClient) == ERROR_SUCCESS) {
             PWLAN_INTERFACE_INFO_LIST ifs{};
-            if (WlanEnumInterfaces(hClient, nullptr, &ifs) == ERROR_SUCCESS) {
-                const auto& g = ifs->InterfaceInfo[0].InterfaceGuid;
-                PWLAN_CONNECTION_ATTRIBUTES attr{};
-                DWORD attrSize = 0;
-                WLAN_OPCODE_VALUE_TYPE opType{};
-                if (WlanQueryInterface(hClient, &g, wlan_intf_opcode_current_connection, nullptr,
-                                       &attrSize, reinterpret_cast<PVOID*>(&attr),
-                                       &opType) == ERROR_SUCCESS) {
+            if (WlanEnumInterfaces(hClient, nullptr, &ifs) == ERROR_SUCCESS && ifs != nullptr) {
+                if (ifs->dwNumberOfItems > 0) {
+                    const auto& g = ifs->InterfaceInfo[0].InterfaceGuid;
+                    PWLAN_CONNECTION_ATTRIBUTES attr{};
+                    DWORD attrSize = 0;
+                    WLAN_OPCODE_VALUE_TYPE opType{};
+                    if (WlanQueryInterface(hClient, &g, wlan_intf_opcode_current_connection, nullptr,
+                                           &attrSize, reinterpret_cast<PVOID*>(&attr),
+                                           &opType) == ERROR_SUCCESS &&
+                        attr != nullptr) {
 
-                    const DOT11_SSID& ssid = attr->wlanAssociationAttributes.dot11Ssid;
-                    const size_t len = std::min<size_t>(ssid.uSSIDLength, sizeof(st.ssid) - 1);
-                    std::memset(st.ssid, 0, sizeof(st.ssid));
-                    std::memcpy(st.ssid, ssid.ucSSID, len);
+                        const DOT11_SSID& ssid = attr->wlanAssociationAttributes.dot11Ssid;
+                        const size_t len = std::min<size_t>(ssid.uSSIDLength, sizeof(st.ssid) - 1);
+                        std::memset(st.ssid, 0, sizeof(st.ssid));
+                        std::memcpy(st.ssid, ssid.ucSSID, len);
 
-                    st.bars = QualityToBars(
-                        static_cast<u8>(attr->wlanAssociationAttributes.wlanSignalQuality));
-                    WlanFreeMemory(attr);
+                        st.bars = QualityToBars(
+                            static_cast<u8>(attr->wlanAssociationAttributes.wlanSignalQuality));
+                        WlanFreeMemory(attr);
+                    }
                 }
                 WlanFreeMemory(ifs);
             }

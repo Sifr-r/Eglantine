@@ -15,6 +15,8 @@ namespace Service::Nvidia::Devices {
 
 class nvhost_nvjpg final : public nvdevice {
 public:
+    static constexpr DeviceKind Kind = DeviceKind::NvHostNvjpg;
+
     explicit nvhost_nvjpg(Core::System& system_);
     ~nvhost_nvjpg() override;
 

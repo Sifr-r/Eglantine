@@ -78,16 +78,17 @@ object InputHandler {
     }
 
     fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        val device = event.device ?: return false
         val action = when (event.action) {
             KeyEvent.ACTION_DOWN -> NativeInput.ButtonState.PRESSED
             KeyEvent.ACTION_UP -> NativeInput.ButtonState.RELEASED
             else -> return false
         }
 
-        var controllerData = androidControllers[event.device.controllerNumber]
+        var controllerData = androidControllers[device.controllerNumber]
         if (controllerData == null) {
             updateControllerData()
-            controllerData = androidControllers[event.device.controllerNumber] ?: return false
+            controllerData = androidControllers[device.controllerNumber] ?: return false
         }
 
         NativeInput.onGamePadButtonEvent(
@@ -113,9 +114,10 @@ object InputHandler {
     }
 
     fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        val device = event.device ?: return false
         val controllerData =
-            androidControllers[event.device.controllerNumber] ?: return false
-        event.device.motionRanges.forEach {
+            androidControllers[device.controllerNumber] ?: return false
+        device.motionRanges.forEach {
             NativeInput.onGamePadAxisEvent(
                 controllerData.getGUID(),
                 controllerData.getPort(),
@@ -135,13 +137,16 @@ object InputHandler {
             InputDevice.getDevice(deviceId)?.apply {
                 if (isPhysicalGameController(this)) {
                     if (!gameControllerDeviceIds.contains(controllerNumber)) {
+                        if (port >= inputSettings.size) {
+                            return@forEach
+                        }
                         gameControllerDeviceIds[controllerNumber] = YuzuPhysicalDevice(
                             this,
                             port,
                             inputSettings[port].useSystemVibrator
                         )
+                        port++
                     }
-                    port++
                 }
             }
         }

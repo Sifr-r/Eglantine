@@ -4,25 +4,29 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "core/hle/service/psc/time/time_zone.h"
 
 namespace Service::PSC::Time {
 namespace {
 constexpr Result ValidateRule(const Tz::Rule& rule) {
-    if (rule.typecnt > static_cast<s32>(Tz::TZ_MAX_TYPES) ||
-        rule.timecnt > static_cast<s32>(Tz::TZ_MAX_TIMES) ||
-        rule.charcnt > static_cast<s32>(Tz::TZ_MAX_CHARS)) {
+    if (rule.typecnt <= 0 || rule.typecnt > static_cast<s32>(Tz::TZ_MAX_TYPES) ||
+        rule.timecnt < 0 || rule.timecnt > static_cast<s32>(Tz::TZ_MAX_TIMES) ||
+        rule.charcnt < 0 || rule.charcnt > static_cast<s32>(Tz::TZ_MAX_CHARS) ||
+        rule.defaulttype < 0 || rule.defaulttype >= rule.typecnt) {
         R_RETURN(ResultTimeZoneOutOfRange);
     }
 
     for (s32 i = 0; i < rule.timecnt; i++) {
-        if (rule.types[i] >= rule.typecnt) {
+        if (static_cast<s32>(rule.types[i]) >= rule.typecnt) {
             R_RETURN(ResultTimeZoneOutOfRange);
         }
     }
 
     for (s32 i = 0; i < rule.typecnt; i++) {
-        if (rule.ttis[i].tt_desigidx >= static_cast<s32>(rule.chars.size())) {
+        if (rule.ttis[i].tt_desigidx < 0 ||
+            rule.ttis[i].tt_desigidx >= static_cast<s32>(rule.chars.size())) {
             R_RETURN(ResultTimeZoneOutOfRange);
         }
     }
@@ -259,8 +263,14 @@ Result TimeZone::ToPosixTimeImpl(u32& out_count, std::span<s64> out_times,
         ASSERT(false);
     }
 
+    const size_t max_count = (std::min)(out_times_max_count, out_times.size());
+    if (max_count == 0) {
+        out_count = 0;
+        R_SUCCEED();
+    }
+
     out_times[0] = time;
-    if (out_times_max_count < 2) {
+    if (max_count < 2) {
         out_count = 1;
         R_SUCCEED();
     }

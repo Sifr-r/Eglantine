@@ -5,7 +5,7 @@
 # Boot Ocarina of Time hidden and load the newest save. Extra arguments go to `lab_ctl launch`
 # (e.g. --tensor, --env NAME=VALUE). Needs $D/qt-copy.ini with keyboard bindings merged in.
 REPO=${REPO:-/home/kraibse/clones/Eglantine}
-D=${D:-$TMPDIR/ootlab}
+D=${D:-${TMPDIR:-/tmp}/ootlab}
 GAME="/run/media/kraibse/SOINC/emulation/Switch 2/games/The Legend of Zelda Ocarina of TIme [04004860224DEC000].nup"
 cd "$REPO" || exit 1
 L=(python3 -I tools/nx2/lab_ctl.py -d "$D")
@@ -15,7 +15,7 @@ if [ -f "$D/qt-copy.ini" ]; then
 fi
 $L stop 2>/dev/null
 $L launch --hidden --max-seconds 420 --config "$D/qt-copy.ini" \
-  --dump-dir ~/Documents/hermes/eglantine/oot-shader-dump --game "$GAME" "$@"
+  --dump-dir ~/Documents/hermes/eglantine/oot-shader-dump --game "$GAME" "$@" || exit 1
 sleep 84; $L press a --hold 200   # title (fully up by ~81 s) -> load screen
 sleep 9;  $L press a --hold 200   # newest save
 sleep 4;  $L press a --hold 200   # confirm

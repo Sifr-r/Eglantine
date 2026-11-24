@@ -41,6 +41,9 @@ Alarms::Alarms(Core::System& system, StandardSteadyClockCore& steady_clock, Powe
 {}
 
 Alarms::~Alarms() {
+    std::scoped_lock l{m_mutex};
+    m_alarms.clear();
+    m_closest_alarm = nullptr;
     m_ctx.CloseEvent(m_event);
 }
 
@@ -48,7 +51,9 @@ Result Alarms::Enable(Kernel::KernelCore& kernel, Alarm& alarm, s64 time) {
     R_UNLESS(m_steady_clock.IsInitialized(), ResultClockUninitialized);
 
     std::scoped_lock l{m_mutex};
-    R_UNLESS(alarm.IsLinked(), ResultAlarmNotRegistered);
+    if (alarm.IsLinked()) {
+        Erase(kernel, alarm);
+    }
 
     auto time_ns{time + m_steady_clock.GetRawTime()};
     auto one_second_ns{
@@ -70,6 +75,11 @@ void Alarms::Disable(Kernel::KernelCore& kernel, Alarm& alarm) {
     UpdateClosestAndSignal(kernel);
 }
 
+bool Alarms::IsEnabled(const Alarm& alarm) {
+    std::scoped_lock l{m_mutex};
+    return alarm.IsLinked();
+}
+
 void Alarms::CheckAndSignal(Kernel::KernelCore& kernel) {
     std::scoped_lock l{m_mutex};
     if (m_alarms.empty()) {
@@ -77,15 +87,19 @@ void Alarms::CheckAndSignal(Kernel::KernelCore& kernel) {
     }
 
     bool alarm_signalled{false};
-    for (auto& alarm : m_alarms) {
-        if (m_steady_clock.GetRawTime() >= alarm.GetAlertTime()) {
+    const s64 current_time{m_steady_clock.GetRawTime()};
+    for (auto it = m_alarms.begin(); it != m_alarms.end();) {
+        auto& alarm = *it;
+        if (current_time >= alarm.GetAlertTime()) {
             alarm.Signal(kernel);
             alarm.Lock();
-            Erase(kernel, alarm);
+            it = m_alarms.erase(it);
 
             m_power_state_request_manager.UpdatePendingPowerStateRequestPriority(
                 alarm.GetPriority());
             alarm_signalled = true;
+        } else {
+            ++it;
         }
     }
 
@@ -135,7 +149,8 @@ Result Alarms::UpdateClosestAndSignal(Kernel::KernelCore& kernel) {
 
 IAlarmService::IAlarmService(Core::System& system_, std::shared_ptr<TimeManager> manager)
     : ServiceFramework{system_, "time:al"}
-    , m_alarms{manager->m_alarms}
+    , m_manager{std::move(manager)}
+    , m_alarms{m_manager->m_alarms}
 {
     // clang-format off
     static const FunctionInfo functions[] = {
@@ -151,7 +166,7 @@ void IAlarmService::CreateWakeupAlarm(HLERequestContext& ctx) {
 
     IPC::ResponseBuilder rb{ctx, 2, 0, 1};
     rb.Push(ResultSuccess);
-    rb.PushIpcInterface<ISteadyClockAlarm>(ctx, system, m_alarms, AlarmType::WakeupAlarm);
+    rb.PushIpcInterface<ISteadyClockAlarm>(ctx, system, m_manager, AlarmType::WakeupAlarm);
 }
 
 void IAlarmService::CreateBackgroundTaskAlarm(HLERequestContext& ctx) {
@@ -159,12 +174,14 @@ void IAlarmService::CreateBackgroundTaskAlarm(HLERequestContext& ctx) {
 
     IPC::ResponseBuilder rb{ctx, 2, 0, 1};
     rb.Push(ResultSuccess);
-    rb.PushIpcInterface<ISteadyClockAlarm>(ctx, system, m_alarms, AlarmType::BackgroundTaskAlarm);
+    rb.PushIpcInterface<ISteadyClockAlarm>(ctx, system, m_manager, AlarmType::BackgroundTaskAlarm);
 }
 
-ISteadyClockAlarm::ISteadyClockAlarm(Core::System& system_, Alarms& alarms, AlarmType type)
+ISteadyClockAlarm::ISteadyClockAlarm(Core::System& system_, std::shared_ptr<TimeManager> manager,
+                                     AlarmType type)
     : ServiceFramework{system_, "ISteadyClockAlarm"}, m_ctx{system, "Psc:ISteadyClockAlarm"},
-      m_alarms{alarms}, m_alarm{system, m_ctx, type} {
+      m_manager{std::move(manager)}, m_alarms{m_manager->m_alarms},
+      m_alarm{system, m_ctx, type} {
     // clang-format off
     static const FunctionInfo functions[] = {
         {0,  &ISteadyClockAlarm::GetAlarmEvent, "GetAlarmEvent"},
@@ -176,6 +193,10 @@ ISteadyClockAlarm::ISteadyClockAlarm(Core::System& system_, Alarms& alarms, Alar
     };
     // clang-format on
     RegisterHandlers(functions);
+}
+
+ISteadyClockAlarm::~ISteadyClockAlarm() {
+    m_alarms.Disable(system.Kernel(), m_alarm);
 }
 
 void ISteadyClockAlarm::GetAlarmEvent(HLERequestContext& ctx) {
@@ -212,7 +233,7 @@ void ISteadyClockAlarm::IsEnabled(HLERequestContext& ctx) {
 
     IPC::ResponseBuilder rb{ctx, 3};
     rb.Push(ResultSuccess);
-    rb.Push<bool>(m_alarm.IsLinked());
+    rb.Push<bool>(m_alarms.IsEnabled(m_alarm));
 }
 
 } // namespace Service::PSC::Time

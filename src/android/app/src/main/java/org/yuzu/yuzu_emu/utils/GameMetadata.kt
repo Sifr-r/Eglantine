@@ -4,6 +4,14 @@
 package org.yuzu.yuzu_emu.utils
 
 object GameMetadata {
+    val gameExtensions: Set<String> by lazy { getFileExtensions(externalContent = false).toSet() }
+
+    val externalContentExtensions: Set<String> by lazy {
+        getFileExtensions(externalContent = true).toSet()
+    }
+
+    private external fun getFileExtensions(externalContent: Boolean): Array<String>
+
     external fun getIsValid(path: String): Boolean
 
     external fun getTitle(path: String): String

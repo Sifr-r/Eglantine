@@ -25,7 +25,7 @@ using Core::Memory::YUZU_PAGESIZE;
 namespace Service::Nvidia::Devices {
 
 nvmap::nvmap(Core::System& system_, NvCore::Container& container_)
-    : nvdevice{system_}, container{container_}, file{container.GetNvMapFile()} {}
+    : nvdevice{system_, Kind}, container{container_}, file{container.GetNvMapFile()} {}
 
 nvmap::~nvmap() = default;
 
@@ -126,19 +126,41 @@ NvResult nvmap::IocAlloc(IocAllocParams& params, DeviceFD fd) {
         return NvResult::InsufficientMemory;
     }
 
+    const auto session_it = sessions.find(fd);
+    if (session_it == sessions.end()) {
+        return NvResult::InvalidState;
+    }
+    const NvCore::SessionId session_id = session_it->second;
+    bool has_valid_session = false;
+    container.WithSession(session_id, [&](const NvCore::Session& session) {
+        has_valid_session = session.process != nullptr;
+    });
+    if (!has_valid_session) {
+        return NvResult::InvalidState;
+    }
+
     const auto result = handle_description->Alloc(params.flags, params.align, params.kind,
-                                                  params.address, sessions[fd]);
+                                                  params.address, session_id);
     if (result != NvResult::Success) {
         LOG_CRITICAL(Service_NVDRV, "Object failed to allocate, handle={:08X}", params.handle);
         return result;
     }
     bool is_out_io{};
-    auto process = container.GetSession(sessions[fd])->process;
-    ASSERT(process->GetPageTable()
-               .LockForMapDeviceAddressSpace(&is_out_io, handle_description->address,
-                                             handle_description->size,
-                                             Kernel::KMemoryPermission::None, true, false)
-               .IsSuccess());
+    bool locked_pages = false;
+    container.WithSession(session_id, [&](const NvCore::Session& session) {
+        if (session.process == nullptr) {
+            return;
+        }
+        ASSERT(session.process->GetPageTable()
+                   .LockForMapDeviceAddressSpace(&is_out_io, handle_description->address,
+                                                 handle_description->size,
+                                                 Kernel::KMemoryPermission::None, true, false)
+                   .IsSuccess());
+        locked_pages = true;
+    });
+    if (!locked_pages) {
+        return NvResult::InvalidState;
+    }
     return result;
 }
 
@@ -243,11 +265,14 @@ NvResult nvmap::IocFree(IocFreeParams& params, DeviceFD fd) {
     }
 
     if (auto freeInfo{file.FreeHandle(params.handle, false)}) {
-        auto process = container.GetSession(sessions[fd])->process;
         if (freeInfo->can_unlock) {
-            ASSERT(process->GetPageTable()
-                       .UnlockForDeviceAddressSpace(freeInfo->address, freeInfo->size)
-                       .IsSuccess());
+            container.WithSession(freeInfo->session_id, [&](const NvCore::Session& session) {
+                if (session.process != nullptr) {
+                    ASSERT(session.process->GetPageTable()
+                               .UnlockForDeviceAddressSpace(freeInfo->address, freeInfo->size)
+                               .IsSuccess());
+                }
+            });
         }
         params.address = freeInfo->address;
         params.size = static_cast<u32>(freeInfo->size);

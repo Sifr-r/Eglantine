@@ -35,7 +35,7 @@ DirectConnectWindow::DirectConnectWindow(Core::System& system_, QWidget* parent)
     ui->setupUi(this);
 
     // setup the watcher for background connections
-    watcher = new QFutureWatcher<void>;
+    watcher = new QFutureWatcher<void>(this);
     connect(watcher, &QFutureWatcher<void>::finished, this, &DirectConnectWindow::OnConnection);
 
     ui->nickname->setValidator(validation.GetNickname());
@@ -112,12 +112,14 @@ void DirectConnectWindow::Connect() {
     emit SaveConfig();
 
     // attempt to connect in a different thread
-    QFuture<void> f = QtConcurrent::run([&] {
+    const std::string nickname = ui->nickname->text().toStdString();
+    const std::string ip = ui->ip->text().toStdString();
+    const std::string password = ui->password->text().toStdString();
+    const u16 port = UISettings::values.multiplayer_port.GetValue();
+
+    QFuture<void> f = QtConcurrent::run([nickname, ip, password, port] {
         if (auto room_member = Network::GetRoomMember().lock()) {
-            auto port = UISettings::values.multiplayer_port.GetValue();
-            room_member->Join(ui->nickname->text().toStdString(),
-                              ui->ip->text().toStdString().c_str(), port, 0, Network::NoPreferredIP,
-                              ui->password->text().toStdString().c_str());
+            room_member->Join(nickname, ip.c_str(), port, 0, Network::NoPreferredIP, password);
         }
     });
     watcher->setFuture(f);

@@ -24,6 +24,8 @@ class nvmap;
 
 class nvdisp_disp0 final : public nvdevice {
 public:
+    static constexpr DeviceKind Kind = DeviceKind::NvDispDisp0;
+
     explicit nvdisp_disp0(Core::System& system_, NvCore::Container& core);
     ~nvdisp_disp0() override;
 

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "audio_core/renderer/behavior/behavior_info.h"
 #include "audio_core/renderer/memory/memory_pool_info.h"
 #include "audio_core/renderer/performance/performance_manager.h"
@@ -110,7 +112,7 @@ void PerformanceManagerImpl<
     max_detail_count = MaxDetailEntries;
     frame_size = GetRequiredBufferSizeForPerformanceMetricsPerFrame(behavior, params);
     const auto frame_count{static_cast<u32>(workbuffer_size / frame_size)};
-    max_frames = frame_count - 1;
+    max_frames = frame_count > 0 ? frame_count - 1 : 0;
     translated_buffer = memory_pool.Translate(CpuAddr(workbuffer.data()), workbuffer_size);
 
     // The first frame is the "current" frame we're writing to.
@@ -180,15 +182,19 @@ u32 PerformanceManagerImpl<PerformanceVersion::Version1, PerformanceFrameHeaderV
         std::span<PerformanceEntryVersion1> history_entries{};
         std::span<PerformanceDetailVersion1> history_details{};
 
+        u32 history_entry_count{0};
+        u32 history_detail_count{0};
         if (max_frames > 0) {
             auto frame_offset{&frame_history[last_output_frame_index * frame_size]};
             history_header = reinterpret_cast<PerformanceFrameHeaderVersion1*>(frame_offset);
             frame_offset += sizeof(PerformanceFrameHeaderVersion1);
+            history_entry_count = (std::min)(history_header->entry_count, entries_per_frame);
             history_entries = {reinterpret_cast<PerformanceEntryVersion1*>(frame_offset),
-                               history_header->entry_count};
-            frame_offset += entries_per_frame * sizeof(PerformanceFrameHeaderVersion1);
+                               history_entry_count};
+            frame_offset += entries_per_frame * sizeof(PerformanceEntryVersion1);
+            history_detail_count = (std::min)(history_header->detail_count, max_detail_count);
             history_details = {reinterpret_cast<PerformanceDetailVersion1*>(frame_offset),
-                               history_header->detail_count};
+                               history_detail_count};
         } else {
             // Original code does not break here, but will crash when trying to dereference the
             // header in the next if, so let's just skip this frame and continue...
@@ -199,8 +205,8 @@ u32 PerformanceManagerImpl<PerformanceVersion::Version1, PerformanceFrameHeaderV
             continue;
         }
 
-        if (out_size < history_header->entry_count * sizeof(PerformanceEntryVersion1) +
-                           history_header->detail_count * sizeof(PerformanceDetailVersion1) +
+        if (out_size < history_entry_count * sizeof(PerformanceEntryVersion1) +
+                           history_detail_count * sizeof(PerformanceDetailVersion1) +
                            2 * sizeof(PerformanceFrameHeaderVersion1)) {
             break;
         }
@@ -208,7 +214,7 @@ u32 PerformanceManagerImpl<PerformanceVersion::Version1, PerformanceFrameHeaderV
         u32 out_offset{sizeof(PerformanceFrameHeaderVersion1)};
         auto out_entries{std::span<PerformanceEntryVersion1>(
             reinterpret_cast<PerformanceEntryVersion1*>(out_buffer + out_offset),
-            history_header->entry_count)};
+            history_entry_count)};
         u32 out_entry_count{0};
         u32 total_processing_time{0};
         for (auto& history_entry : history_entries) {
@@ -221,7 +227,7 @@ u32 PerformanceManagerImpl<PerformanceVersion::Version1, PerformanceFrameHeaderV
         out_offset += static_cast<u32>(out_entry_count * sizeof(PerformanceEntryVersion1));
         auto out_details{std::span<PerformanceDetailVersion1>(
             reinterpret_cast<PerformanceDetailVersion1*>(out_buffer + out_offset),
-            history_header->detail_count)};
+            history_detail_count)};
         u32 out_detail_count{0};
         for (auto& history_detail : history_details) {
             if (history_detail.processed_time > 0 || history_detail.start_time > 0) {
@@ -269,7 +275,7 @@ bool PerformanceManagerImpl<
     PerformanceDetailVersion1>::GetNextEntry(PerformanceEntryAddresses& addresses,
                                              const PerformanceEntryType entry_type,
                                              const s32 node_id) {
-    if (!is_initialized) {
+    if (!is_initialized || entry_count >= entries_per_frame || entry_count >= entry_buffer.size()) {
         return false;
     }
 
@@ -296,7 +302,8 @@ bool PerformanceManagerImpl<
                                              const PerformanceDetailType detail_type,
                                              const PerformanceEntryType entry_type,
                                              const s32 node_id) {
-    if (!is_initialized || detail_count > MaxDetailEntries) {
+    if (!is_initialized || detail_count >= MaxDetailEntries ||
+        detail_count >= detail_buffer.size()) {
         return false;
     }
 
@@ -369,7 +376,7 @@ void PerformanceManagerImpl<
     max_detail_count = MaxDetailEntries;
     frame_size = GetRequiredBufferSizeForPerformanceMetricsPerFrame(behavior, params);
     const auto frame_count{static_cast<u32>(workbuffer_size / frame_size)};
-    max_frames = frame_count - 1;
+    max_frames = frame_count > 0 ? frame_count - 1 : 0;
     translated_buffer = memory_pool.Translate(CpuAddr(workbuffer.data()), workbuffer_size);
 
     // The first frame is the "current" frame we're writing to.
@@ -439,15 +446,19 @@ u32 PerformanceManagerImpl<PerformanceVersion::Version2, PerformanceFrameHeaderV
         std::span<PerformanceEntryVersion2> history_entries{};
         std::span<PerformanceDetailVersion2> history_details{};
 
+        u32 history_entry_count{0};
+        u32 history_detail_count{0};
         if (max_frames > 0) {
             auto frame_offset{&frame_history[last_output_frame_index * frame_size]};
             history_header = reinterpret_cast<PerformanceFrameHeaderVersion2*>(frame_offset);
             frame_offset += sizeof(PerformanceFrameHeaderVersion2);
+            history_entry_count = (std::min)(history_header->entry_count, entries_per_frame);
             history_entries = {reinterpret_cast<PerformanceEntryVersion2*>(frame_offset),
-                               history_header->entry_count};
-            frame_offset += entries_per_frame * sizeof(PerformanceFrameHeaderVersion2);
+                               history_entry_count};
+            frame_offset += entries_per_frame * sizeof(PerformanceEntryVersion2);
+            history_detail_count = (std::min)(history_header->detail_count, max_detail_count);
             history_details = {reinterpret_cast<PerformanceDetailVersion2*>(frame_offset),
-                               history_header->detail_count};
+                               history_detail_count};
         } else {
             // Original code does not break here, but will crash when trying to dereference the
             // header in the next if, so let's just skip this frame and continue...
@@ -458,16 +469,17 @@ u32 PerformanceManagerImpl<PerformanceVersion::Version2, PerformanceFrameHeaderV
             continue;
         }
 
-        if (out_size < history_header->entry_count * sizeof(PerformanceEntryVersion2) +
-                           history_header->detail_count * sizeof(PerformanceDetailVersion2) +
-                           2 * sizeof(PerformanceFrameHeaderVersion2)) {
+        if (out_size <
+            static_cast<u64>(history_entry_count) * sizeof(PerformanceEntryVersion2) +
+                static_cast<u64>(history_detail_count) * sizeof(PerformanceDetailVersion2) +
+                2 * sizeof(PerformanceFrameHeaderVersion2)) {
             break;
         }
 
         u32 out_offset{sizeof(PerformanceFrameHeaderVersion2)};
         auto out_entries{std::span<PerformanceEntryVersion2>(
             reinterpret_cast<PerformanceEntryVersion2*>(out_buffer + out_offset),
-            history_header->entry_count)};
+            history_entry_count)};
         u32 out_entry_count{0};
         u32 total_processing_time{0};
         for (auto& history_entry : history_entries) {
@@ -480,7 +492,7 @@ u32 PerformanceManagerImpl<PerformanceVersion::Version2, PerformanceFrameHeaderV
         out_offset += static_cast<u32>(out_entry_count * sizeof(PerformanceEntryVersion2));
         auto out_details{std::span<PerformanceDetailVersion2>(
             reinterpret_cast<PerformanceDetailVersion2*>(out_buffer + out_offset),
-            history_header->detail_count)};
+            history_detail_count)};
         u32 out_detail_count{0};
         for (auto& history_detail : history_details) {
             if (history_detail.processed_time > 0 || history_detail.start_time > 0) {
@@ -522,7 +534,8 @@ bool PerformanceManagerImpl<
     PerformanceDetailVersion2>::GetNextEntry(PerformanceEntryAddresses& addresses, u32** unk,
                                              const PerformanceSysDetailType sys_detail_type,
                                              const s32 node_id) {
-    if (!is_initialized || detail_count > MaxDetailEntries) {
+    if (!is_initialized || detail_count >= MaxDetailEntries ||
+        detail_count >= detail_buffer.size()) {
         return false;
     }
 
@@ -552,7 +565,7 @@ bool PerformanceManagerImpl<
     PerformanceDetailVersion2>::GetNextEntry(PerformanceEntryAddresses& addresses,
                                              const PerformanceEntryType entry_type,
                                              const s32 node_id) {
-    if (!is_initialized) {
+    if (!is_initialized || entry_count >= entries_per_frame || entry_count >= entry_buffer.size()) {
         return false;
     }
 
@@ -579,7 +592,8 @@ bool PerformanceManagerImpl<
                                              const PerformanceDetailType detail_type,
                                              const PerformanceEntryType entry_type,
                                              const s32 node_id) {
-    if (!is_initialized || detail_count > MaxDetailEntries) {
+    if (!is_initialized || detail_count >= MaxDetailEntries ||
+        detail_count >= detail_buffer.size()) {
         return false;
     }
 

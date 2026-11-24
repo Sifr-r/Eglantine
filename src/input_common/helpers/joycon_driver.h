@@ -82,6 +82,9 @@ private:
         bool vibration{};
     };
 
+    /// Stops and joins input_thread; caller must hold lifecycle_mutex.
+    void StopInputThreadLocked();
+
     /// Main thread, actively request new data from the handle
     void InputThread(std::stop_token stop_token);
 
@@ -154,14 +157,18 @@ private:
     SupportedFeatures supported_features{};
 
     /// Queue of vibration request to controllers
-    Common::Input::DriverResult last_vibration_result{Common::Input::DriverResult::Success};
+    std::atomic<Common::Input::DriverResult> last_vibration_result{
+        Common::Input::DriverResult::Success};
     Common::SPSCQueue<VibrationValue> vibration_queue;
+    JoyconCallbacks registered_callbacks{};
 
     // Thread related
     mutable std::mutex mutex;
+    std::mutex lifecycle_mutex;
+    std::mutex io_mutex;
+    std::atomic<bool> input_thread_running{false};
+    std::atomic<bool> disable_input_thread{false};
     std::jthread input_thread;
-    bool input_thread_running{};
-    bool disable_input_thread{};
 };
 
 } // namespace InputCommon::Joycon

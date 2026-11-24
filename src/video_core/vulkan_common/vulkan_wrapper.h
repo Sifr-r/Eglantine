@@ -719,17 +719,24 @@ public:
     Image& operator=(const Image&) = delete;
 
     Image(Image&& rhs) noexcept
-        : handle{std::exchange(rhs.handle, VkImage{})}, usage{rhs.usage}, owner{rhs.owner},
-          allocator{rhs.allocator}, allocation{rhs.allocation}, dld{rhs.dld} {}
+        : handle{std::exchange(rhs.handle, VkImage{})},
+          usage{std::exchange(rhs.usage, VkImageUsageFlags{})},
+          owner{std::exchange(rhs.owner, nullptr)},
+          allocator{std::exchange(rhs.allocator, nullptr)},
+          allocation{std::exchange(rhs.allocation, nullptr)},
+          dld{std::exchange(rhs.dld, nullptr)} {}
 
     Image& operator=(Image&& rhs) noexcept {
+        if (this == &rhs) {
+            return *this;
+        }
         Release();
         handle = std::exchange(rhs.handle, VkImage{});
-        usage = rhs.usage;
-        owner = rhs.owner;
-        allocator = rhs.allocator;
-        allocation = rhs.allocation;
-        dld = rhs.dld;
+        usage = std::exchange(rhs.usage, VkImageUsageFlags{});
+        owner = std::exchange(rhs.owner, nullptr);
+        allocator = std::exchange(rhs.allocator, nullptr);
+        allocation = std::exchange(rhs.allocation, nullptr);
+        dld = std::exchange(rhs.dld, nullptr);
         return *this;
     }
 
@@ -744,6 +751,11 @@ public:
     void reset() noexcept {
         Release();
         handle = VkImage{};
+        usage = {};
+        owner = nullptr;
+        allocator = nullptr;
+        allocation = nullptr;
+        dld = nullptr;
     }
 
     explicit operator bool() const noexcept {
@@ -796,20 +808,28 @@ public:
     Buffer& operator=(const Buffer&) = delete;
 
     Buffer(Buffer&& rhs) noexcept
-        : handle{std::exchange(rhs.handle, VkBuffer{})}, owner{rhs.owner}, allocator{rhs.allocator},
-          allocation{rhs.allocation}, mapped{rhs.mapped}, location{rhs.location},
-          is_coherent{rhs.is_coherent}, dld{rhs.dld} {}
+        : handle{std::exchange(rhs.handle, VkBuffer{})},
+          owner{std::exchange(rhs.owner, nullptr)},
+          allocator{std::exchange(rhs.allocator, nullptr)},
+          allocation{std::exchange(rhs.allocation, nullptr)},
+          mapped{std::exchange(rhs.mapped, std::span<u8>{})},
+          location{std::exchange(rhs.location, MemoryLocation{})},
+          is_coherent{std::exchange(rhs.is_coherent, false)},
+          dld{std::exchange(rhs.dld, nullptr)} {}
 
     Buffer& operator=(Buffer&& rhs) noexcept {
+        if (this == &rhs) {
+            return *this;
+        }
         Release();
         handle = std::exchange(rhs.handle, VkBuffer{});
-        owner = rhs.owner;
-        allocator = rhs.allocator;
-        allocation = rhs.allocation;
-        mapped = rhs.mapped;
-        location = rhs.location;
-        is_coherent = rhs.is_coherent;
-        dld = rhs.dld;
+        owner = std::exchange(rhs.owner, nullptr);
+        allocator = std::exchange(rhs.allocator, nullptr);
+        allocation = std::exchange(rhs.allocation, nullptr);
+        mapped = std::exchange(rhs.mapped, std::span<u8>{});
+        location = std::exchange(rhs.location, MemoryLocation{});
+        is_coherent = std::exchange(rhs.is_coherent, false);
+        dld = std::exchange(rhs.dld, nullptr);
         return *this;
     }
 
@@ -824,6 +844,13 @@ public:
     void reset() noexcept {
         Release();
         handle = VkBuffer{};
+        owner = nullptr;
+        allocator = nullptr;
+        allocation = nullptr;
+        mapped = {};
+        location = {};
+        is_coherent = false;
+        dld = nullptr;
     }
 
     explicit operator bool() const noexcept {
@@ -1426,15 +1453,28 @@ public:
             const auto dst_stage_mask2 = static_cast<VkPipelineStageFlags2>(dst_stage_mask);
 
             std::array<VkMemoryBarrier2, MaxBarriers> memory_barriers2;
-            for (u32 i = 0; i < memory_barriers.size(); ++i) {
-                memory_barriers2[i] = VkMemoryBarrier2{
+            u32 memory_barrier_count = memory_barriers.size();
+            if (memory_barrier_count == 0 && buffer_barriers.empty() && image_barriers.empty()) {
+                memory_barriers2[0] = VkMemoryBarrier2{
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
                     .pNext = nullptr,
                     .srcStageMask = src_stage_mask2,
-                    .srcAccessMask = static_cast<VkAccessFlags2>(memory_barriers[i].srcAccessMask),
+                    .srcAccessMask = 0,
                     .dstStageMask = dst_stage_mask2,
-                    .dstAccessMask = static_cast<VkAccessFlags2>(memory_barriers[i].dstAccessMask),
+                    .dstAccessMask = 0,
                 };
+                memory_barrier_count = 1;
+            } else {
+                for (u32 i = 0; i < memory_barrier_count; ++i) {
+                    memory_barriers2[i] = VkMemoryBarrier2{
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                        .pNext = nullptr,
+                        .srcStageMask = src_stage_mask2,
+                        .srcAccessMask = static_cast<VkAccessFlags2>(memory_barriers[i].srcAccessMask),
+                        .dstStageMask = dst_stage_mask2,
+                        .dstAccessMask = static_cast<VkAccessFlags2>(memory_barriers[i].dstAccessMask),
+                    };
+                }
             }
             std::array<VkBufferMemoryBarrier2, MaxBarriers> buffer_barriers2;
             for (u32 i = 0; i < buffer_barriers.size(); ++i) {
@@ -1475,7 +1515,7 @@ public:
                 .sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
                 .pNext = nullptr,
                 .dependencyFlags = dependency_flags,
-                .memoryBarrierCount = memory_barriers.size(),
+                .memoryBarrierCount = memory_barrier_count,
                 .pMemoryBarriers = memory_barriers2.data(),
                 .bufferMemoryBarrierCount = buffer_barriers.size(),
                 .pBufferMemoryBarriers = buffer_barriers2.data(),
@@ -1801,8 +1841,8 @@ public:
     }
 
 private:
-    VkCommandBuffer handle;
-    const DeviceDispatch* dld;
+    VkCommandBuffer handle = nullptr;
+    const DeviceDispatch* dld = nullptr;
 };
 
 u32 AvailableVersion(const InstanceDispatch& dld) noexcept;

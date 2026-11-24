@@ -35,13 +35,14 @@ public:
     void Delete() override;
 
 private:
-    std::vector<std::jthread> detached_tasks;
     AnnounceMultiplayerRoom::Room room;
     Client client;
     std::string host;
     std::string username;
     std::string token;
     std::string room_id;
+    // Destroyed first so background Delete() tasks finish before client/room_id are torn down.
+    std::vector<std::jthread> detached_tasks;
 };
 
 } // namespace WebService

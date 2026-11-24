@@ -163,10 +163,12 @@ Shader::RuntimeInfo MakeRuntimeInfo(const GraphicsPipelineKey& key,
 
 void SetXfbState(VideoCommon::TransformFeedbackState& state, const Maxwell& regs) {
     std::ranges::transform(regs.transform_feedback.controls, state.layouts.begin(),
-                           [](const auto& layout) {
+                           [&state](const auto& layout) {
                                return VideoCommon::TransformFeedbackState::Layout{
                                    .stream = layout.stream,
-                                   .varying_count = layout.varying_count,
+                                   .varying_count = (std::min)(
+                                       layout.varying_count,
+                                       static_cast<u32>(state.varyings[0].size() * 4)),
                                    .stride = layout.stride,
                                };
                            });

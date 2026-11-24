@@ -62,7 +62,7 @@ void A64JitState::SetFpcr(u32 value) {
 
     asimd_MXCSR &= 0x0000003D;
     guest_MXCSR &= 0x0000003D;
-    asimd_MXCSR |= 0x00001f80;
+    asimd_MXCSR |= 0x00009fc0;
     guest_MXCSR |= 0x00001f80;  // Mask all exceptions
 
     // RMode

@@ -118,6 +118,7 @@ public:
 protected:
     explicit CDmaPusher(Host1x::Host1x& host1x, s32 id);
 
+    void Stop();
     virtual void ProcessMethod(u32 method, u32 arg) = 0;
 
 private:

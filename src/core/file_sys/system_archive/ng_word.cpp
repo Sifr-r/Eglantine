@@ -24,9 +24,9 @@ constexpr std::array<u8, 30> WORD_TXT{
 
 VirtualDir NgWord1() {
     std::vector<VirtualFile> files;
-    files.reserve(NgWord1Data::NUMBER_WORD_TXT_FILES);
+    files.reserve(NgWord1Data::NUMBER_WORD_TXT_FILES + 2);
 
-    for (std::size_t i = 0; i < files.size(); ++i) {
+    for (std::size_t i = 0; i < NgWord1Data::NUMBER_WORD_TXT_FILES; ++i) {
         files.push_back(MakeArrayFile(NgWord1Data::WORD_TXT, fmt::format("{}.txt", i)));
     }
 

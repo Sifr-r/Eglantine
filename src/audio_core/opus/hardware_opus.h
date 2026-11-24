@@ -48,6 +48,5 @@ private:
     std::mutex mutex;
     std::array<OpusDecoder*, 24> decoders{};
     ADSP::OpusDecoder::OpusDecoder& opus_decoder;
-    ADSP::OpusDecoder::SharedMemory shared_memory;
 };
 } // namespace AudioCore::OpusDecoder

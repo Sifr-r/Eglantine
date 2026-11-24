@@ -796,7 +796,10 @@ pub extern "C" fn egl_sw2_gyro_mouse_process(
         return -1;
     }
     let result = catch_unwind(AssertUnwindSafe(|| {
-        let Some(samples_flat) = (unsafe { slice_from_raw(cal_samples_xyz, cal_sample_count * 3) })
+        let Some(sample_elem_count) = cal_sample_count.checked_mul(3) else {
+            return -1;
+        };
+        let Some(samples_flat) = (unsafe { slice_from_raw(cal_samples_xyz, sample_elem_count) })
         else {
             return -1;
         };

@@ -503,6 +503,18 @@ struct VibrationValue {
 };
 
 struct JoyconHandle {
+    JoyconHandle() = default;
+    ~JoyconHandle() {
+        if (handle != nullptr) {
+            SDL_hid_close(handle);
+            handle = nullptr;
+        }
+    }
+    JoyconHandle(const JoyconHandle&) = delete;
+    JoyconHandle& operator=(const JoyconHandle&) = delete;
+    JoyconHandle(JoyconHandle&&) = delete;
+    JoyconHandle& operator=(JoyconHandle&&) = delete;
+
     SDL_hid_device* handle = nullptr;
     u8 packet_counter{};
 };

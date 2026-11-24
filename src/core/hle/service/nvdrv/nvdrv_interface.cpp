@@ -164,14 +164,12 @@ void NVDRV::Close(HLERequestContext& ctx) {
 
 void NVDRV::Initialize(HLERequestContext& ctx) {
     LOG_WARNING(Service_NVDRV, "(STUBBED) called");
-    IPC::ResponseBuilder rb{ctx, 3};
-    SCOPE_EXIT {
-        rb.Push(ResultSuccess);
-        rb.PushEnum(NvResult::Success);
-    };
 
     if (is_initialized) {
         // No need to initialize again
+        IPC::ResponseBuilder rb{ctx, 3};
+        rb.Push(ResultSuccess);
+        rb.PushEnum(NvResult::Success);
         return;
     }
 
@@ -182,11 +180,21 @@ void NVDRV::Initialize(HLERequestContext& ctx) {
     [[maybe_unused]] const auto transfer_memory_handle{ctx.GetCopyHandle(1)};
     [[maybe_unused]] const auto transfer_memory_size = rp.Pop<u32>();
 
-    auto& container = nvdrv->GetContainer();
     auto process = ctx.GetObjectFromHandle<Kernel::KProcess>(process_handle);
+    if (process.IsNull()) {
+        LOG_ERROR(Service_NVDRV, "Invalid process handle {:#x}", process_handle);
+        ServiceError(ctx, NvResult::BadValue);
+        return;
+    }
+
+    auto& container = nvdrv->GetContainer();
     session_id = container.OpenSession(process.GetPointerUnsafe());
 
     is_initialized = true;
+
+    IPC::ResponseBuilder rb{ctx, 3};
+    rb.Push(ResultSuccess);
+    rb.PushEnum(NvResult::Success);
 }
 
 void NVDRV::InitializeForProcess(Kernel::KProcess* process) {

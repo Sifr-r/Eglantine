@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include "common/common_funcs.h"
@@ -120,7 +121,12 @@ public:
     }
 
     bool IsInVirtualRange(void* address) const noexcept {
-        return address >= virtual_base && address < virtual_base + virtual_size;
+        if (virtual_base == nullptr || address == nullptr) {
+            return false;
+        }
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
+        const uintptr_t base = reinterpret_cast<uintptr_t>(virtual_base);
+        return addr >= base && addr - base < virtual_size;
     }
 
 private:

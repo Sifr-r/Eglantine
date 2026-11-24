@@ -375,14 +375,24 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
         val pointerIndex = event.actionIndex
         val fingerPositionX = event.getX(pointerIndex).toInt()
         val fingerPositionY = event.getY(pointerIndex).toInt()
+        val action = event.action and MotionEvent.ACTION_MASK
+
+        if (action == MotionEvent.ACTION_CANCEL) {
+            buttonBeingConfigured = null
+            dpadBeingConfigured = null
+            joystickBeingConfigured = null
+            return true
+        }
 
         for (button in overlayButtons) {
             // Determine the button state to apply based on the MotionEvent action flag.
-            when (event.action and MotionEvent.ACTION_MASK) {
+            when (action) {
                 MotionEvent.ACTION_DOWN,
                 MotionEvent.ACTION_POINTER_DOWN ->
-                    // If no button is being moved now, remember the currently touched button to move.
+                    // If no control is being moved now, remember the currently touched button to move.
                     if (buttonBeingConfigured == null &&
+                        dpadBeingConfigured == null &&
+                        joystickBeingConfigured == null &&
                         button.bounds.contains(fingerPositionX, fingerPositionY)
                     ) {
                         buttonBeingConfigured = button
@@ -392,7 +402,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
                         hasMoved = false
                     }
 
-                MotionEvent.ACTION_MOVE -> if (buttonBeingConfigured != null) {
+                MotionEvent.ACTION_MOVE -> if (buttonBeingConfigured === button) {
                     val moveDistance = kotlin.math.sqrt(
                         (event.getX(pointerIndex) - touchStartX).let { it * it } +
                                 (event.getY(pointerIndex) - touchStartY).let { it * it }
@@ -432,11 +442,13 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
 
         for (dpad in overlayDpads) {
             // Determine the button state to apply based on the MotionEvent action flag.
-            when (event.action and MotionEvent.ACTION_MASK) {
+            when (action) {
                 MotionEvent.ACTION_DOWN,
                 MotionEvent.ACTION_POINTER_DOWN ->
-                    // If no button is being moved now, remember the currently touched button to move.
+                    // If no control is being moved now, remember the currently touched dpad to move.
                     if (buttonBeingConfigured == null &&
+                        dpadBeingConfigured == null &&
+                        joystickBeingConfigured == null &&
                         dpad.bounds.contains(fingerPositionX, fingerPositionY)
                     ) {
                         dpadBeingConfigured = dpad
@@ -446,7 +458,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
                         hasMoved = false
                     }
 
-                MotionEvent.ACTION_MOVE -> if (dpadBeingConfigured != null) {
+                MotionEvent.ACTION_MOVE -> if (dpadBeingConfigured === dpad) {
                     val moveDistance = kotlin.math.sqrt(
                         (event.getX(pointerIndex) - touchStartX).let { it * it } +
                                 (event.getY(pointerIndex) - touchStartY).let { it * it }
@@ -487,9 +499,11 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
         }
 
         for (joystick in overlayJoysticks) {
-            when (event.action) {
+            when (action) {
                 MotionEvent.ACTION_DOWN,
-                MotionEvent.ACTION_POINTER_DOWN -> if (joystickBeingConfigured == null &&
+                MotionEvent.ACTION_POINTER_DOWN -> if (buttonBeingConfigured == null &&
+                    dpadBeingConfigured == null &&
+                    joystickBeingConfigured == null &&
                     joystick.bounds.contains(fingerPositionX, fingerPositionY)
                 ) {
                     joystickBeingConfigured = joystick
@@ -499,7 +513,7 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
                     hasMoved = false
                 }
 
-                MotionEvent.ACTION_MOVE -> if (joystickBeingConfigured != null) {
+                MotionEvent.ACTION_MOVE -> if (joystickBeingConfigured === joystick) {
                     val moveDistance = kotlin.math.sqrt(
                         (event.getX(pointerIndex) - touchStartX).let { it * it } +
                                 (event.getY(pointerIndex) - touchStartY).let { it * it }
@@ -509,11 +523,12 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
                         hasMoved = true
                         joystickBeingConfigured!!.onConfigureTouch(event)
                         invalidate()
+                        return true
                     }
                 }
 
                 MotionEvent.ACTION_UP,
-                MotionEvent.ACTION_POINTER_UP -> if (joystickBeingConfigured != null) {
+                MotionEvent.ACTION_POINTER_UP -> if (joystickBeingConfigured === joystick) {
                     if (!hasMoved) {
                         showScaleDialog(
                             null,
@@ -840,6 +855,9 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
     fun setIsInEditMode(editMode: Boolean) {
         inEditMode = editMode
         if (!editMode) {
+            buttonBeingConfigured = null
+            dpadBeingConfigured = null
+            joystickBeingConfigured = null
             scaleDialog?.dismiss()
             scaleDialog = null
             gamelessMode = false
@@ -964,8 +982,9 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
 
         val overlayControlData = NativeConfig.getOverlayControlData()
         overlayControlData.forEach {
-            it.enabled = OverlayControl.from(it.id)?.defaultVisibility == true
-            it.individualScale = OverlayControl.from(it.id)?.defaultIndividualScaleResource!!
+            val defaultControlData = OverlayControl.from(it.id)
+            it.enabled = defaultControlData?.defaultVisibility == true
+            it.individualScale = defaultControlData?.defaultIndividualScaleResource ?: 1.0f
         }
         NativeConfig.setOverlayControlData(overlayControlData)
 
@@ -1027,9 +1046,11 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
         private fun getBitmap(context: Context, drawableId: Int, scale: Float): Bitmap {
             val vectorDrawable = ContextCompat.getDrawable(context, drawableId) as VectorDrawable
 
+            val baseWidth = (vectorDrawable.intrinsicWidth * scale).toInt().coerceAtLeast(1)
+            val baseHeight = (vectorDrawable.intrinsicHeight * scale).toInt().coerceAtLeast(1)
             val bitmap = Bitmap.createBitmap(
-                (vectorDrawable.intrinsicWidth * scale).toInt(),
-                (vectorDrawable.intrinsicHeight * scale).toInt(),
+                baseWidth,
+                baseHeight,
                 Bitmap.Config.ARGB_8888
             )
 
@@ -1039,12 +1060,17 @@ class InputOverlay(context: Context, attrs: AttributeSet?) :
             val maxBitmapDimension = max(bitmap.width, bitmap.height)
             val bitmapScale = scale * minScreenDimension / maxBitmapDimension
 
+            val scaledWidth = (bitmap.width * bitmapScale).toInt().coerceAtLeast(1)
+            val scaledHeight = (bitmap.height * bitmapScale).toInt().coerceAtLeast(1)
             val scaledBitmap = Bitmap.createScaledBitmap(
                 bitmap,
-                (bitmap.width * bitmapScale).toInt(),
-                (bitmap.height * bitmapScale).toInt(),
+                scaledWidth,
+                scaledHeight,
                 true
             )
+            if (scaledBitmap !== bitmap) {
+                bitmap.recycle()
+            }
 
             val canvas = Canvas(scaledBitmap)
             vectorDrawable.setBounds(0, 0, canvas.width, canvas.height)

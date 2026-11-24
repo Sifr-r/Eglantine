@@ -1,8 +1,28 @@
 # ARCHITECTURE.md — Eglantine
 
-Ledger of the core domains, their public contracts and their build dependencies.
+Ledger of the core domains, their public contracts and their build dependencies. Use the task
+map for the first files to read, then verify behavior at the named entry point.
 
-Baseline generated 2026-11-16 against `upstream/nx2` = `cf6cfe9caa` (v0.1.0-rc4).
+The original architecture baseline was recorded on 2026-11-16 at `upstream/nx2`, revision
+`cf6cfe9caa` (v0.1.0-rc4). Dated verification entries describe their specific runs.
+
+## Task map
+
+| Task | Start in source | Verification |
+| --- | --- | --- |
+| Boot, platform detection, shutdown | [`Core::System`](src/core/core.cpp), [platform profile](src/core/platform_profile.h), [session state](src/core/nx2_session_state.h) | `[platform-profile]`, `[platform-sizing]`, `[shutdown-ordering]`, `[nx2-session]` |
+| File recognition, library scans, NUP | [Loader](src/core/loader/loader.cpp), [Qt discovery](src/qt_common/game_list/discovery.h), [Android metadata bridge](src/android/app/src/main/jni/game_metadata.cpp), [NUP writer](src/core/file_sys/nup_writer.cpp) | `[loader-formats]`, `[nup]`, affected frontend smoke test |
+| Native shader or Vulkan rendering | [Ampere lowering](src/shader_recompiler/frontend/ampere/lower_to_maxwell.h), [pipeline cache](src/video_core/renderer_vulkan/vk_pipeline_cache.cpp), [shader triage](.claude/skills/nx2-shader-triage/SKILL.md) | `[ampere]`, `[draw_skip_policy]`, controlled frame comparison for visual changes |
+| Host memory, GPU readbacks, textures | [Host memory](src/common/host_memory.cpp), [buffer cache](src/video_core/buffer_cache/buffer_cache.h), [texture code](src/video_core/textures) | `[host_memory]`, `[buffer-download-policy]`, `[textures]` |
+| Controllers and frontend settings | [Switch 2 protocol](src/input_common/helpers/switch2_protocol), [shared config](src/frontend_common/config.cpp) | `[switch2]`, `[config_persistence]`, hardware checks for transport changes |
+| Build, CI, and release outputs | [CMake targets](CMakeLists.txt), [source checks](.github/workflows/source-checks.yml), [release workflow](.github/workflows/release.yml) | See [source and release checks](#source-and-release-checks) |
+| Live debugging and tool interfaces | [Debug server](src/core/debugger/nx2_debug_server.cpp), [tool index](tools/README.md), [live workflow](.claude/skills/nx2-debug-server/SKILL.md) | Read-only status first, then capture targeted evidence |
+
+From a configured desktop build, run `cmake --build build --target yuzu yuzu-cmd tests --parallel`.
+Use `./build/bin/tests "[tag]"` for one Catch2 filter (`tests.exe` on Windows). For Rust, use
+`cargo test --manifest-path rust/Cargo.toml --locked --offline`. Record the actual configuration
+and test results in the handoff. For archived plans, start from their revision and recheck the
+source before adopting a proposed change.
 
 ---
 
@@ -37,8 +57,8 @@ to `shader_recompiler` for shader translation.
 | 14 | `yuzu` | `src/yuzu` | Qt frontend, built as `yuzu` with executable name `eglantine` |
 | 15 | `updater` | `src/updater` | The self-update helper |
 | 16 | `web_service` | `src/web_service` | Telemetry and other web services |
-| 17 | `android` | `src/android` | The Android port (JNI glue over `core`) |
-| 18 | `simd_kernels` | `src/simd_kernels` | Multi-ISA ISPC texture/audio kernels (`AddIspcKernel.cmake`; empty `INTERFACE` fallback when `ispc` is absent) |
+| 17 | `android` | `src/android` | Android UI and platform integration with JNI over `core` |
+| 18 | `simd_kernels` | `src/simd_kernels` | Multi-ISA ISPC texture kernels (`AddIspcKernel.cmake`; empty `INTERFACE` fallback when `ispc` is absent) |
 | 19 | `eglantine_rs` | `rust/` | Single `staticlib` Cargo FFI bundle (`eglantine_ffi` -> `eglantine_rs`) exporting the Rust domains via `rust/include/*.h` |
 | — | `tests` | `src/tests` | Catch2 unit tests; links against the layers it tests |
 
@@ -47,11 +67,32 @@ fetched through CPM into `.cache/cpm/` at configure time. `dist/` holds packagin
 `tools/nx2/` holds the Switch 2 debugging toolchain; `tools/windows/` holds the Vulkan SDK
 bootstrap.
 
-### Polyglot Rust, Slang, and ISPC architecture
+### First-party language and domain ownership
 
-The [polyglot migration guide](POLYGLOT_IMPLEMENTATION_PLAN.md) tracks the phased integration
-and parity switches. Five `std`-only Cargo crates (zero external `crates.io` dependencies in
-`rust/Cargo.lock`) live under `rust/crates/`:
+C++ owns emulator state, the guest loader and memory interfaces, desktop frontends, and platform
+integration. Rust owns the direct SM86-to-SPIR-V compiler and provides optional implementations
+for three existing C++ domains through the common C ABI. The
+[polyglot migration guide](POLYGLOT_IMPLEMENTATION_PLAN.md) records the original rollout.
+
+| Area | First-party sources and entry points | Decision |
+|---|---|---|
+| Guest runtime and desktop frontends | `src/core`, `src/video_core`, `src/input_common`, Qt and SDL targets | Keep C++ as the production owner of emulator state and frontend integration. Keep ARM assembly for NCE entry, context switching and Dynarmic tests. Preserve the macOS Dynarmic C exception bridge. |
+| Guest shaders | `src/shader_recompiler`, `rust/crates/ampere_core`, `rust/crates/ampere_spirv` | Keep C++ as the default Ampere-to-Maxwell lowering implementation. Keep the Rust alternative pending shader rejection, program-key, override and cache parity on representative titles. The opt-in Rust direct SPIR-V path has a separate output contract. |
+| NUP files | `src/core/file_sys`, `rust/crates/nup_fs` | Keep C++ as the default reader and writer. Keep the Rust implementation pending cross-backend journal recovery, destructive-pack behavior and old-archive interoperability. The backends currently handle some malformed journal rows differently. |
+| Switch 2 input | `src/input_common`, `rust/crates/switch2_io` | Keep C++ as the default protocol codec and platform transport owner. Keep the Rust codec pending output and error parity for USB and BLE, including hardware reconnect and rumble. |
+| Host shaders and SIMD | `src/video_core/host_shaders`, `dist/post_shaders`, `src/simd_kernels` | Use the existing GLSL build and preserve post-processing assets. The unused Slang modules and ISPC audio mixer were retired. Retain the three active ISPC texture kernels until each meets output and throughput gates on x86-64 and ARM64. |
+| Android frontend | `src/android`, `src/common/android`, `src/common/fs/fs_android.*` | Keep Android UI, lifecycle, SAF and permissions in Kotlin/Android APIs, with JNI at the shared C++ boundary. Keep Gradle Kotlin DSL and platform resources. |
+| Build, CI and release | CMake, Gradle, Cargo, GitHub workflow YAML, Nix, NSIS, `tools/ci`, `tools/windows` | Keep declarative configuration and shell/PowerShell platform setup. Keep Python release archive and path validation with its existing tests and trusted workflow entry points. |
+| Development and asset tools | `tools/nx2`, `tools/mcp`, `tools/cpm`, `tools/translations`, generators under `tools/` | Keep existing Python and shell workflows for lab automation, dependency management, localization and generation. Keep the standalone Perl DTrace and filter tools and the Linux C crash tracing helper. Consolidate when it removes duplicated logic or a workflow's interpreter dependency. |
+| Documentation and dependencies | `docs/`, `externals/`, CPM packages | Keep project documentation in repository Markdown. Preserve the build and licensing conventions of external dependencies. |
+
+Retire a duplicate only after the same inputs produce compatible output, failure behavior and
+side effects, with acceptable performance. Prefer C++ on a tie. Before making Rust the sole
+implementation, verify desktop builds and the ARM64 Android link. The current CMake Cargo helper
+does not infer an Android target triple or NDK linker.
+
+Five `std`-only Cargo crates (zero external `crates.io` dependencies in `rust/Cargo.lock`)
+live under `rust/crates/`:
 
 | Crate | Path | Library | Responsibility & C ABI Header |
 |---|---|---|---|
@@ -70,8 +111,16 @@ and parity switches. Five `std`-only Cargo crates (zero external `crates.io` dep
   * `src/CMakeLists.txt` loads `src/simd_kernels` before `core`/`audio_core`/`video_core` via `CMakeModules/AddIspcKernel.cmake`; `video_core` links `PRIVATE simd_kernels` (`EGLANTINE_ENABLE_ISPC=1` when `ispc` is found; empty `INTERFACE` no-op with scalar C++ fallback otherwise) and `PUBLIC xbyak::xbyak` (`x86_64`) / `PUBLIC merry::oaknut` (`arm64` for `TuringMacroJit`).
   * `tests` links `audio_core`, `common`, `core`, `frontend_common`, `input_common`, `video_core`, `eglantine_rs`, and (when `ENABLE_QT`) `qt_common`.
 * **Flat C ABI boundary:** Every Rust <-> C++ crossing uses `#[repr(C)]` POD structs, primitives, and callback tables declared in `rust/include/*.h`. All Rust domain modules enforce `#![deny(warnings)]` and `#![forbid(unsafe_code)]`, isolating pointer/alignment validation, `catch_unwind`, and idempotent `*_free` helpers inside `ffi.rs`.
-* **Slang & ISPC host-shader scaffolding:** `src/video_core/host_shaders/CMakeLists.txt` optionally compiles `hmma_tiled_fallback.slang` and `nv12_to_block_linear.slang` when `slangc` is on `PATH` (skipping cleanly when absent). `src/simd_kernels/*.ispc` (`tex_etc2.ispc`, `tex_astc_scan.ispc`, `tex_swizzle.ispc`, `audio_mix.ispc`) compile multi-ISA (`sse4-i32x4,avx2-i32x8,avx512skx-i32x16` / `neon-i32x4`) behind `EGLANTINE_ENABLE_ISPC`.
+* **ISPC texture kernels:** `tex_etc2.ispc` decodes ETC2, `tex_astc_scan.ispc` checks ASTC opacity, and `tex_swizzle.ispc` copies between linear and block-linear layouts. They compile multi-ISA (`sse4-i32x4,avx2-i32x8,avx512skx-i32x16` / `neon-i32x4`) behind `EGLANTINE_ENABLE_ISPC`. Use five interleaved runs per backend on each architecture and require bit-exact output and median C++ throughput within 5% of ISPC on each workload before retiring that kernel. `src/tests/video_core/astc.cpp` owns ASTC opacity fixtures and the `[.astc_bench]` benchmark. The other performance filters are `[.etc2_bench]` and `[.native_swizzle_bench]`. Set `EDEN_NX2_ISPC=0` or `1` in a fresh process for each measurement.
 * **Runtime switches:** `EDEN_NX2_RUST_AMPERE`, `EDEN_NX2_DIRECT_SM86`, `EDEN_NX2_RUST_NUP`, `EDEN_NX2_RUST_SWITCH2_IO`, `EDEN_NX2_ISPC` (plus `*_VERIFY=1` differential modes), `EDEN_NX2_VK_VIDEO=1`, and `EDEN_NX2_DRAW_CACHE`. Temporal upscaling shares `Vulkan::ITemporalUpscaler` (`src/video_core/renderer_vulkan/vk_temporal_upscaler.h`) with runtime fallback `DLSS -> XeSS -> FSR 3.1 -> temporal stand-in` (`vk_xess_upscaler.{h,cpp}`).
+
+**Cleanup verification (2026-11-24).** Windows x86-64 Release builds of Qt, SDL and Catch2
+passed. The full Catch2 suite passed 740 cases, and the locked offline Cargo suite passed 47.
+Texture, NUP, Switch 2 input and Ampere suites also passed with their alternate and verification
+settings. The standalone desktop discovery test passed. On the tested x86-64 machine, median
+C++ throughput was about 1.4× ISPC for ETC2, 5.0× for ASTC opacity and 5.4–5.7× for swizzle
+on the measured workloads. ARM64 measurements and an Android APK/device smoke run are still
+needed. The Android Kotlin JNI declaration passed a standalone JVM signature check.
 
 ## 3. Core domain contracts
 
@@ -248,6 +297,18 @@ convention.
   calls `release()` before allocating and updates `buffer_capacity` only after allocation succeeds;
   covered by `src/tests/common/scratch_buffer.cpp` (`[scratch_oom]`).
 
+### Critical input boundaries and recovery
+
+| Boundary | Responsibility |
+| --- | --- |
+| HLE IPC (`src/core/hle/service/hle_ipc.cpp`, `cmif_serialization.h`, and `src/core/hle/kernel/k_server_session.cpp`) | Snapshot the request, bound descriptor and argument reads, and return receive failures to the client before dispatch. |
+| Filesystem and loader (`src/core/hle/service/filesystem/fsp/fs_i_{file,storage}.cpp`, `src/core/file_sys/vfs/vfs_vector.cpp`, and `src/core/loader/nso.cpp`) | Check request capacity, file ranges, and loaded image ranges before transferring bytes. `src/core/file_sys/fssystem/fssystem_nca_file_system_driver.cpp` returns the alignment wrapper for encrypted XTS storage. |
+| Applets (`src/core/hle/service/am/frontend/applet_{web_browser,software_keyboard}.cpp`) | Validate frontend argument data and deliver invalid arguments through the applet completion result. |
+| NIFM and AOC (`src/core/hle/service/nifm/nifm.cpp` and `src/core/hle/service/aoc/addon_content_manager.cpp`) | Bound the SSID field and content-list output transfers by their actual capacities. |
+| NVDRV (`src/core/hle/service/nvdrv/devices/nvhost_ctrl.cpp` and `nvhost_nvdec_common.cpp`) | Protect event cleanup with slot validation and validate command, session, and syncpoint state before queuing a submission. |
+| Kernel and ARM64 backend (`src/core/hle/kernel/k_page_table_base.cpp` and `src/dynarmic/src/dynarmic/backend/arm64/emit_arm64_vector_floating_point.cpp`) | Advance both ends of coalesced heap copies and preserve caller-saved registers across the floating-point fallback. |
+| Qt migration (`src/yuzu/ryujinx_dialog.cpp`) | Keep the Eden save directory and leave the dialog open if copying to Ryujinx fails. |
+
 ### `video_core` — the GPU
 
 * `VideoCommon::Maxwell3D` is the register file. `GetNativeMacroEngine().native_turing`
@@ -360,7 +421,21 @@ convention.
   * `PendingDownload` (`pending_download.h`, `texture_cache.h`) pins DMA readback destinations via `HostRuns` (`GatherHostRuns` / `WriteHostRuns`), and `FenceManager` (`fence_manager.h`) tracks `buffer_downloads` / `ordered_fences_in_flight` while preserving `force_completion` and `SkipEmptyFence()`; covered by `src/tests/video_core/pending_download.cpp` and `src/tests/video_core/texture_cache_lifetime.cpp`.
   * Ampere geometry exit-envelope capture (`exit_setup`, `exit_handler_end`, `IsGeometryExitSetup`, omitting `FallbackEnd`) stays bit-exact between `src/shader_recompiler/frontend/ampere/program_capture.h`, `rust/include/eglantine_ampere.h`, and `rust/crates/ampere_core/src/{capture.rs,ffi.rs}`; covered by `src/tests/video_core/{ampere_geometry,ampere_rust_parity}.cpp` and `eglantine_ampere_core` Cargo tests.
 
-### `audio_core` — audio sinks and silent recovery
+### `audio_core` — audio sinks and Opus decoding
+
+* **Opus PCM output capacity.** The single-stream and multistream ADSP decoder objects
+  (`src/audio_core/adsp/apps/opus/opus_decode_object.{h,cpp}` and
+  `src/audio_core/adsp/apps/opus/opus_multistream_decode_object.{h,cpp}`) keep the
+  configured channel count with the host libopus state. They convert the
+  output buffer's byte capacity to complete interleaved PCM frames before
+  calling libopus. The guest work-buffer layout and reported sizes are preserved.
+  `src/audio_core/opus/decoder.cpp` also bounds the decoded PCM copy by the caller's
+  IPC output capacity.
+* **Renderer input validation.** `src/audio_core/renderer/behavior/info_updater.cpp`
+  validates update layout and voice, mix, and sink indices. Splitter parsing is
+  bounded by its declared section in `src/audio_core/renderer/splitter/splitter_context.cpp`.
+  `src/audio_core/renderer/command/data_source/decode.cpp` bounds ADPCM reads, sample
+  arithmetic, and PCM output.
 
 * **`SinkStream` silent fallback and backend recovery.** `AudioCore::Sink::SinkStream` (`src/audio_core/sink/sink_stream.{h,cpp}`) provides protected `StartSilentDevice()` / `StopSilentDevice()` with `std::jthread silent_device` declared last so teardown joins before base members are destroyed, driving paced output/zeroed input frames when paused or unbound. `CubebSink` / `CubebSinkStream` (`src/audio_core/sink/cubeb_sink.{h,cpp}`) adds `streams_mutex`, a COM-MTA `watchdog` thread, and stall/error reopen recovery; `SDLSinkStream` (`src/audio_core/sink/sdl3_sink.cpp`) handles device disconnect/hotplug recovery with `StartSilentDevice()` fallback; covered by `src/tests/audio_core/sink_stream_silent.cpp`.
 * **ETC2 and EAC decoding lives in `src/video_core/textures/etc2.cpp`.** `Tegra::Texture::ETC2`
@@ -522,9 +597,13 @@ usually binds a gamepad; the SDL file binds the keyboard by default.
 
 `src/qt_common/config/qt_config.cpp` persists shortcuts under their group and action names
 and reloads multiplayer username and IP ban lists from their indexed keys (`src/tests/qt_common/qt_config_ban_list.cpp`).
-An empty binding can be an explicit override of the default. Android's game scanner and
-launch-by-URI handler share the extension allowlist in `model/Game.kt`. The native NUP
-loader publishes a program ID once the selected ExeFS contains both `main` and `main.npdm`.
+An empty binding can be an explicit override of the default. The extension registry in
+`src/core/loader/loader.cpp` owns filename recognition and the separate desktop, Android game,
+and Android external-content lists. Qt builds its scan and file-dialog list from the desktop
+policy. Android's scanner and URI handler use `GameMetadata.kt` to cache the corresponding lists
+from JNI. `src/tests/core/loader_file_formats.cpp` verifies the lists and filename-to-type mapping.
+The native NUP loader publishes a program ID once the selected ExeFS contains both `main` and
+`main.npdm`.
 
 * **INI persistence, play time, rescan rollback, startup probe, and input cancel rollback.**
   * `Config::WriteToIni()` (`src/frontend_common/config.cpp`) writes through a unique sibling temporary file, flushes and syncs (`_commit` on Windows, `fsync` + parent dir sync on POSIX), preserves target permissions, and atomically renames into place (`src/tests/frontend_common/config_persistence.cpp`).
@@ -560,6 +639,43 @@ take Player 1 from the factory keyboard mapping. Other assignments prefer the lo
 unconnected slot, reusing a disconnected Switch 2 slot before replacing an active
 non-Switch 2 mapping. Set `switch2_auto_pair=false` in the config file to keep the manual
 behaviour.
+
+### Sentry crash reporting
+
+Windows, Linux, and macOS desktop builds can enable Sentry Native with `ENABLE_SENTRY=ON`.
+The option defaults to `OFF`. An enabled build starts Sentry only when the launching process has
+a valid `SENTRY_DSN`. `SENTRY_ENVIRONMENT` labels reports and defaults to `production` in the SDK.
+Reports use `eglantine@<commit>` as the release and `qt` or `sdl` as the `frontend` tag.
+
+| File | Responsibility |
+|---|---|
+| `CMakeLists.txt` | Gate desktop support and validate the installed static SDK, its crash backend, and its transport. |
+| `src/frontend_common/CMakeLists.txt` | Build the crash reporter and link the SDK when enabled. |
+| `src/frontend_common/sentry_crash_reporter.h` | Expose scoped crash reporting and identify its owning frontend. |
+| `src/frontend_common/sentry_crash_reporter.cpp` | Read runtime configuration, manage the SDK lifetime, and store its queue under the Eglantine cache at `sentry/<frontend>`. |
+| `src/yuzu/main.cpp` | Start Sentry after Qt startup probes and keep Breakpad available when Sentry is inactive. |
+| `src/yuzu_cmd/yuzu.cpp` | Own Sentry through the SDL callback lifetime and give the Windows `EDEN_NX2_CRASH_DUMP` option precedence. |
+
+Build and install the [Sentry Native 0.17.5 SDK](https://github.com/getsentry/sentry-native/releases/tag/0.17.5)
+from a source distribution with its bundled dependencies or a checkout with its submodules. Use
+the same target architecture and compatible C runtime for both builds.
+
+```text
+cmake -S <sentry-source> -B <sentry-build> -DCMAKE_BUILD_TYPE=Release -DSENTRY_BACKEND=inproc -DSENTRY_BUILD_SHARED_LIBS=OFF -DSENTRY_BUILD_TESTS=OFF -DSENTRY_BUILD_EXAMPLES=OFF
+cmake --build <sentry-build> --config Release
+cmake --install <sentry-build> --config Release --prefix <sentry-install>
+cmake -S . -B build -DENABLE_SENTRY=ON -DCMAKE_PREFIX_PATH=<sentry-install>
+cmake --build build --target yuzu yuzu-cmd --parallel
+```
+
+Copy the project DSN from Sentry's Client Keys settings and set `SENTRY_DSN` in the shell that
+launches the emulator. Unset it to disable reporting for future launches. Native reports include
+crash stacks and loaded module metadata. Eglantine leaves out application logs, user accounts,
+game metadata, and attachments.
+Upload the matching debug files from an enabled build with `sentry-cli debug-files upload`
+using the intended Sentry project and a CI or developer auth token. Preserve the corresponding
+PDBs on Windows, debug ELF files on Linux, or dSYMs on macOS.
+Include the SDK and linked dependency license notices when distributing Sentry-enabled builds.
 
 ## 5. The Switch 2 debugging toolchain (`tools/nx2/`)
 
@@ -647,10 +763,10 @@ The release workflow uses its trusted checkout to scan the exact build commit an
   Eglantine artwork (`dist/Eglantine.png` and `dist/eglantine.icns`). Earlier revisions still
   contain the quarantined game-derived fixtures and macOS catalog.
 * The public suite omits 31 cases containing or depending on title-derived instructions. Eight
-  independently encoded cases now cover priority DMA and Ampere regressions. The Windows
-  comparison passed 445 of 450 cases before the fixes and 453 of 458 afterwards, with identical
-  calibration, debug-server and networking failures. The Linux pull-request job still needs a
-  run on GitHub.
+  independently encoded cases from that cleanup cover priority DMA and Ampere regressions.
+  The Windows audit snapshot passed 445 of 450 cases before the fixes and 453 of 458 afterwards.
+  Calibration, debug-server, and networking failures occurred in both runs. Use the dated
+  records and current workflow results to assess the current tree.
 
 ### Closed by the full-codebase audit pass
 

@@ -5,6 +5,8 @@
 #pragma once
 
 #include <array>
+#include <memory>
+#include <mutex>
 #include <vector>
 #include "common/bit_field.h"
 #include "common/common_types.h"
@@ -21,6 +23,8 @@ namespace Service::Nvidia::Devices {
 
 class nvhost_ctrl final : public nvdevice {
 public:
+    static constexpr DeviceKind Kind = DeviceKind::NvHostCtrl;
+
     explicit nvhost_ctrl(Core::System& system_, EventInterface& events_interface_,
                          NvCore::Container& core);
     ~nvhost_ctrl() override;
@@ -95,7 +99,12 @@ private:
 
     u32 FindFreeNvEvent(u32 syncpoint_id);
 
-    std::array<InternalEvent, MaxNvEvents> events{};
+    struct SharedState {
+        std::mutex callback_mutex;
+        bool alive{true};
+        std::array<InternalEvent, MaxNvEvents> events{};
+    };
+
     std::mutex events_mutex;
     u64 events_mask{};
 
@@ -198,6 +207,7 @@ private:
     EventInterface& events_interface;
     NvCore::Container& core;
     NvCore::SyncpointManager& syncpoint_manager;
+    std::shared_ptr<SharedState> shared_state;
 };
 
 } // namespace Service::Nvidia::Devices

@@ -282,6 +282,14 @@ void Interface::SetRegisterInfoPrivate(HLERequestContext& ctx) {
     LOG_INFO(Service_NFP, "called, device_handle={}, buffer_size={}", device_handle,
              register_info_buffer.size());
 
+    if (register_info_buffer.size() < sizeof(RegisterInfoPrivate)) {
+        LOG_ERROR(Service_NFP, "RegisterInfoPrivate buffer too small: {}",
+                  register_info_buffer.size());
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultInvalidArgument);
+        return;
+    }
+
     RegisterInfoPrivate register_info{};
     memcpy(&register_info, register_info_buffer.data(), sizeof(RegisterInfoPrivate));
     auto result = GetManager()->SetRegisterInfoPrivate(device_handle, register_info);
@@ -358,6 +366,13 @@ void Interface::SetAll(HLERequestContext& ctx) {
     const auto nfp_data_buffer{ctx.ReadBuffer()};
 
     LOG_INFO(Service_NFP, "called, device_handle={}", device_handle);
+
+    if (nfp_data_buffer.size() < sizeof(NfpData)) {
+        LOG_ERROR(Service_NFP, "NfpData buffer too small: {}", nfp_data_buffer.size());
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(ResultInvalidArgument);
+        return;
+    }
 
     NfpData nfp_data{};
     memcpy(&nfp_data, nfp_data_buffer.data(), sizeof(NfpData));

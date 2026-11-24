@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stop_token>
@@ -23,6 +24,7 @@
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "common/logging.h"
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/nx2_session_state.h"
 #include "core/hle/service/nvdrv/core/container.h"
@@ -42,7 +44,7 @@
 namespace Service::Nvidia::Devices {
 
 nvhost_as_gpu::nvhost_as_gpu(Core::System& system_, Module& module_, NvCore::Container& core)
-    : nvdevice{system_}, module{module_}, container{core}, nvmap{core.GetNvMapFile()}, vm{},
+    : nvdevice{system_, Kind}, module{module_}, container{core}, nvmap{core.GetNvMapFile()}, vm{},
       gmmu{} {}
 
 nvhost_as_gpu::~nvhost_as_gpu() {
@@ -629,6 +631,7 @@ bool nvhost_as_gpu::FreeMappingLocked(u64 offset) noexcept {
             gmmu->Unmap(offset, mapping.size);
         }
         mapping_map.erase(offset);
+        map_buffer_offsets.erase(offset);
         return true;
     }
     return false;
@@ -666,6 +669,8 @@ NvResult nvhost_as_gpu::FreeSpace(IoctlFreeSpace& params) {
 NvResult nvhost_as_gpu::Remap(std::span<IoctlRemapEntry> entries) {
     LOG_DEBUG(Service_NVDRV, "called, num_entries={:#x}", entries.size());
 
+    std::scoped_lock lock(mutex);
+
     if (!vm.initialised) {
         return NvResult::BadValue;
     }
@@ -678,7 +683,8 @@ NvResult nvhost_as_gpu::Remap(std::span<IoctlRemapEntry> entries) {
         auto alloc{allocation_map.upper_bound(virtual_address)};
 
         if (alloc-- == allocation_map.begin() ||
-            (virtual_address - alloc->first) + size > alloc->second.size) {
+            size > alloc->second.size ||
+            (virtual_address - alloc->first) > alloc->second.size - size) {
             LOG_WARNING(Service_NVDRV, "Cannot remap into an unallocated region!");
             return NvResult::BadValue;
         }
@@ -752,6 +758,12 @@ NvResult nvhost_as_gpu::MapBufferEx(IoctlMapBufferEx& params) {
     if (base == 0) {
         return NvResult::BadValue;
     }
+    bool pinned = true;
+    SCOPE_EXIT {
+        if (pinned) {
+            nvmap.UnpinHandle(params.handle);
+        }
+    };
     DAddr device_address = DAddr(base + params.buffer_offset);
     u64 size{params.mapping_size ? params.mapping_size : handle->orig_size};
 
@@ -770,8 +782,9 @@ NvResult nvhost_as_gpu::MapBufferEx(IoctlMapBufferEx& params) {
         auto alloc{allocation_map.upper_bound(params.offset)};
 
         if (alloc-- == allocation_map.begin() ||
-            (params.offset - alloc->first) + size > alloc->second.size) {
-            ASSERT_MSG(false, "Cannot perform a fixed mapping into an unallocated region!");
+            size > alloc->second.size ||
+            (params.offset - alloc->first) > alloc->second.size - size) {
+            LOG_ERROR(Service_NVDRV, "Cannot perform a fixed mapping into an unallocated region!");
             return NvResult::BadValue;
         }
 
@@ -785,16 +798,24 @@ NvResult nvhost_as_gpu::MapBufferEx(IoctlMapBufferEx& params) {
         u32 page_size{big_page ? vm.big_page_size : VM::YUZU_PAGESIZE};
         u32 page_size_bits{big_page ? vm.big_page_size_bits : VM::PAGE_SIZE_BITS};
 
-        params.offset = u64(allocator.Allocate(u32(Common::AlignUp(size, page_size) >> page_size_bits))) << page_size_bits;
+        const u64 aligned_size = Common::AlignUp(size, page_size);
+        const u64 page_count = aligned_size >> page_size_bits;
+        if (aligned_size < size || page_count == 0 ||
+            page_count > std::numeric_limits<u32>::max()) {
+            return NvResult::BadValue;
+        }
+
+        params.offset = u64(allocator.Allocate(static_cast<u32>(page_count))) << page_size_bits;
         if (!params.offset) {
-            ASSERT_MSG(false, "Failed to allocate free space in the GPU AS!");
+            LOG_ERROR(Service_NVDRV, "Failed to allocate free space in the GPU AS!");
             return NvResult::InsufficientMemory;
         }
-        gmmu->Map(params.offset, device_address, Common::AlignUp(size, page_size), Tegra::PTEKind(params.kind), big_page);
+        gmmu->Map(params.offset, device_address, aligned_size, Tegra::PTEKind(params.kind), big_page);
         mapping_map.insert_or_assign(params.offset, Mapping(params.handle, device_address, params.offset, size, false, big_page, false));
     }
 
     map_buffer_offsets.insert(params.offset);
+    pinned = false;
 
     return NvResult::Success;
 }
@@ -808,6 +829,10 @@ NvResult nvhost_as_gpu::UnmapBuffer(IoctlUnmapBuffer& params) {
         }
 
         auto const it = mapping_map.find(params.offset);
+        if (it == mapping_map.end()) {
+            map_buffer_offsets.erase(offset_it);
+            return NvResult::BadValue;
+        }
         auto const mapping = it->second;
         if (!mapping.fixed) {
             auto& allocator{mapping.big_page ? *vm.big_page_allocator : *vm.small_page_allocator};
@@ -834,6 +859,9 @@ NvResult nvhost_as_gpu::BindChannel(IoctlBindChannel& params) {
     LOG_DEBUG(Service_NVDRV, "called, fd={:X}", params.fd);
 
     auto gpu_channel_device = module.GetDevice<nvhost_gpu>(params.fd);
+    if (gpu_channel_device == nullptr || gpu_channel_device->channel_state == nullptr) {
+        return NvResult::BadParameter;
+    }
     gpu_channel_device->channel_state->memory_manager = gmmu.get();
     return NvResult::Success;
 }

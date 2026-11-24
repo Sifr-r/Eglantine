@@ -62,10 +62,10 @@ public:
 
 private:
     /// Initializes the normal software keyboard.
-    void InitializeForeground();
+    Result InitializeForeground();
 
     /// Initializes the inline software keyboard.
-    void InitializePartialForeground(LibraryAppletMode library_applet_mode);
+    Result InitializePartialForeground(LibraryAppletMode library_applet_mode);
 
     /// Processes the text check sent by the application.
     void ProcessTextCheck();

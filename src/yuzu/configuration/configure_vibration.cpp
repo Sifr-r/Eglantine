@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2020 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "common/settings.h"
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
@@ -11,6 +13,10 @@
 ConfigureVibration::ConfigureVibration(QWidget* parent, Core::HID::HIDCore& hid_core_)
     : QDialog(parent), ui(std::make_unique<Ui::ConfigureVibration>()), hid_core{hid_core_} {
     ui->setupUi(this);
+
+    qRegisterMetaType<Core::HID::ControllerTriggerType>("Core::HID::ControllerTriggerType");
+    connect(this, &ConfigureVibration::VibrationUpdateRequested, this,
+            &ConfigureVibration::VibrateController, Qt::QueuedConnection);
 
     vibration_groupboxes = {
         ui->vibrationGroupPlayer1, ui->vibrationGroupPlayer2, ui->vibrationGroupPlayer3,
@@ -29,8 +35,12 @@ ConfigureVibration::ConfigureVibration(QWidget* parent, Core::HID::HIDCore& hid_
     for (std::size_t i = 0; i < NUM_PLAYERS; ++i) {
         auto controller = hid_core.GetEmulatedControllerByIndex(i);
         Core::HID::ControllerUpdateCallback engine_callback{
-            .on_change = [this,
-                          i](Core::HID::ControllerTriggerType type) { VibrateController(type, i); },
+            .on_change =
+                [this, i](Core::HID::ControllerTriggerType type) {
+                    if (type == Core::HID::ControllerTriggerType::Button) {
+                        emit VibrationUpdateRequested(type, static_cast<int>(i));
+                    }
+                },
             .is_npad_service = false,
         };
         controller_callback_key[i] = controller->SetCallback(engine_callback);
@@ -49,13 +59,13 @@ ConfigureVibration::ConfigureVibration(QWidget* parent, Core::HID::HIDCore& hid_
 }
 
 ConfigureVibration::~ConfigureVibration() {
-    StopVibrations();
-
     for (std::size_t i = 0; i < NUM_PLAYERS; ++i) {
         auto controller = hid_core.GetEmulatedControllerByIndex(i);
         controller->DeleteCallback(controller_callback_key[i]);
     }
-};
+
+    StopVibrations();
+}
 
 void ConfigureVibration::ApplyConfiguration() {
     auto& players = Settings::values.players.GetValue();
@@ -82,29 +92,30 @@ void ConfigureVibration::RetranslateUI() {
 }
 
 void ConfigureVibration::VibrateController(Core::HID::ControllerTriggerType type,
-                                           std::size_t player_index) {
+                                           int player_index) {
     if (type != Core::HID::ControllerTriggerType::Button) {
         return;
     }
-
-    auto& player = Settings::values.players.GetValue()[player_index];
-    auto controller = hid_core.GetEmulatedControllerByIndex(player_index);
-    const int vibration_strength = vibration_spinboxes[player_index]->value();
-    const auto& buttons = controller->GetButtonsValues();
-
-    bool button_is_pressed = false;
-    for (std::size_t i = 0; i < buttons.size(); ++i) {
-        if (buttons[i].value) {
-            button_is_pressed = true;
-            break;
-        }
-    }
-
-    if (!button_is_pressed) {
-        StopVibrations();
+    if (player_index < 0 || static_cast<std::size_t>(player_index) >= NUM_PLAYERS) {
         return;
     }
 
+    const auto idx = static_cast<std::size_t>(player_index);
+    auto controller = hid_core.GetEmulatedControllerByIndex(idx);
+    const auto buttons = controller->GetButtonsValues();
+
+    const bool button_is_pressed =
+        std::any_of(buttons.begin(), buttons.end(), [](const auto& button) { return button.value; });
+
+    if (!button_is_pressed) {
+        if (is_vibrating[idx]) {
+            StopVibration(idx);
+        }
+        return;
+    }
+
+    auto& player = Settings::values.players.GetValue()[idx];
+    const int vibration_strength = vibration_spinboxes[idx]->value();
     const bool old_vibration_enabled = player.vibration_enabled;
     const int old_vibration_strength = player.vibration_strength;
     player.vibration_enabled = true;
@@ -118,16 +129,26 @@ void ConfigureVibration::VibrateController(Core::HID::ControllerTriggerType type
     };
     controller->SetVibration(Core::HID::DeviceIndex::Left, vibration);
     controller->SetVibration(Core::HID::DeviceIndex::Right, vibration);
+    is_vibrating[idx] = true;
 
     // Restore previous values
     player.vibration_enabled = old_vibration_enabled;
     player.vibration_strength = old_vibration_strength;
 }
 
+void ConfigureVibration::StopVibration(std::size_t player_index) {
+    auto controller = hid_core.GetEmulatedControllerByIndex(player_index);
+    auto& player = Settings::values.players.GetValue()[player_index];
+    const bool old_vibration_enabled = player.vibration_enabled;
+    player.vibration_enabled = true;
+    controller->SetVibration(Core::HID::DeviceIndex::Left, Core::HID::DEFAULT_VIBRATION_VALUE);
+    controller->SetVibration(Core::HID::DeviceIndex::Right, Core::HID::DEFAULT_VIBRATION_VALUE);
+    player.vibration_enabled = old_vibration_enabled;
+    is_vibrating[player_index] = false;
+}
+
 void ConfigureVibration::StopVibrations() {
     for (std::size_t i = 0; i < NUM_PLAYERS; ++i) {
-        auto controller = hid_core.GetEmulatedControllerByIndex(i);
-        controller->SetVibration(Core::HID::DeviceIndex::Left, Core::HID::DEFAULT_VIBRATION_VALUE);
-        controller->SetVibration(Core::HID::DeviceIndex::Right, Core::HID::DEFAULT_VIBRATION_VALUE);
+        StopVibration(i);
     }
 }

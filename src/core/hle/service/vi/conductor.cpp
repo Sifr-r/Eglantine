@@ -25,7 +25,7 @@ namespace Service::VI {
 Conductor::Conductor(Core::System& system, Container& container, DisplayList& displays)
     : m_system(system), m_container(container) {
     displays.ForEachDisplay([&](Display& display) {
-        m_vsync_managers.insert({display.GetId(), VsyncManager{}});
+        m_vsync_managers.try_emplace(display.GetId());
     });
 
     if (system.IsMulticore()) {

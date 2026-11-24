@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <thread>
+#include <utility>
 
 #include "common/logging.h"
 #include "common/string_util.h"
@@ -14,13 +15,18 @@ namespace Core::Frontend {
 
 SoftwareKeyboardApplet::~SoftwareKeyboardApplet() = default;
 
-DefaultSoftwareKeyboardApplet::~DefaultSoftwareKeyboardApplet() = default;
+DefaultSoftwareKeyboardApplet::~DefaultSoftwareKeyboardApplet() {
+    CancelInlineSubmit();
+}
 
-void DefaultSoftwareKeyboardApplet::Close() const {}
+void DefaultSoftwareKeyboardApplet::Close() const {
+    CancelInlineSubmit();
+}
 
 void DefaultSoftwareKeyboardApplet::InitializeKeyboard(
     bool is_inline, KeyboardInitializeParameters initialize_parameters,
     SubmitNormalCallback submit_normal_callback_, SubmitInlineCallback submit_inline_callback_) {
+    CancelInlineSubmit();
     if (is_inline) {
         LOG_WARNING(
             Service_AM,
@@ -103,12 +109,23 @@ void DefaultSoftwareKeyboardApplet::ShowInlineKeyboard(
              appear_parameters.key_top_as_floating, appear_parameters.enable_backspace_button,
              appear_parameters.enable_return_button, appear_parameters.disable_cancel_button);
 
-    std::thread([this] { SubmitInlineText(u"Eden"); }).detach();
+    CancelInlineSubmit();
+    {
+        std::scoped_lock lk{inline_submit_mutex};
+        if (inline_submit_thread.joinable() &&
+            inline_submit_thread.get_id() == std::this_thread::get_id()) {
+            return;
+        }
+        inline_submit_thread = std::jthread([this](std::stop_token stop_token) {
+            SubmitInlineText(stop_token, u"Eden");
+        });
+    }
 }
 
 void DefaultSoftwareKeyboardApplet::HideInlineKeyboard() const {
     LOG_WARNING(Service_AM,
                 "(STUBBED) called, backend requested to hide the inline software keyboard.");
+    CancelInlineSubmit();
 }
 
 void DefaultSoftwareKeyboardApplet::InlineTextChanged(InlineTextParameters text_parameters) const {
@@ -127,23 +144,56 @@ void DefaultSoftwareKeyboardApplet::InlineTextChanged(InlineTextParameters text_
 
 void DefaultSoftwareKeyboardApplet::ExitKeyboard() const {
     LOG_WARNING(Service_AM, "(STUBBED) called, backend requested to exit the software keyboard.");
+    CancelInlineSubmit();
+}
+
+void DefaultSoftwareKeyboardApplet::CancelInlineSubmit() const {
+    std::jthread thread_to_join;
+    {
+        std::scoped_lock lk{inline_submit_mutex};
+        if (inline_submit_thread.joinable() &&
+            inline_submit_thread.get_id() != std::this_thread::get_id()) {
+            thread_to_join = std::move(inline_submit_thread);
+        }
+    }
+    if (thread_to_join.joinable()) {
+        thread_to_join.request_stop();
+        thread_to_join.join();
+    }
 }
 
 void DefaultSoftwareKeyboardApplet::SubmitNormalText(std::u16string text) const {
     submit_normal_callback(Service::AM::Frontend::SwkbdResult::Ok, text, true);
 }
 
-void DefaultSoftwareKeyboardApplet::SubmitInlineText(std::u16string_view text) const {
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+void DefaultSoftwareKeyboardApplet::SubmitInlineText(std::stop_token stop_token,
+                                                     std::u16string_view text) const {
+    const auto wait_for_step = [&](std::chrono::milliseconds delay) {
+        std::unique_lock lk{inline_submit_mutex};
+        return !inline_submit_cv.wait_for(lk, stop_token, delay,
+                                          [&stop_token] { return stop_token.stop_requested(); });
+    };
+
+    if (!wait_for_step(std::chrono::milliseconds{500})) {
+        return;
+    }
 
     for (std::size_t index = 0; index < text.size(); ++index) {
+        if (stop_token.stop_requested()) {
+            return;
+        }
         submit_inline_callback(Service::AM::Frontend::SwkbdReplyType::ChangedString,
                                std::u16string(text.data(), text.data() + index + 1),
                                static_cast<s32>(index) + 1);
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        if (!wait_for_step(std::chrono::milliseconds{250})) {
+            return;
+        }
     }
 
+    if (stop_token.stop_requested()) {
+        return;
+    }
     submit_inline_callback(Service::AM::Frontend::SwkbdReplyType::DecidedEnter,
                            std::u16string(text), static_cast<s32>(text.size()));
 }

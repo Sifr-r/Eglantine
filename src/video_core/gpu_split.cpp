@@ -384,7 +384,9 @@ bool GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u
         return false;
     }
     constexpr GPUVAddr page_mask = ~GPUVAddr{0xfff};
-    for (GPUVAddr page = address & page_mask; page < address + size; page += 0x1000) {
+    const GPUVAddr first_page = address & page_mask;
+    const GPUVAddr last_page = Tegra::Nx2SaturatingLastByte(address, size) & page_mask;
+    for (GPUVAddr page = first_page;; page += 0x1000) {
         if (&memory != note_memory || page != note_page || note_function != last_function_position) {
             const std::optional<DAddr> device = memory.GpuToCpuAddress(page);
             if (!device) {
@@ -398,6 +400,9 @@ bool GpuSplit::NoteWrite(const Tegra::MemoryManager& memory, GPUVAddr address, u
             note_function = last_function_position;
         }
         writes.Write(note_device, note_device + 0x1000, write_position, kind);
+        if (page == last_page) {
+            break;
+        }
     }
     return true;
 }

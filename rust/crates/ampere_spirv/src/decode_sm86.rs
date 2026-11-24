@@ -531,6 +531,7 @@ pub enum DecodedOp {
         dst_ur: u8,
         bank: u8,
         offset: u16,
+        index_reg: Option<u8>,
         width: MemWidth,
     },
     Ldg {
@@ -595,6 +596,7 @@ pub enum DecodedOp {
         imm_offset: i32,
         src_a: u8,
         op: AtomicOp,
+        signed: bool,
     },
     Shfl {
         dst: u8,
@@ -726,13 +728,16 @@ fn decode_half_operand(insn: &Instruction, which: u32) -> Option<HalfSrc> {
     };
     if wide {
         let immediate = form == 2 || form == 4;
-        let op = if immediate {
-            SrcOperand::Imm32(insn.words[1])
-        } else {
-            SrcOperand::Cbuf(cbuf_from_insn(insn)?)
-        };
+        if immediate {
+            return Some(HalfSrc {
+                op: SrcOperand::Imm32(insn.words[1]),
+                swizzle: 0,
+                abs: false,
+                neg: false,
+            });
+        }
         Some(HalfSrc {
-            op,
+            op: SrcOperand::Cbuf(cbuf_from_insn(insn)?),
             swizzle: insn.bits(60, 2) as u8,
             abs: insn.bits(62, 1) != 0,
             neg: insn.bits(63, 1) != 0,
@@ -742,9 +747,9 @@ fn decode_half_operand(insn: &Instruction, which: u32) -> Option<HalfSrc> {
         let reg = insn.bits(if upper { 64 } else { 32 }, 8);
         Some(HalfSrc {
             op: SrcOperand::reg(reg),
-            swizzle: insn.bits(if upper { 68 } else { 60 }, 2) as u8,
-            abs: insn.bits(if upper { 70 } else { 62 }, 1) != 0,
-            neg: insn.bits(if upper { 71 } else { 63 }, 1) != 0,
+            swizzle: insn.bits(if upper { 81 } else { 60 }, 2) as u8,
+            abs: insn.bits(if upper { 83 } else { 62 }, 1) != 0,
+            neg: insn.bits(if upper { 84 } else { 63 }, 1) != 0,
         })
     }
 }
@@ -1026,7 +1031,7 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
             let b = if imm_b {
                 SrcOperand::Imm32(insn.words[1])
             } else {
-                SrcOperand::ureg(insn.bits(32, 8))
+                SrcOperand::ureg(insn.bits(if imm_c { 64 } else { 32 }, 8))
             };
             let c = if imm_c {
                 SrcOperand::Imm32(insn.words[1])
@@ -1144,12 +1149,13 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
         }
         0x299 | 0x499 | 0x899 => {
             let a = SrcOperand::ureg(insn.bits(24, 8));
+            let c_is_imm = raw_opcode == 0x499 || form == 2;
             let shift = if raw_opcode == 0x899 || form == 4 {
                 SrcOperand::Imm32(insn.words[1])
             } else {
-                SrcOperand::ureg(insn.bits(32, 8))
+                SrcOperand::ureg(insn.bits(if c_is_imm { 64 } else { 32 }, 8))
             };
-            let c = if raw_opcode == 0x499 || form == 2 {
+            let c = if c_is_imm {
                 SrcOperand::Imm32(insn.words[1])
             } else {
                 SrcOperand::ureg(insn.bits(64, 8))
@@ -1438,35 +1444,30 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
             }
         }
         0x306 | 0x906 | 0xd06 => {
-            let is_signed = insn.bits(74, 1) != 0;
-            let dst_f16 = insn.bits(76, 2) == 1 && insn.bits(72, 1) == 0;
-            let src_fmt = insn.bits(72, 2);
-            let src_bits = match insn.bits(75, 2) {
+            let dst_f16 = match insn.bits(75, 2) {
+                1 => true,
+                2 => false,
+                _ => return unsup(raw_opcode, "unsupported I2F dst format"),
+            };
+            let src_bits = match insn.bits(84, 2) {
                 0 => 8,
                 1 => 16,
-                _ => 32,
+                2 => 32,
+                _ => return unsup(raw_opcode, "unsupported I2F src width"),
             };
-            let _ = src_fmt;
             let src = match raw_opcode {
                 0x906 => SrcOperand::Imm32(insn.words[1]),
                 0xd06 => SrcOperand::ureg(insn.bits(32, 8)),
                 _ => SrcOperand::reg(insn.bits(32, 8)),
             };
-            let _ = is_signed;
             DecodedOp::I2f {
                 dst,
                 src,
                 src_signed: insn.bits(74, 1) != 0,
-                src_bits: if insn.bits(84, 1) != 0 {
-                    16
-                } else if insn.bits(75, 2) == 2 || insn.bits(85, 1) != 0 {
-                    32
-                } else {
-                    src_bits
-                },
-                byte_lane: insn.bits(60, 2) as u8,
+                src_bits,
+                byte_lane: if raw_opcode == 0x906 { 0 } else { insn.bits(60, 2) as u8 },
                 dst_f16,
-                abs: insn.bits(62, 1) != 0,
+                abs: raw_opcode != 0x906 && insn.bits(62, 1) != 0,
             }
         }
         0x305 | 0xb05 | 0xd05 => {
@@ -1491,7 +1492,7 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
             DecodedOp::F2i {
                 dst,
                 src,
-                dst_signed: insn.bits(74, 1) != 0,
+                dst_signed: insn.bits(72, 1) != 0,
                 dst_bits,
                 src_f16: insn.bits(84, 1) != 0,
                 half_lane: insn.bits(60, 2) as u8,
@@ -1563,7 +1564,7 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
                 b,
                 c,
                 sat: insn.bits(77, 1) != 0,
-                relu: insn.bits(87, 4) != 7 && insn.bits(81, 1) != 0,
+                relu: insn.bits(79, 1) != 0,
             }
         }
 
@@ -1595,6 +1596,18 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
             let Some(bank) = bank_from_insn(insn) else {
                 return unsup(raw_opcode, "invalid ULDC cbuf bank");
             };
+            let index_reg = if raw_opcode == 0xabb {
+                let raw_idx = insn.bits(24, 8);
+                if raw_idx == 63 {
+                    None
+                } else if raw_idx < 63 {
+                    Some(raw_idx as u8)
+                } else {
+                    return unsup(raw_opcode, "invalid ULDC index uniform register");
+                }
+            } else {
+                None
+            };
             if unif_dst == 63 {
                 return DecodedOp::Nop;
             }
@@ -1602,6 +1615,7 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
                 dst_ur: unif_dst,
                 bank,
                 offset: insn.bits(38, 16) as u16,
+                index_reg,
                 width,
             }
         }
@@ -1750,6 +1764,25 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
             if raw_opcode == 0x98e {
                 return unsup(raw_opcode, "RED atomic requires dedicated opcode check");
             }
+            let mode_ok = if raw_opcode == 0x9a8 {
+                (insn.words[2] & !0x0780_0e3fu32) == 0x081e_e140u32
+            } else {
+                (insn.words[2] & !0x0780_0e00u32) == 0x001e_e100u32
+            };
+            if !mode_ok {
+                return unsup(raw_opcode, "unsupported ATOMG mode");
+            }
+            let Some(op) = decode_atomic_op(insn.bits(87, 4)) else {
+                return unsup(raw_opcode, "unsupported ATOMG op");
+            };
+            if matches!(op, AtomicOp::Inc | AtomicOp::Dec) {
+                return unsup(raw_opcode, "unsupported ATOMG inc/dec op");
+            }
+            let signed = match insn.bits(73, 3) {
+                0 => false,
+                1 => true,
+                _ => return unsup(raw_opcode, "unsupported ATOMG type/width"),
+            };
             let ur = if raw_opcode == 0x9a8 {
                 let u = insn.bits(64, 6) as u8;
                 if u == 63 { None } else { Some(u) }
@@ -1762,7 +1795,8 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
                 uniform_reg: ur,
                 imm_offset: ((insn.bits(40, 24) as i32) << 8) >> 8,
                 src_a: insn.bits(32, 8) as u8,
-                op: AtomicOp::Add,
+                op,
+                signed,
             }
         }
 

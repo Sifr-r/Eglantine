@@ -179,13 +179,16 @@ public:
     }
 
     s64 FindFreeRange(size_t count) {
+        if (m_used_depths == 0 || count == 0 || count > Common::BitSize<u64>()) {
+            return -1;
+        }
+
         // Check that it is possible to find a range.
         const u64* const storage_start = m_bit_storages[m_used_depths - 1];
         const u64* const storage_end = m_end_storages[m_used_depths - 1];
 
-        // If we don't have a storage to iterate (or want more blocks than fit in a single storage),
-        // we can't find a free range.
-        if (!(storage_start < storage_end && count <= Common::BitSize<u64>())) {
+        // If we don't have a storage to iterate, we can't find a free range.
+        if (storage_start >= storage_end) {
             return -1;
         }
 
@@ -193,7 +196,8 @@ public:
         const size_t options_per_storage = std::max<size_t>(Common::BitSize<u64>() / count, 1);
         const size_t num_entries = std::max<size_t>(storage_end - storage_start, 1);
 
-        const u64 free_mask = (static_cast<u64>(1) << count) - 1;
+        const u64 free_mask =
+            (count == Common::BitSize<u64>()) ? ~u64(0) : ((static_cast<u64>(1) << count) - 1);
 
         size_t num_valid_options = 0;
         s64 chosen_offset = -1;
@@ -211,7 +215,9 @@ public:
                         chosen_offset = storage_index * Common::BitSize<u64>() + option * count;
                     }
                 }
-                storage >>= count;
+                if (option + 1 < options_per_storage) {
+                    storage >>= count;
+                }
             }
         }
 

@@ -6,7 +6,12 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <functional>
+#include <mutex>
+#include <stop_token>
+#include <string_view>
+#include <thread>
 
 #include "common/common_types.h"
 
@@ -108,13 +113,17 @@ public:
     void ExitKeyboard() const override;
 
 private:
+    void CancelInlineSubmit() const;
     void SubmitNormalText(std::u16string text) const;
-    void SubmitInlineText(std::u16string_view text) const;
+    void SubmitInlineText(std::stop_token stop_token, std::u16string_view text) const;
 
     KeyboardInitializeParameters parameters{};
 
     mutable SubmitNormalCallback submit_normal_callback;
     mutable SubmitInlineCallback submit_inline_callback;
+    mutable std::mutex inline_submit_mutex;
+    mutable std::condition_variable_any inline_submit_cv;
+    mutable std::jthread inline_submit_thread;
 };
 
 } // namespace Core::Frontend

@@ -30,13 +30,20 @@ void KeplerMemory::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
 
 void KeplerMemory::ConsumeSinkImpl(Core::System& system) {
     for (auto [method, value] : method_sink) {
+        if (method >= Regs::NUM_REGS) {
+            LOG_ERROR(HW_GPU, "Ignoring out-of-range KeplerMemory register {:#x}", method);
+            continue;
+        }
         regs.reg_array[method] = value;
     }
     method_sink.clear();
 }
 
 void KeplerMemory::CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) {
-    ASSERT_MSG(method < Regs::NUM_REGS, "Invalid KeplerMemory register, increase the size of the Regs structure");
+    if (method >= Regs::NUM_REGS) {
+        LOG_ERROR(HW_GPU, "Ignoring out-of-range KeplerMemory register {:#x}", method);
+        return;
+    }
 
     regs.reg_array[method] = method_argument;
 

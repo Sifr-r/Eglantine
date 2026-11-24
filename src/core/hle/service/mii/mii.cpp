@@ -142,9 +142,10 @@ private:
 
     Result BuildDefault(Out<CharInfo> out_char_info, s32 index) {
         LOG_DEBUG(Service_Mii, "called with index={}", index);
-        R_UNLESS(index < static_cast<s32>(RawData::DefaultMii.size()), ResultInvalidArgument);
+        R_UNLESS(index >= 0 && index < static_cast<s32>(RawData::DefaultMii.size()),
+                 ResultInvalidArgument);
 
-        manager->BuildDefault(*out_char_info, index);
+        manager->BuildDefault(*out_char_info, static_cast<u32>(index));
 
         R_SUCCEED();
     }

@@ -759,3 +759,650 @@ fn batch_compilation_and_ffi_safety() {
         }
     }
 }
+
+mod regression_tests {
+    use super::*;
+    use eglantine_ampere_spirv::decode_sm86::{
+        decode_insn, DecodedOp, MemWidth, ShflMode, SrcOperand,
+    };
+    use eglantine_ampere_spirv::ssa_ir::SsaOp;
+    use eglantine_ampere_spirv::{lower_to_ssa, LowerInput};
+
+    fn enc_shf_imm(dst: u32, a: u32, shift: u32, c: u32, ty: u32, wrap: bool, right: bool, hi: bool) -> Instruction {
+        let w0 = 0x819 | (7 << 12) | (dst << 16) | (a << 24);
+        let w2 = c
+            | (ty << 9)
+            | (u32::from(wrap) << 11)
+            | (u32::from(right) << 12)
+            | (u32::from(hi) << 16);
+        sm86(w0, shift, w2, 0)
+    }
+
+    fn enc_shf_reg(dst: u32, a: u32, shift_reg: u32, c: u32, ty: u32, wrap: bool, right: bool, hi: bool) -> Instruction {
+        let w0 = 0x219 | (7 << 12) | (dst << 16) | (a << 24);
+        let w2 = c
+            | (ty << 9)
+            | (u32::from(wrap) << 11)
+            | (u32::from(right) << 12)
+            | (u32::from(hi) << 16);
+        sm86(w0, shift_reg, w2, 0)
+    }
+
+    fn enc_shfl_imm(dst: u32, pred_out: u32, src: u32, lane: u32, mask: u32, mode: u32) -> Instruction {
+        let w0 = 0xf89 | (7 << 12) | (dst << 16) | (src << 24);
+        let w1 = ((mode & 3) << 26) | ((lane & 0x1f) << 21) | ((mask & 0x1fff) << 8);
+        let w2 = (pred_out & 7) << 17;
+        sm86(w0, w1, w2, 0)
+    }
+
+    fn enc_uisetp_lt_imm(dst_up: u32, a_ur: u32, imm: u32) -> Instruction {
+        let w0 = 0x88c | (7 << 12) | (a_ur << 24);
+        let w2 = (1 << 12) | ((dst_up & 7) << 17) | (7 << 23);
+        sm86(w0, imm, w2, 0)
+    }
+
+    fn default_compute_input(code: &[Instruction]) -> LowerInput<'_> {
+        LowerInput {
+            stage: Stage::Compute,
+            program_key: 0x1234_5678,
+            code,
+            workgroup_size: [32, 1, 1],
+            local_memory_size: 0,
+            shared_memory_size: 0,
+            profile: Profile::spirv_1_6_default(),
+            bindings: Bindings::default(),
+            snapshot: SnapshotEnv::default(),
+        }
+    }
+
+    #[test]
+    fn decoded_half_u_imm_i2f_f2i_hfma2_and_uldc_indexed_ops() {
+        // F0082: HFMA2 (0x431, form=2) has !wide+upper on b and wide+imm on c;
+        // HFMA2 (0x831, form=4) has wide+imm on b and !wide+upper on c.
+        let w1_lit = 0xbc00_bc00;
+        let w2_upper = 0x15 | (2 << 17) | (1 << 19) | (1 << 20) | (7 << 23);
+        let hfma_f2 = sm86(0x431 | (7 << 12) | (4 << 16) | (1 << 24), w1_lit, w2_upper, 0);
+        match decode_insn(0, &hfma_f2).op {
+            DecodedOp::Hfma2 { dst: 4, b, c, relu, .. } => {
+                assert_eq!(b.op, SrcOperand::Reg(0x15));
+                assert_eq!((b.swizzle, b.abs, b.neg), (2, true, true));
+                assert_eq!(c.op, SrcOperand::Imm32(w1_lit));
+                assert_eq!((c.swizzle, c.abs, c.neg), (0, false, false));
+                assert!(!relu);
+            }
+            other => panic!("unexpected HFMA2 form=2 decode: {other:?}"),
+        }
+        let hfma_f4 = sm86(0x831 | (7 << 12) | (4 << 16) | (1 << 24), w1_lit, w2_upper, 0);
+        match decode_insn(0, &hfma_f4).op {
+            DecodedOp::Hfma2 { dst: 4, b, c, .. } => {
+                assert_eq!(b.op, SrcOperand::Imm32(w1_lit));
+                assert_eq!((b.swizzle, b.abs, b.neg), (0, false, false));
+                assert_eq!(c.op, SrcOperand::Reg(0x15));
+                assert_eq!((c.swizzle, c.abs, c.neg), (2, true, true));
+            }
+            other => panic!("unexpected HFMA2 form=4 decode: {other:?}"),
+        }
+
+        // F0339: HFMA2.RELU sets bit 79 even with PT predicate (bits 87..90 == 7).
+        let hfma_relu = sm86(
+            0x231 | (7 << 12) | (2 << 16) | (1 << 24),
+            2,
+            3 | (1 << 15) | (7 << 23),
+            0,
+        );
+        assert!(matches!(decode_insn(0, &hfma_relu).op, DecodedOp::Hfma2 { relu: true, .. }));
+        let relu_code = [hfma_relu, exit_insn(7, false)];
+        assert!(compile_shader(&default_compute_input(&relu_code)).fallback.is_some());
+
+        // F0198: 0x4a4 UIMAD (form == 2) reads b from bits(64, 8), not words[1] & 0xff.
+        let uimad = sm86(0x4a4 | (7 << 12) | (2 << 16) | (1 << 24), 0x1234_5609, 6, 0);
+        match decode_insn(0, &uimad).op {
+            DecodedOp::Uimad { dst_ur: 2, a, b, c, .. } => {
+                assert_eq!(a, SrcOperand::UReg(1));
+                assert_eq!(b, SrcOperand::UReg(6));
+                assert_eq!(c, SrcOperand::Imm32(0x1234_5609));
+            }
+            other => panic!("unexpected UIMAD decode: {other:?}"),
+        }
+
+        // F0260: 0x499 USHF (form == 2) reads shift from bits(64, 8), not words[1] & 0xff.
+        let ushf = sm86(0x499 | (7 << 12) | (3 << 16) | (1 << 24), 0xdead_000a, 5 | (3 << 9), 0);
+        match decode_insn(0, &ushf).op {
+            DecodedOp::Ushf { dst_ur: 3, a, shift, c, .. } => {
+                assert_eq!(a, SrcOperand::UReg(1));
+                assert_eq!(shift, SrcOperand::UReg(5));
+                assert_eq!(c, SrcOperand::Imm32(0xdead_000a));
+            }
+            other => panic!("unexpected USHF decode: {other:?}"),
+        }
+
+        // F0052: I2F destination/source formats and 0x906 immediate modifier suppression.
+        let i2f_u8 = sm86(0x306 | (7 << 12) | (1 << 16), 2, 0x1000, 0);
+        let i2f_u16 = sm86(0x306 | (7 << 12) | (1 << 16), 2, 0x0010_1000, 0);
+        let i2f_s32_f16 = sm86(0x306 | (7 << 12) | (1 << 16), 2, 0x0020_0c00, 0);
+        let i2f_imm = sm86(0x906 | (7 << 12) | (1 << 16), 0xc000_0000, 0x0020_1400, 0);
+        assert!(matches!(decode_insn(0, &i2f_u8).op, DecodedOp::I2f { dst_f16: false, src_bits: 8, src_signed: false, .. }));
+        assert!(matches!(decode_insn(0, &i2f_u16).op, DecodedOp::I2f { dst_f16: false, src_bits: 16, .. }));
+        assert!(matches!(decode_insn(0, &i2f_s32_f16).op, DecodedOp::I2f { dst_f16: true, src_bits: 32, src_signed: true, .. }));
+        assert!(matches!(
+            decode_insn(0, &i2f_imm).op,
+            DecodedOp::I2f {
+                src: SrcOperand::Imm32(0xc000_0000),
+                dst_f16: false,
+                src_bits: 32,
+                src_signed: true,
+                byte_lane: 0,
+                abs: false,
+                ..
+            }
+        ));
+
+        // F0258: F2I.S32 (0x0020_f100: bit 72=1, bit 74=0) decodes dst_signed=true & lowers to F32ConvertToS.
+        let f2i_s32 = sm86(0x305 | (7 << 12) | (4 << 16), 1, 0x0020_f100, 0);
+        assert!(matches!(decode_insn(0, &f2i_s32).op, DecodedOp::F2i { dst_signed: true, dst_bits: 32, .. }));
+        let f2i_code = [
+            uldc_u64(4, 0, 0x160),
+            s2r(1, 33),
+            f2i_s32,
+            stg_ur(4, 255, 4, 0),
+            exit_insn(7, false),
+        ];
+        let f2i_ssa = lower_to_ssa(&default_compute_input(&f2i_code)).expect("F2I SSA");
+        assert!(f2i_ssa.blocks[0].insns.iter().any(|i| matches!(i.op, SsaOp::F32ConvertToS(_))));
+
+        // F0216: Indexed ULDC (0xabb) extracts index_reg and marks indirect cbuf read of 0x10_000 bytes.
+        let uldc_idx = sm86(
+            0xabb | (7 << 12) | (4 << 16) | (2 << 24),
+            6 << 6,
+            4 << 9,
+            0,
+        );
+        assert!(matches!(
+            decode_insn(0, &uldc_idx).op,
+            DecodedOp::Uldc { dst_ur: 4, bank: 0, offset: 6, index_reg: Some(2), width: MemWidth::B32 }
+        ));
+        let uldc_code = [
+            uldc_u64(6, 0, 0x160),
+            uldc_idx,
+            enc_op_dst(0xc02, 5, 4, 0), // MOV R5, UR4
+            stg_ur(5, 255, 6, 0),
+            exit_insn(7, false),
+        ];
+        let uldc_ssa = lower_to_ssa(&default_compute_input(&uldc_code)).expect("ULDC indexed SSA");
+        assert!(uldc_ssa.uses_dynamic_cbuf);
+        assert!(uldc_ssa.info.uses_cbuf_indirect);
+        assert!(uldc_ssa.info.constant_buffer_used_sizes[0] >= 0x10_000);
+        assert!(uldc_ssa.blocks[0].insns.iter().any(|i| matches!(i.op, SsaOp::ReadCbufDynamic { bank: 0, .. })));
+    }
+
+    #[test]
+    fn subword_ldc_uldc_and_imad_wide_hi_64bit_addend() {
+        // F0094: Unaligned static LDC.S16 and dynamic ULDC.U8 extract subwords & align cbuf lookup.
+        let ldc_s16 = sm86(
+            0xb82 | (7 << 12) | (2 << 16) | (255 << 24),
+            0x12 << 6,
+            3 << 9, // S16
+            0,
+        );
+        let uldc_u8_idx = sm86(
+            0xabb | (7 << 12) | (2 << 16) | (1 << 24),
+            0x20 << 6,
+            0 << 9, // U8
+            0,
+        );
+        let code = [
+            uldc_u64(4, 0, 0x160),
+            ldc_s16,
+            stg_ur(2, 255, 4, 0),
+            uldc_u8_idx,
+            enc_op_dst(0xc02, 3, 2, 0), // MOV R3, UR2
+            stg_ur(3, 255, 4, 4),
+            exit_insn(7, false),
+        ];
+        let mut input = default_compute_input(&code);
+        input.snapshot.replacements.insert((0, 0x10), 0x1234_8001);
+        let ssa = lower_to_ssa(&input).expect("subword LDC/ULDC");
+        assert!(ssa.blocks[0].insns.iter().any(|i| matches!(i.op, SsaOp::ConstU32(0x1234_8001))));
+        assert!(ssa.blocks[0].insns.iter().any(|i| matches!(i.op, SsaOp::SBitFieldExtract { count: 16, .. })));
+        assert!(ssa.blocks[0].insns.iter().any(|i| matches!(i.op, SsaOp::ReadCbufDynamic { bank: 0, .. })));
+
+        // F0050: IMAD.WIDE / IMAD.HI / UIMAD.WIDE include c:c+1 & neg_c carry into hi word.
+        let imad_wide = sm86(0x225 | (7 << 12) | (6 << 16) | (1 << 24), 2, 4 | (1 << 11), 0);
+        let imad_hi = sm86(0x227 | (7 << 12) | (8 << 16) | (1 << 24), 2, 4, 0);
+        let uimad_wide = sm86(0x2a5 | (7 << 12) | (2 << 16) | (0 << 24), 1, 4, 0);
+        let uldc_u64_pair0 = uldc_u64(0, 0, 0x140);
+        let uldc_u64_pair4 = uldc_u64(4, 0, 0x148);
+        let wide_code = [
+            uldc_u64(6, 0, 0x160),
+            s2r(1, 33),
+            s2r(2, 34),
+            s2r(4, 35),
+            s2r(5, 33),
+            uldc_u64_pair0,
+            uldc_u64_pair4,
+            imad_wide,
+            imad_hi,
+            uimad_wide,
+            enc_op_dst(0xc02, 9, 3, 0), // MOV R9, UR3
+            stg_ur(6, 255, 6, 0),
+            stg_ur(7, 255, 6, 4),
+            stg_ur(8, 255, 6, 8),
+            stg_ur(9, 255, 6, 12),
+            exit_insn(7, false),
+        ];
+        let out = compile_shader(&default_compute_input(&wide_code));
+        assert!(out.fallback.is_none(), "unexpected IMAD fallback: {:?}", out.fallback);
+        let _ = assert_valid_spirv_1_6(&out.spirv_words, [32, 1, 1]);
+
+        let ssa_wide = lower_to_ssa(&default_compute_input(&wide_code)).expect("wide IMAD SSA");
+        let add_count = ssa_wide.blocks[0]
+            .insns
+            .iter()
+            .filter(|i| matches!(i.op, SsaOp::IAdd(_, _)))
+            .count();
+        assert!(add_count >= 5, "expected 64-bit c:c+1 add & carry across wide/hi IMADs");
+
+        // Odd c register on IMAD.WIDE cleanly triggers fallback instead of miscompiling.
+        let bad_c_code = [
+            sm86(0x225 | (7 << 12) | (6 << 16) | (1 << 24), 2, 3, 0),
+            exit_insn(7, false),
+        ];
+        assert!(compile_shader(&default_compute_input(&bad_c_code)).fallback.is_some());
+    }
+
+    #[test]
+    fn selection_predicated_ptr_and_loop_phi_tracking() {
+        // F0051: Single-armed If updates R2 ptr offset; merge_states must Phi byte_offset (valid SSA dominance).
+        let ldc_r2_b64 = sm86(0xb82 | (7 << 12) | (2 << 16) | (255 << 24), 0x160 << 6, 5 << 9, 0);
+        let pred_iadd_r2 = sm86(
+            0x210 | (0 << 12) | (2 << 16) | (2 << 24),
+            4,
+            255 | (0x3f << 17) | (15 << 23),
+            0,
+        );
+        let pred_uisetp = sm86(0x88c | (0 << 12), 10, (1 << 12) | (2 << 17) | (7 << 23), 0);
+        let if_code = [
+            ldc_r2_b64,
+            s2r(0, 33),
+            mov_imm(1, 8),
+            mov_imm(4, 16),
+            isetp_lt_u32(0, 0, 1),
+            bra_rel(0, false, 1),
+            iadd3_reg(2, 2, 4, 255),
+            pred_iadd_r2,
+            pred_uisetp,
+            sm86(0x386 | (7 << 12) | (2 << 24), 0, 4 << 9, 0), // STG [R2], R0
+            exit_insn(7, false),
+        ];
+        let if_out = compile_shader(&default_compute_input(&if_code));
+        assert!(if_out.fallback.is_none(), "If ptr merge failed: {:?}", if_out.fallback);
+        let if_ops = assert_valid_spirv_1_6(&if_out.spirv_words, [32, 1, 1]);
+        assert!(if_ops.iter().any(|o| o.opcode == 245), "expected OpPhi for pointer offset merge");
+        assert!(if_ops.iter().any(|o| o.opcode == 169), "expected OpSelect for predicated ptr/up");
+
+        // F0061: Loop modifies R2 ptr offset, UP1 (UISETP), and P2 (SHFL), requiring header Phis.
+        let loop_code = [
+            ldc_r2_b64,
+            mov_imm(0, 0),
+            mov_imm(1, 4),
+            mov_imm(4, 16),
+            mov_imm(6, 0),
+            isetp_lt_u32(2, 1, 0), // init P2 = false (4 < 0 is false)
+            // Loop header (idx 6):
+            sm86(0x210 | (2 << 12) | (6 << 16) | (6 << 24), 4, 255 | (0x3f << 17) | (15 << 23), 0), // @P2 IADD3 R6, R6, R4
+            iadd3_reg(2, 2, 4, 255),
+            iadd3_reg(6, 6, 2, 255),
+            enc_uisetp_lt_imm(1, 0, 5),
+            enc_shfl_imm(7, 2, 0, 1, 0x1f, 1),
+            sm86(0x386 | (7 << 12) | (2 << 24), 7, 4 << 9, 0), // STG [R2], R7
+            sm86(0x386 | (7 << 12) | (2 << 24), 6 | (4 << 8), 4 << 9, 0), // STG [R2+4], R6
+            iadd3_reg(0, 0, 255, 4),
+            isetp_lt_u32(0, 0, 1),
+            bra_rel(0, false, -10), // target = 15 + 1 - 10 = 6
+            exit_insn(7, false),
+        ];
+        let loop_out = compile_shader(&default_compute_input(&loop_code));
+        assert!(loop_out.fallback.is_none(), "loop ptr/up/shfl failed: {:?}", loop_out.fallback);
+        let _ = assert_valid_spirv_1_6(&loop_out.spirv_words, [32, 1, 1]);
+        let loop_ssa = lower_to_ssa(&default_compute_input(&loop_code)).expect("loop SSA");
+        let loop_header_phis: usize = loop_ssa
+            .blocks
+            .iter()
+            .skip(1)
+            .map(|b| b.insns.iter().filter(|i| matches!(i.op, SsaOp::Phi(_))).count())
+            .sum();
+        assert!(loop_header_phis >= 4, "expected Phis for R0, R2/r_ptr, R6, P2");
+
+        // Overwriting a pointer register with a non-pointer constant inside a loop must invalidate
+        // provenance across the loop rather than keeping stale PtrOrigin.
+        let clobber_loop_code = [
+            ldc_r2_b64,
+            mov_imm(0, 0),
+            mov_imm(1, 2),
+            mov_imm(2, 0), // loop header (idx 3): overwrites R2 with non-pointer imm
+            isetp_lt_u32(0, 0, 1),
+            bra_rel(0, false, -3), // target = 5 + 1 - 3 = 3
+            sm86(0x386 | (7 << 12) | (2 << 24), 0, 4 << 9, 0), // STG [R2], R0 -> no provenance!
+            exit_insn(7, false),
+        ];
+        assert!(compile_shader(&default_compute_input(&clobber_loop_code)).fallback.is_some());
+    }
+
+    #[test]
+    fn ssbo_direct_indirect_offset_min_alignment_and_shf_shfl() {
+        // F0015 & F0144: Direct SSBO indirect_offset == u32::MAX + min_ssbo_alignment masking.
+        let ssbo_code = [
+            uldc_u64(4, 0, 0x160),
+            mov_imm(0, 42),
+            stg_ur(0, 255, 4, 0),
+            exit_insn(7, false),
+        ];
+        let mut input = default_compute_input(&ssbo_code);
+        input.profile.min_ssbo_alignment = 256;
+        let ssa_256 = lower_to_ssa(&input).expect("min_ssbo_alignment 256");
+        assert_eq!(ssa_256.info.storage_buffer_descriptors[0].indirect_offset, u32::MAX);
+        assert!(ssa_256.blocks[0].insns.iter().any(|i| matches!(i.op, SsaOp::ConstU32(255))));
+
+        let mut input_rep = default_compute_input(&ssbo_code);
+        input_rep.profile.min_ssbo_alignment = 256;
+        input_rep.snapshot.replacements.insert((0, 0x160), 0x1040);
+        let ssa_rep = lower_to_ssa(&input_rep).expect("min_ssbo_alignment replacement");
+        assert!(ssa_rep.blocks[0].insns.iter().any(|i| matches!(i.op, SsaOp::ConstU32(0x40))));
+
+        // F0121: SHFL clamp/seg_mask, pred_out = in_range, and !support_shuffle_relative fallback.
+        let shfl_code = [
+            uldc_u64(4, 0, 0x160),
+            mov_imm(1, 99),
+            enc_shfl_imm(2, 0, 1, 1, 0x0f0f, 1), // SHFL.UP P0, R2, R1, 1, 0x0f0f
+            stg_ur(2, 255, 4, 0),
+            sm86(0x986 | (0 << 12), 1 | (4 << 8), 0x0810_a100 | 4 | (4 << 9), 0), // @P0 STG [UR4+4], R1
+            exit_insn(7, false),
+        ];
+        let mut shfl_in = default_compute_input(&shfl_code);
+        shfl_in.profile.support_shuffle_relative = false;
+        let shfl_ssa = lower_to_ssa(&shfl_in).expect("SHFL SSA");
+        assert!(shfl_ssa.blocks[0]
+            .insns
+            .iter()
+            .any(|i| matches!(i.op, SsaOp::SubgroupShuffle { mode: ShflMode::Idx, .. })));
+        let shfl_out = compile_shader(&shfl_in);
+        assert!(shfl_out.fallback.is_none(), "SHFL fallback: {:?}", shfl_out.fallback);
+        let shfl_ops = assert_valid_spirv_1_6(&shfl_out.spirv_words, [32, 1, 1]);
+        // Must use OpGroupNonUniformShuffle (345) instead of ShuffleUp (346) when !support_shuffle_relative.
+        assert!(shfl_ops.iter().any(|o| o.opcode == 345));
+        assert!(!shfl_ops.iter().any(|o| o.opcode == 346));
+        assert!(shfl_ops.iter().any(|o| o.opcode == 169), "expected OpSelect clamping out-of-range lane");
+
+        let mut unsup_stage = default_compute_input(&shfl_code);
+        unsup_stage.profile.supported_subgroup_stages = 1 << (Stage::VertexB as u32);
+        assert!(compile_shader(&unsup_stage).fallback.is_some());
+
+        // F0031: SHF never emits Shl/LShr/AShr with shift >= 32 and compiles dynamic/wide shifts cleanly.
+        let shf_code = [
+            mov_imm(1, 0x1122_3344),
+            mov_imm(2, 0x5566_7788),
+            s2r(3, 33),
+            enc_shf_imm(4, 1, 0, 2, 3, false, true, false),   // shift=0 right lo -> R1
+            enc_shf_imm(5, 1, 40, 2, 2, false, true, false),  // shift=40 signed right lo -> c >>_s 8
+            enc_shf_imm(6, 1, 64, 2, 3, false, true, true),   // shift=64 unsigned right hi -> 0
+            enc_shf_reg(7, 1, 3, 2, 2, false, true, false),   // dynamic signed right lo
+            enc_shf_reg(8, 1, 3, 2, 3, false, false, true),   // dynamic left hi
+            enc_shf_reg(9, 1, 3, 2, 3, true, true, false),    // wrapped right lo
+            exit_insn(7, false),
+        ];
+        let shf_out = compile_shader(&default_compute_input(&shf_code));
+        assert!(shf_out.fallback.is_none(), "SHF failed: {:?}", shf_out.fallback);
+        let _ = assert_valid_spirv_1_6(&shf_out.spirv_words, [32, 1, 1]);
+
+        let shf_ssa = lower_to_ssa(&default_compute_input(&shf_code)).expect("SHF SSA");
+        let consts: std::collections::HashMap<_, _> = shf_ssa
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .filter_map(|i| match i.op {
+                SsaOp::ConstU32(v) => Some((i.id, v)),
+                _ => None,
+            })
+            .collect();
+        for blk in &shf_ssa.blocks {
+            for insn in &blk.insns {
+                if let SsaOp::Shl(_, s) | SsaOp::LShr(_, s) | SsaOp::AShr(_, s) = insn.op {
+                    if let Some(&v) = consts.get(&s) {
+                        assert!(v < 32, "found out-of-range constant shift {v} >= 32");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coop_config_and_depth8_fallback_f0420() {
+        let cfg = Profile::spirv_1_6_default().coop_layout;
+        assert!(cfg.validate(16).is_ok());
+        assert!(cfg.validate(8).is_err(), "depth 8 must be rejected");
+
+        let mut bad_k = cfg;
+        bad_k.tile_k = 8;
+        assert!(bad_k.validate(16).is_err());
+
+        let mut bad_a = cfg;
+        bad_a.a_word_map = [0, 1, 2, 4];
+        assert!(bad_a.validate(16).is_err());
+
+        let mut bad_a_dup = cfg;
+        bad_a_dup.a_word_map = [0, 1, 1, 3];
+        assert!(bad_a_dup.validate(16).is_err());
+
+        let mut bad_b = cfg;
+        bad_b.b_word_map = [0, 2];
+        assert!(bad_b.validate(16).is_err());
+
+        let hmma8 = sm86(0x23c | (7 << 12) | (8 << 16) | (4 << 24), 6, 255, 0);
+        let code = [
+            mov_imm(4, 0),
+            mov_imm(5, 0),
+            mov_imm(6, 0),
+            mov_imm(7, 0),
+            hmma8,
+            exit_insn(7, false),
+        ];
+        let out = compile_shader(&default_compute_input(&code));
+        assert!(out.fallback.is_some(), "expected fallback for depth=8 HMMA");
+        assert!(out.spirv_words.is_empty());
+    }
+
+    #[test]
+    fn atomg_decode_and_lowering_f0152() {
+        use eglantine_ampere_spirv::decode_sm86::AtomicOp;
+
+        let enc_atomg_reg =
+            |dst: u32, base: u32, src: u32, off: i32, op_bits: u32, ty_bits: u32, extra: u32| {
+                sm86(
+                    0x3a8 | (7 << 12) | ((dst & 0xff) << 16) | ((base & 0xff) << 24),
+                    (src & 0xff) | (((off as u32) & 0xff_ffff) << 8),
+                    0x001e_e100 | ((ty_bits & 7) << 9) | ((op_bits & 0xf) << 23) | extra,
+                    0,
+                )
+            };
+        let enc_atomg_ur =
+            |dst: u32, ur: u32, src: u32, off: i32, op_bits: u32, ty_bits: u32, extra: u32| {
+                sm86(
+                    0x9a8 | (7 << 12) | ((dst & 0xff) << 16) | (255 << 24),
+                    (src & 0xff) | (((off as u32) & 0xff_ffff) << 8),
+                    0x081e_e140 | (ur & 0x3f) | ((ty_bits & 7) << 9) | ((op_bits & 0xf) << 23) | extra,
+                    0,
+                )
+            };
+
+        match decode_insn(0, &enc_atomg_reg(2, 4, 3, 8, 8, 1, 0)).op {
+            DecodedOp::Atomg {
+                dst: Some(2),
+                base_reg: 4,
+                uniform_reg: None,
+                imm_offset: 8,
+                src_a: 3,
+                op: AtomicOp::Exch,
+                signed: true,
+            } => {}
+            other => panic!("unexpected ATOMG reg decode: {other:?}"),
+        }
+
+        // Unsupported ops (Inc=3, Dec=4, CAS/reserved=9), types (B64=2, F32=3), and extra mode bits must fail cleanly.
+        for bad in [
+            enc_atomg_reg(2, 4, 3, 0, 3, 0, 0),
+            enc_atomg_ur(2, 4, 3, 0, 4, 0, 0),
+            enc_atomg_ur(2, 4, 3, 0, 9, 0, 0),
+            enc_atomg_ur(2, 4, 3, 0, 0, 2, 0),
+            enc_atomg_ur(2, 4, 3, 0, 0, 3, 0),
+            enc_atomg_reg(2, 4, 3, 0, 0, 0, 1 << 12),
+            enc_atomg_ur(2, 4, 3, 0, 0, 0, 1 << 12),
+        ] {
+            assert!(
+                matches!(decode_insn(0, &bad).op, DecodedOp::Unsupported { .. }),
+                "expected Unsupported for {bad:?}"
+            );
+            let fb = compile_shader(&default_compute_input(&[uldc_u64(4, 0, 0x160), mov_imm(3, 1), bad, exit_insn(7, false)]));
+            assert!(fb.fallback.is_some(), "expected Maxwell fallback for unsupported ATOMG");
+        }
+
+        let code = [
+            uldc_u64(4, 0, 0x160),
+            mov_imm(1, 7),
+            enc_atomg_ur(2, 4, 1, 0, 8, 0, 0),   // EXCH U32 -> OpAtomicExchange (229)
+            enc_atomg_ur(3, 4, 1, 4, 5, 0, 0),   // AND U32 -> OpAtomicAnd (240)
+            enc_atomg_ur(4, 4, 1, 8, 6, 0, 0),   // OR U32 -> OpAtomicOr (241)
+            enc_atomg_ur(5, 4, 1, 12, 7, 0, 0),  // XOR U32 -> OpAtomicXor (242)
+            enc_atomg_ur(6, 4, 1, 16, 1, 0, 0),  // MIN U32 -> OpAtomicUMin (237)
+            enc_atomg_ur(7, 4, 1, 20, 2, 0, 0),  // MAX U32 -> OpAtomicUMax (239)
+            enc_atomg_ur(8, 4, 1, 24, 1, 1, 0),  // MIN S32 -> OpAtomicSMin (236)
+            enc_atomg_ur(9, 4, 1, 28, 2, 1, 0),  // MAX S32 -> OpAtomicSMax (238)
+            stg_ur(9, 255, 4, 32),
+            exit_insn(7, false),
+        ];
+        let out = compile_shader(&default_compute_input(&code));
+        assert!(out.fallback.is_none(), "ATOMG failed: {:?}", out.fallback);
+        let ops = assert_valid_spirv_1_6(&out.spirv_words, [32, 1, 1]);
+        for expected_op in [229u16, 236, 237, 238, 239, 240, 241, 242] {
+            assert!(
+                ops.iter().any(|o| o.opcode == expected_op),
+                "missing expected SPIR-V atomic opcode {expected_op}"
+            );
+        }
+    }
+
+    #[test]
+    fn uiadd3_up_carry_and_accum_f0431() {
+        let enc_uiadd3_reg =
+            |dst_ur: u32, a_ur: u32, b_ur: u32, c_ur: u32, x_mode: bool, carry_in: u32, carry_out: u32| {
+                let w0 = 0x290 | (7 << 12) | ((dst_ur & 0x3f) << 16) | ((a_ur & 0x3f) << 24);
+                let w1 = b_ur & 0x3f;
+                let w2 = (c_ur & 0x3f)
+                    | (u32::from(x_mode) << 10)
+                    | ((carry_out & 7) << 17)
+                    | ((carry_in & 0xf) << 23);
+                sm86(w0, w1, w2, 0)
+            };
+        let enc_uiadd3_imm =
+            |dst_ur: u32, a_ur: u32, imm: u32, c_ur: u32, x_mode: bool, carry_in: u32, carry_out: u32| {
+                let w0 = 0x890 | (7 << 12) | ((dst_ur & 0x3f) << 16) | ((a_ur & 0x3f) << 24);
+                let w2 = (c_ur & 0x3f)
+                    | (u32::from(x_mode) << 10)
+                    | ((carry_out & 7) << 17)
+                    | ((carry_in & 0xf) << 23);
+                sm86(w0, imm, w2, 0)
+            };
+
+        let code = [
+            uldc_u64(4, 0, 0x160),                    // UR4/UR5 = SSBO base
+            enc_uisetp_lt_imm(0, 63, 1),              // UP0 = (0 < 1) == true, while P0 untouched
+            enc_uiadd3_imm(6, 63, 0x7fff_ffff, 63, false, 15, 7),
+            enc_uiadd3_imm(7, 63, 1, 63, false, 15, 7),
+            enc_uiadd3_reg(8, 6, 6, 7, false, 15, 7), // UR8 = 0xffff_ffff
+            enc_uiadd3_reg(9, 63, 63, 8, true, 0, 1), // UP1 = carry(0 + 0 + 0xffff_ffff + UP0)
+            enc_uiadd3_reg(6, 4, 63, 9, true, 1, 7),  // consume UR9 & UP1 into SSBO offset
+            mov_imm(2, 42),
+            stg_ur(2, 255, 6, 0),
+            exit_insn(7, false),
+        ];
+
+        let input = default_compute_input(&code);
+        let ssa = lower_to_ssa(&input).expect("UIADD3 SSA");
+        let uisetp_cmp_id = ssa.blocks[0]
+            .insns
+            .iter()
+            .find(|i| matches!(i.op, SsaOp::IntCmp { signed: false, .. }))
+            .expect("expected UISETP IntCmp")
+            .id;
+        let uisetp_up0_id = ssa.blocks[0]
+            .insns
+            .iter()
+            .find(|i| matches!(i.op, SsaOp::BoolAnd(a, _) if a == uisetp_cmp_id))
+            .expect("expected UISETP BoolAnd result for UP0")
+            .id;
+
+        // UIADD3.X carry_in = UP0 must read `state.up[0]` (`uisetp_up0_id`), not `state.p[0]`.
+        let uses_up0_select = ssa.blocks[0].insns.iter().any(|i| {
+            matches!(
+                i.op,
+                SsaOp::Select { cond, .. } if cond == uisetp_up0_id
+            )
+        });
+        assert!(uses_up0_select, "UIADD3 must read UP0 from state.up rather than P0");
+
+        let out = compile_shader(&input);
+        assert!(out.fallback.is_none(), "UIADD3 compile failed: {:?}", out.fallback);
+        let _ = assert_valid_spirv_1_6(&out.spirv_words, [32, 1, 1]);
+    }
+
+    #[test]
+    fn f2i_rounding_and_signed_subword_f0402() {
+        use eglantine_ampere_spirv::ssa_ir::GlslOp;
+
+        let enc_f2i = |dst: u32, src: u32, signed: bool, size_bits: u32, round_mode: u32| {
+            let w0 = 0x305 | (7 << 12) | ((dst & 0xff) << 16);
+            let w2 = (u32::from(signed) << 8)
+                | ((size_bits & 3) << 11)
+                | ((round_mode & 3) << 14);
+            sm86(w0, src & 0xff, w2, 0)
+        };
+
+        let code = [
+            uldc_u64(4, 0, 0x160),
+            mov_imm(1, 0x3fc0_0000),       // 1.5f
+            enc_f2i(2, 1, true, 2, 0),     // F2I.ROUND.S32
+            enc_f2i(3, 1, false, 2, 1),    // F2I.FLOOR.U32
+            enc_f2i(4, 1, true, 2, 2),     // F2I.CEIL.S32
+            enc_f2i(5, 1, true, 0, 3),     // F2I.TRUNC.S8
+            enc_f2i(6, 1, true, 1, 3),     // F2I.TRUNC.S16
+            enc_f2i(7, 1, false, 0, 3),    // F2I.TRUNC.U8
+            stg_ur(2, 255, 4, 0),
+            stg_ur(3, 255, 4, 4),
+            stg_ur(4, 255, 4, 8),
+            stg_ur(5, 255, 4, 12),
+            stg_ur(6, 255, 4, 16),
+            stg_ur(7, 255, 4, 20),
+            exit_insn(7, false),
+        ];
+
+        let input = default_compute_input(&code);
+        let ssa = lower_to_ssa(&input).expect("F2I SSA");
+        let insns = &ssa.blocks[0].insns;
+        assert!(insns.iter().any(|i| matches!(i.op, SsaOp::Glsl1(GlslOp::RoundEven, _))));
+        assert!(insns.iter().any(|i| matches!(i.op, SsaOp::Glsl1(GlslOp::Floor, _))));
+        assert!(insns.iter().any(|i| matches!(i.op, SsaOp::Glsl1(GlslOp::Ceil, _))));
+        assert!(insns
+            .iter()
+            .any(|i| matches!(i.op, SsaOp::SBitFieldExtract { offset: 0, count: 8, .. })));
+        assert!(insns
+            .iter()
+            .any(|i| matches!(i.op, SsaOp::SBitFieldExtract { offset: 0, count: 16, .. })));
+
+        let out = compile_shader(&input);
+        assert!(out.fallback.is_none(), "F2I compile failed: {:?}", out.fallback);
+        let ops = assert_valid_spirv_1_6(&out.spirv_words, [32, 1, 1]);
+        assert!(
+            ops.iter().any(|o| o.opcode == 202),
+            "expected OpBitFieldSExtract (202) for signed 8/16-bit F2I"
+        );
+    }
+}

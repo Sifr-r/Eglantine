@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <nlohmann/json.hpp>
+#include "common/logging.h"
 #include "web_service/verify_login.h"
 #include "web_service/web_backend.h"
 #include "web_service/web_result.h"
@@ -14,14 +15,22 @@ bool VerifyLogin(const std::string& host, const std::string& username, const std
     if (reply.empty()) {
         return false;
     }
-    nlohmann::json json = nlohmann::json::parse(reply);
-    const auto iter = json.find("username");
+    try {
+        nlohmann::json json = nlohmann::json::parse(reply);
+        if (!json.is_object()) {
+            return false;
+        }
+        const auto iter = json.find("username");
 
-    if (iter == json.end()) {
-        return username.empty();
+        if (iter == json.end()) {
+            return username.empty();
+        }
+
+        return iter->is_string() && *iter == username;
+    } catch (const nlohmann::json::exception& e) {
+        LOG_ERROR(WebService, "Failed to parse login verification response: {}", e.what());
+        return false;
     }
-
-    return *iter == username;
 }
 
 } // namespace WebService

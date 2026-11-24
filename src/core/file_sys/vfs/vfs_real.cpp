@@ -480,12 +480,21 @@ VirtualFile RealVfsDirectory::CreateFileRelative(std::string_view relative_path)
 }
 
 VirtualDir RealVfsDirectory::CreateDirectoryRelative(std::string_view relative_path) {
+    const auto sanitized_root = FS::SanitizePath(path);
     const auto full_path = FS::SanitizePath(path + '/' + std::string(relative_path));
+    if (sanitized_root.empty() || !IsWithinRoot(sanitized_root, full_path)) {
+        return nullptr;
+    }
     return base.CreateDirectory(full_path, perms);
 }
 
 bool RealVfsDirectory::DeleteSubdirectoryRecursive(std::string_view name) {
+    const auto sanitized_root = FS::SanitizePath(this->path);
     const auto full_path = FS::SanitizePath(this->path + '/' + std::string(name));
+    if (sanitized_root.empty() || !IsWithinRoot(sanitized_root, full_path) ||
+        full_path == sanitized_root) {
+        return false;
+    }
     return FS::RemoveDirRecursively(full_path);
 }
 
@@ -561,8 +570,19 @@ bool RealVfsDirectory::DeleteFile(std::string_view name) {
 }
 
 bool RealVfsDirectory::Rename(std::string_view name) {
+    if (path.empty() || path_components.empty() || name.empty() || name == "." || name == ".." ||
+        name.find_first_of("/\\") != std::string_view::npos) {
+        return false;
+    }
     const std::string new_name = (parent_path + '/').append(name);
-    return base.MoveFile(path, new_name) != nullptr;
+    if (base.MoveDirectory(path, new_name) == nullptr) {
+        return false;
+    }
+    const auto sanitized = FS::SanitizePath(new_name, FS::DirectorySeparator::PlatformDefault);
+    path = std::string(FS::RemoveTrailingSlash(sanitized));
+    parent_path = FS::GetParentPath(path);
+    path_components = FS::SplitPathComponentsCopy(path);
+    return true;
 }
 
 std::string RealVfsDirectory::GetFullPath() const {

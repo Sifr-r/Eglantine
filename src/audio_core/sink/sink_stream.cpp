@@ -30,8 +30,12 @@
 namespace AudioCore::Sink {
 
 void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
-    if (type == StreamType::In)
+    if (type == StreamType::In || system_channels == 0 || device_channels == 0 ||
+        system_channels > MaxChannels) {
         return;
+    }
+
+    samples = samples.subspan(0, (samples.size() / system_channels) * system_channels);
 
     constexpr s32 min = (std::numeric_limits<s16>::min)();
     constexpr s32 max = (std::numeric_limits<s16>::max)();
@@ -64,7 +68,6 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
             samples[w_offs + 1] = s16(std::clamp(s32(right * volume), min, max));
         }
 
-        queue.EmplaceWait(buffer);
         samples_buffer.Push(samples.subspan(0, samples.size() / system_channels * device_channels));
     } else if (system_channels < device_channels) {
         std::vector<s16> new_samples(samples.size() / system_channels * device_channels);
@@ -72,7 +75,6 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
             for (u32 channel = 0; channel < system_channels; ++channel)
                 new_samples[w_offs + channel] = s16(std::clamp(s32(f32(samples[r_offs + channel]) * volume), min, max));
 
-        queue.EmplaceWait(buffer);
         samples_buffer.Push(new_samples);
     } else {
         if (volume != 1.0f) {
@@ -80,11 +82,12 @@ void SinkStream::AppendBuffer(SinkBuffer& buffer, std::span<s16> samples) {
                 samples[i] = s16(std::clamp(s32(f32(samples[i]) * volume), min, max));
         }
 
-        queue.EmplaceWait(buffer);
         samples_buffer.Push(samples);
     }
 
+    // Publish samples and buffer count before making the SinkBuffer visible to the audio thread.
     ++queued_buffers;
+    queue.EmplaceWait(buffer);
 }
 
 std::vector<s16> SinkStream::ReleaseBuffer(u64 num_samples) {
@@ -107,15 +110,18 @@ std::vector<s16> SinkStream::ReleaseBuffer(u64 num_samples) {
 }
 
 void SinkStream::ClearQueue() {
-    std::scoped_lock lk{release_mutex};
+    {
+        std::scoped_lock lk{release_mutex};
 
-    samples_buffer.Pop();
-    SinkBuffer tmp;
-    while (queue.TryPop(tmp));
+        samples_buffer.Pop();
+        SinkBuffer tmp;
+        while (queue.TryPop(tmp));
 
-    queued_buffers = 0;
-    playing_buffer = {};
-    playing_buffer.consumed = true;
+        queued_buffers = 0;
+        playing_buffer = {};
+        playing_buffer.consumed = true;
+    }
+    release_cv.notify_one();
 }
 
 void SinkStream::ProcessAudioIn(std::span<const s16> input_buffer, std::size_t num_frames) {
@@ -124,38 +130,44 @@ void SinkStream::ProcessAudioIn(std::span<const s16> input_buffer, std::size_t n
     const std::size_t frame_size_bytes = frame_size * sizeof(s16);
     size_t frames_written{0};
 
+    if (num_channels == 0 || num_channels > MaxChannels || num_frames == 0)
+        return;
+
     // If we're paused or going to shut down, we don't want to consume buffers as coretiming is
     // paused and we'll desync, so just return.
     if (system.IsPaused() || system.IsShuttingDown())
         return;
 
-    while (frames_written < num_frames) {
-        // If the playing buffer has been consumed or has no frames, we need a new one
-        if (playing_buffer.consumed || playing_buffer.frames == 0) {
-            if (!queue.TryPop(playing_buffer)) {
-                // If no buffer was available we've underrun, just push the samples and
-                // continue.
-                samples_buffer.Push(&input_buffer[frames_written * frame_size], (num_frames - frames_written) * frame_size);
-                frames_written = num_frames;
-                continue;
+    {
+        std::scoped_lock lk{release_mutex};
+        while (frames_written < num_frames) {
+            // If the playing buffer has been consumed or has no frames, we need a new one
+            if (playing_buffer.consumed || playing_buffer.frames == 0) {
+                if (!queue.TryPop(playing_buffer)) {
+                    // If no buffer was available we've underrun, just push the samples and
+                    // continue.
+                    samples_buffer.Push(&input_buffer[frames_written * frame_size], (num_frames - frames_written) * frame_size);
+                    frames_written = num_frames;
+                    continue;
+                }
+                // Successfully dequeued a new buffer.
+                queued_buffers--;
             }
-            // Successfully dequeued a new buffer.
-            queued_buffers--;
+
+            // Get the minimum frames available between the currently playing buffer, and the
+            // amount we have left to fill
+            size_t frames_available{std::min<u64>(playing_buffer.frames - playing_buffer.frames_played, num_frames - frames_written)};
+
+            samples_buffer.Push(&input_buffer[frames_written * frame_size], frames_available * frame_size);
+
+            frames_written += frames_available;
+            playing_buffer.frames_played += frames_available;
+
+            // If that's all the frames in the current buffer, add its samples and mark it as
+            // consumed
+            if (playing_buffer.frames_played >= playing_buffer.frames)
+                playing_buffer.consumed = true;
         }
-
-        // Get the minimum frames available between the currently playing buffer, and the
-        // amount we have left to fill
-        size_t frames_available{std::min<u64>(playing_buffer.frames - playing_buffer.frames_played, num_frames - frames_written)};
-
-        samples_buffer.Push(&input_buffer[frames_written * frame_size], frames_available * frame_size);
-
-        frames_written += frames_available;
-        playing_buffer.frames_played += frames_available;
-
-        // If that's all the frames in the current buffer, add its samples and mark it as
-        // consumed
-        if (playing_buffer.frames_played >= playing_buffer.frames)
-            playing_buffer.consumed = true;
     }
 
     if (frames_written > 0) {
@@ -178,6 +190,9 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
     size_t frames_written{0};
     size_t actual_frames_written{0};
 
+    if (num_channels == 0 || num_channels > MaxChannels || num_frames == 0)
+        return;
+
     if (system.IsPaused() || system.IsShuttingDown()) {
         if (system.IsShuttingDown()) {
             std::scoped_lock lk{release_mutex};
@@ -189,36 +204,42 @@ void SinkStream::ProcessAudioOutAndRender(std::span<s16> output_buffer, std::siz
         return;
     }
 
-    while (frames_written < num_frames) {
-        if (playing_buffer.consumed || playing_buffer.frames == 0) {
-            std::unique_lock lk{release_mutex};
+    bool popped_buffer = false;
+    {
+        // Hold release_mutex across queue/playing_buffer consumption so ClearQueue cannot violate SPSC invariants.
+        std::unique_lock lk{release_mutex};
+        while (frames_written < num_frames) {
+            if (playing_buffer.consumed || playing_buffer.frames == 0) {
+                if (!queue.TryPop(playing_buffer)) {
+                    for (size_t i = frames_written; i < num_frames; i++)
+                        std::memcpy(&output_buffer[i * frame_size], last_frame.data(), frame_size_bytes);
+                    frames_written = num_frames;
+                    continue;
+                }
 
-            if (!queue.TryPop(playing_buffer)) {
-                lk.unlock();
-                for (size_t i = frames_written; i < num_frames; i++)
-                    std::memcpy(&output_buffer[i * frame_size], last_frame.data(), frame_size_bytes);
-                frames_written = num_frames;
-                continue;
+                --queued_buffers;
+                popped_buffer = true;
             }
 
-            --queued_buffers;
-            lk.unlock();
-            release_cv.notify_one();
+            const size_t frames_available = std::min<u64>(playing_buffer.frames - playing_buffer.frames_played, num_frames - frames_written);
+
+            samples_buffer.Pop(&output_buffer[frames_written * frame_size], frames_available * frame_size);
+
+            frames_written += frames_available;
+            actual_frames_written += frames_available;
+            playing_buffer.frames_played += frames_available;
+
+            if (playing_buffer.frames_played >= playing_buffer.frames)
+                playing_buffer.consumed = true;
         }
-
-        const size_t frames_available = std::min<u64>(playing_buffer.frames - playing_buffer.frames_played, num_frames - frames_written);
-
-        samples_buffer.Pop(&output_buffer[frames_written * frame_size], frames_available * frame_size);
-
-        frames_written += frames_available;
-        actual_frames_written += frames_available;
-        playing_buffer.frames_played += frames_available;
-
-        if (playing_buffer.frames_played >= playing_buffer.frames)
-            playing_buffer.consumed = true;
+    }
+    if (popped_buffer) {
+        release_cv.notify_one();
     }
 
-    std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
+    if (frames_written > 0) {
+        std::memcpy(last_frame.data(), &output_buffer[(frames_written - 1) * frame_size], frame_size_bytes);
+    }
 
     // EDEN_NX2_AUDIO_LEVEL: log the output peak about every two seconds (is a game audible?).
     if (static const bool meter = std::getenv("EDEN_NX2_AUDIO_LEVEL") != nullptr; meter) {

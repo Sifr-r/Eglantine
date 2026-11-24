@@ -6,8 +6,10 @@
 
 #pragma once
 
-#include <type_traits>
+#include <algorithm>
 #include <cstddef>
+#include <limits>
+#include <type_traits>
 #include "common/literals.h"
 
 #include "core/file_sys/errors.h"
@@ -693,7 +695,11 @@ private:
             R_SUCCEED();
         }
 
-        Result Read(CompressedStorageCore& core, s64 offset, void* buffer, size_t size) {
+        Result Read(CompressedStorageCore& core, s64 offset, void* buffer, size_t size,
+                    size_t* out_read_size) {
+            ASSERT(out_read_size != nullptr);
+            *out_read_size = 0;
+
             // If we have nothing to read, succeed.
             R_SUCCEED_IF(size == 0);
 
@@ -701,10 +707,12 @@ private:
             R_UNLESS(buffer != nullptr, ResultNullptrArgument);
 
             // Check that the read is in bounds.
-            R_UNLESS(offset <= m_storage_size, ResultInvalidOffset);
+            R_UNLESS(0 <= offset && offset <= m_storage_size, ResultInvalidOffset);
 
             // Determine how much we can read.
-            const size_t read_size = std::min<size_t>(size, m_storage_size - offset);
+            const size_t read_size =
+                (std::min)(size, static_cast<size_t>(m_storage_size - offset));
+            R_SUCCEED_IF(read_size == 0);
 
             // Create head/tail ranges.
             AccessRange head_range = {};
@@ -876,6 +884,7 @@ private:
                     R_SUCCEED();
                 }));
 
+            *out_read_size = read_size;
             R_SUCCEED();
         }
 
@@ -936,8 +945,13 @@ public:
     }
 
     virtual size_t Read(u8* buffer, size_t size, size_t offset) const override {
-        if (R_SUCCEEDED(m_cache_manager.Read(m_core, offset, buffer, size))) {
-            return size;
+        if (offset > static_cast<size_t>((std::numeric_limits<s64>::max)())) {
+            return 0;
+        }
+        size_t read_size = 0;
+        if (R_SUCCEEDED(m_cache_manager.Read(m_core, static_cast<s64>(offset), buffer, size,
+                                             std::addressof(read_size)))) {
+            return read_size;
         } else {
             return 0;
         }

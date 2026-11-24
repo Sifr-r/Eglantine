@@ -31,12 +31,24 @@ KAddressArbiter::~KAddressArbiter() = default;
 
 namespace {
 
+bool CanAccessUser32(KernelCore& kernel, KProcessAddress address) {
+    const u64 raw_addr = GetInteger(address);
+    return raw_addr <= (std::numeric_limits<u64>::max)() - sizeof(s32) &&
+           GetCurrentMemory(kernel).IsValidVirtualAddressRange(raw_addr, sizeof(s32));
+}
+
 bool ReadFromUser(KernelCore& kernel, s32* out, KProcessAddress address) {
-    *out = GetCurrentMemory(kernel).Read32(GetInteger(address));
+    if (!CanAccessUser32(kernel, address)) {
+        return false;
+    }
+    *out = static_cast<s32>(GetCurrentMemory(kernel).Read32(GetInteger(address)));
     return true;
 }
 
 bool DecrementIfLessThan(KernelCore& kernel, s32* out, KProcessAddress address, s32 value) {
+    if (!CanAccessUser32(kernel, address)) {
+        return false;
+    }
     auto& monitor = GetCurrentProcess(kernel).GetExclusiveMonitor();
     const auto current_core = kernel.CurrentPhysicalCoreIndex();
 
@@ -78,6 +90,9 @@ bool DecrementIfLessThan(KernelCore& kernel, s32* out, KProcessAddress address, 
 
 bool UpdateIfEqual(KernelCore& kernel, s32* out, KProcessAddress address, s32 value,
                    s32 new_value) {
+    if (!CanAccessUser32(kernel, address)) {
+        return false;
+    }
     auto& monitor = GetCurrentProcess(kernel).GetExclusiveMonitor();
     const auto current_core = kernel.CurrentPhysicalCoreIndex();
 

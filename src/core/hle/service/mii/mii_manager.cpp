@@ -21,6 +21,7 @@ constexpr std::size_t DefaultMiiCount{RawData::DefaultMii.size()};
 MiiManager::MiiManager() {}
 
 Result MiiManager::Initialize(DatabaseSessionMetadata& metadata) {
+    std::scoped_lock lock{mutex};
     database_manager.MountSaveData();
     database_manager.Initialize(metadata, is_broken_with_clear_flag);
     return ResultSuccess;
@@ -45,6 +46,7 @@ void MiiManager::BuildRandom(CharInfo& out_char_info, Age age, Gender gender, Ra
 }
 
 bool MiiManager::IsFullDatabase() const {
+    std::scoped_lock lock{mutex};
     return database_manager.IsFullDatabase();
 }
 
@@ -57,6 +59,7 @@ bool MiiManager::IsUpdated(DatabaseSessionMetadata& metadata, SourceFlag source_
         return false;
     }
 
+    std::scoped_lock lock{mutex};
     const u64 metadata_update_counter = metadata.update_counter;
     const u64 database_update_counter = database_manager.GetUpdateCounter();
     metadata.update_counter = database_update_counter;
@@ -64,6 +67,7 @@ bool MiiManager::IsUpdated(DatabaseSessionMetadata& metadata, SourceFlag source_
 }
 
 u32 MiiManager::GetCount(const DatabaseSessionMetadata& metadata, SourceFlag source_flag) const {
+    std::scoped_lock lock{mutex};
     u32 mii_count{};
     if ((source_flag & SourceFlag::Default) != SourceFlag::None) {
         mii_count += DefaultMiiCount;
@@ -76,6 +80,7 @@ u32 MiiManager::GetCount(const DatabaseSessionMetadata& metadata, SourceFlag sou
 
 Result MiiManager::Move(DatabaseSessionMetadata& metadata, u32 index,
                         const Common::UUID& create_id) {
+    std::scoped_lock lock{mutex};
     const auto result = database_manager.Move(metadata, index, create_id);
 
     if (result.IsFailure()) {
@@ -90,6 +95,7 @@ Result MiiManager::Move(DatabaseSessionMetadata& metadata, u32 index,
 }
 
 Result MiiManager::AddOrReplace(DatabaseSessionMetadata& metadata, const StoreData& store_data) {
+    std::scoped_lock lock{mutex};
     const auto result = database_manager.AddOrReplace(metadata, store_data);
 
     if (result.IsFailure()) {
@@ -104,6 +110,7 @@ Result MiiManager::AddOrReplace(DatabaseSessionMetadata& metadata, const StoreDa
 }
 
 Result MiiManager::Delete(DatabaseSessionMetadata& metadata, const Common::UUID& create_id) {
+    std::scoped_lock lock{mutex};
     const auto result = database_manager.Delete(metadata, create_id);
 
     if (result.IsFailure()) {
@@ -118,6 +125,7 @@ Result MiiManager::Delete(DatabaseSessionMetadata& metadata, const Common::UUID&
 }
 
 s32 MiiManager::FindIndex(const Common::UUID& create_id, bool is_special) const {
+    std::scoped_lock lock{mutex};
     s32 index{};
     const auto result = database_manager.FindIndex(index, create_id, is_special);
     if (result.IsError()) {
@@ -132,6 +140,7 @@ Result MiiManager::GetIndex(const DatabaseSessionMetadata& metadata, const CharI
         return ResultInvalidCharInfo;
     }
 
+    std::scoped_lock lock{mutex};
     s32 index{};
     const bool is_special = metadata.magic == MiiMagic;
     const auto result = database_manager.FindIndex(index, char_info.GetCreateId(), is_special);
@@ -149,6 +158,7 @@ Result MiiManager::GetIndex(const DatabaseSessionMetadata& metadata, const CharI
 }
 
 Result MiiManager::Append(DatabaseSessionMetadata& metadata, const CharInfo& char_info) {
+    std::scoped_lock lock{mutex};
     const auto result = database_manager.Append(metadata, char_info);
 
     if (result.IsError()) {
@@ -163,6 +173,7 @@ Result MiiManager::Append(DatabaseSessionMetadata& metadata, const CharInfo& cha
 }
 
 bool MiiManager::IsBrokenWithClearFlag(DatabaseSessionMetadata& metadata) {
+    std::scoped_lock lock{mutex};
     const bool is_broken = is_broken_with_clear_flag;
     if (is_broken_with_clear_flag) {
         is_broken_with_clear_flag = false;
@@ -173,15 +184,18 @@ bool MiiManager::IsBrokenWithClearFlag(DatabaseSessionMetadata& metadata) {
 }
 
 Result MiiManager::DestroyFile(DatabaseSessionMetadata& metadata) {
+    std::scoped_lock lock{mutex};
     is_broken_with_clear_flag = true;
     return database_manager.DestroyFile(metadata);
 }
 
 Result MiiManager::DeleteFile() {
+    std::scoped_lock lock{mutex};
     return database_manager.DeleteFile();
 }
 
 Result MiiManager::Format(DatabaseSessionMetadata& metadata) {
+    std::scoped_lock lock{mutex};
     database_manager.Format(metadata);
 
     if (!database_manager.IsModified()) {
@@ -250,6 +264,7 @@ Result MiiManager::UpdateLatest(const DatabaseSessionMetadata& metadata, CharInf
         }
     }
 
+    std::scoped_lock lock{mutex};
     u32 index{};
     Result result = database_manager.FindIndex(metadata, index, char_info.GetCreateId());
 
@@ -285,6 +300,7 @@ Result MiiManager::UpdateLatest(const DatabaseSessionMetadata& metadata, StoreDa
         }
     }
 
+    std::scoped_lock lock{mutex};
     u32 index{};
     Result result = database_manager.FindIndex(metadata, index, store_data.GetCreateId());
 
@@ -308,6 +324,7 @@ Result MiiManager::UpdateLatest(const DatabaseSessionMetadata& metadata, StoreDa
 Result MiiManager::Get(const DatabaseSessionMetadata& metadata,
                        std::span<CharInfoElement> out_elements, u32& out_count,
                        SourceFlag source_flag) const {
+    std::scoped_lock lock{mutex};
     if ((source_flag & SourceFlag::Database) == SourceFlag::None) {
         return BuildDefault(out_elements, out_count, source_flag);
     }
@@ -333,6 +350,7 @@ Result MiiManager::Get(const DatabaseSessionMetadata& metadata,
 
 Result MiiManager::Get(const DatabaseSessionMetadata& metadata, std::span<CharInfo> out_char_info,
                        u32& out_count, SourceFlag source_flag) const {
+    std::scoped_lock lock{mutex};
     if ((source_flag & SourceFlag::Database) == SourceFlag::None) {
         return BuildDefault(out_char_info, out_count, source_flag);
     }
@@ -358,6 +376,7 @@ Result MiiManager::Get(const DatabaseSessionMetadata& metadata, std::span<CharIn
 Result MiiManager::Get(const DatabaseSessionMetadata& metadata,
                        std::span<StoreDataElement> out_elements, u32& out_count,
                        SourceFlag source_flag) const {
+    std::scoped_lock lock{mutex};
     if ((source_flag & SourceFlag::Database) == SourceFlag::None) {
         return BuildDefault(out_elements, out_count, source_flag);
     }
@@ -383,6 +402,7 @@ Result MiiManager::Get(const DatabaseSessionMetadata& metadata,
 
 Result MiiManager::Get(const DatabaseSessionMetadata& metadata, std::span<StoreData> out_store_data,
                        u32& out_count, SourceFlag source_flag) const {
+    std::scoped_lock lock{mutex};
     if ((source_flag & SourceFlag::Database) == SourceFlag::None) {
         return BuildDefault(out_store_data, out_count, source_flag);
     }

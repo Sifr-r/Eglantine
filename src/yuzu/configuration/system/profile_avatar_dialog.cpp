@@ -132,5 +132,9 @@ bool ProfileAvatarDialog::AreImagesLoaded() const {
 }
 
 QPixmap ProfileAvatarDialog::GetSelectedAvatar() {
-    return CreateAvatar(avatar_image_store[avatar_list->currentRow()]);
+    const int row = avatar_list->currentRow();
+    if (row < 0 || static_cast<qsizetype>(row) >= avatar_image_store.size()) {
+        return {};
+    }
+    return CreateAvatar(avatar_image_store[row]);
 }

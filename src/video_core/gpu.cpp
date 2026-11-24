@@ -44,6 +44,7 @@
 #include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/macro.h"
 #include "video_core/memory_manager.h"
+#include "video_core/native_qmd.h"
 #include "video_core/nx2.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/renderer_base.h"
@@ -54,39 +55,56 @@ namespace Tegra {
 struct GPU::Impl {
     explicit Impl(Core::System& system_, bool is_async_, bool use_nvdec_)
         : system{system_}
-        , gpu_thread{system_}
         , use_nvdec{use_nvdec_}
         , shader_notify()
         , is_async{is_async_}
+        , gpu_thread{system_}
     {}
 
-    ~Impl() = default;
+    ~Impl() {
+        NotifyShutdown();
+        cpu_context.reset();
+        renderer.reset();
+        std::scoped_lock lock{channels_mutex};
+        channels.clear();
+        current_channel = nullptr;
+        bound_channel = -1;
+    }
 
     std::shared_ptr<Control::ChannelState> CreateChannel(s32 channel_id) {
         auto channel_state = std::make_shared<Tegra::Control::ChannelState>(channel_id);
-        channels.emplace(channel_id, channel_state);
+        {
+            std::scoped_lock lock{channels_mutex};
+            channels.emplace(channel_id, channel_state);
+        }
         scheduler.DeclareChannel(channel_state);
         return channel_state;
     }
 
     void BindChannel(s32 channel_id) {
         if (bound_channel != channel_id) {
-            auto it = channels.find(channel_id);
-            ASSERT(it != channels.end());
+            std::shared_ptr<Tegra::Control::ChannelState> channel_state;
+            {
+                std::scoped_lock lock{channels_mutex};
+                auto it = channels.find(channel_id);
+                ASSERT(it != channels.end());
+                channel_state = it->second;
+            }
             bound_channel = channel_id;
-            current_channel = it->second.get();
+            current_channel = channel_state.get();
             renderer->ReadRasterizer()->BindChannel(*current_channel);
         }
     }
 
     std::shared_ptr<Control::ChannelState> AllocateChannel() {
-        return CreateChannel(new_channel_id++);
+        return CreateChannel(new_channel_id.fetch_add(1, std::memory_order_relaxed));
     }
 
     void InitChannel(Control::ChannelState& to_init, u64 program_id) {
         const bool use_ampere =
             g_nx2_ampere.load(std::memory_order_relaxed) || system.Platform().IsSwitch2();
-        to_init.Init(system, program_id, use_ampere ? GetOrCreateNativeMacroContext() : nullptr);
+        to_init.Init(system, program_id, use_ampere ? GetOrCreateNativeMacroContext() : nullptr,
+                     use_ampere ? GetOrCreateNativeQmdTable() : nullptr);
         to_init.BindRasterizer(renderer->ReadRasterizer());
         renderer->ReadRasterizer()->InitializeChannel(to_init);
     }
@@ -104,6 +122,14 @@ struct GPU::Impl {
     std::shared_ptr<NativeMacroContext> GetNativeMacroContext() const {
         std::scoped_lock lock{native_macro_context_mutex};
         return native_macro_context;
+    }
+
+    std::shared_ptr<NativeQmdStateTable> GetOrCreateNativeQmdTable() {
+        std::scoped_lock lock{native_qmd_table_mutex};
+        if (!native_qmd_table) {
+            native_qmd_table = std::make_shared<NativeQmdStateTable>();
+        }
+        return native_qmd_table;
     }
 
     void InitAddressSpace(Tegra::MemoryManager& memory_manager) {
@@ -421,15 +447,11 @@ struct GPU::Impl {
     // Owned by the GPU session and destroyed after channels, renderer, and gpu_thread.
     mutable std::mutex native_macro_context_mutex;
     std::shared_ptr<NativeMacroContext> native_macro_context;
+    mutable std::mutex native_qmd_table_mutex;
+    std::shared_ptr<NativeQmdStateTable> native_qmd_table;
 
-    // Destruction of thread must be done before all (non trivial)
-    // previous members has been destroyed
-    VideoCommon::GPUThread::ThreadManager gpu_thread;
-
-    std::unique_ptr<VideoCore::RendererBase> renderer;
     const bool use_nvdec;
 
-    s32 new_channel_id{1};
     /// Shader build notifier
     VideoCore::ShaderNotify shader_notify;
     /// When true, we are about to shut down emulation session, so terminate outstanding tasks
@@ -466,17 +488,23 @@ struct GPU::Impl {
 
     const bool is_async;
 
-    std::unique_ptr<Core::Frontend::GraphicsContext> cpu_context;
-
+    mutable std::mutex channels_mutex;
+    std::atomic<s32> new_channel_id{1};
     Tegra::Control::Scheduler scheduler;
     ::Common::unordered_map<s32, std::shared_ptr<Tegra::Control::ChannelState>> channels;
-    Tegra::Control::ChannelState* current_channel;
+    Tegra::Control::ChannelState* current_channel{nullptr};
     s32 bound_channel{-1};
 
     std::deque<size_t> free_swap_counters;
     std::deque<size_t> request_swap_counters;
     std::mutex request_swap_mutex;
     u64 pending_composite_fence{};
+
+    std::unique_ptr<VideoCore::RendererBase> renderer;
+    std::unique_ptr<Core::Frontend::GraphicsContext> cpu_context;
+
+    // Declared last so reverse destruction joins the GPU thread before renderer and channel state.
+    VideoCommon::GPUThread::ThreadManager gpu_thread;
 };
 
 GPU::GPU(Core::System& system, bool is_async, bool use_nvdec)
@@ -499,6 +527,10 @@ std::shared_ptr<NativeMacroContext> GPU::GetOrCreateNativeMacroContext() {
 
 std::shared_ptr<NativeMacroContext> GPU::GetNativeMacroContext() const {
     return impl->GetNativeMacroContext();
+}
+
+std::shared_ptr<NativeQmdStateTable> GPU::GetOrCreateNativeQmdTable() {
+    return impl->GetOrCreateNativeQmdTable();
 }
 
 void GPU::BindChannel(s32 channel_id) {

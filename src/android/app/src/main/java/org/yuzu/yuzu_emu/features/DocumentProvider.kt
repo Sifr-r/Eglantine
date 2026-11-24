@@ -52,21 +52,53 @@ class DocumentProvider : DocumentsProvider() {
         return true
     }
 
+    private fun ensureContainedIn(candidate: File, root: File, label: String): File {
+        val canonicalRoot = root.canonicalFile
+        val canonicalCandidate = candidate.canonicalFile
+        val rootPath = canonicalRoot.path
+        val rootPrefix = if (rootPath.endsWith(File.separator)) {
+            rootPath
+        } else {
+            rootPath + File.separator
+        }
+        if (canonicalCandidate != canonicalRoot && !canonicalCandidate.path.startsWith(rootPrefix)) {
+            throw FileNotFoundException("'$label' is outside allowed directory")
+        }
+        return canonicalCandidate
+    }
+
+    private fun validateDisplayName(displayName: String?): String {
+        if (displayName.isNullOrEmpty() ||
+            displayName == "." ||
+            displayName == ".." ||
+            displayName.contains('/') ||
+            displayName.contains('\\') ||
+            displayName.contains('\u0000')
+        ) {
+            throw FileNotFoundException("Invalid document name '$displayName'")
+        }
+        return displayName
+    }
+
     /**
      * @return The [File] that corresponds to the document ID supplied by [getDocumentId]
      */
     private fun getFile(documentId: String): File {
-        if (documentId.startsWith(ROOT_ID)) {
-            val file = baseDirectory.resolve(documentId.drop(ROOT_ID.length + 1))
-            if (!file.exists()) {
-                throw FileNotFoundException(
-                    "${file.absolutePath} ($documentId) not found"
-                )
-            }
-            return file
-        } else {
+        if (documentId != ROOT_ID && !documentId.startsWith("$ROOT_ID/")) {
             throw FileNotFoundException("'$documentId' is not in any known root")
         }
+        val relativePath = if (documentId == ROOT_ID) {
+            ""
+        } else {
+            documentId.removePrefix("$ROOT_ID/")
+        }
+        val file = ensureContainedIn(baseDirectory.resolve(relativePath), baseDirectory, documentId)
+        if (!file.exists()) {
+            throw FileNotFoundException(
+                "${file.absolutePath} ($documentId) not found"
+            )
+        }
+        return file
     }
 
     /**
@@ -103,7 +135,15 @@ class DocumentProvider : DocumentsProvider() {
     }
 
     override fun isChildDocument(parentDocumentId: String?, documentId: String?): Boolean {
-        return documentId?.startsWith(parentDocumentId!!) ?: false
+        if (parentDocumentId == null || documentId == null) {
+            return false
+        }
+        val prefix = if (parentDocumentId.endsWith('/')) {
+            parentDocumentId
+        } else {
+            "$parentDocumentId/"
+        }
+        return documentId == parentDocumentId || documentId.startsWith(prefix)
     }
 
     /**
@@ -127,8 +167,16 @@ class DocumentProvider : DocumentsProvider() {
         mimeType: String?,
         displayName: String
     ): String {
-        val parentFile = getFile(parentDocumentId!!)
-        val newFile = parentFile.resolveWithoutConflict(displayName)
+        val parentId = parentDocumentId
+            ?: throw FileNotFoundException("Parent document ID cannot be null")
+        val parentFile = getFile(parentId)
+        if (!parentFile.isDirectory) {
+            throw FileNotFoundException("Parent '$parentId' is not a directory")
+        }
+        val safeName = validateDisplayName(displayName)
+        val candidate = parentFile.resolveWithoutConflict(safeName)
+        val newFile = ensureContainedIn(candidate, baseDirectory, safeName)
+        ensureContainedIn(newFile, parentFile, safeName)
 
         try {
             if (DocumentsContract.Document.MIME_TYPE_DIR == mimeType) {
@@ -148,17 +196,20 @@ class DocumentProvider : DocumentsProvider() {
     }
 
     override fun deleteDocument(documentId: String?) {
-        val file = getFile(documentId!!)
+        val docId = documentId ?: throw FileNotFoundException("Document ID cannot be null")
+        val file = getFile(docId)
         if (!file.delete()) {
-            throw FileNotFoundException("Couldn't delete document with ID '$documentId'")
+            throw FileNotFoundException("Couldn't delete document with ID '$docId'")
         }
     }
 
     override fun removeDocument(documentId: String, parentDocumentId: String?) {
-        val parent = getFile(parentDocumentId!!)
+        val parentId = parentDocumentId
+            ?: throw FileNotFoundException("Parent document ID cannot be null")
+        val parent = getFile(parentId)
         val file = getFile(documentId)
 
-        if (parent == file || file.parentFile == null || file.parentFile!! == parent) {
+        if (parent == file || file.parentFile == null || file.parentFile == parent) {
             if (!file.delete()) {
                 throw FileNotFoundException("Couldn't delete document with ID '$documentId'")
             }
@@ -168,18 +219,24 @@ class DocumentProvider : DocumentsProvider() {
     }
 
     override fun renameDocument(documentId: String?, displayName: String?): String {
-        if (displayName == null) {
-            throw FileNotFoundException(
-                "Couldn't rename document '$documentId' as the new name is null"
-            )
-        }
+        val docId = documentId ?: throw FileNotFoundException("Document ID cannot be null")
+        val safeName = validateDisplayName(displayName)
 
-        val sourceFile = getFile(documentId!!)
+        val sourceFile = getFile(docId)
+        if (sourceFile == baseDirectory.canonicalFile) {
+            throw FileNotFoundException("Couldn't rename root directory '$docId'")
+        }
         val sourceParentFile = sourceFile.parentFile
             ?: throw FileNotFoundException(
-                "Couldn't rename document '$documentId' as it has no parent"
+                "Couldn't rename document '$docId' as it has no parent"
             )
-        val destFile = sourceParentFile.resolve(displayName)
+        ensureContainedIn(sourceParentFile, baseDirectory, docId)
+        val destFile = ensureContainedIn(
+            sourceParentFile.resolve(safeName),
+            baseDirectory,
+            safeName
+        )
+        ensureContainedIn(destFile, sourceParentFile, safeName)
 
         try {
             if (!sourceFile.renameTo(destFile)) {
@@ -213,9 +270,15 @@ class DocumentProvider : DocumentsProvider() {
     }
 
     override fun copyDocument(sourceDocumentId: String, targetParentDocumentId: String?): String {
-        val parent = getFile(targetParentDocumentId!!)
+        val parentId = targetParentDocumentId
+            ?: throw FileNotFoundException("Target parent document ID cannot be null")
+        val parent = getFile(parentId)
         val oldFile = getFile(sourceDocumentId)
-        val newFile = parent.resolveWithoutConflict(oldFile.name)
+        val newFile = ensureContainedIn(
+            parent.resolveWithoutConflict(oldFile.name),
+            baseDirectory,
+            oldFile.name
+        )
 
         try {
             if (!(
@@ -322,9 +385,15 @@ class DocumentProvider : DocumentsProvider() {
     ): Cursor {
         var cursor = MatrixCursor(projection ?: DEFAULT_DOCUMENT_PROJECTION)
 
-        val parent = getFile(parentDocumentId!!)
-        for (file in parent.listFiles()!!)
+        val parentId = parentDocumentId
+            ?: throw FileNotFoundException("Parent document ID cannot be null")
+        val parent = getFile(parentId)
+        if (!parent.isDirectory) {
+            throw FileNotFoundException("'$parentId' is not a directory")
+        }
+        for (file in parent.listFiles().orEmpty()) {
             cursor = includeFile(cursor, null, file)
+        }
 
         return cursor
     }
@@ -334,7 +403,8 @@ class DocumentProvider : DocumentsProvider() {
         mode: String?,
         signal: CancellationSignal?
     ): ParcelFileDescriptor {
-        val file = documentId?.let { getFile(it) }
+        val docId = documentId ?: throw FileNotFoundException("Document ID cannot be null")
+        val file = getFile(docId)
         val accessMode = ParcelFileDescriptor.parseMode(mode)
         return ParcelFileDescriptor.open(file, accessMode)
     }

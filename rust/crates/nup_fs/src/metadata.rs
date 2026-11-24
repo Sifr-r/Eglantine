@@ -6,12 +6,13 @@
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use crate::format::{
-    put_u16_le, put_u32_le, put_u64_le, read_u16_le, read_u32_le, read_u64_le, sha256, ReadAt,
-    DIR_RECORD_SIZE, EXTENT_ALIGNMENT, FILE_RECORD_SIZE, HEADER_MAGIC, PACKAGE_RECORD_SIZE,
-    PROGRESS_STEP, READ_BUFFER_SIZE, SUPERBLOCK_SIZE, TLV_HEADER_SIZE, TOC_HEADER_SIZE,
+    is_cancelled, put_u16_le, put_u32_le, put_u64_le, read_u16_le, read_u32_le, read_u64_le,
+    sha256, ReadAt, DIR_RECORD_SIZE, EXTENT_ALIGNMENT, FILE_RECORD_SIZE, HEADER_MAGIC,
+    PACKAGE_RECORD_SIZE, PROGRESS_STEP, READ_BUFFER_SIZE, SUPERBLOCK_SIZE, TLV_HEADER_SIZE,
+    TOC_HEADER_SIZE,
 };
 use crate::reader::{FileReader, NupContainer, PackageInfo, PackageKind};
 use crate::writer::PackProgress;
@@ -615,15 +616,13 @@ fn newest_product_tag(dir: &Path, prefix: &str) -> String {
         let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !file_name.starts_with(prefix) || file_name.len() < prefix.len() + 4 {
+        let Some(rest) = file_name.as_bytes().strip_prefix(prefix.as_bytes()) else {
+            continue;
+        };
+        if rest.len() < 4 || rest[3] != b'.' || !rest[..3].iter().all(u8::is_ascii_digit) {
             continue;
         }
-        let digits = &file_name[prefix.len()..prefix.len() + 3];
-        if file_name.as_bytes()[prefix.len() + 3] != b'.'
-            || !digits.bytes().all(|b| b.is_ascii_digit())
-        {
-            continue;
-        }
+        let digits = std::str::from_utf8(&rest[..3]).expect("validated ASCII digits");
         if digits > best.as_str() {
             best = digits.to_owned();
         }
@@ -879,6 +878,16 @@ pub fn edit_nup_metadata(
     archive: &Path,
     edit: &MetadataEdit,
     cancel: Option<&AtomicBool>,
+    progress_cb: Option<&mut dyn FnMut(&PackProgress)>,
+) -> Result<EditResult, (EditResult, String)> {
+    edit_nup_metadata_with_cancel_poll(archive, edit, cancel, None, progress_cb)
+}
+
+pub(crate) fn edit_nup_metadata_with_cancel_poll(
+    archive: &Path,
+    edit: &MetadataEdit,
+    cancel: Option<&AtomicBool>,
+    cancel_poll: Option<&dyn Fn() -> bool>,
     mut progress_cb: Option<&mut dyn FnMut(&PackProgress)>,
 ) -> Result<EditResult, (EditResult, String)> {
     if edit.title_name.is_none()
@@ -888,6 +897,9 @@ pub fn edit_nup_metadata(
         && edit.localized_titles.is_none()
     {
         return Ok(EditResult::NoChange);
+    }
+    if is_cancelled(cancel, cancel_poll) {
+        return Err((EditResult::Cancelled, "cancelled".to_string()));
     }
     if !archive.is_file() {
         return Err((
@@ -1241,7 +1253,7 @@ pub fn edit_nup_metadata(
             .map_err(|_| (EditResult::IoError, "cannot seek to blob".to_string()))?;
 
         while offset < data_end {
-            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            if is_cancelled(cancel, cancel_poll) {
                 return Err((EditResult::Cancelled, "cancelled".to_string()));
             }
             let chunk = (data_end - offset).min(buffer.len() as u64) as usize;
@@ -1269,6 +1281,9 @@ pub fn edit_nup_metadata(
         }
 
         for block in &new_metas {
+            if is_cancelled(cancel, cancel_poll) {
+                return Err((EditResult::Cancelled, "cancelled".to_string()));
+            }
             if !block.is_empty() {
                 write_all(block)?;
             }

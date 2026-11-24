@@ -10,13 +10,15 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <thread>
 #include <vector>
-#include <atomic>
 
 #include "common/container/unordered_map.h"
 
@@ -373,13 +375,13 @@ public:
     BatteryLevelState GetBattery() const;
 
     /// Returns the latest camera status from the controller
-    const CameraState& GetCamera() const;
+    CameraState GetCamera() const;
 
     /// Returns the latest ringcon force sensor value
     RingSensorForce GetRingSensorForce() const;
 
     /// Returns the latest ntag status from the controller
-    const NfcState& GetNfc() const;
+    NfcState GetNfc() const;
 
     /**
      * Sends an on/off vibration to the left device
@@ -599,7 +601,7 @@ private:
     const NpadIdType npad_id_type;
     NpadStyleTag supported_style_tag{NpadStyleSet::All};
     f32 motion_sensitivity{Core::HID::MotionInput::IsAtRestStandard};
-    u32 turbo_button_state{0};
+    std::atomic<u32> turbo_button_state{0};
     std::size_t nfc_handles{0};
     std::array<VibrationValue, 2> last_vibration_value{DEFAULT_VIBRATION_VALUE,
                                                        DEFAULT_VIBRATION_VALUE};
@@ -656,6 +658,8 @@ private:
     std::optional<InjectedInput> Injected() const;
 
     mutable std::mutex callback_mutex;
+    std::condition_variable callback_cv;
+    std::vector<std::thread::id> active_callback_threads;
     ::Common::unordered_map<int, ControllerUpdateCallback> callback_list;
 
     mutable std::mutex injector_mutex;
@@ -664,6 +668,7 @@ private:
     int last_callback_key = 0;
 
     // Stores the current status of all controller input
+    mutable std::mutex controller_mutex;
     ControllerStatus controller;
 };
 

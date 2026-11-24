@@ -24,6 +24,8 @@
 
 namespace Common {
 
+[[nodiscard]] static inline u64 MultiplyHigh(u64 a, u64 b);
+
 // This function multiplies 2 u64 values and divides it by a u64 value.
 [[nodiscard]] static inline u64 MultiplyAndDivide64(u64 a, u64 b, u64 d) {
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -49,13 +51,36 @@ namespace Common {
     const u64 moda = a % d;
     const u64 divb = b / d;
     const u64 modb = b % d;
-    return diva * b + moda * divb + moda * modb / d;
+    const unsigned __int128 rem_product = static_cast<unsigned __int128>(moda) * modb;
+    const u64 rem_div = (rem_product >> 64) == 0
+                            ? static_cast<u64>(rem_product) / d
+                            : static_cast<u64>(rem_product / d);
+    return diva * b + moda * divb + rem_div;
 #else
     const u64 diva = a / d;
     const u64 moda = a % d;
     const u64 divb = b / d;
     const u64 modb = b % d;
-    return diva * b + moda * divb + moda * modb / d;
+    const u64 lo_prod = moda * modb;
+    const u64 hi_prod = MultiplyHigh(moda, modb);
+    u64 rem_div = 0;
+    if (hi_prod == 0) {
+        rem_div = lo_prod / d;
+    } else {
+        u64 rem = hi_prod;
+        u64 lo = lo_prod;
+        for (int i = 0; i < 64; ++i) {
+            const u64 top_bit = rem >> 63;
+            rem = (rem << 1) | (lo >> 63);
+            lo <<= 1;
+            rem_div <<= 1;
+            if (top_bit != 0 || rem >= d) {
+                rem -= d;
+                rem_div |= 1;
+            }
+        }
+    }
+    return diva * b + moda * divb + rem_div;
 #endif
 }
 

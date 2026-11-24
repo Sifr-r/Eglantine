@@ -160,6 +160,9 @@ std::map<IR::Attribute, IR::Attribute> GenerateLegacyToGenericMappings(
                 mapping.insert({attr + i, previous_stage_mapping.at(attr + i)});
             }
         } else {
+            if (unused_generics.empty()) {
+                throw NotImplementedException("Out of generic attribute slots for legacy mapping");
+            }
             for (size_t i = 0; i < count; ++i) {
                 mapping.insert({attr + i, unused_generics.front() + i});
             }
@@ -510,10 +513,10 @@ IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b
     result.info.loads.mask |= vertex_b.info.loads.mask;
     result.info.stores.mask |= vertex_b.info.stores.mask;
 
-    Optimization::JoinTextureInfo(result.info, vertex_b.info);
     // The two halves are one stage: their storage buffers share its limit.
     Optimization::JoinStorageInfo(result.info, vertex_b.info,
                                   Optimization::StorageBufferLimit(host_info));
+    Optimization::JoinTextureInfo(result.info, vertex_b.info);
     Optimization::DeadCodeEliminationPass(result);
     if (Settings::values.renderer_debug) {
         Optimization::VerificationPass(result);

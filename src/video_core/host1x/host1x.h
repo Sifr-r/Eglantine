@@ -7,6 +7,7 @@
 #pragma once
 
 #include "common/container/unordered_map.h"
+#include <mutex>
 #include <unordered_map>
 #include <variant>
 
@@ -172,9 +173,15 @@ public:
     void StopDevice(s32 fd, ChannelType type);
 
     void PushEntries(s32 fd, ChCommandHeaderList&& entries) {
-        if (auto const nvdec = std::get_if<Tegra::Host1x::Nvdec>(&devices[fd])) {
+        std::scoped_lock lock{devices_mutex};
+        const auto it = devices.find(fd);
+        if (it == devices.end()) {
+            LOG_ERROR(HW_GPU, "PushEntries for unknown host1x fd {}", fd);
+            return;
+        }
+        if (auto* const nvdec = std::get_if<Tegra::Host1x::Nvdec>(&it->second)) {
             nvdec->PushEntries(std::move(entries));
-        } else if (auto const vic = std::get_if<Tegra::Host1x::Vic>(&devices[fd])) {
+        } else if (auto* const vic = std::get_if<Tegra::Host1x::Vic>(&it->second)) {
             vic->PushEntries(std::move(entries));
         }
     }
@@ -185,11 +192,9 @@ public:
     Tegra::MemoryManager gmmu_manager;
     Common::FlatAllocator<u32, 0, 32> allocator;
     FrameQueue frame_queue;
-    std::array<std::variant<
-        std::monostate,
-        Tegra::Host1x::Nvdec,
-        Tegra::Host1x::Vic
-    >, 1024> devices;
+    using DeviceVariant = std::variant<std::monostate, Tegra::Host1x::Nvdec, Tegra::Host1x::Vic>;
+    std::mutex devices_mutex;
+    std::unordered_map<s32, DeviceVariant> devices;
 #ifdef YUZU_LEGACY
     std::once_flag nvdec_first_init;
     std::once_flag vic_first_init;

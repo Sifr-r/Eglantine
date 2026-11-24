@@ -4,9 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
+#include <limits>
 #include <memory>
 #include <span>
+#include <utility>
 
 #include <glad/glad.h>
 
@@ -18,10 +21,69 @@
 
 namespace OpenGL {
 
-StagingBufferMap::~StagingBufferMap() {
-    if (sync) {
-        sync->Create();
+StagingBufferMap::StagingBufferMap(const StagingBufferMap& rhs)
+    : mapped_span{rhs.mapped_span}, offset{rhs.offset}, owner{rhs.owner}, buffer{rhs.buffer},
+      index{rhs.index} {
+    if (owner != nullptr) {
+        ++owner->allocs[index].ref_count;
     }
+}
+
+StagingBufferMap& StagingBufferMap::operator=(const StagingBufferMap& rhs) {
+    if (this == &rhs) {
+        return *this;
+    }
+    Release();
+    mapped_span = rhs.mapped_span;
+    offset = rhs.offset;
+    owner = rhs.owner;
+    buffer = rhs.buffer;
+    index = rhs.index;
+    if (owner != nullptr) {
+        ++owner->allocs[index].ref_count;
+    }
+    return *this;
+}
+
+StagingBufferMap::StagingBufferMap(StagingBufferMap&& rhs) noexcept
+    : mapped_span{std::exchange(rhs.mapped_span, std::span<u8>{})},
+      offset{std::exchange(rhs.offset, size_t{0})},
+      owner{std::exchange(rhs.owner, nullptr)},
+      buffer{std::exchange(rhs.buffer, GLuint{0})},
+      index{std::exchange(rhs.index, size_t{0})} {}
+
+StagingBufferMap& StagingBufferMap::operator=(StagingBufferMap&& rhs) noexcept {
+    if (this == &rhs) {
+        return *this;
+    }
+    Release();
+    mapped_span = std::exchange(rhs.mapped_span, std::span<u8>{});
+    offset = std::exchange(rhs.offset, size_t{0});
+    owner = std::exchange(rhs.owner, nullptr);
+    buffer = std::exchange(rhs.buffer, GLuint{0});
+    index = std::exchange(rhs.index, size_t{0});
+    return *this;
+}
+
+StagingBufferMap::~StagingBufferMap() {
+    Release();
+}
+
+void StagingBufferMap::Release() noexcept {
+    if (owner == nullptr) {
+        return;
+    }
+    auto& alloc = owner->allocs[index];
+    ASSERT(alloc.ref_count > 0);
+    if (--alloc.ref_count == 0 && alloc.insert_fence && !alloc.deferred) {
+        alloc.sync.Create();
+        alloc.insert_fence = false;
+    }
+    owner = nullptr;
+    mapped_span = std::span<u8>{};
+    offset = 0;
+    buffer = 0;
+    index = 0;
 }
 
 StagingBuffers::StagingBuffers(GLenum storage_flags_, GLenum map_flags_)
@@ -31,22 +93,29 @@ StagingBuffers::~StagingBuffers() = default;
 
 StagingBufferMap StagingBuffers::RequestMap(size_t requested_size, bool insert_fence,
                                             bool deferred) {
-
     const size_t index = RequestBuffer(requested_size);
-    OGLSync* const sync = insert_fence ? &allocs[index].sync : nullptr;
-    allocs[index].sync_index = insert_fence ? ++current_sync_index : 0;
-    allocs[index].deferred = deferred;
-    return StagingBufferMap{
-        .mapped_span = std::span(allocs[index].map, requested_size),
-        .sync = sync,
-        .buffer = allocs[index].buffer.handle,
-        .index = index,
-    };
+    auto& alloc = allocs[index];
+    alloc.sync_index = insert_fence ? ++current_sync_index : 0;
+    alloc.deferred = deferred;
+    alloc.insert_fence = insert_fence;
+    alloc.ref_count = 1;
+    StagingBufferMap result;
+    result.mapped_span = std::span(alloc.map, requested_size);
+    result.offset = 0;
+    result.owner = this;
+    result.buffer = alloc.buffer.handle;
+    result.index = index;
+    return result;
 }
 
 void StagingBuffers::FreeDeferredStagingBuffer(size_t index) {
-    ASSERT(allocs[index].deferred);
-    allocs[index].deferred = false;
+    auto& alloc = allocs[index];
+    ASSERT(alloc.deferred);
+    alloc.deferred = false;
+    if (alloc.insert_fence) {
+        alloc.sync.Create();
+        alloc.insert_fence = false;
+    }
 }
 
 size_t StagingBuffers::RequestBuffer(size_t requested_size) {
@@ -77,7 +146,7 @@ std::optional<size_t> StagingBuffers::FindBuffer(size_t requested_size) {
         if (buffer_size < requested_size || buffer_size >= smallest_buffer) {
             continue;
         }
-        if (alloc.deferred) {
+        if (alloc.deferred || alloc.ref_count > 0) {
             continue;
         }
         if (alloc.sync.handle != 0) {
@@ -146,8 +215,8 @@ std::pair<std::span<u8>, size_t> StreamBuffer::Request(size_t size) noexcept {
     return {std::span(mapped_pointer + offset, size), offset};
 }
 
-StagingBufferMap StagingBufferPool::RequestUploadBuffer(size_t size) {
-    return upload_buffers.RequestMap(size, true);
+StagingBufferMap StagingBufferPool::RequestUploadBuffer(size_t size, bool deferred) {
+    return upload_buffers.RequestMap(size, true, deferred);
 }
 
 StagingBufferMap StagingBufferPool::RequestDownloadBuffer(size_t size, bool deferred) {
@@ -155,7 +224,11 @@ StagingBufferMap StagingBufferPool::RequestDownloadBuffer(size_t size, bool defe
 }
 
 void StagingBufferPool::FreeDeferredStagingBuffer(StagingBufferMap& buffer) {
-    download_buffers.FreeDeferredStagingBuffer(buffer.index);
+    if (buffer.owner == nullptr) {
+        return;
+    }
+    ASSERT(buffer.owner == &upload_buffers || buffer.owner == &download_buffers);
+    buffer.owner->FreeDeferredStagingBuffer(buffer.index);
 }
 
 } // namespace OpenGL

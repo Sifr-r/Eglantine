@@ -165,8 +165,9 @@ void RasterizerOpenGL::Clear(u32 layer_count) {
     bool use_depth{};
     bool use_stencil{};
 
-    if (regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
-        regs.clear_surface.A) {
+    if ((regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
+         regs.clear_surface.A) &&
+        regs.clear_surface.RT < Maxwell::NumRenderTargets) {
         use_color = true;
 
         const GLuint index = regs.clear_surface.RT;
@@ -359,6 +360,7 @@ void RasterizerOpenGL::DrawTexture() {
         gpu.TickWork();
     };
 
+    std::scoped_lock lock{texture_cache.mutex};
     texture_cache.SynchronizeDescriptors(false);
     texture_cache.UpdateRenderTargets(false);
 
@@ -406,6 +408,7 @@ void RasterizerOpenGL::DispatchCompute() {
     if (!pipeline) {
         return;
     }
+    std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
     if (pipeline->UsesLocalMemory()) {
         program_manager.LocalMemoryWarmup();
     }
@@ -421,9 +424,9 @@ void RasterizerOpenGL::DispatchCompute() {
             buffer_cache.ObtainBuffer(*indirect_address, 12, sync_info, post_op);
         glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, buffer->Handle());
         glDispatchComputeIndirect(static_cast<GLintptr>(offset));
-        return;
+    } else {
+        glDispatchCompute(qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z);
     }
-    glDispatchCompute(qmd.grid_dim_x, qmd.grid_dim_y, qmd.grid_dim_z);
     ++num_queued_commands;
     has_written_global_memory |= pipeline->WritesGlobalMemory();
 }

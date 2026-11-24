@@ -233,7 +233,8 @@ DrawParams MakeDrawParams(const Tegra::Engines::Maxwell3D::DrawManager::State& d
         params.base_vertex = 0;
         params.is_indexed = true;
     } else if (draw_state.topology == Maxwell::PrimitiveTopology::QuadStrip) {
-        params.num_vertices = (params.num_vertices - 2) / 2 * 6;
+        params.num_vertices =
+            params.num_vertices >= 4 ? ((params.num_vertices - 2) / 2) * 6 : 0;
         params.base_vertex = 0;
         params.is_indexed = true;
     }
@@ -1722,7 +1723,8 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     UpdateViewportsState(regs);
 
     const u32 color_attachment = regs.clear_surface.RT;
-    if (use_color && framebuffer->HasAspectColorBit(color_attachment)) {
+    if (use_color && color_attachment < VideoCommon::NUM_RT &&
+        framebuffer->HasAspectColorBit(color_attachment)) {
         const auto format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(regs.rt[color_attachment].format);
         bool is_integer = IsPixelFormatInteger(format);
         bool is_signed = IsPixelFormatSignedInteger(format);
@@ -3895,8 +3897,11 @@ void RasterizerVulkan::UpdateDepthBiasEnable(Tegra::Engines::Maxwell3D::Regs& re
         regs.polygon_offset_line_enable,
         regs.polygon_offset_fill_enable,
     };
-    const u32 topology_index = u32(maxwell3d->draw_manager.draw_state.topology);
-    const u32 enable = enabled_lut[POLYGON_OFFSET_ENABLE_LUT[topology_index]];
+    const size_t topology_index = static_cast<size_t>(maxwell3d->draw_manager.draw_state.topology);
+    const size_t offset_kind = topology_index < POLYGON_OFFSET_ENABLE_LUT.size()
+                                   ? POLYGON_OFFSET_ENABLE_LUT[topology_index]
+                                   : POINT;
+    const u32 enable = enabled_lut[offset_kind];
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthBiasEnableEXT(enable != 0); });
 }
 

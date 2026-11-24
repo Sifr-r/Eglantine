@@ -126,7 +126,7 @@ ValidationResult CharInfo::Verify() const {
     if (eye_aspect > MaxEyeAspect) {
         return ValidationResult::InvalidEyeAspect;
     }
-    if (eye_rotate > MaxEyeX) {
+    if (eye_rotate > MaxEyeRotate) {
         return ValidationResult::InvalidEyeRotate;
     }
     if (eye_x > MaxEyeX) {

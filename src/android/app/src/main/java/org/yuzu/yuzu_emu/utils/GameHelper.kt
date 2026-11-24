@@ -107,10 +107,6 @@ object GameHelper {
         NativeLibrary.addFileToFilesystemProvider(game.path)
     }
 
-    // File extensions considered as external content, buuut should
-    // be done better imo.
-    private val externalContentExtensions = setOf("nsp", "xci", "nsz", "xcz")
-
     private fun scanContentContainersRecursive(
         files: Array<MinimalDocumentFile>,
         depth: Int,
@@ -129,7 +125,7 @@ object GameHelper {
                 )
             } else {
                 val extension = FileUtil.getExtension(it.uri).lowercase()
-                if (externalContentExtensions.contains(extension)) {
+                if (GameMetadata.externalContentExtensions.contains(extension)) {
                     onContainerFound(it)
                 }
             }
@@ -160,13 +156,13 @@ object GameHelper {
                 val extension = FileUtil.getExtension(it.uri).lowercase()
                 val filePath = it.uri.toString()
 
-                val mountedContainer = externalContentExtensions.contains(extension) &&
+                val mountedContainer = GameMetadata.externalContentExtensions.contains(extension) &&
                     mountedContainerUris.add(filePath)
                 if (mountedContainer) {
                     NativeLibrary.addGameFolderFileToFilesystemProvider(filePath)
                 }
 
-                if (Game.extensions.contains(extension)) {
+                if (GameMetadata.gameExtensions.contains(extension)) {
                     val game = getGame(it.uri, true, false)
                     if (game != null) {
                         games.add(game)
@@ -231,7 +227,7 @@ object GameHelper {
             }
 
             val extension = sibling.extension.lowercase()
-            if (externalContentExtensions.contains(extension)) {
+            if (GameMetadata.externalContentExtensions.contains(extension)) {
                 val containerUri = Uri.fromFile(sibling).toString()
                 if (mountedContainerUris.add(containerUri)) {
                     NativeLibrary.addGameFolderFileToFilesystemProvider(containerUri)

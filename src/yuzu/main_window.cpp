@@ -2452,7 +2452,7 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
     SCOPE_EXIT {
         boot_in_progress = false;
         LOG_INFO(Frontend, "Launch finished: elapsed_ms={} running={}", boot_timer.elapsed(),
-                 emulation_running);
+                 emulation_running.load());
         if (!emulation_running && !close_pending) {
             game_list->SetScanEnabled(true);
             game_list->PopulateAsync(UISettings::values.game_dirs);
@@ -2489,6 +2489,16 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
         Loader::GetLoader(*QtCommon::system, v_file, params.program_id, params.program_index);
 
     std::optional<QtConfig> per_game_config;
+    SCOPE_EXIT {
+        if (!emulation_running) {
+            if (!QtCommon::system->IsPoweredOn()) {
+                Settings::values.players.SetGlobal(true);
+            }
+            Settings::RestoreGlobalState(QtCommon::system->IsPoweredOn());
+            QtCommon::system->HIDCore().ReloadInputDevices();
+            QtCommon::system->ApplySettings();
+        }
+    };
     if (loader != nullptr && loader->ReadProgramId(title_id) == Loader::ResultStatus::Success &&
         type == StartGameType::Normal) {
         // Load per game settings
@@ -2513,8 +2523,6 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
             LOG_INFO(Config, "Recommended settings prompt for {:016X} closed; boot cancelled",
                      title_id);
             asked_recommended_settings.erase(title_id);
-            Settings::RestoreGlobalState(QtCommon::system->IsPoweredOn());
-            QtCommon::system->HIDCore().ReloadInputDevices();
             return;
         }
         const bool accepted = choice == RecommendedSettingsDialog::Apply;
@@ -2599,6 +2607,11 @@ void MainWindow::BootGame(const QString& filename, Service::AM::FrontendAppletPa
 
     QtCommon::system->SetShuttingDown(false);
     game_list->setDisabled(true);
+
+    {
+        std::scoped_lock lk{QtCommon::renderer_mutex};
+        QtCommon::renderer_active.store(true, std::memory_order_release);
+    }
 
     // Create and start the emulation thread
     QtCommon::emu_thread = std::make_unique<EmuThread>();
@@ -2822,6 +2835,10 @@ void MainWindow::OnEmulationStopped() {
         shutdown_dialog = nullptr;
     }
 
+    {
+        std::scoped_lock lk{QtCommon::renderer_mutex};
+        QtCommon::renderer_active.store(false, std::memory_order_release);
+    }
     emulation_running = false;
 
     discord_rpc->Update();
@@ -2958,29 +2975,32 @@ void MainWindow::OnGameListOpenFolder(u64 program_id, GameListOpenTarget target,
     std::filesystem::path path;
     QString open_target;
 
-    const auto [user_save_size, device_save_size] = [&game_path, &program_id] {
-        const FileSys::PatchManager pm{program_id, QtCommon::system->GetFileSystemController(),
-                                       QtCommon::system->GetContentProvider()};
-        const auto control = pm.GetControlMetadata().first;
-        if (control != nullptr) {
-            return std::make_pair(control->GetDefaultNormalSaveSize(),
-                                  control->GetDeviceSaveDataSize());
-        } else {
-            const auto file = Core::GetGameFileFromPath(QtCommon::vfs, game_path);
-            const auto loader = Loader::GetLoader(*QtCommon::system, file);
-
-            FileSys::NACP nacp{};
-            loader->ReadControlData(nacp);
-            return std::make_pair(nacp.GetDefaultNormalSaveSize(), nacp.GetDeviceSaveDataSize());
-        }
-    }();
-
-    // Some titles (e.g. NX2 games) report no sizes in their NACP yet still create account saves
-    // at runtime, so only use the device layout when it is explicitly declared.
-    const bool use_device_save{device_save_size > 0 && user_save_size == 0};
-
     switch (target) {
     case GameListOpenTarget::SaveData: {
+        const auto [user_save_size, device_save_size] = [&game_path, &program_id] {
+            const FileSys::PatchManager pm{program_id, QtCommon::system->GetFileSystemController(),
+                                           QtCommon::system->GetContentProvider()};
+            const auto control = pm.GetControlMetadata().first;
+            if (control != nullptr) {
+                return std::make_pair(control->GetDefaultNormalSaveSize(),
+                                      control->GetDeviceSaveDataSize());
+            } else {
+                const auto file = Core::GetGameFileFromPath(QtCommon::vfs, game_path);
+                const auto loader = Loader::GetLoader(*QtCommon::system, file);
+
+                FileSys::NACP nacp{};
+                if (loader != nullptr) {
+                    loader->ReadControlData(nacp);
+                }
+                return std::make_pair(nacp.GetDefaultNormalSaveSize(),
+                                      nacp.GetDeviceSaveDataSize());
+            }
+        }();
+
+        // Some titles (e.g. NX2 games) report no sizes in their NACP yet still create account
+        // saves at runtime, so only use the device layout when it is explicitly declared.
+        const bool use_device_save{device_save_size > 0 && user_save_size == 0};
+
         open_target = tr("Save Data");
         const auto save_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::SaveDir);
         auto vfs_save_dir = QtCommon::vfs->OpenDirectory(Common::FS::PathToUTF8String(save_dir),
@@ -3490,6 +3510,9 @@ void MainWindow::OnMenuLoadFolder() {
 }
 
 void MainWindow::IncrementInstallProgress() {
+    if (!install_progress) {
+        return;
+    }
     install_progress->setValue(install_progress->value() + 1);
 }
 
@@ -3540,16 +3563,27 @@ void MainWindow::OnMenuInstallToNAND() {
 
     ui->action_Install_File_NAND->setEnabled(false);
 
+    install_cancel = std::make_shared<std::atomic_bool>(false);
+    const auto cancel = install_cancel;
+
     install_progress = new QProgressDialog(QString{}, tr("Cancel"), 0, total_size, this);
     install_progress->setWindowFlags(windowFlags() & ~Qt::WindowMaximizeButtonHint);
-    install_progress->setAttribute(Qt::WA_DeleteOnClose, true);
+    install_progress->setAutoClose(false);
+    install_progress->setAutoReset(false);
     install_progress->setFixedWidth(installDialog.GetMinimumWidth() + 40);
+    connect(install_progress, &QProgressDialog::canceled, this,
+            [cancel] { cancel->store(true, std::memory_order_relaxed); });
     install_progress->show();
 
     for (const QString& file : files) {
-        install_progress->setWindowTitle(tr("%n file(s) remaining", "", remaining));
-        install_progress->setLabelText(
-            tr("Installing file \"%1\"...").arg(QFileInfo(file).fileName()));
+        if (cancel->load(std::memory_order_relaxed)) {
+            break;
+        }
+        if (install_progress) {
+            install_progress->setWindowTitle(tr("%n file(s) remaining", "", remaining));
+            install_progress->setLabelText(
+                tr("Installing file \"%1\"...").arg(QFileInfo(file).fileName()));
+        }
 
         QFuture<ContentManager::InstallResult> future;
         ContentManager::InstallResult result;
@@ -3558,14 +3592,11 @@ void MainWindow::OnMenuInstallToNAND() {
             file.endsWith(QStringLiteral("nsz"), Qt::CaseInsensitive) ||
             file.endsWith(QStringLiteral("xci"), Qt::CaseInsensitive) ||
             file.endsWith(QStringLiteral("xcz"), Qt::CaseInsensitive)) {
-            const auto progress_callback = [this](size_t size, size_t progress) {
+            const auto progress_callback = [this, cancel](size_t, size_t) {
                 emit UpdateInstallProgress();
-                if (install_progress->wasCanceled()) {
-                    return true;
-                }
-                return false;
+                return cancel->load(std::memory_order_relaxed);
             };
-            future = QtConcurrent::run([&file, progress_callback] {
+            future = QtConcurrent::run([file, progress_callback] {
                 return ContentManager::InstallNSP(*QtCommon::system, *QtCommon::vfs,
                                                   file.toStdString(), progress_callback);
             });
@@ -3602,7 +3633,12 @@ void MainWindow::OnMenuInstallToNAND() {
         --remaining;
     }
 
-    install_progress->close();
+    if (install_progress) {
+        install_progress->close();
+        install_progress->deleteLater();
+        install_progress = nullptr;
+    }
+    install_cancel.reset();
 
     if (detected_base_install) {
         QMessageBox::warning(
@@ -3662,12 +3698,13 @@ ContentManager::InstallResult MainWindow::InstallNCA(const QString& filename) {
     auto* registered_cache = is_application ? fs_controller.GetUserNANDContents()
                                             : fs_controller.GetSystemNANDContents();
 
-    const auto progress_callback = [this](size_t size, size_t progress) {
+    const auto cancel = install_cancel;
+    const auto progress_callback = [this, cancel](size_t, size_t) {
         emit UpdateInstallProgress();
-        if (install_progress->wasCanceled()) {
-            return true;
+        if (cancel) {
+            return cancel->load(std::memory_order_relaxed);
         }
-        return false;
+        return !install_progress || install_progress->wasCanceled();
     };
     return ContentManager::InstallNCA(*QtCommon::vfs, filename.toStdString(), *registered_cache,
                                       static_cast<FileSys::TitleType>(index), progress_callback);

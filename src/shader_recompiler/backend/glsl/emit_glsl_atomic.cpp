@@ -7,6 +7,7 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <string>
 #include <string_view>
 
 #include "shader_recompiler/backend/glsl/emit_glsl_instructions.h"
@@ -41,6 +42,77 @@ void SsboCasFunctionF32(EmitContext& ctx, IR::Inst& inst, const IR::Value& bindi
     const auto ret{ctx.var_alloc.Define(inst, GlslVarType::U32)};
     ctx.Add(cas_loop, ssbo, ret, ssbo, function, ssbo, value, ret);
     ctx.AddF32("{}=utof({});", inst, ret);
+}
+
+void StorageAtomicMinMax64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
+                           const IR::Value& offset, std::string_view value, bool is_signed,
+                           std::string_view op) {
+    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to non-atomic");
+    const std::string offset_var{ctx.var_alloc.Consume(offset)};
+    const u32 binding_index{binding.U32()};
+    if (is_signed) {
+        ctx.AddU64("{}=packInt2x32(ivec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]));", inst,
+                   ctx.stage_name, binding_index, offset_var, ctx.stage_name, binding_index,
+                   offset_var);
+        ctx.Add("for(int i=0;i<2;++i){{ "
+                "{}_ssbo{}[({}>>2)+i]=uint({}(int({}_ssbo{}[({}>>2)+i]),unpackInt2x32(int64_t({}))"
+                "[i]));}}",
+                ctx.stage_name, binding_index, offset_var, op, ctx.stage_name, binding_index,
+                offset_var, value);
+    } else {
+        ctx.AddU64("{}=packUint2x32(uvec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]));", inst,
+                   ctx.stage_name, binding_index, offset_var, ctx.stage_name, binding_index,
+                   offset_var);
+        ctx.Add("for(int i=0;i<2;++i){{ "
+                "{}_ssbo{}[({}>>2)+i]={}({}_ssbo{}[({}>>2)+i],unpackUint2x32(uint64_t({}))[i]);}}",
+                ctx.stage_name, binding_index, offset_var, op, ctx.stage_name, binding_index,
+                offset_var, value);
+    }
+}
+
+void StorageAtomicBitwise64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
+                            const IR::Value& offset, std::string_view value, std::string_view op) {
+    const std::string offset_var{ctx.var_alloc.Consume(offset)};
+    const u32 binding_index{binding.U32()};
+    ctx.AddU64("{}=packUint2x32(uvec2({}({}_ssbo{}[{}>>2],unpackUint2x32({}).x),{}({}_"
+               "ssbo{}[({}>>2)+1],unpackUint2x32({}).y)));",
+               inst, op, ctx.stage_name, binding_index, offset_var, value, op, ctx.stage_name,
+               binding_index, offset_var, value);
+}
+
+void StorageAtomicMinMax32x2(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
+                             const IR::Value& offset, std::string_view value, bool is_signed,
+                             std::string_view op) {
+    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to non-atomic");
+    const std::string offset_var{ctx.var_alloc.Consume(offset)};
+    const u32 binding_index{binding.U32()};
+    if (is_signed) {
+        ctx.AddU32x2("{}=ivec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]);", inst, ctx.stage_name,
+                     binding_index, offset_var, ctx.stage_name, binding_index, offset_var);
+        ctx.Add("for(int "
+                "i=0;i<2;++i){{{}_ssbo{}[({}>>2)+i]=uint({}(int({}_ssbo{}[({}>>2)+i]),int({}[i]))"
+                ");}}",
+                ctx.stage_name, binding_index, offset_var, op, ctx.stage_name, binding_index,
+                offset_var, value);
+    } else {
+        ctx.AddU32x2("{}=uvec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]);", inst, ctx.stage_name,
+                     binding_index, offset_var, ctx.stage_name, binding_index, offset_var);
+        ctx.Add("for(int i=0;i<2;++i){{ "
+                "{}_ssbo{}[({}>>2)+i]={}({}_ssbo{}[({}>>2)+i],{}[i]);}}",
+                ctx.stage_name, binding_index, offset_var, op, ctx.stage_name, binding_index,
+                offset_var, value);
+    }
+}
+
+void StorageAtomicBitwise32x2(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
+                              const IR::Value& offset, std::string_view value,
+                              std::string_view op) {
+    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to 32x2");
+    const std::string offset_var{ctx.var_alloc.Consume(offset)};
+    const u32 binding_index{binding.U32()};
+    ctx.AddU32x2("{}=uvec2({}({}_ssbo{}[{}>>2],{}.x),{}({}_ssbo{}[({}>>2)+1],{}.y));", inst, op,
+                 ctx.stage_name, binding_index, offset_var, value, op, ctx.stage_name,
+                 binding_index, offset_var, value);
 }
 } // Anonymous namespace
 
@@ -191,188 +263,105 @@ void EmitStorageAtomicCompareExchange32(EmitContext& ctx, IR::Inst& inst, const 
 void EmitStorageAtomicIAdd64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                              const IR::Value& offset, std::string_view value) {
     LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to non-atomic");
+    const std::string offset_var{ctx.var_alloc.Consume(offset)};
+    const u32 binding_index{binding.U32()};
     ctx.AddU64("{}=packUint2x32(uvec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]));", inst,
-               ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name,
-               binding.U32(), ctx.var_alloc.Consume(offset));
+               ctx.stage_name, binding_index, offset_var, ctx.stage_name, binding_index,
+               offset_var);
     ctx.Add("{}_ssbo{}[{}>>2]+=unpackUint2x32({}).x;{}_ssbo{}[({}>>2)+1]+=unpackUint2x32({}).y;",
-            ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value, ctx.stage_name,
-            binding.U32(), ctx.var_alloc.Consume(offset), value);
+            ctx.stage_name, binding_index, offset_var, value, ctx.stage_name, binding_index,
+            offset_var, value);
 }
 
 void EmitStorageAtomicSMin64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                              const IR::Value& offset, std::string_view value) {
-    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to non-atomic");
-    ctx.AddU64("{}=packInt2x32(ivec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]));", inst,
-               ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name,
-               binding.U32(), ctx.var_alloc.Consume(offset));
-    ctx.Add("for(int i=0;i<2;++i){{ "
-            "{}_ssbo{}[({}>>2)+i]=uint(min(int({}_ssbo{}[({}>>2)+i]),unpackInt2x32(int64_t({}))[i])"
-            ");}}",
-            ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name,
-            binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicMinMax64(ctx, inst, binding, offset, value, true, "min");
 }
 
 void EmitStorageAtomicUMin64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                              const IR::Value& offset, std::string_view value) {
-    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to non-atomic");
-    ctx.AddU64("{}=packUint2x32(uvec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]));", inst,
-               ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name,
-               binding.U32(), ctx.var_alloc.Consume(offset));
-    ctx.Add("for(int i=0;i<2;++i){{ "
-            "{}_ssbo{}[({}>>2)+i]=min({}_ssbo{}[({}>>2)+i],unpackUint2x32(uint64_t({}))[i]);}}",
-            ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name,
-            binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicMinMax64(ctx, inst, binding, offset, value, false, "min");
 }
 
 void EmitStorageAtomicSMax64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                              const IR::Value& offset, std::string_view value) {
-    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to non-atomic");
-    ctx.AddU64("{}=packInt2x32(ivec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]));", inst,
-               ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name,
-               binding.U32(), ctx.var_alloc.Consume(offset));
-    ctx.Add("for(int i=0;i<2;++i){{ "
-            "{}_ssbo{}[({}>>2)+i]=uint(max(int({}_ssbo{}[({}>>2)+i]),unpackInt2x32(int64_t({}))[i])"
-            ");}}",
-            ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name,
-            binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicMinMax64(ctx, inst, binding, offset, value, true, "max");
 }
 
 void EmitStorageAtomicUMax64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                              const IR::Value& offset, std::string_view value) {
-    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to non-atomic");
-    ctx.AddU64("{}=packUint2x32(uvec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]));", inst,
-               ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name,
-               binding.U32(), ctx.var_alloc.Consume(offset));
-    ctx.Add("for(int "
-            "i=0;i<2;++i){{{}_ssbo{}[({}>>2)+i]=max({}_ssbo{}[({}>>2)+i],unpackUint2x32(uint64_t({}"
-            "))[i]);}}",
-            ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name,
-            binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicMinMax64(ctx, inst, binding, offset, value, false, "max");
 }
 
 void EmitStorageAtomicAnd64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                             const IR::Value& offset, std::string_view value) {
-    ctx.AddU64(
-        "{}=packUint2x32(uvec2(atomicAnd({}_ssbo{}[{}>>2],unpackUint2x32({}).x),atomicAnd({}_"
-        "ssbo{}[({}>>2)+1],unpackUint2x32({}).y)));",
-        inst, ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value, ctx.stage_name,
-        binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicBitwise64(ctx, inst, binding, offset, value, "atomicAnd");
 }
 
 void EmitStorageAtomicOr64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                            const IR::Value& offset, std::string_view value) {
-    ctx.AddU64("{}=packUint2x32(uvec2(atomicOr({}_ssbo{}[{}>>2],unpackUint2x32({}).x),atomicOr({}_"
-               "ssbo{}[({}>>2)+1],unpackUint2x32({}).y)));",
-               inst, ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value,
-               ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicBitwise64(ctx, inst, binding, offset, value, "atomicOr");
 }
 
 void EmitStorageAtomicXor64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                             const IR::Value& offset, std::string_view value) {
-    ctx.AddU64(
-        "{}=packUint2x32(uvec2(atomicXor({}_ssbo{}[{}>>2],unpackUint2x32({}).x),atomicXor({}_"
-        "ssbo{}[({}>>2)+1],unpackUint2x32({}).y)));",
-        inst, ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value, ctx.stage_name,
-        binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicBitwise64(ctx, inst, binding, offset, value, "atomicXor");
 }
 
 void EmitStorageAtomicExchange64(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                                  const IR::Value& offset, std::string_view value) {
-    ctx.AddU64("{}=packUint2x32(uvec2(atomicExchange({}_ssbo{}[{}>>2],unpackUint2x32({}).x),"
-               "atomicExchange({}_ssbo{}[({}>>2)+1],unpackUint2x32({}).y)));",
-               inst, ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value,
-               ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicBitwise64(ctx, inst, binding, offset, value, "atomicExchange");
 }
 
 void EmitStorageAtomicIAdd32x2(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                                const IR::Value& offset, std::string_view value) {
     LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to non-atomic");
+    const std::string offset_var{ctx.var_alloc.Consume(offset)};
+    const u32 binding_index{binding.U32()};
     ctx.AddU32x2("{}=uvec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]);", inst, ctx.stage_name,
-                 binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name, binding.U32(),
-                 ctx.var_alloc.Consume(offset));
-    ctx.Add("{}_ssbo{}[{}>>2]+={}.x;{}_ssbo{}[({}>>2)+1]+={}.y;", ctx.stage_name, binding.U32(),
-            ctx.var_alloc.Consume(offset), value, ctx.stage_name, binding.U32(),
-            ctx.var_alloc.Consume(offset), value);
+                 binding_index, offset_var, ctx.stage_name, binding_index, offset_var);
+    ctx.Add("{}_ssbo{}[{}>>2]+={}.x;{}_ssbo{}[({}>>2)+1]+={}.y;", ctx.stage_name, binding_index,
+            offset_var, value, ctx.stage_name, binding_index, offset_var, value);
 }
 
 void EmitStorageAtomicSMin32x2(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                                const IR::Value& offset, std::string_view value) {
-    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to non-atomic");
-    ctx.AddU32x2("{}=ivec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]);", inst, ctx.stage_name,
-                 binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name, binding.U32(),
-                 ctx.var_alloc.Consume(offset));
-    ctx.Add("for(int "
-            "i=0;i<2;++i){{{}_ssbo{}[({}>>2)+i]=uint(min(int({}_ssbo{}[({}>>2)+i]),int({}[i])));}}",
-            ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name,
-            binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicMinMax32x2(ctx, inst, binding, offset, value, true, "min");
 }
 
 void EmitStorageAtomicUMin32x2(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                                const IR::Value& offset, std::string_view value) {
-    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to non-atomic");
-    ctx.AddU32x2("{}=uvec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]);", inst, ctx.stage_name,
-                 binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name, binding.U32(),
-                 ctx.var_alloc.Consume(offset));
-    ctx.Add("for(int i=0;i<2;++i){{ "
-            "{}_ssbo{}[({}>>2)+i]=min({}_ssbo{}[({}>>2)+i],{}[i]);}}",
-            ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name,
-            binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicMinMax32x2(ctx, inst, binding, offset, value, false, "min");
 }
 
 void EmitStorageAtomicSMax32x2(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                                const IR::Value& offset, std::string_view value) {
-    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to non-atomic");
-    ctx.AddU32x2("{}=ivec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]);", inst, ctx.stage_name,
-                 binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name, binding.U32(),
-                 ctx.var_alloc.Consume(offset));
-    ctx.Add("for(int "
-            "i=0;i<2;++i){{{}_ssbo{}[({}>>2)+i]=uint(max(int({}_ssbo{}[({}>>2)+i]),int({}[i])));}}",
-            ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name,
-            binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicMinMax32x2(ctx, inst, binding, offset, value, true, "max");
 }
 
 void EmitStorageAtomicUMax32x2(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                                const IR::Value& offset, std::string_view value) {
-    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to non-atomic");
-    ctx.AddU32x2("{}=uvec2({}_ssbo{}[{}>>2],{}_ssbo{}[({}>>2)+1]);", inst, ctx.stage_name,
-                 binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name, binding.U32(),
-                 ctx.var_alloc.Consume(offset));
-    ctx.Add("for(int i=0;i<2;++i){{{}_ssbo{}[({}>>2)+i]=max({}_ssbo{}[({}>>2)+i],{}[i]);}}",
-            ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), ctx.stage_name,
-            binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicMinMax32x2(ctx, inst, binding, offset, value, false, "max");
 }
 
 void EmitStorageAtomicAnd32x2(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                               const IR::Value& offset, std::string_view value) {
-    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to 32x2");
-    ctx.AddU32x2("{}=uvec2(atomicAnd({}_ssbo{}[{}>>2],{}.x),atomicAnd({}_ssbo{}[({}>>2)+1],{}.y));",
-                 inst, ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value,
-                 ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicBitwise32x2(ctx, inst, binding, offset, value, "atomicAnd");
 }
 
 void EmitStorageAtomicOr32x2(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                              const IR::Value& offset, std::string_view value) {
-    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to 32x2");
-    ctx.AddU32x2("{}=uvec2(atomicOr({}_ssbo{}[{}>>2],{}.x),atomicOr({}_ssbo{}[({}>>2)+1],{}.y));",
-                 inst, ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value,
-                 ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicBitwise32x2(ctx, inst, binding, offset, value, "atomicOr");
 }
 
 void EmitStorageAtomicXor32x2(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                               const IR::Value& offset, std::string_view value) {
-    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to 32x2");
-    ctx.AddU32x2("{}=uvec2(atomicXor({}_ssbo{}[{}>>2],{}.x),atomicXor({}_ssbo{}[({}>>2)+1],{}.y));",
-                 inst, ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value,
-                 ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicBitwise32x2(ctx, inst, binding, offset, value, "atomicXor");
 }
 
 void EmitStorageAtomicExchange32x2(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,
                                    const IR::Value& offset, std::string_view value) {
-    LOG_WARNING(Shader_GLSL, "Int64 atomics not supported, fallback to 32x2");
-    ctx.AddU32x2("{}=uvec2(atomicExchange({}_ssbo{}[{}>>2],{}.x),atomicExchange({}_ssbo{}[({}>>2)+"
-                 "1],{}.y));",
-                 inst, ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value,
-                 ctx.stage_name, binding.U32(), ctx.var_alloc.Consume(offset), value);
+    StorageAtomicBitwise32x2(ctx, inst, binding, offset, value, "atomicExchange");
 }
 
 void EmitStorageAtomicAddF32(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding,

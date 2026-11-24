@@ -34,6 +34,7 @@ public:
      *
      * @param session_id - Output session_id.
      * @return Result code.
+     * @note mutex must be held by the caller.
      */
     Result AcquireSessionId(size_t& session_id);
 
@@ -48,6 +49,7 @@ public:
      * Link this manager to the main audio manager.
      *
      * @return Result code.
+     * @note mutex must be held by the caller.
      */
     Result LinkToManager();
 
@@ -88,7 +90,12 @@ public:
     /// Whether the sessions have been started
     bool sessions_started{};
     /// Protect state due to audio manager callback
-    std::recursive_mutex mutex{};
+    std::mutex mutex{};
+
+private:
+    friend class Out;
+
+    void ReleaseSessionIdLocked(size_t session_id);
 };
 
 } // namespace AudioCore::AudioOut

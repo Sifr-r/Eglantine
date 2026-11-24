@@ -195,6 +195,9 @@ Decoder::Decoder(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
 }
 
 bool Decoder::SupportsDecodingOnDevice(AVPixelFormat* out_pix_fmt, AVHWDeviceType type) const {
+    if (!m_codec) {
+        return false;
+    }
     for (int i = 0;; i++) {
         const AVCodecHWConfig* config = avcodec_get_hw_config(m_codec, i);
         if (!config) {
@@ -305,6 +308,9 @@ void DecoderContext::InitializeHardwareDecoder(const HardwareContext& context, A
 }
 
 bool DecoderContext::OpenContext(const Decoder& decoder, std::span<const u8> extradata) {
+    if (!decoder.GetCodec()) {
+        return false;
+    }
     if (!extradata.empty()) {
         av_freep(&m_codec_context->extradata);
         m_codec_context->extradata = static_cast<u8*>(
@@ -380,6 +386,10 @@ void DecodeApi::Reset() {
 bool DecodeApi::Initialize(Tegra::Host1x::NvdecCommon::VideoCodec codec) {
     this->Reset();
     m_decoder.emplace(codec);
+    if (m_decoder->GetCodec() == nullptr) {
+        this->Reset();
+        return false;
+    }
     m_decoder_context.emplace(*m_decoder);
 
     bool is_mediacodec = false;

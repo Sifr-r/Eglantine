@@ -359,14 +359,15 @@ Result FSP_SRV::OpenFileSystemWithPatch(OutInterface<IFileSystem> out_interface,
               open_program_id);
 
     // FIXME: many issues with this
-    ASSERT(type == FileSystemProxyType::Manual);
+    R_UNLESS(type == FileSystemProxyType::Manual, FileSys::ResultInvalidArgument);
+    R_UNLESS(romfs_controller != nullptr, FileSys::ResultTargetNotFound);
+
     const auto manual_romfs = romfs_controller->OpenPatchedRomFS(
         open_program_id, FileSys::ContentRecordType::HtmlDocument);
-
-    ASSERT(manual_romfs != nullptr);
+    R_UNLESS(manual_romfs != nullptr, FileSys::ResultTargetNotFound);
 
     const auto extracted_romfs = FileSys::ExtractRomFS(manual_romfs);
-    ASSERT(extracted_romfs != nullptr);
+    R_UNLESS(extracted_romfs != nullptr, FileSys::ResultTargetNotFound);
 
     *out_interface = std::make_shared<IFileSystem>(
         system, extracted_romfs, SizeGetter::FromStorageId(fsc, FileSys::StorageId::NandUser));
@@ -378,7 +379,8 @@ Result FSP_SRV::OpenSdCardFileSystem(OutInterface<IFileSystem> out_interface) {
     LOG_DEBUG(Service_FS, "called");
 
     FileSys::VirtualDir sdmc_dir{};
-    fsc.OpenSDMC(&sdmc_dir);
+    R_TRY(fsc.OpenSDMC(&sdmc_dir));
+    R_UNLESS(sdmc_dir != nullptr, FileSys::ResultPortSdCardNoDevice);
 
     *out_interface = std::make_shared<IFileSystem>(
         system, sdmc_dir, SizeGetter::FromStorageId(fsc, FileSys::StorageId::SdCard));
@@ -494,6 +496,8 @@ Result FSP_SRV::CreateSaveDataFileSystem(FileSys::SaveDataCreationInfo save_crea
     LOG_DEBUG(Service_FS, "called save_struct = {}, uid = {:016X}{:016X}", save_struct.DebugInfo(),
               uid[1], uid[0]);
 
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
+
     FileSys::VirtualDir save_data_dir{};
     R_RETURN(save_data_controller->CreateSaveData(&save_data_dir, FileSys::SaveDataSpaceId::User,
                                                   save_struct));
@@ -503,6 +507,8 @@ Result FSP_SRV::CreateSaveDataFileSystemBySystemSaveDataId(
     FileSys::SaveDataAttribute save_struct, FileSys::SaveDataCreationInfo save_create_struct) {
     LOG_DEBUG(Service_FS, "called save_struct = {}", save_struct.DebugInfo());
 
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
+
     FileSys::VirtualDir save_data_dir{};
     R_RETURN(save_data_controller->CreateSaveData(&save_data_dir, FileSys::SaveDataSpaceId::System,
                                                   save_struct));
@@ -510,6 +516,8 @@ Result FSP_SRV::CreateSaveDataFileSystemBySystemSaveDataId(
 
 Result FSP_SRV::CreateSaveDataFileSystemWithCreationInfo2(
     FileSys::SaveDataCreationInfo2 save_data_creation_info) {
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
+
     FileSys::VirtualDir save_data_dir{};
     R_RETURN(save_data_controller->CreateSaveData(&save_data_dir, save_data_creation_info.space_id,
                                                   save_data_creation_info.attribute));
@@ -518,12 +526,15 @@ Result FSP_SRV::CreateSaveDataFileSystemWithCreationInfo2(
 Result FSP_SRV::DeleteSaveDataFileSystem(u64 save_data_id) {
     LOG_DEBUG(Service_FS, "called, save_data_id={:016X}", save_data_id);
 
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
+
     R_RETURN(DeleteSaveDataById(*save_data_controller, system, FileSys::SaveDataSpaceId::User,
                                 save_data_id));
 }
 
 Result FSP_SRV::RegisterSaveDataFileSystemAtomicDeletion(
     InBuffer<BufferAttr_HipcMapAlias> save_data_id_buffer) {
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
     R_UNLESS(save_data_id_buffer.size() >= sizeof(u64) &&
                  (save_data_id_buffer.size() % sizeof(u64)) == 0,
              FileSys::ResultInvalidArgument);
@@ -562,6 +573,7 @@ Result FSP_SRV::DeleteSaveDataFileSystemBySaveDataSpaceId(FileSys::SaveDataSpace
                                                           u64 save_data_id) {
     LOG_DEBUG(Service_FS, "called, space_id={}, save_data_id={:016X}", space_id, save_data_id);
 
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
     R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
 
     R_RETURN(DeleteSaveDataById(*save_data_controller, system, space_id, save_data_id));
@@ -571,6 +583,7 @@ Result FSP_SRV::DeleteSaveDataFileSystemBySaveDataAttribute(FileSys::SaveDataSpa
                                                              FileSys::SaveDataAttribute attribute) {
     LOG_DEBUG(Service_FS, "called, space_id={}, {}", space_id, attribute.DebugInfo());
 
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
     R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
     R_UNLESS(IsSupportedSaveDataType(attribute.type), FileSys::ResultInvalidArgument);
     R_UNLESS(attribute.type != FileSys::SaveDataType::System ||
@@ -582,6 +595,8 @@ Result FSP_SRV::DeleteSaveDataFileSystemBySaveDataAttribute(FileSys::SaveDataSpa
 
 Result FSP_SRV::DeleteCacheStorage(u16 index) {
     LOG_DEBUG(Service_FS, "called, index={}", index);
+
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
 
     R_RETURN(save_data_controller->DeleteCacheStorage(index));
 }
@@ -598,6 +613,8 @@ Result FSP_SRV::OpenSaveDataFileSystem(OutInterface<IFileSystem> out_interface,
                                        FileSys::SaveDataSpaceId space_id,
                                        FileSys::SaveDataAttribute attribute) {
     LOG_INFO(Service_FS, "called.");
+
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
 
     FileSys::VirtualDir dir{};
     R_TRY(save_data_controller->OpenSaveData(&dir, space_id, attribute));
@@ -640,6 +657,7 @@ Result FSP_SRV::OpenSaveDataFileSystemBySystemSaveDataId(OutInterface<IFileSyste
     LOG_INFO(Service_FS, "called, space_id={}, {}",
              space_id, attribute.DebugInfo());
 
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
     R_UNLESS(attribute.system_save_data_id != FileSys::InvalidSystemSaveDataId,
              FileSys::ResultInvalidArgument);
 
@@ -691,6 +709,8 @@ Result FSP_SRV::OpenSaveDataInfoReaderBySaveDataSpaceId(
     OutInterface<ISaveDataInfoReader> out_interface, FileSys::SaveDataSpaceId space) {
     LOG_INFO(Service_FS, "called, space={}", space);
 
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
+
     *out_interface = std::make_shared<ISaveDataInfoReader>(system, save_data_controller, space);
 
     R_SUCCEED();
@@ -698,6 +718,8 @@ Result FSP_SRV::OpenSaveDataInfoReaderBySaveDataSpaceId(
 
 Result FSP_SRV::OpenSaveDataInfoReader(OutInterface<ISaveDataInfoReader> out_interface) {
     LOG_DEBUG(Service_FS, "called");
+
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
 
     *out_interface = std::make_shared<ISaveDataInfoReader>(system, save_data_controller,
                                                            FileSys::SaveDataSpaceId::User);
@@ -710,6 +732,7 @@ Result FSP_SRV::OpenSaveDataInfoReaderBySaveDataFilter(
     FileSys::SaveDataFilter filter) {
     LOG_DEBUG(Service_FS, "called, space_id={}", space_id);
 
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
     R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
 
     if (filter.use_save_data_type) {
@@ -732,6 +755,7 @@ Result FSP_SRV::OpenSaveDataMetaFile(OutInterface<IFile> out_interface,
     LOG_DEBUG(Service_FS, "called, space_id={}, meta_type={:08X}, {}", space_id, meta_type_raw,
               attribute.DebugInfo());
 
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
     R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
     R_UNLESS(IsSupportedSaveDataType(attribute.type), FileSys::ResultInvalidArgument);
     R_UNLESS(meta_type_raw == static_cast<u32>(FileSys::SaveDataMetaType::Thumbnail) ||
@@ -750,6 +774,8 @@ Result FSP_SRV::OpenSaveDataMetaFile(OutInterface<IFile> out_interface,
 Result FSP_SRV::OpenSaveDataInfoReaderOnlyCacheStorage(
     OutInterface<ISaveDataInfoReader> out_interface) {
     LOG_DEBUG(Service_FS, "called");
+
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
 
     FileSys::SaveDataFilter filter{};
     filter.use_save_data_type = true;
@@ -849,6 +875,8 @@ Result FSP_SRV::OpenSaveDataTransferProhibiter(
 Result FSP_SRV::OpenDataFileSystemByCurrentProcess(OutInterface<IFileSystem> out_interface) {
     LOG_DEBUG(Service_FS, "called");
 
+    R_UNLESS(romfs_controller != nullptr, FileSys::ResultTargetNotFound);
+
     if (!romfs) {
         auto current_romfs = romfs_controller->OpenRomFSCurrentProcess();
         if (!current_romfs) {
@@ -874,6 +902,8 @@ Result FSP_SRV::OpenDataFileSystemByCurrentProcess(OutInterface<IFileSystem> out
 Result FSP_SRV::OpenDataStorageByCurrentProcess(OutInterface<IStorage> out_interface) {
     LOG_DEBUG(Service_FS, "called");
 
+    R_UNLESS(romfs_controller != nullptr, FileSys::ResultTargetNotFound);
+
     if (!romfs) {
         auto current_romfs = romfs_controller->OpenRomFSCurrentProcess();
         if (!current_romfs) {
@@ -894,6 +924,8 @@ Result FSP_SRV::OpenDataStorageByDataId(OutInterface<IStorage> out_interface,
                                         FileSys::StorageId storage_id, u32 unknown, u64 title_id) {
     LOG_DEBUG(Service_FS, "called with storage_id={:02X}, unknown={:08X}, title_id={:016X}",
               storage_id, unknown, title_id);
+
+    R_UNLESS(romfs_controller != nullptr, FileSys::ResultTargetNotFound);
 
     auto data = romfs_controller->OpenRomFS(title_id, storage_id, FileSys::ContentRecordType::Data);
 
@@ -935,6 +967,8 @@ Result FSP_SRV::OpenDataStorageWithProgramIndex(OutInterface<IStorage> out_inter
                                                 u8 program_index) {
     LOG_DEBUG(Service_FS, "called, program_index={}", program_index);
 
+    R_UNLESS(romfs_controller != nullptr, FileSys::ResultTargetNotFound);
+
     auto patched_romfs = romfs_controller->OpenPatchedRomFSWithProgramIndex(
         program_id, program_index, FileSys::ContentRecordType::Program);
 
@@ -959,6 +993,8 @@ Result FSP_SRV::IsSdCardAccessible(Out<bool> out_is_accessible) {
 
 Result FSP_SRV::DisableAutoSaveDataCreation() {
     LOG_DEBUG(Service_FS, "called");
+
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
 
     save_data_controller->SetAutoCreate(false);
 
@@ -1032,6 +1068,7 @@ Result FSP_SRV::QuerySaveDataTotalSize(s64 data_size, s64 journal_size, Out<s64>
     R_UNLESS(data_size >= 0 && journal_size >= 0, FileSys::ResultInvalidArgument);
 
     if (data_size == 0 && journal_size == 0) {
+        R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
         *out_total_size = save_data_controller->QueryTotalSize(FileSys::SaveDataSpaceId::User);
         R_SUCCEED();
     }
@@ -1051,6 +1088,7 @@ Result FSP_SRV::GetFreeSpaceSizeForSaveData(FileSys::SaveDataSpaceId space_id,
                                             Out<s64> out_free_space_size) {
     LOG_DEBUG(Service_FS, "called, space_id={}", space_id);
 
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
     R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
 
     *out_free_space_size = save_data_controller->GetFreeSpace(space_id);
@@ -1065,6 +1103,7 @@ Result FSP_SRV::QuerySaveDataInternalStorageTotalSize(s64 data_size, s64 journal
     R_UNLESS(data_size >= 0 && journal_size >= 0, FileSys::ResultInvalidArgument);
 
     if (data_size == 0 && journal_size == 0) {
+        R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
         *out_total_size = save_data_controller->QueryTotalSize(FileSys::SaveDataSpaceId::System);
         R_SUCCEED();
     }
@@ -1084,6 +1123,7 @@ Result FSP_SRV::GetSaveDataCommitId(FileSys::SaveDataSpaceId space_id, u64 save_
                                     Out<s64> out_commit_id) {
     LOG_DEBUG(Service_FS, "called, space_id={}, save_data_id={:016X}", space_id, save_data_id);
 
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
     R_UNLESS(IsSupportedSaveDataSpace(space_id), FileSys::ResultInvalidArgument);
 
     *out_commit_id = static_cast<s64>(save_data_controller->GetCommitId(space_id, save_data_id));
@@ -1094,6 +1134,7 @@ Result FSP_SRV::GetSaveDataCommitId(FileSys::SaveDataSpaceId space_id, u64 save_
 Result FSP_SRV::SetSaveDataSize(s64 data_size, s64 journal_size) {
     LOG_DEBUG(Service_FS, "called, data_size={:#x}, journal_size={:#x}", data_size, journal_size);
 
+    R_UNLESS(save_data_controller != nullptr, FileSys::ResultTargetNotFound);
     R_UNLESS(data_size >= 0 && journal_size >= 0, FileSys::ResultInvalidArgument);
     R_UNLESS(program_id != 0, FileSys::ResultInvalidArgument);
 

@@ -788,8 +788,9 @@ std::variant<std::vector<AddrInfo>, GetAddrInfoError> GetAddressInfo(
     std::vector<AddrInfo> ret;
     for (auto* current = addrinfo; current; current = current->ai_next) {
         // We should only get AF_INET results due to the hints value.
-        ASSERT_OR_EXECUTE(addrinfo->ai_family == AF_INET &&
-                              addrinfo->ai_addrlen == sizeof(sockaddr_in),
+        ASSERT_OR_EXECUTE(current->ai_family == AF_INET &&
+                              current->ai_addrlen == sizeof(sockaddr_in) &&
+                              current->ai_addr != nullptr,
                           continue;);
 
         AddrInfo& out = ret.emplace_back();

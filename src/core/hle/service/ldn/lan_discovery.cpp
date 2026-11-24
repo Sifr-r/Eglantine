@@ -32,6 +32,7 @@ void LanStation::OnClose() {
 
 void LanStation::Reset() {
     status = NodeStatus::Disconnected;
+    local_ip = {};
 };
 
 void LanStation::OverrideInfo() {
@@ -533,6 +534,9 @@ void LANDiscovery::ReceivePacket(const Network::LDNPacket& packet) {
 
         NetworkInfo info{};
         std::memcpy(&info, packet.data.data(), sizeof(NetworkInfo));
+        if (info.common.ssid.length > SsidLengthMax) {
+            break;
+        }
         scan_results.insert({info.common.bssid, info});
 
         break;
@@ -559,6 +563,7 @@ void LANDiscovery::ReceivePacket(const Network::LDNPacket& packet) {
         for (LanStation& station : stations) {
             if (station.status != NodeStatus::Connected) {
                 *station.node_info = info;
+                station.local_ip = packet.local_ip;
                 station.status = NodeStatus::Connected;
                 break;
             }
@@ -578,12 +583,8 @@ void LANDiscovery::ReceivePacket(const Network::LDNPacket& packet) {
             std::remove(connected_clients.begin(), connected_clients.end(), packet.local_ip),
             connected_clients.end());
 
-        NodeInfo info{};
-        std::memcpy(&info, packet.data.data(), sizeof(NodeInfo));
-
         for (LanStation& station : stations) {
-            if (station.status == NodeStatus::Connected &&
-                station.node_info->mac_address == info.mac_address) {
+            if (station.status == NodeStatus::Connected && station.local_ip == packet.local_ip) {
                 station.OnClose();
                 break;
             }

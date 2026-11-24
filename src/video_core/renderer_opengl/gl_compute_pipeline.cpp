@@ -69,7 +69,7 @@ ComputePipeline::ComputePipeline(const Device& device, TextureCache& texture_cac
     const bool is_glasm{assembly_program.handle != 0};
     const u32 num_storage_buffers{Shader::NumDescriptors(info.storage_buffers_descriptors)};
     use_storage_buffers =
-        !is_glasm || num_storage_buffers < device.GetMaxGLASMStorageBufferBlocks();
+        !is_glasm || num_storage_buffers <= device.GetMaxGLASMStorageBufferBlocks();
     writes_global_memory = !use_storage_buffers &&
                            std::ranges::any_of(info.storage_buffers_descriptors,
                                                [](const auto& desc) { return desc.is_written; });

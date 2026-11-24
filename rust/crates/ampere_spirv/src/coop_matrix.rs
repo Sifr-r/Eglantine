@@ -93,17 +93,26 @@ impl CoopConfig {
         if !self.supported {
             return Err("cooperative matrix unsupported by device profile");
         }
-        if self.tile_m == 0 || self.tile_n == 0 || self.tile_k == 0 {
+        if depth != 16 {
+            return Err("cooperative matrix requires depth 16");
+        }
+        if self.tile_m == 0 || self.tile_n == 0 || self.tile_k != 16 {
             return Err("invalid cooperative matrix tile dimensions");
         }
         if self.subgroup_size != 32 {
             return Err("cooperative matrix requires 32-lane guest subgroup");
         }
-        let a_words = (depth / 4).min(4) as usize;
-        if !is_valid_map(&self.a_word_map[..a_words], 4) {
+        let a_words = (depth / 4) as usize;
+        let b_words = (depth / 8) as usize;
+        if a_words == 0
+            || a_words > self.a_word_map.len()
+            || !is_valid_map(&self.a_word_map[..a_words], a_words)
+        {
             return Err("invalid cooperative matrix a_word_map");
         }
-        if !is_valid_map(&self.b_word_map, 2)
+        if b_words == 0
+            || b_words > self.b_word_map.len()
+            || !is_valid_map(&self.b_word_map[..b_words], b_words)
             || !is_valid_map(&self.c_word_map, 2)
             || !is_valid_map(&self.d_word_map, 2)
         {
@@ -233,9 +242,18 @@ pub fn emit_native_coop_hmma<B: CoopSpirvBuilder>(
         mat
     }
 
+    assert!(
+        a_words.len() <= config.a_word_map.len(),
+        "a_words exceeds a_word_map length"
+    );
+    assert!(
+        b_words.len() <= config.b_word_map.len(),
+        "b_words exceeds b_word_map length"
+    );
+
     let mut mat_a = b.op_undef(matrix_a_ty);
     for (slot, &guest_idx) in config.a_word_map.iter().take(a_words.len()).enumerate() {
-        let word_id = a_words[(guest_idx as usize).min(a_words.len() - 1)];
+        let word_id = a_words[guest_idx as usize];
         mat_a = insert_f16_word(
             b,
             f16_ty,
@@ -252,7 +270,7 @@ pub fn emit_native_coop_hmma<B: CoopSpirvBuilder>(
 
     let mut mat_b = b.op_undef(matrix_b_ty);
     for (slot, &guest_idx) in config.b_word_map.iter().take(b_words.len()).enumerate() {
-        let word_id = b_words[(guest_idx as usize).min(b_words.len() - 1)];
+        let word_id = b_words[guest_idx as usize];
         mat_b = insert_f16_word(
             b,
             f16_ty,
@@ -269,7 +287,7 @@ pub fn emit_native_coop_hmma<B: CoopSpirvBuilder>(
 
     let mut mat_c = b.op_undef(matrix_c_ty);
     for (slot, &guest_idx) in config.c_word_map.iter().enumerate() {
-        let word_id = c_words[(guest_idx as usize).min(1)];
+        let word_id = c_words[guest_idx as usize];
         mat_c = insert_f16_word(
             b,
             f16_ty,
@@ -301,7 +319,7 @@ pub fn emit_native_coop_hmma<B: CoopSpirvBuilder>(
             (b.op_fconvert(f16_ty, e0), b.op_fconvert(f16_ty, e1))
         };
         let packed = b.op_composite_construct(f16x2_ty, &[h0, h1]);
-        out_words[(guest_idx as usize).min(1)] = b.op_bitcast(u32_ty, packed);
+        out_words[guest_idx as usize] = b.op_bitcast(u32_ty, packed);
     }
     out_words
 }

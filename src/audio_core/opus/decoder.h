@@ -49,6 +49,7 @@ private:
     s32 total_stream_count{};
     s32 stereo_stream_count{};
     bool shared_memory_mapped{false};
+    bool is_multistream{false};
     bool decode_object_initialized{false};
 };
 

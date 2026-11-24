@@ -9,6 +9,7 @@
 
 #include "common/bit_field.h"
 #include "common/common_types.h"
+#include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/maxwell/translate/impl/impl.h"
 
 namespace Shader::Maxwell {
@@ -105,13 +106,42 @@ void TranslatorVisitor::ISBERD(u64 insn) {
 
         IR::F32 float_index{};
         switch (isberd.mode.Value()) {
-        case Mode::Patch: float_index = ir.GetPatch(index.Patch());
+        case Mode::Patch: {
+            if (!index.IsImmediate()) {
+                throw NotImplementedException("Dynamic ISBERD patch read");
+            }
+            const u32 byte_offset{index.U32()};
+            if (byte_offset % 4 != 0) {
+                throw NotImplementedException("Unaligned ISBERD patch offset {}", byte_offset);
+            }
+            const IR::Patch patch{static_cast<IR::Patch>(byte_offset / 4U)};
+            if (!IR::IsGeneric(patch)) {
+                throw NotImplementedException("Non-generic ISBERD patch {}", byte_offset / 4U);
+            }
+            float_index = ir.GetPatch(patch);
             break;
-        case Mode::Prim:  float_index = ir.GetAttribute(index.Attribute());
+        }
+        case Mode::Prim: {
+            if (!index.IsImmediate()) {
+                throw NotImplementedException("Dynamic ISBERD primitive read");
+            }
+            const u32 byte_offset{index.U32()};
+            if (byte_offset % 4 != 0) {
+                throw NotImplementedException("Unaligned ISBERD primitive offset {}", byte_offset);
+            }
+            const u32 entry{byte_offset / 4U};
+            if (entry < static_cast<u32>(IR::Attribute::PrimitiveId) ||
+                entry > static_cast<u32>(IR::Attribute::DrawID)) {
+                throw NotImplementedException("Out-of-range ISBERD primitive attribute {}", entry);
+            }
+            float_index = ir.GetAttribute(static_cast<IR::Attribute>(entry));
             break;
-        case Mode::Attr:  float_index = ir.GetAttributeIndexed(index);
+        }
+        case Mode::Attr:
+            float_index = ir.GetAttributeIndexed(index);
             break;
-        default: UNREACHABLE();
+        default:
+            UNREACHABLE();
         }
         X(isberd.dest_reg.Value(), ir.BitCast<IR::U32>(float_index));
 

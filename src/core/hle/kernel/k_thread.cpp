@@ -308,12 +308,12 @@ namespace Kernel {
     }
 
     Result KThread::InitializeUserThread(Core::System& system, KThread* thread, KThreadFunction func, uintptr_t arg, KProcessAddress user_stack_top, s32 prio, s32 virt_core, KProcess* owner) {
+        R_TRY(InitializeThread(system.Kernel(), thread, func, arg, user_stack_top, prio, virt_core, owner, ThreadType::User, system.GetCpuManager().GetGuestThreadFunc(system.Kernel())));
         system.Kernel().GlobalSchedulerContext().AddThread(thread);
-        R_RETURN(InitializeThread(system.Kernel(), thread, func, arg, user_stack_top, prio, virt_core, owner, ThreadType::User, system.GetCpuManager().GetGuestThreadFunc(system.Kernel())));
+        R_SUCCEED();
     }
 
     Result KThread::InitializeServiceThread(Core::System& system, KThread* thread, std::function<void()>&& func, s32 prio, s32 virt_core, KProcess* owner) {
-        system.Kernel().GlobalSchedulerContext().AddThread(thread);
         std::function<void()> func2{[&system, func_{std::move(func)}] {
             // Similar to UserModeThreadStarter.
             system.Kernel().CurrentScheduler()->OnThreadStart(system.Kernel());
@@ -325,8 +325,10 @@ namespace Kernel {
             Svc::ExitThread(system);
         }};
 
-        R_RETURN(InitializeThread(system.Kernel(), thread, {}, {}, {}, prio, virt_core, owner, ThreadType::HighPriority,
-                                  std::move(func2)));
+        R_TRY(InitializeThread(system.Kernel(), thread, {}, {}, {}, prio, virt_core, owner, ThreadType::HighPriority,
+                               std::move(func2)));
+        system.Kernel().GlobalSchedulerContext().AddThread(thread);
+        R_SUCCEED();
     }
 
     void KThread::PostDestroy(KernelCore& kernel, uintptr_t arg) {
@@ -340,6 +342,8 @@ namespace Kernel {
     }
 
     void KThread::Finalize(KernelCore& kernel) {
+        kernel.GlobalSchedulerContext().RemoveThread(this);
+
         // If the thread has an owner process, unregister it.
         if (m_parent != nullptr) {
             m_parent->UnregisterThread(kernel, this);
@@ -1212,6 +1216,8 @@ namespace Kernel {
 
     void KThread::Exit(KernelCore& kernel) {
         ASSERT(this == GetCurrentThreadPointer(kernel));
+
+        kernel.GlobalSchedulerContext().RemoveThread(this);
 
         // Release the thread resource hint, running thread count from parent.
         if (m_parent != nullptr) {

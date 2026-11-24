@@ -94,6 +94,8 @@ Result TouchResource::ActivateTouch(u64 aruid) {
 }
 
 Result TouchResource::ActivateGesture() {
+    std::scoped_lock lock{*shared_mutex};
+
     if (global_ref_counter == (std::numeric_limits<s32>::max)() - 1 ||
         gesture_ref_counter == (std::numeric_limits<s32>::max)() - 1) {
         return ResultGestureOverflow;
@@ -462,10 +464,10 @@ void TouchResource::ReadTouchInput() {
 
     for (std::size_t i = 0; i < static_cast<std::size_t>(current_touch_state.entry_count); i++) {
         auto& state = current_touch_state.states[i];
-        state.position.x = static_cast<u32>((magnification.y * static_cast<f32>(state.position.x)) +
+        state.position.x = static_cast<u32>((magnification.x * static_cast<f32>(state.position.x)) +
                                             (offset.x * static_cast<f32>(TouchSensorWidth)));
         state.position.y = static_cast<u32>((magnification.y * static_cast<f32>(state.position.y)) +
-                                            (offset.x * static_cast<f32>(TouchSensorHeight)));
+                                            (offset.y * static_cast<f32>(TouchSensorHeight)));
         state.diameter_x = static_cast<u32>(magnification.x * static_cast<f32>(state.diameter_x));
         state.diameter_y = static_cast<u32>(magnification.y * static_cast<f32>(state.diameter_y));
     }

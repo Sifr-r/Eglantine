@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstring>
+#include <limits>
 #include <vector>
 #include <optional>
 #include <string>
@@ -17,6 +19,7 @@
 #include "core/file_sys/vfs/vfs.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_transfer_memory.h"
+#include "core/hle/kernel/svc_results.h"
 #include "core/hle/result.h"
 #include "core/hle/service/cmif_serialization.h"
 #include "core/hle/service/cmif_types.h"
@@ -301,44 +304,76 @@ Result IReadOnlyApplicationControlDataInterface::GetApplicationControlData2(
 void IReadOnlyApplicationControlDataInterface::ListApplicationIcon(HLERequestContext& ctx) {
     LOG_WARNING(Service_NS, "(stubbed)");
     const auto app_ids_buffer = ctx.ReadBuffer();
-    const u64 app_count = app_ids_buffer.size() / sizeof(u64);
+    const size_t app_count = app_ids_buffer.size() / sizeof(u64);
     auto t_mem_obj = ctx.GetObjectFromHandle<Kernel::KTransferMemory>(ctx.GetCopyHandle(0));
     auto* t_mem = t_mem_obj.GetPointerUnsafe();
+    if (t_mem == nullptr || t_mem->GetOwner() == nullptr) {
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(Kernel::ResultInvalidHandle);
+        return;
+    }
+
     size_t out_length = 0;
-    if (t_mem != nullptr && t_mem->GetOwner() != nullptr && app_count > 0) {
+    if (app_count > 0) {
+        const size_t t_mem_size = t_mem->GetSize();
+        constexpr size_t max_s32 = static_cast<size_t>((std::numeric_limits<s32>::max)());
+        if (t_mem_size < sizeof(u64) || app_count > (t_mem_size - sizeof(u64)) / sizeof(u64) ||
+            (1 + app_count) * sizeof(u64) > max_s32) {
+            LOG_ERROR(Service_NS, "Transfer memory too small for {} icon sizes (size={:#x})",
+                      app_count, t_mem_size);
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(Kernel::ResultInvalidSize);
+            return;
+        }
+
+        size_t total_size = (1 + app_count) * sizeof(u64);
+        std::vector<FileSys::VirtualFile> icons(app_count);
+        std::vector<u64> icon_sizes(app_count);
+        for (size_t i = 0; i < app_count; ++i) {
+            u64 app_id{};
+            std::memcpy(&app_id, app_ids_buffer.data() + i * sizeof(u64), sizeof(u64));
+            const FileSys::PatchManager pm{app_id, system.GetFileSystemController(),
+                                           system.GetContentProvider()};
+            if (const auto control = pm.GetControlMetadata(); control.second) {
+                const size_t full_size = control.second->GetSize();
+                if (full_size > t_mem_size - total_size || full_size > max_s32 - total_size) {
+                    LOG_ERROR(Service_NS,
+                              "Transfer memory too small for application icons (required>{:#x}, "
+                              "size={:#x})",
+                              total_size, t_mem_size);
+                    IPC::ResponseBuilder rb{ctx, 2};
+                    rb.Push(Kernel::ResultInvalidSize);
+                    return;
+                }
+                icons[i] = control.second;
+                icon_sizes[i] = static_cast<u64>(full_size);
+                total_size += full_size;
+            }
+        }
+
         auto& memory = t_mem->GetOwner()->GetMemory();
         const auto t_mem_address = t_mem->GetSourceAddress();
         // u64 - app count
-        memory.WriteBlock(t_mem_address + out_length, &app_count, sizeof(u64));
+        const u64 app_count_u64 = static_cast<u64>(app_count);
+        memory.WriteBlock(t_mem_address + out_length, &app_count_u64, sizeof(u64));
         out_length += sizeof(u64);
-        ASSERT(out_length <= t_mem->GetSize());
         // [list of u64] - size of icons
         for (size_t i = 0; i < app_count; ++i) {
-            const u64 app_id = app_ids_buffer[i];
-            const FileSys::PatchManager pm{app_id, system.GetFileSystemController(), system.GetContentProvider()};
-            if (const auto control = pm.GetControlMetadata(); control.second) {
-                u64 full_size = control.second->GetSize();
-                memory.WriteBlock(t_mem_address + out_length, &full_size, sizeof(u64));
-            }
+            memory.WriteBlock(t_mem_address + out_length, &icon_sizes[i], sizeof(u64));
             out_length += sizeof(u64);
-            ASSERT(out_length <= t_mem->GetSize());
         }
         // [list of raw icon data]
         for (size_t i = 0; i < app_count; ++i) {
-            const u64 app_id = app_ids_buffer[i];
-            const FileSys::PatchManager pm{app_id, system.GetFileSystemController(), system.GetContentProvider()};
-            if (const auto control = pm.GetControlMetadata(); control.second) {
-                if (auto const full_size = control.second->GetSize(); full_size > 0) {
-                    std::vector<u8> full_icon_data(full_size);
-                    control.second->Read(full_icon_data.data(), full_size, 0);
-                    memory.WriteBlock(t_mem_address + out_length, full_icon_data.data(), full_size);
-                    out_length += full_size;
-                    ASSERT(out_length <= t_mem->GetSize());
-                }
+            if (icons[i] != nullptr && icon_sizes[i] > 0) {
+                const size_t full_size = static_cast<size_t>(icon_sizes[i]);
+                std::vector<u8> full_icon_data(full_size, 0);
+                icons[i]->Read(full_icon_data.data(), full_size, 0);
+                memory.WriteBlock(t_mem_address + out_length, full_icon_data.data(), full_size);
+                out_length += full_size;
             }
         }
     }
-    auto async_value = std::make_shared<IAsyncValue>(system, 0, s32(out_length));
+    auto async_value = std::make_shared<IAsyncValue>(system, 0, static_cast<s32>(out_length));
     IPC::ResponseBuilder rb{ctx, 2, 1, 1};
     rb.Push(ResultSuccess);
     rb.PushCopyObjects(ctx, async_value->ReadableEvent());
@@ -349,18 +384,33 @@ void IReadOnlyApplicationControlDataInterface::ListApplicationTitle(HLERequestCo
     const auto app_ids_buffer = ctx.ReadBuffer();
     const size_t app_count = app_ids_buffer.size() / sizeof(u64);
 
-    std::vector<u64> application_ids(app_count);
-    if (app_count > 0) {
-        std::memcpy(application_ids.data(), app_ids_buffer.data(), app_count * sizeof(u64));
-    }
-
     auto t_mem_obj = ctx.GetObjectFromHandle<Kernel::KTransferMemory>(ctx.GetCopyHandle(0));
     auto* t_mem = t_mem_obj.GetPointerUnsafe();
+    if (t_mem == nullptr || t_mem->GetOwner() == nullptr) {
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(Kernel::ResultInvalidHandle);
+        return;
+    }
+
     constexpr size_t title_entry_size = sizeof(FileSys::LanguageEntry);
+    constexpr size_t max_s32 = static_cast<size_t>((std::numeric_limits<s32>::max)());
+    const size_t t_mem_size = t_mem->GetSize();
+    if (app_count > t_mem_size / title_entry_size || app_count > max_s32 / title_entry_size) {
+        LOG_ERROR(Service_NS,
+                  "Transfer memory too small for {} application titles (size={:#x})", app_count,
+                  t_mem_size);
+        IPC::ResponseBuilder rb{ctx, 2};
+        rb.Push(Kernel::ResultInvalidSize);
+        return;
+    }
+
     const size_t total_data_size = app_count * title_entry_size;
     constexpr s32 data_offset = 0;
-    if (t_mem != nullptr && app_count > 0) {
-        auto& memory = system.ApplicationMemory();
+    if (app_count > 0) {
+        std::vector<u64> application_ids(app_count);
+        std::memcpy(application_ids.data(), app_ids_buffer.data(), app_count * sizeof(u64));
+
+        auto& memory = t_mem->GetOwner()->GetMemory();
         const auto t_mem_address = t_mem->GetSourceAddress();
         for (size_t i = 0; i < app_count; ++i) {
             const u64 app_id = application_ids[i];
@@ -375,7 +425,8 @@ void IReadOnlyApplicationControlDataInterface::ListApplicationTitle(HLERequestCo
             memory.WriteBlock(t_mem_address + offset, &entry, title_entry_size);
         }
     }
-    auto async_value = std::make_shared<IAsyncValue>(system, data_offset, s32(total_data_size));
+    auto async_value =
+        std::make_shared<IAsyncValue>(system, data_offset, static_cast<s32>(total_data_size));
     IPC::ResponseBuilder rb{ctx, 2, 1, 1};
     rb.Push(ResultSuccess);
     rb.PushCopyObjects(ctx, async_value->ReadableEvent());

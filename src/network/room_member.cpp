@@ -5,8 +5,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <list>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include "common/assert.h"
@@ -79,7 +81,8 @@ public:
     /// are written by the network thread while they are read by other threads.
     mutable std::mutex state_mutex;
 
-    std::mutex network_mutex; ///< Mutex that controls access to the `client` variable.
+    std::mutex network_mutex;   ///< Mutex that controls access to the `client` variable.
+    std::mutex lifecycle_mutex; ///< Serializes Join, Leave, and destruction.
     /// Thread that receives and dispatches network packets
     std::optional<std::jthread> loop_thread;
     /// The id of the network loop thread. It is written when the thread starts and is never
@@ -88,6 +91,7 @@ public:
     /// Set when the member wants to leave from the network thread itself. The network thread
     /// performs the state change when it returns to its loop.
     std::atomic<bool> leave_requested{false};
+    std::atomic<bool> join_abort_requested{false};
     std::mutex send_list_mutex;  ///< Mutex that controls access to the `send_list` variable.
     std::vector<Packet> send_list; ///< A list that stores all packets to send the async
 
@@ -119,6 +123,7 @@ public:
      * @param packet The data to send
      */
     void Send(Packet&& packet);
+    void SendGameInfoPacket(const GameInfo& game_info);
 
     /**
      * Sends a request to the server, asking for permission to join a room with the specified
@@ -179,6 +184,9 @@ public:
      * Disconnects the RoomMember from the Room
      */
     void Disconnect();
+
+    /// Stops the network loop and destroys the ENet client. Caller must hold lifecycle_mutex.
+    void LeaveInternal();
 
     template <typename T>
     void Invoke(const T& data);
@@ -296,10 +304,11 @@ void RoomMember::RoomMemberImpl::StartLoop() {
                     enet_packet_destroy(event.packet);
                     break;
                 case ENET_EVENT_TYPE_DISCONNECT:
-                    if (state == State::Joined || state == State::Moderator) {
+                    if (IsConnected()) {
                         SetState(State::Idle);
                         SetError(Error::LostConnection);
                     }
+                    server = nullptr;
                     break;
                 case ENET_EVENT_TYPE_NONE:
                     break;
@@ -316,12 +325,16 @@ void RoomMember::RoomMemberImpl::StartLoop() {
                 std::lock_guard send_lock(send_list_mutex);
                 packets.swap(send_list);
             }
-            for (auto const& packet : packets) {
-                ENetPacket* enetPacket = enet_packet_create(packet.GetData(), packet.GetDataSize(),
-                                                            ENET_PACKET_FLAG_RELIABLE);
-                enet_peer_send(server, 0, enetPacket);
+            if (IsConnected() && server != nullptr) {
+                for (auto const& packet : packets) {
+                    ENetPacket* enetPacket = enet_packet_create(
+                        packet.GetData(), packet.GetDataSize(), ENET_PACKET_FLAG_RELIABLE);
+                    if (enetPacket != nullptr && enet_peer_send(server, 0, enetPacket) < 0) {
+                        enet_packet_destroy(enetPacket);
+                    }
+                }
+                enet_host_flush(client);
             }
-            enet_host_flush(client);
         }
         if (leave_requested.exchange(false, std::memory_order_acq_rel)) {
             // The leave was requested from a callback that runs on this thread. The state
@@ -336,8 +349,20 @@ void RoomMember::RoomMemberImpl::StartLoop() {
 }
 
 void RoomMember::RoomMemberImpl::Send(Packet&& packet) {
+    if (!IsConnected()) {
+        return;
+    }
     std::lock_guard lock(send_list_mutex);
     send_list.push_back(std::move(packet));
+}
+
+void RoomMember::RoomMemberImpl::SendGameInfoPacket(const GameInfo& game_info) {
+    Packet packet;
+    packet.Write(static_cast<u8>(IdSetGameInfo));
+    packet.Write(game_info.name);
+    packet.Write(game_info.id);
+    packet.Write(game_info.version);
+    Send(std::move(packet));
 }
 
 void RoomMember::RoomMemberImpl::SendJoinRequest(const std::string& nickname_,
@@ -573,8 +598,13 @@ void RoomMember::RoomMemberImpl::Disconnect() {
         room_information.member_slots = 0;
         room_information.name.clear();
     }
+    {
+        std::lock_guard send_lock(send_list_mutex);
+        send_list.clear();
+    }
 
-    if (!server) {
+    if (!server || !client || server->state == ENET_PEER_STATE_DISCONNECTED) {
+        server = nullptr;
         return;
     }
     enet_peer_disconnect(server, 0);
@@ -662,14 +692,31 @@ RoomMember::CallbackHandle<T> RoomMember::RoomMemberImpl::Bind(
     return handle;
 }
 
+void RoomMember::RoomMemberImpl::LeaveInternal() {
+    SetState(State::Idle);
+    loop_thread.reset();
+    {
+        std::lock_guard send_lock(send_list_mutex);
+        send_list.clear();
+    }
+    if (server != nullptr) {
+        enet_peer_reset(server);
+        server = nullptr;
+    }
+    if (client != nullptr) {
+        enet_host_destroy(client);
+        client = nullptr;
+    }
+}
+
 // RoomMember
 RoomMember::RoomMember() : room_member_impl{std::make_unique<RoomMemberImpl>()} {}
 
 RoomMember::~RoomMember() {
     ASSERT_MSG(!IsConnected(), "RoomMember is being destroyed while connected");
-    if (room_member_impl->loop_thread) {
-        Leave();
-    }
+    room_member_impl->join_abort_requested.store(true, std::memory_order_release);
+    std::lock_guard lock(room_member_impl->lifecycle_mutex);
+    room_member_impl->LeaveInternal();
 }
 
 RoomMember::State RoomMember::GetState() const {
@@ -710,45 +757,91 @@ void RoomMember::Join(const std::string& nick, const char* server_addr, u16 serv
         return;
     }
 
-    // If the member is connected, kill the connection first
-    if (room_member_impl->loop_thread && room_member_impl->loop_thread->joinable()) {
-        Leave();
+    std::optional<Error> error_to_emit;
+    {
+        std::lock_guard lock(room_member_impl->lifecycle_mutex);
+
+        room_member_impl->LeaveInternal();
+        room_member_impl->join_abort_requested.store(false, std::memory_order_release);
+
+        if (!room_member_impl->client) {
+            room_member_impl->client = enet_host_create(nullptr, 1, NumChannels, 0, 0);
+            if (!room_member_impl->client) {
+                LOG_CRITICAL(Network, "Could not create client");
+                room_member_impl->SetState(State::Idle);
+                error_to_emit = Error::UnknownError;
+            }
+        }
+
+        ENetAddress address{};
+        if (!error_to_emit) {
+            if (!server_addr || enet_address_set_host(&address, server_addr) != 0) {
+                LOG_ERROR(Network, "Failed to resolve server address '{}'",
+                          server_addr ? server_addr : "");
+                room_member_impl->SetState(State::Idle);
+                error_to_emit = Error::CouldNotConnect;
+            }
+        }
+
+        if (!error_to_emit) {
+            room_member_impl->SetState(State::Joining);
+
+            address.port = server_port;
+            room_member_impl->server =
+                enet_host_connect(room_member_impl->client, &address, NumChannels, 0);
+
+            if (!room_member_impl->server) {
+                room_member_impl->SetState(State::Idle);
+                error_to_emit = Error::UnknownError;
+            } else {
+                constexpr u32 ConnectPollSliceMs = 25;
+                const auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(ConnectionTimeoutMs);
+                ENetEvent event{};
+                int net = 0;
+                while (!room_member_impl->join_abort_requested.load(std::memory_order_acquire)) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now >= deadline) {
+                        break;
+                    }
+                    const auto remaining_ms = static_cast<u32>(
+                        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+                            .count());
+                    const u32 slice_ms = (std::min)(remaining_ms, ConnectPollSliceMs);
+                    net = enet_host_service(room_member_impl->client, &event, slice_ms);
+                    if (net != 0) {
+                        break;
+                    }
+                }
+
+                const bool aborted =
+                    room_member_impl->join_abort_requested.load(std::memory_order_acquire);
+                if (!aborted && net > 0 && event.type == ENET_EVENT_TYPE_CONNECT) {
+                    room_member_impl->nickname = nick;
+                    room_member_impl->StartLoop();
+                    room_member_impl->SendJoinRequest(nick, preferred_fake_ip, password, token);
+                    {
+                        std::lock_guard state_lock(room_member_impl->state_mutex);
+                        room_member_impl->SendGameInfoPacket(room_member_impl->current_game_info);
+                    }
+                } else {
+                    if (net > 0 && event.type == ENET_EVENT_TYPE_RECEIVE &&
+                        event.packet != nullptr) {
+                        enet_packet_destroy(event.packet);
+                    }
+                    enet_peer_reset(room_member_impl->server);
+                    room_member_impl->server = nullptr;
+                    room_member_impl->SetState(State::Idle);
+                    if (!aborted) {
+                        error_to_emit = Error::CouldNotConnect;
+                    }
+                }
+            }
+        }
     }
-    // If the thread isn't running but the ptr still exists, reset it
-    else if (room_member_impl->loop_thread) {
-        room_member_impl->loop_thread.reset();
-    }
 
-    if (!room_member_impl->client) {
-        room_member_impl->client = enet_host_create(nullptr, 1, NumChannels, 0, 0);
-        ASSERT_MSG(room_member_impl->client != nullptr, "Could not create client");
-    }
-
-    room_member_impl->SetState(State::Joining);
-
-    ENetAddress address{};
-    enet_address_set_host(&address, server_addr);
-    address.port = server_port;
-    room_member_impl->server =
-        enet_host_connect(room_member_impl->client, &address, NumChannels, 0);
-
-    if (!room_member_impl->server) {
-        room_member_impl->SetState(State::Idle);
-        room_member_impl->SetError(Error::UnknownError);
-        return;
-    }
-
-    ENetEvent event{};
-    int net = enet_host_service(room_member_impl->client, &event, ConnectionTimeoutMs);
-    if (net > 0 && event.type == ENET_EVENT_TYPE_CONNECT) {
-        room_member_impl->nickname = nick;
-        room_member_impl->StartLoop();
-        room_member_impl->SendJoinRequest(nick, preferred_fake_ip, password, token);
-        SendGameInfo(room_member_impl->current_game_info);
-    } else {
-        enet_peer_disconnect(room_member_impl->server, 0);
-        room_member_impl->SetState(State::Idle);
-        room_member_impl->SetError(Error::CouldNotConnect);
+    if (error_to_emit) {
+        room_member_impl->SetError(*error_to_emit);
     }
 }
 
@@ -757,6 +850,10 @@ bool RoomMember::IsConnected() const {
 }
 
 void RoomMember::SendProxyPacket(const ProxyPacket& proxy_packet) {
+    if (!IsConnected()) {
+        return;
+    }
+
     Packet packet;
     packet.Write(static_cast<u8>(IdProxyPacket));
 
@@ -776,6 +873,10 @@ void RoomMember::SendProxyPacket(const ProxyPacket& proxy_packet) {
 }
 
 void RoomMember::SendLdnPacket(const LDNPacket& ldn_packet) {
+    if (!IsConnected()) {
+        return;
+    }
+
     Packet packet;
     packet.Write(static_cast<u8>(IdLdnPacket));
 
@@ -791,6 +892,10 @@ void RoomMember::SendLdnPacket(const LDNPacket& ldn_packet) {
 }
 
 void RoomMember::SendChatMessage(const std::string& message) {
+    if (!IsConnected()) {
+        return;
+    }
+
     Packet packet;
     packet.Write(static_cast<u8>(IdChatMessage));
     packet.Write(message);
@@ -798,16 +903,13 @@ void RoomMember::SendChatMessage(const std::string& message) {
 }
 
 void RoomMember::SendGameInfo(const GameInfo& game_info) {
+    std::lock_guard lock(room_member_impl->state_mutex);
     room_member_impl->current_game_info = game_info;
-    if (!IsConnected())
+    if (!IsConnected()) {
         return;
+    }
 
-    Packet packet;
-    packet.Write(static_cast<u8>(IdSetGameInfo));
-    packet.Write(game_info.name);
-    packet.Write(game_info.id);
-    packet.Write(game_info.version);
-    room_member_impl->Send(std::move(packet));
+    room_member_impl->SendGameInfoPacket(room_member_impl->current_game_info);
 }
 
 void RoomMember::SendModerationRequest(RoomMessageTypes type, const std::string& nickname) {
@@ -890,10 +992,9 @@ void RoomMember::Leave() {
                  "itself.");
         return;
     }
-    room_member_impl->SetState(State::Idle);
-    room_member_impl->loop_thread.reset();
-    enet_host_destroy(room_member_impl->client);
-    room_member_impl->client = nullptr;
+    room_member_impl->join_abort_requested.store(true, std::memory_order_release);
+    std::lock_guard lock(room_member_impl->lifecycle_mutex);
+    room_member_impl->LeaveInternal();
 }
 
 template void RoomMember::Unbind(CallbackHandle<ProxyPacket>);

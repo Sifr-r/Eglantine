@@ -7,10 +7,12 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <ostream>
 #include <string>
+#include <string_view>
 #include <concepts>
 #include <algorithm>
 #include "common/concepts.h"
@@ -38,6 +40,30 @@
 namespace Loader {
 
 namespace {
+
+enum class AndroidExtensionUse {
+    None,
+    Game,
+    GameAndExternalContent,
+};
+
+struct FileFormat {
+    std::string_view extension;
+    FileType type;
+    AndroidExtensionUse android_use;
+};
+
+constexpr std::array kFileFormats{
+    FileFormat{"nro", FileType::NRO, AndroidExtensionUse::Game},
+    FileFormat{"nso", FileType::NSO, AndroidExtensionUse::None},
+    FileFormat{"nca", FileType::NCA, AndroidExtensionUse::Game},
+    FileFormat{"xci", FileType::XCI, AndroidExtensionUse::GameAndExternalContent},
+    FileFormat{"xcz", FileType::XCZ, AndroidExtensionUse::GameAndExternalContent},
+    FileFormat{"nsp", FileType::NSP, AndroidExtensionUse::GameAndExternalContent},
+    FileFormat{"nsz", FileType::NSZ, AndroidExtensionUse::GameAndExternalContent},
+    FileFormat{"nup", FileType::NUP, AndroidExtensionUse::Game},
+    FileFormat{"kip", FileType::KIP, AndroidExtensionUse::None},
+};
 
 template <std::derived_from<AppLoader> T>
 std::optional<FileType> IdentifyFileLoader(FileSys::VirtualFile file) {
@@ -194,6 +220,20 @@ bool IsBootableGameContainer(FileSys::VirtualFile file, FileType type, u64 progr
     return HasApplicationProgramContent(OpenContainerAsNsp(file, type, program_id, program_index));
 }
 
+std::vector<std::string> GetFileExtensions(FileExtensionUse use) {
+    std::vector<std::string> extensions;
+    for (const auto& format : kFileFormats) {
+        if (use == FileExtensionUse::DesktopGame ||
+            (use == FileExtensionUse::AndroidGame &&
+             format.android_use != AndroidExtensionUse::None) ||
+            (use == FileExtensionUse::AndroidExternalContent &&
+             format.android_use == AndroidExtensionUse::GameAndExternalContent)) {
+            extensions.emplace_back(format.extension);
+        }
+    }
+    return extensions;
+}
+
 FileType GuessFromFilename(const std::string& name) {
     if (name == "main")
         return FileType::DeconstructedRomDirectory;
@@ -202,25 +242,8 @@ FileType GuessFromFilename(const std::string& name) {
 
     auto const extension =
         Common::ToLower(std::string(Common::FS::GetExtensionFromFilename(name)));
-    if (extension == "nro")
-        return FileType::NRO;
-    else if (extension == "nso")
-        return FileType::NSO;
-    else if (extension == "nca")
-        return FileType::NCA;
-    else if (extension == "xci")
-        return FileType::XCI;
-    else if (extension == "xcz")
-        return FileType::XCZ;
-    else if (extension == "nsp")
-        return FileType::NSP;
-    else if (extension == "nup")
-        return FileType::NUP;
-    else if (extension == "nsz")
-        return FileType::NSZ;
-    else if (extension == "kip")
-        return FileType::KIP;
-    return FileType::Unknown;
+    const auto format = std::ranges::find(kFileFormats, extension, &FileFormat::extension);
+    return format != kFileFormats.end() ? format->type : FileType::Unknown;
 }
 
 std::string GetFileTypeString(FileType type) {

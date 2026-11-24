@@ -4,6 +4,8 @@
 #pragma once
 
 #include <array>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -64,11 +66,15 @@ public:
     std::string GetLastFilePath() const;
 
 private:
+    Info LoadAmiiboLocked(std::span<u8> data, std::optional<Common::Input::NfcStatus>& out_status);
+    Info CloseAmiiboLocked(std::optional<Common::Input::NfcStatus>& out_status);
+
     static constexpr std::size_t AmiiboSize = 0x21C;
     static constexpr std::size_t AmiiboSizeWithoutPassword = AmiiboSize - 0x8;
     static constexpr std::size_t AmiiboSizeWithSignature = AmiiboSize + 0x20;
     static constexpr std::size_t MifareSize = 0x400;
 
+    mutable std::mutex state_mutex;
     std::string file_path{};
     State state{State::Disabled};
     std::vector<u8> nfc_data;

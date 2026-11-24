@@ -291,12 +291,36 @@ private:
         TipcReplyWords(ctx, {static_cast<u32>(value), static_cast<u32>(value >> 32), 0});
     }
 
+    static constexpr u32 MaxSlots = 0x400;
+
+    Kernel::KEvent* GetOrCreateSlotEvent(u32 slot, Result& out_result) {
+        if (slot >= MaxSlots) {
+            out_result = Kernel::ResultOutOfRange;
+            return nullptr;
+        }
+        if (const auto it = m_events.find(slot); it != m_events.end()) {
+            out_result = ResultSuccess;
+            return it->second;
+        }
+        auto* const event = m_context.CreateEvent(fmt::format("nx2:syncpt:Slot{:x}", slot));
+        if (event == nullptr) {
+            out_result = Kernel::ResultOutOfResource;
+            return nullptr;
+        }
+        m_events.emplace(slot, event);
+        out_result = ResultSuccess;
+        return event;
+    }
+
     void GetSlotEvent(HLERequestContext& ctx) {
         const u32 slot = ctx.CommandBuffer()[2];
         LOG_WARNING(Service, "(STUBBED) nx2:syncpt TIPC 22 slot={:#x}, returning an event", slot);
-        auto*& event = m_events[slot];
+        Result result = ResultSuccess;
+        auto* const event = GetOrCreateSlotEvent(slot, result);
         if (event == nullptr) {
-            event = m_context.CreateEvent(fmt::format("nx2:syncpt:Slot{:x}", slot));
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(result);
+            return;
         }
         IPC::ResponseBuilder rb{ctx, 2, 1, 0};
         rb.Push(ResultSuccess);
@@ -325,9 +349,12 @@ private:
         const u32 mode = cmd_buf[6];
         LOG_DEBUG(Service, "nx2:syncpt TIPC 201 slot={:#x} syncpoint={} value={:#x} mode={}", slot,
                   syncpoint, value, mode);
-        auto*& event = m_events[slot];
+        Result result = ResultSuccess;
+        auto* const event = GetOrCreateSlotEvent(slot, result);
         if (event == nullptr) {
-            event = m_context.CreateEvent(fmt::format("nx2:syncpt:Slot{:x}", slot));
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.PushRaw<u32>(result.raw);
+            return;
         }
         if (syncpoint >= HostSyncpoints) {
             LOG_WARNING(Service, "nx2:syncpt TIPC 201 syncpoint {} out of range, signalling",
@@ -363,6 +390,13 @@ private:
     void CancelSlotEvent(HLERequestContext& ctx) {
         const u32 slot = ctx.CommandBuffer()[2];
         LOG_DEBUG(Service, "nx2:syncpt TIPC 202 slot={:#x}", slot);
+        Result result = ResultSuccess;
+        auto* const event = GetOrCreateSlotEvent(slot, result);
+        if (event == nullptr) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.PushRaw<u32>(result.raw);
+            return;
+        }
         if (auto it = m_requests.find(slot); it != m_requests.end()) {
             Cancel(it->second);
         }
@@ -372,10 +406,6 @@ private:
         // behind (EDEN_NX2_FRAMES_AHEAD) and a mid-frame wait outlasted NvOsEventPool's 100 ms,
         // and its movie player cancels each slot before its first request: signalled only for
         // pending requests, the player never got to start a movie.
-        auto*& event = m_events[slot];
-        if (event == nullptr) {
-            event = m_context.CreateEvent(fmt::format("nx2:syncpt:Slot{:x}", slot));
-        }
         event->Signal(system.Kernel());
         TipcReplyWords(ctx, {});
     }
@@ -475,6 +505,11 @@ public:
                 m_context.CloseEvent(event);
             }
         }
+        // Stop the cold-hint worker before unmapping/closing the page groups it reads.
+        m_cold_hint_thread.request_stop();
+        if (m_cold_hint_thread.joinable()) {
+            m_cold_hint_thread.join();
+        }
         // The page groups the session owns: unmap and close them, so none of them leaks.
         FreeOwnedPageGroups();
     }
@@ -525,11 +560,15 @@ private:
     Kernel::KEvent* EventFor(u32 id) {
         id %= NumIds;
         if (m_events[id] == nullptr) {
-            m_events[id] = m_context.CreateEvent(fmt::format("nx2:gpu:Event{}", id));
+            auto* const event = m_context.CreateEvent(fmt::format("nx2:gpu:Event{}", id));
+            if (event == nullptr) {
+                return nullptr;
+            }
+            m_events[id] = event;
             // The callbacks queued for the GPU thread signal the event through the shared state:
             // publish it there, so they never hold the session's event array.
             std::scoped_lock lk{m_callback_state->mutex};
-            m_callback_state->events[id] = m_events[id];
+            m_callback_state->events[id] = event;
         }
         return m_events[id];
     }
@@ -542,15 +581,27 @@ private:
     void GetIdEvent(HLERequestContext& ctx) {
         const u32 id = ctx.CommandBuffer()[2];
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 12 id={}", id);
+        auto* const event = EventFor(id);
+        if (event == nullptr) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(Kernel::ResultOutOfResource);
+            return;
+        }
         IPC::ResponseBuilder rb{ctx, 2, 1, 0};
         rb.Push(ResultSuccess);
-        rb.PushCopyObjects(ctx, EventFor(id)->GetReadableEvent());
+        rb.PushCopyObjects(ctx, event->GetReadableEvent());
     }
 
     void Start(HLERequestContext& ctx) {
         const u32 id = ctx.CommandBuffer()[2];
         LOG_WARNING(Service, "(STUBBED) nx2:gpu TIPC 21 id={}, signalling completion", id);
-        EventFor(id)->Signal(system.Kernel());
+        auto* const event = EventFor(id);
+        if (event == nullptr) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(Kernel::ResultOutOfResource);
+            return;
+        }
+        event->Signal(system.Kernel());
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
@@ -670,7 +721,9 @@ private:
         const auto* w = ctx.CommandBuffer();
         LOG_DEBUG(Service, "(STUBBED) nx2:gpu {} words {:08x} slot={}", ctx.GetCommand(),
                  fmt::join(std::span<const u32>{w + 2, 18}, " "), w[Slot]);
-        EventFor(w[Slot])->Signal(system.Kernel());
+        if (auto* const event = EventFor(w[Slot]); event != nullptr) {
+            event->Signal(system.Kernel());
+        }
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
@@ -719,7 +772,9 @@ private:
                       result.raw);
         }
         // The job slot is signalled either way: the guest waits for it.
-        EventFor(slot)->Signal(system.Kernel());
+        if (auto* const event = EventFor(slot); event != nullptr) {
+            event->Signal(system.Kernel());
+        }
         IPC::ResponseBuilder rb{ctx, 2};
         rb.PushRaw<u32>(result.raw);
     }
@@ -735,7 +790,9 @@ private:
         const u32 kind = w[7] & 0xff;
         LOG_DEBUG(Service, "nx2:gpu 212 modify [{:#x}, {:#x}] kind={:#x} fallback={:#x} slot={}",
                   first, last, kind, w[8] & 0xff, w[10]);
-        EventFor(w[10])->Signal(system.Kernel());
+        if (auto* const event = EventFor(w[10]); event != nullptr) {
+            event->Signal(system.Kernel());
+        }
         TipcReplyWords(ctx, {kind});
     }
 
@@ -907,7 +964,9 @@ private:
                          start, last, address, m_gpu_only_bytes >> 20, m_gpu_only_peak >> 20);
             }
         }
-        EventFor(slot)->Signal(system.Kernel());
+        if (auto* const event = EventFor(slot); event != nullptr) {
+            event->Signal(system.Kernel());
+        }
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
     }
@@ -1773,7 +1832,7 @@ private:
     // page it out before anything else. Marking it cold (when RAM is low mode, RAM not low) is done
     // once per region; paging out repeats every pass, since using the pages brings them back.
     // Last member: stops before the regions are destroyed.
-    void HintColdBacking() {
+    void HintColdBacking(const std::stop_token& stop) {
         const auto mode = Common::ColdHintModeInEffect();
         if (mode == Settings::ColdHintMode::Off) {
             m_cold_hinted.clear();
@@ -1811,6 +1870,9 @@ private:
         u64 paged{};
         auto& buffer = system.DeviceMemory().buffer;
         for (const Range& range : ranges) {
+            if (stop.stop_requested()) {
+                break;
+            }
             const auto action =
                 buffer.HintCold(range.physical_offset, range.size, range.virtual_address);
             (action == Common::ColdHintAction::PagedOut ? paged : marked) +=
@@ -1827,16 +1889,20 @@ private:
     }
     /// GPU-only regions already marked cold, by GPU address and page group (cold hint thread).
     std::set<std::pair<u64, const void*>> m_cold_hinted;
+    std::mutex m_cold_hint_mutex;
+    std::condition_variable_any m_cold_hint_cv;
     std::jthread m_cold_hint_thread{[this](std::stop_token stop) {
         Common::SetCurrentThreadName("nx2:ColdHint");
         Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+        std::unique_lock lk{m_cold_hint_mutex};
         while (!stop.stop_requested()) {
-            for (int i = 0; i < 30 && !stop.stop_requested(); ++i) {
-                std::this_thread::sleep_for(std::chrono::seconds{1});
+            if (m_cold_hint_cv.wait_for(lk, stop, std::chrono::seconds{30},
+                                        [&stop] { return stop.stop_requested(); })) {
+                break;
             }
-            if (!stop.stop_requested()) {
-                HintColdBacking();
-            }
+            lk.unlock();
+            HintColdBacking(stop);
+            lk.lock();
         }
     }};
 };
@@ -1929,12 +1995,27 @@ private:
         TipcReplyWords(ctx, {0});
     }
 
+    static constexpr u32 MaxEventIds = 0x400;
+
     void GetEvent(HLERequestContext& ctx) {
         const u32 id = ctx.CommandBuffer()[2];
         LOG_WARNING(Service, "(STUBBED) nx2:chat:gsv TIPC 11 id={}, returning an event", id);
-        auto*& event = m_events[id];
-        if (event == nullptr) {
+        if (id >= MaxEventIds) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(Kernel::ResultOutOfRange);
+            return;
+        }
+        Kernel::KEvent* event = nullptr;
+        if (const auto it = m_events.find(id); it != m_events.end()) {
+            event = it->second;
+        } else {
             event = m_context.CreateEvent(fmt::format("nx2:chat:gsv:Event{}", id));
+            if (event == nullptr) {
+                IPC::ResponseBuilder rb{ctx, 2};
+                rb.Push(Kernel::ResultOutOfResource);
+                return;
+            }
+            m_events.emplace(id, event);
         }
         IPC::ResponseBuilder rb{ctx, 2, 1, 0};
         rb.Push(ResultSuccess);
@@ -2738,7 +2819,11 @@ private:
         auto& syncpoints = system.Host1x().GetSyncpointManager();
         auto& waiter = *m_frame_waiter;
         if (waiter.event == nullptr) {
-            waiter.event = m_context.CreateEvent("nx2:vi2:FrameFence");
+            auto* const created = m_context.CreateEvent("nx2:vi2:FrameFence");
+            if (created == nullptr) {
+                return;
+            }
+            waiter.event = created;
             m_events.push_back(waiter.event);
         }
         auto* const event = waiter.event;
@@ -3118,10 +3203,22 @@ private:
         TipcReplyWords(ctx, {7});
     }
 
+    static constexpr std::size_t MaxVi2Events = 256;
+
     void ReturnEvent(HLERequestContext& ctx) {
         LOG_WARNING(Service, "(STUBBED) nx2:vi2 TIPC {} [2]={:#x} [3]={:#x}, returning an event",
                     ctx.GetCommand(), ctx.CommandBuffer()[2], ctx.CommandBuffer()[3]);
+        if (m_events.size() >= MaxVi2Events) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(Kernel::ResultOutOfResource);
+            return;
+        }
         auto* event = m_context.CreateEvent(fmt::format("nx2:vi2:Event{}", m_events.size()));
+        if (event == nullptr) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(Kernel::ResultOutOfResource);
+            return;
+        }
         m_events.push_back(event);
         IPC::ResponseBuilder rb{ctx, 2, 1, 0};
         rb.Push(ResultSuccess);
@@ -3204,7 +3301,13 @@ private:
     void ReplyNativeEvent(HLERequestContext& ctx, u32 index) {
         auto*& event = m_native_events[index];
         if (!event) {
-            event = m_context.CreateEvent(fmt::format("nx2:vi2:Native{}", index));
+            auto* const created = m_context.CreateEvent(fmt::format("nx2:vi2:Native{}", index));
+            if (created == nullptr) {
+                IPC::ResponseBuilder rb{ctx, 2};
+                rb.Push(Kernel::ResultOutOfResource);
+                return;
+            }
+            event = created;
             m_events.push_back(event);
             SetVsyncSlot(index, true);
             StartVsyncTimer();
@@ -3487,6 +3590,11 @@ private:
         Log(ctx, "event");
         if (m_event == nullptr) {
             m_event = m_context.CreateEvent(fmt::format("{}:Ready", GetServiceName()));
+            if (m_event == nullptr) {
+                IPC::ResponseBuilder rb{ctx, 2};
+                rb.Push(Kernel::ResultOutOfResource);
+                return;
+            }
             // The client attaches it auto-clearing, so one signal is consumed by the first wait:
             // while the input queue has room, re-signal every 4 ms; a spurious wake only makes it
             // check again.
@@ -3548,6 +3656,7 @@ private:
                     system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_syncpoint));
                 m_sync_base = reached;
                 m_handed = 0;
+                m_completed_ahead = 0;
                 value = reached;
             } else {
                 value = m_sync_base + ++m_handed;
@@ -3575,7 +3684,12 @@ private:
         const u32 image = ctx.CommandBuffer()[2];
         {
             std::scoped_lock lk{m_mutex};
-            std::erase(m_free, image);
+            const size_t erased = std::erase(m_free, image);
+            if (erased > 0 && m_completed_ahead > 0) {
+                const u32 drop =
+                    static_cast<u32>((std::min)(erased, static_cast<size_t>(m_completed_ahead)));
+                m_completed_ahead -= drop;
+            }
             m_registered.erase(image);
             m_release_fences.erase(image);
         }
@@ -3729,10 +3843,14 @@ private:
         auto& syncpoints = system.Host1x().GetSyncpointManager();
         const u32 target = m_sync_base + m_handed;
         u32 current = static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_syncpoint));
+        u32 advanced = 0;
         while (static_cast<s32>(target - current) > 0) {
             syncpoints.IncrementGuest(m_syncpoint);
             ++current;
+            ++advanced;
         }
+        const u32 active_frames = static_cast<u32>(m_free.size() + (m_writing_image ? 1U : 0U));
+        m_completed_ahead = (std::min)(m_completed_ahead + advanced, active_frames);
     }
 
     void GetOutputInfo(HLERequestContext& ctx) {
@@ -3802,12 +3920,14 @@ private:
                     fence = it->second;
                     m_release_fences.erase(it);
                 }
+                m_writing_image = true;
                 lk.unlock();
                 if (fence) {
                     WaitForRelease(*fence);
                 }
                 const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
                 lk.lock();
+                m_writing_image = false;
                 // Even an image written during a flush counts: the client waits for its value.
                 if (!m_flush && frame.picture && frame.picture->frame &&
                     MkwMovieActivity::IsLargeMovie(m_movie_program_id, frame.picture->width)) {
@@ -3818,7 +3938,17 @@ private:
                     m_stream_ended = true;
                     m_ready->room.store(false, std::memory_order_relaxed);
                 }
-                system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
+                if (m_completed_ahead > 0) {
+                    --m_completed_ahead;
+                } else if (m_syncpoint != NoSyncpoint) {
+                    auto& syncpoints = system.Host1x().GetSyncpointManager();
+                    const u32 target = m_sync_base + m_handed;
+                    const u32 current =
+                        static_cast<u32>(syncpoints.GetGuestSyncpointValue(m_syncpoint));
+                    if (static_cast<s32>(target - current) > 0) {
+                        syncpoints.IncrementGuest(m_syncpoint);
+                    }
+                }
                 ++m_frames_out;
                 if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
                     LOG_INFO(Service,
@@ -4019,6 +4149,8 @@ private:
     std::map<u32, Fence> m_release_fences;
     std::deque<Output> m_outputs;      ///< Finished, for 213
     std::set<u32> m_registered;        ///< Output images the client has registered
+    u32 m_completed_ahead{};           ///< Handed fences already completed by Stop/Finalize
+    bool m_writing_image{};            ///< Decode thread unlocked m_mutex to write an image
     bool m_stream_ended{};             ///< End-of-stream frame handed out, nothing submitted since
     bool m_flush{};
     bool m_quit{};
@@ -4395,65 +4527,79 @@ private:
         Tegra::Host1x::SyncpointManager::GuestMirrorHandle old_mirror{
             Tegra::Host1x::SyncpointManager::InvalidGuestMirrorHandle};
         Kernel::KScopedAutoObject<Kernel::KProcess> old_owner{system.Kernel()};
+        bool events_ready = false;
         {
             std::scoped_lock lk{m_syncpt_state->mutex};
             if (m_syncpt_events[0] == nullptr) {
                 m_syncpt_events[0] = m_context.CreateEvent("nx2:gsv:SyncptRequest");
                 m_syncpt_events[1] = m_context.CreateEvent("nx2:gsv:SyncptNotify");
-            }
-            m_syncpt_state->notify_event = m_syncpt_events[1];
-            // The poll reads the RW page at +0x100, so it must be a full page, and both pages must
-            // belong to the same process: the memory below is that process's.
-            const bool same_owner =
-                rw.IsNotNull() && ro.IsNotNull() && rw->GetOwner() == ro->GetOwner();
-            if (same_owner && ro->GetSize() >= 0x2000 && rw->GetSize() >= 0x1000) {
-                // Keep any prior owner alive until UnregisterGuestMirror drains its callback.
-                old_owner.Reset(m_syncpt_state->owner.GetPointerUnsafe());
-                m_syncpt_state->owner.Reset(ro->GetOwner());
-                auto& memory = m_syncpt_state->owner->GetMemory();
-                m_syncpt_state->rw = GetInteger(rw->GetSourceAddress());
-                m_syncpt_state->ro = GetInteger(ro->GetSourceAddress());
-                m_syncpt_state->count = max_syncpoints;
-                m_syncpt_state->last_rw_summary = 0;
-                m_syncpt_state->has_last_rw_summary = false;
-                memory.Write32(m_syncpt_state->ro + 0x00, 1); // version
-                memory.Write32(m_syncpt_state->ro + 0x04, 0); // base id (guess)
-                memory.Write32(m_syncpt_state->ro + 0x08, max_syncpoints);
-                memory.Write32(m_syncpt_state->ro + 0x0c, SyncptValuesOffset);
-                memory.Write32(m_syncpt_state->ro + 0x10, SyncptRwSummaryOffset);
-                memory.Write32(m_syncpt_state->ro + 0x14, SyncptRoSummaryOffset);
-                memory.Write32(m_syncpt_state->ro + 0x18, SyncptRwBitsOffset);
-                memory.Write32(m_syncpt_state->ro + 0x1c, SyncptRoBitsOffset);
-                // Seed and register under one SyncpointManager lock so no increment lands between
-                // snapshot and registration, and the mirror remains the sole value writer.
-                auto* const memory_ptr = &memory;
-                const auto new_mirror = system.Host1x().GetSyncpointManager().RegisterGuestMirror(
-                    [memory_ptr, values = m_syncpt_state->ro + SyncptValuesOffset,
-                     count = (std::min)(m_syncpt_state->count, HostSyncpoints)](u32 id, u32 value) {
-                        if (id < count) {
-                            memory_ptr->Write64(values + u64{id} * 8, value);
-                        }
-                    },
-                    true);
-                old_mirror = std::exchange(m_syncpt_state->mirror_handle, new_mirror);
-                if (!m_syncpt_poll) {
-                    m_syncpt_poll = Core::Timing::CreateEvent(
-                        "nx2:gsv:SyncptPoll",
-                        [state = m_syncpt_state, &system_ref = system](
-                            s64,
-                            std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
-                            PollSyncpts(state, system_ref);
-                            return std::nullopt;
-                        });
-                    system.CoreTiming().ScheduleLoopingEvent(SyncptPollInterval, SyncptPollInterval,
-                                                             m_syncpt_poll);
+                if (m_syncpt_events[0] == nullptr || m_syncpt_events[1] == nullptr) {
+                    m_context.CloseEvent(std::exchange(m_syncpt_events[0], nullptr));
+                    m_context.CloseEvent(std::exchange(m_syncpt_events[1], nullptr));
                 }
-            } else {
-                LOG_ERROR(Service, "nx2:gsv TIPC 204: missing or invalid syncpt transfer memory");
+            }
+            events_ready = m_syncpt_events[0] != nullptr && m_syncpt_events[1] != nullptr;
+            if (events_ready) {
+                m_syncpt_state->notify_event = m_syncpt_events[1];
+                // The poll reads the RW page at +0x100, so it must be a full page, and both pages
+                // must belong to the same process: the memory below is that process's.
+                const bool same_owner =
+                    rw.IsNotNull() && ro.IsNotNull() && rw->GetOwner() == ro->GetOwner();
+                if (same_owner && ro->GetSize() >= 0x2000 && rw->GetSize() >= 0x1000) {
+                    // Keep any prior owner alive until UnregisterGuestMirror drains its callback.
+                    old_owner.Reset(m_syncpt_state->owner.GetPointerUnsafe());
+                    m_syncpt_state->owner.Reset(ro->GetOwner());
+                    auto& memory = m_syncpt_state->owner->GetMemory();
+                    m_syncpt_state->rw = GetInteger(rw->GetSourceAddress());
+                    m_syncpt_state->ro = GetInteger(ro->GetSourceAddress());
+                    m_syncpt_state->count = max_syncpoints;
+                    m_syncpt_state->last_rw_summary = 0;
+                    m_syncpt_state->has_last_rw_summary = false;
+                    memory.Write32(m_syncpt_state->ro + 0x00, 1); // version
+                    memory.Write32(m_syncpt_state->ro + 0x04, 0); // base id (guess)
+                    memory.Write32(m_syncpt_state->ro + 0x08, max_syncpoints);
+                    memory.Write32(m_syncpt_state->ro + 0x0c, SyncptValuesOffset);
+                    memory.Write32(m_syncpt_state->ro + 0x10, SyncptRwSummaryOffset);
+                    memory.Write32(m_syncpt_state->ro + 0x14, SyncptRoSummaryOffset);
+                    memory.Write32(m_syncpt_state->ro + 0x18, SyncptRwBitsOffset);
+                    memory.Write32(m_syncpt_state->ro + 0x1c, SyncptRoBitsOffset);
+                    // Seed and register under one SyncpointManager lock so no increment lands
+                    // between snapshot and registration, and the mirror remains the sole value
+                    // writer.
+                    auto* const memory_ptr = &memory;
+                    const auto new_mirror = system.Host1x().GetSyncpointManager().RegisterGuestMirror(
+                        [memory_ptr, values = m_syncpt_state->ro + SyncptValuesOffset,
+                         count = (std::min)(m_syncpt_state->count, HostSyncpoints)](u32 id, u32 value) {
+                            if (id < count) {
+                                memory_ptr->Write64(values + u64{id} * 8, value);
+                            }
+                        },
+                        true);
+                    old_mirror = std::exchange(m_syncpt_state->mirror_handle, new_mirror);
+                    if (!m_syncpt_poll) {
+                        m_syncpt_poll = Core::Timing::CreateEvent(
+                            "nx2:gsv:SyncptPoll",
+                            [state = m_syncpt_state, &system_ref = system](
+                                s64,
+                                std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
+                                PollSyncpts(state, system_ref);
+                                return std::nullopt;
+                            });
+                        system.CoreTiming().ScheduleLoopingEvent(SyncptPollInterval, SyncptPollInterval,
+                                                                 m_syncpt_poll);
+                    }
+                } else {
+                    LOG_ERROR(Service, "nx2:gsv TIPC 204: missing or invalid syncpt transfer memory");
+                }
             }
         }
         system.Host1x().GetSyncpointManager().UnregisterGuestMirror(old_mirror);
         old_owner.Reset(nullptr);
+        if (!events_ready) {
+            IPC::ResponseBuilder rb{ctx, 2};
+            rb.Push(Kernel::ResultOutOfResource);
+            return;
+        }
 
         IPC::ResponseBuilder rb{ctx, 2, 2, 0};
         rb.Push(ResultSuccess);

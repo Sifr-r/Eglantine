@@ -7,6 +7,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cctype>
 #include "core/core.h"
 #include "core/debugger/debugger.h"
@@ -34,6 +35,13 @@ void Break(Core::System& system, BreakReason reason, u64 info1, u64 info2) {
             return;
         }
 
+        constexpr u64 MaxDebugBufferSize = 4096;
+        const u64 clamped_sz = (std::min)(sz, MaxDebugBufferSize);
+        if (addr >= addr + clamped_sz ||
+            !GetCurrentProcess(system.Kernel()).GetPageTable().Contains(addr, clamped_sz)) {
+            return;
+        }
+
         auto& memory = GetCurrentMemory(system.Kernel());
 
         // This typically is an error code so we're going to assume this is the case
@@ -41,16 +49,22 @@ void Break(Core::System& system, BreakReason reason, u64 info1, u64 info2) {
             LOG_CRITICAL(Debug_Emulated, "debug_buffer_err_code={:X}", memory.Read32(addr));
         } else {
             // We don't know what's in here so we'll hexdump it
-            debug_buffer.resize(sz);
-            memory.ReadBlock(addr, debug_buffer.data(), sz);
+            debug_buffer.resize(static_cast<std::size_t>(clamped_sz));
+            memory.ReadBlock(addr, debug_buffer.data(), debug_buffer.size());
             std::string hexdump;
+            hexdump.reserve(debug_buffer.size() * 3 + debug_buffer.size() / 32);
             for (std::size_t i = 0; i < debug_buffer.size(); i++) {
                 hexdump += fmt::format("{:02X} ", debug_buffer[i]);
                 if ((i + 1) % 32 == 0) {
                     hexdump += '\n';
                 }
             }
-            LOG_CRITICAL(Debug_Emulated, "debug_buffer=\n{}", hexdump);
+            if (sz > MaxDebugBufferSize) {
+                LOG_CRITICAL(Debug_Emulated, "debug_buffer (truncated to {} of {} bytes)=\n{}",
+                             clamped_sz, sz, hexdump);
+            } else {
+                LOG_CRITICAL(Debug_Emulated, "debug_buffer=\n{}", hexdump);
+            }
         }
         has_dumped_buffer = true;
     };

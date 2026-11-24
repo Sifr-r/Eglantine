@@ -217,7 +217,7 @@ def emit_size_check():
         if type != "void":
             lines.append(f"static_assert(sizeof({type}) == {size});")
 
-    return f"\n{lines}"
+    return "\n".join(lines)
 
 
 # Replaces a type with an arch-specific one, if it exists.
@@ -428,7 +428,7 @@ def emit_lines(lines, indent='    '):
             output_lines.append(line)
         first = False
 
-    return f"\n{output_lines}"
+    return "\n".join(output_lines)
 
 
 # Emit a C++ function to wrap a guest SVC.
@@ -529,12 +529,18 @@ void Call(Core::System& system, u32 imm);
 """
 
 PROLOGUE_CPP = """
+#include <cstdlib>
+#include <cstring>
 #include <type_traits>
 
 #include "core/arm/arm_interface.h"
 #include "core/core.h"
+#include "core/debugger/trace_hooks.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/k_readable_event.h"
+#include "core/hle/service/kernel_helpers.h"
+#include "video_core/nx2_spikes.h"
 
 namespace Kernel::Svc {
 
@@ -569,20 +575,136 @@ static To Convert(const From& from) {
 """
 
 EPILOGUE_CPP = """
+/// Dispatches SVC `imm` for the current thread, with optional tracing and trace-hook reporting.
 void Call(Core::System& system, u32 imm) {
     auto& kernel = system.Kernel();
     auto& process = GetCurrentProcess(kernel);
     std::array<uint64_t, 8> args;
     kernel.CurrentPhysicalCore().SaveSvcArguments(process, args);
-    LOG_TRACE(Kernel_SVC, "#{:#x} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
-        imm,
-        GetArg32(args, 0), GetArg32(args, 1), GetArg32(args, 2),
-        GetArg32(args, 3), GetArg32(args, 4), GetArg32(args, 5), GetArg32(args, 6));
+    GetCurrentThread(kernel).SetEnteredKernel();
+    // Inputs for a trace observer (the call overwrites args with its outputs); only copied when
+    // one listens, so an unset hook costs one relaxed load per SVC.
+    const auto svc_hook = Core::Trace::g_svc_hook.load(std::memory_order_relaxed);
+    std::array<u64, 4> svc_in{};
+    if (svc_hook != nullptr) {
+        svc_in = {GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2), GetArg64(args, 3)};
+    }
     //kernel.EnterSVCProfile();
-    if (process.Is64Bit())
-        Call64(system, imm, args);
-    else
-        Call32(system, imm, args);
+    LOG_TRACE(Kernel_SVC, "{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x}",
+        imm, GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2),
+        GetArg64(args, 3), GetArg64(args, 4), GetArg64(args, 5), GetArg64(args, 6));
+    // Set EDEN_NX2_SVC_TRACE=1 to log every SVC with its arguments and results, or
+    // EDEN_NX2_SVC_TRACE=<first>:<last> for presents first..last only (a frame-time profile).
+    static const std::pair<u64, u64> trace_range = [] {
+        const char* text = std::getenv("EDEN_NX2_SVC_TRACE");
+        if (text == nullptr) return std::pair<u64, u64>{1, 0};
+        const char* colon = std::strchr(text, ':');
+        if (colon == nullptr) return std::pair<u64, u64>{0, ~u64{}};
+        return std::pair<u64, u64>{std::strtoull(text, nullptr, 10), std::strtoull(colon + 1, nullptr, 10)};
+    }();
+    const u64 presents = Core::g_nx2_present_count.load(std::memory_order_relaxed);
+    const bool svc_trace = presents >= trace_range.first && presents <= trace_range.second;
+    if (svc_trace) {
+        LOG_INFO(Kernel_SVC, "svc {:#04x} in  t{} [0]={:#x} [1]={:#x} [2]={:#x} [3]={:#x}", imm,
+                 GetCurrentThread(kernel).GetThreadId(),
+                 GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2), GetArg64(args, 3));
+        if (imm == 0x18) {
+            // WaitSynchronization: the handles, with the names services gave their events.
+            std::string list;
+            const s32 count = static_cast<s32>(GetArg64(args, 2));
+            for (s32 i = 0; i < std::min(count, 8); ++i) {
+                const u32 handle = process.GetMemory().Read32(GetArg64(args, 1) + 4 * i);
+                KScopedAutoObject event =
+                    process.GetHandleTable().GetObject<KReadableEvent>(kernel, handle);
+                list += fmt::format(" {:#x}{}", handle,
+                                    event.IsNotNull()
+                                        ? "=" + Service::KernelHelpers::DebugEventName(event.GetPointerUnsafe())
+                                        : std::string{});
+            }
+            LOG_INFO(Kernel_SVC, "svc 0x18 t{} waits on{}", GetCurrentThread(kernel).GetThreadId(), list);
+        }
+    }
+    if (imm == 0x80) {
+        // Switch 2 only: svcSetGpuMemoryAttribute(address, size, mask, attr). nn::gpu::sdk and
+        // nn::gs native memory set the new "GPU accessible" attribute (0x20) before registering
+        // memory with the GPU and clear it on destruction; NVN can see it through QueryMemory.
+        // Same checks as svcSetMemoryAttribute, restricted to that bit (as in changes.patch).
+        const u64 address = GetArg64(args, 0);
+        const u64 size = GetArg64(args, 1);
+        const u32 mask = static_cast<u32>(GetArg64(args, 2));
+        const u32 attr = static_cast<u32>(GetArg64(args, 3));
+        constexpr u32 Supported = static_cast<u32>(Svc::MemoryAttribute::GpuAccessible);
+        auto& page_table = process.GetPageTable();
+        Result result = ResultSuccess;
+        if (!Common::IsAligned(address, PageSize)) {
+            result = ResultInvalidAddress;
+        } else if (size == 0 || !Common::IsAligned(size, PageSize)) {
+            result = ResultInvalidSize;
+        } else if ((attr & ~mask) != 0 || ((mask | attr) & ~Supported) != 0) {
+            result = ResultInvalidCombination;
+        } else if (address + size <= address || !page_table.Contains(address, size)) {
+            result = ResultInvalidCurrentMemory;
+        } else {
+            result = page_table.SetMemoryAttribute(address, size,
+                                                   static_cast<KMemoryAttribute>(mask),
+                                                   static_cast<KMemoryAttribute>(attr));
+        }
+        LOG_DEBUG(Kernel_SVC, "Switch 2 svc 0x80 addr={:#x} size={:#x} mask={:#x} attr={:#x} -> {:#x}",
+                  address, size, mask, attr, result.raw);
+        args[0] = result.raw;
+    } else {
+        namespace Spikes = VideoCommon::Nx2Spikes;
+        const bool spikes = Spikes::Counting();
+        const auto started = spikes ? Spikes::Clock::now() : Spikes::Clock::time_point{};
+        if (process.Is64Bit()) {
+            Call64(system, imm, args);
+        } else {
+            Call32(system, imm, args);
+        }
+        if (spikes) {
+            const auto time = Spikes::Clock::now() - started;
+            Spikes::Note(Spikes::Event::Svc, time);
+            switch (imm) {
+            case 0x0B:
+                Spikes::Note(Spikes::Event::SvcSleep, time);
+                break;
+            case 0x18:
+                Spikes::Note(Spikes::Event::SvcWaitSync, time);
+                break;
+            case 0x1A:
+            case 0x1B:
+            case 0x1C:
+            case 0x1D:
+                Spikes::Note(Spikes::Event::SvcMutexCondvar, time);
+                break;
+            case 0x34:
+            case 0x35:
+                Spikes::Note(Spikes::Event::SvcAddressArbiter, time);
+                break;
+            case 0x21:
+            case 0x22:
+            case 0x43:
+            case 0x44:
+                Spikes::Note(Spikes::Event::SvcIpc, time);
+                break;
+            default:
+                break;
+            }
+        }
+    }
+    if (svc_trace) {
+        LOG_INFO(Kernel_SVC, "svc {:#04x} out t{} [0]={:#x} [1]={:#x} [2]={:#x}", imm,
+                 GetCurrentThread(kernel).GetThreadId(), GetArg64(args, 0), GetArg64(args, 1),
+                 GetArg64(args, 2));
+    }
+    if (svc_hook != nullptr) {
+        svc_hook(Core::Trace::SvcCall{
+            .imm = imm,
+            .thread_id = GetCurrentThread(kernel).GetThreadId(),
+            .in = svc_in,
+            .out = {GetArg64(args, 0), GetArg64(args, 1), GetArg64(args, 2)},
+        });
+    }
     //kernel.ExitSVCProfile();
     kernel.CurrentPhysicalCore().LoadSvcArguments(process, args);
 }
@@ -602,11 +724,11 @@ def emit_call(bitness, names, suffix):
     for _, name in names:
         lines.append(f"{indent}case SvcId::{name}: return SvcWrap_{name}{suffix}(system, args);")
 
-    lines.append(f"{indent}default: UNREACHABLE_MSG(\"Unhandled SVC {{:#x}}\", imm);")
+    lines.append(f"{indent}default: UNREACHABLE_MSG(\"Unhandled SVC {{:#x}}!\", imm);")
     lines.append(f"{indent}}}")
     lines.append("}")
 
-    return f"\n{lines}"
+    return "\n".join(lines)
 
 
 def build_fn_declaration(return_type, name, arguments):
@@ -628,7 +750,7 @@ def build_enum_declarations():
         lines.append(f"{indent}{name} = {hex(imm)},")
 
     lines.append("};")
-    return f"\n{lines}"
+    return "\n".join(lines)
 
 
 def main():
@@ -670,11 +792,11 @@ def main():
     with open("src/core/hle/kernel/svc.h", "w") as f:
         f.write(COPYRIGHT)
         f.write(PROLOGUE_H)
-        f.write(f"\n{svc_fw_declarations}")
+        f.write("\n".join(svc_fw_declarations))
         f.write("\n\n")
-        f.write(f"\n{arch_fw_declarations[BIT_32]}")
+        f.write("\n".join(arch_fw_declarations[BIT_32]))
         f.write("\n\n")
-        f.write(f"\n{arch_fw_declarations[BIT_64]}")
+        f.write("\n".join(arch_fw_declarations[BIT_64]))
         f.write("\n\n")
         f.write(enum_decls)
         f.write(EPILOGUE_H)
@@ -684,7 +806,7 @@ def main():
         f.write(PROLOGUE_CPP)
         f.write(emit_size_check())
         f.write("\n\n")
-        f.write(f"\n\n{wrapper_fns}")
+        f.write("\n\n".join(wrapper_fns))
         f.write("\n\n")
         f.write(call_32)
         f.write("\n\n")

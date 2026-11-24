@@ -746,7 +746,7 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
     }
 
     // VK_EXT_descriptor_buffer requires VK_KHR_buffer_device_address
-    if (extensions.descriptor_buffer && !features.buffer_device_address.bufferDeviceAddress) {
+    if (extensions.descriptor_buffer && !extensions.buffer_device_address) {
         LOG_WARNING(Render_Vulkan, "Descriptor buffer needs buffer device address, disabling.");
         RemoveExtensionFeature(extensions.descriptor_buffer, features.descriptor_buffer,
                                VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
@@ -780,6 +780,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         features.shader_float16_int8.shaderFloat16 = VK_TRUE;
     }
     logical = vk::Device::Create(physical, queue_cis, ExtensionListForVulkan(loaded_extensions), first_next, dld);
+    if (!HasSynchronization2()) {
+        dld.vkCmdPipelineBarrier2 = nullptr;
+        dld.vkQueueSubmit2 = nullptr;
+    }
     features.shader_float16_int8.shaderFloat16 = float16_math;
 
     graphics_queue = logical.GetQueue(graphics_family);
@@ -1160,10 +1164,6 @@ bool Device::GetSuitability(bool requires_swapchain) {
     bool suitable = true;
 
     // Configure properties.
-    VkPhysicalDeviceVulkan12Features features_1_2{};
-    VkPhysicalDeviceVulkan13Features features_1_3{};
-
-    // Configure properties.
     properties.properties = physical.GetProperties();
 
     // Set instance version.
@@ -1276,16 +1276,6 @@ bool Device::GetSuitability(bool requires_swapchain) {
 
     // Set next pointer.
     void** next = &features2.pNext;
-
-    // Vulkan 1.2 and 1.3 features
-    if (instance_version >= VK_API_VERSION_1_2) {
-        features_1_2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-        features_1_3.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
-
-        features_1_2.pNext = &features_1_3;
-
-        *next = &features_1_2;
-    }
 
 // Test all features we know about. If the feature is not available in core at our
 // current API version, and was not enabled by an extension, skip testing the feature.
@@ -1525,6 +1515,13 @@ void Device::RemoveUnsuitableExtensions() {
     extensions.depth_clip_control = features.depth_clip_control.depthClipControl;
     RemoveExtensionFeatureIfUnsuitable(extensions.depth_clip_control, features.depth_clip_control,
                                        VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
+
+    // VK_KHR_buffer_device_address
+    extensions.buffer_device_address =
+        features.buffer_device_address.bufferDeviceAddress != VK_FALSE;
+    RemoveExtensionFeatureIfUnsuitable(extensions.buffer_device_address,
+                                       features.buffer_device_address,
+                                       VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
 
     // VK_EXT_descriptor_buffer (EDEN_NX2_NO_DESCRIPTOR_BUFFER=1 falls back to descriptor sets, for A/B
     // tests of GPU faults)
@@ -2130,7 +2127,7 @@ void Device::InitializeGPULogging() {
     GPU::Logging::GPULogger::GetInstance().EnableDriverDebugInfo(
         Settings::values.gpu_log_driver_debug.GetValue());
     GPU::Logging::GPULogger::GetInstance().SetRingBufferSize(
-        Settings::values.gpu_log_ring_buffer_size.GetValue());
+        static_cast<size_t>((std::max)(Settings::values.gpu_log_ring_buffer_size.GetValue(), 1)));
 
     // Log comprehensive driver and extension information
     if (Settings::values.gpu_log_driver_debug.GetValue()) {

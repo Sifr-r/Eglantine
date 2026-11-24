@@ -22,6 +22,7 @@
 #include "audio_core/renderer/command/command_generator.h"
 #include "audio_core/renderer/command/command_list_header.h"
 #include "audio_core/renderer/effect/effect_info_base.h"
+#include "audio_core/renderer/effect/effect_reset.h"
 #include "audio_core/renderer/effect/effect_result_state.h"
 #include "audio_core/renderer/memory/memory_pool_info.h"
 #include "audio_core/renderer/memory/pool_mapper.h"
@@ -118,7 +119,7 @@ Result System::Initialize(const AudioRendererParameterInternal& params,
         return Service::Audio::ResultInsufficientBuffer;
     }
 
-    if (process_handle_ == 0) {
+    if (process_handle_ == nullptr || transfer_memory == nullptr) {
         return Service::Audio::ResultInvalidHandle;
     }
 
@@ -404,6 +405,10 @@ Result System::Initialize(const AudioRendererParameterInternal& params,
     return ResultSuccess;
 }
 
+System::~System() {
+    Finalize();
+}
+
 void System::Finalize() {
     if (!initialized) {
         return;
@@ -429,6 +434,11 @@ void System::Finalize() {
         // dsp::ProcessCleanup
         // close handle
     }
+
+    for (u32 i = 0; i < effect_context.GetCount(); i++) {
+        ResetEffect(&effect_context.GetInfo(i), EffectInfoBase::Type::Invalid);
+    }
+
     initialized = false;
 }
 
@@ -458,9 +468,9 @@ Result System::Update(std::span<const u8> input, std::span<u8> performance, std:
     std::scoped_lock l{lock};
 
     const auto start_time{core.CoreTiming().GetGlobalTimeNs().count()};
-    std::memset(output.data(), 0, output.size());
-
     InfoUpdater info_updater(input, output, process_handle, behavior);
+    R_TRY(info_updater.BeginUpdate(memory_pool_count, voice_context.GetCount(),
+                                  effect_context.GetCount(), sink_context.GetCount()));
 
     auto result{info_updater.UpdateBehaviorInfo(behavior)};
     if (result.IsError()) {
@@ -480,7 +490,8 @@ Result System::Update(std::span<const u8> input, std::span<u8> performance, std:
         return result;
     }
 
-    result = info_updater.UpdateVoices(voice_context, memory_pool_workbuffer, memory_pool_count);
+    result = info_updater.UpdateVoices(voice_context, memory_pool_workbuffer, memory_pool_count,
+                                       mix_context.GetCount(), splitter_context.GetInfoCount());
     if (result.IsError()) {
         LOG_ERROR(Service_Audio, "Failed to update Voices!");
         return result;
@@ -494,7 +505,7 @@ Result System::Update(std::span<const u8> input, std::span<u8> performance, std:
     }
 
     if (behavior.IsSplitterSupported()) {
-        result = info_updater.UpdateSplitterInfo(splitter_context);
+        result = info_updater.UpdateSplitterInfo(splitter_context, mix_context.GetCount());
         if (result.IsError()) {
             LOG_ERROR(Service_Audio, "Failed to update SplitterInfo!");
             return result;
@@ -823,7 +834,6 @@ u32 System::DropVoices(CommandBuffer& command_buffer, u32 estimated_process_time
             cmd = reinterpret_cast<ICommand*>(command_list);
             i++;
         }
-        i++;
     }
     return voices_dropped;
 }

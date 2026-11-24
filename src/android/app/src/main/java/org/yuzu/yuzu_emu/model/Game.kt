@@ -9,7 +9,6 @@ package org.yuzu.yuzu_emu.model
 import android.content.Intent
 import android.net.Uri
 import android.os.Parcelable
-import java.util.HashSet
 import kotlinx.parcelize.Parcelize
 import kotlinx.serialization.Serializable
 import org.yuzu.yuzu_emu.NativeLibrary
@@ -37,21 +36,21 @@ class Game(
 
     val settingsName: String
         get() {
-            val programIdLong = programId.toLongOrNull() ?: 0L
-            return if (programIdLong == 0L) {
+            val programIdValue = programId.toULongOrNull() ?: 0uL
+            return if (programIdValue == 0uL) {
                 FileUtil.getFilename(Uri.parse(path))
             } else {
-                "0" + programIdLong.toString(16).uppercase()
+                programIdValue.toString(16).uppercase().padStart(16, '0')
             }
         }
 
     val programIdHex: String
         get() {
-            val programIdLong = programId.toLongOrNull() ?: 0L
-            return if (programIdLong == 0L) {
+            val programIdValue = programId.toULongOrNull() ?: 0uL
+            return if (programIdValue == 0uL) {
                 "0"
             } else {
-                "0" + programIdLong.toString(16).uppercase()
+                programIdValue.toString(16).uppercase().padStart(16, '0')
             }
         }
 
@@ -96,11 +95,5 @@ class Game(
         result = 31 * result + version.hashCode()
         result = 31 * result + isHomebrew.hashCode()
         return result
-    }
-
-    companion object {
-        val extensions: Set<String> = HashSet(
-            listOf("xci", "nsp", "nca", "nro", "nsz", "xcz", "nup")
-        )
     }
 }

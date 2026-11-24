@@ -1372,7 +1372,7 @@ void ConvertedLayout(const ImageInfo& info, std::span<BufferImageCopy> copies) {
 
 void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8> output,
                   std::span<BufferImageCopy> copies) {
-    u32 output_offset = 0;
+    size_t output_offset = 0;
     Common::ScratchBuffer<u8> decode_scratch;
 
     const Extent2D tile_size = DefaultBlockSize(info.format);
@@ -1398,7 +1398,8 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
                 copy.image_subresource.num_layers * copy.image_extent.depth, tile_size.width,
                 tile_size.height, output.subspan(output_offset));
 
-            output_offset += copy.image_extent.width * copy.image_extent.height *
+            output_offset += static_cast<size_t>(copy.image_extent.width) *
+                             copy.image_extent.height * copy.image_extent.depth *
                              copy.image_subresource.num_layers *
                              BytesPerBlock(PixelFormat::A8B8G8R8_UNORM);
         } else if (astc) {
@@ -1408,12 +1409,13 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
                 recompression_setting == Settings::AstcRecompression::Bc1 || info.astc_opaque;
             const auto compress =
                 bc1 ? Tegra::Texture::BCN::CompressBC1 : Tegra::Texture::BCN::CompressBC3;
-            const auto bpp_div = bc1 ? 2 : 1;
+            const size_t bpp_div = bc1 ? 2 : 1;
 
-            const u32 plane_dim = copy.image_extent.width * copy.image_extent.height;
-            const u32 level_size = plane_dim * copy.image_extent.depth *
-                                   copy.image_subresource.num_layers *
-                                   BytesPerBlock(PixelFormat::A8B8G8R8_UNORM);
+            const size_t plane_dim =
+                static_cast<size_t>(copy.image_extent.width) * copy.image_extent.height;
+            const size_t level_size = plane_dim * copy.image_extent.depth *
+                                      copy.image_subresource.num_layers *
+                                      BytesPerBlock(PixelFormat::A8B8G8R8_UNORM);
             decode_scratch.resize_destructive(level_size);
 
             Tegra::Texture::ASTC::Decompress(
@@ -1425,13 +1427,14 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
                      copy.image_subresource.num_layers * copy.image_extent.depth,
                      output.subspan(output_offset));
 
-            const u32 aligned_plane_dim = Common::AlignUp(copy.image_extent.width, 4) *
-                                          Common::AlignUp(copy.image_extent.height, 4);
+            const size_t aligned_plane_dim =
+                static_cast<size_t>(Common::AlignUp(copy.image_extent.width, 4U)) *
+                Common::AlignUp(copy.image_extent.height, 4U);
 
             copy.buffer_size =
                 (aligned_plane_dim * copy.image_extent.depth * copy.image_subresource.num_layers) /
                 bpp_div;
-            output_offset += static_cast<u32>(copy.buffer_size);
+            output_offset += copy.buffer_size;
         } else if (etc2) {
             const u32 bytes_per_texel = Tegra::Texture::ETC2::BytesPerTexel(*etc2);
             const u32 layers = copy.image_subresource.num_layers * copy.image_extent.depth;
@@ -1439,13 +1442,14 @@ void ConvertImage(std::span<const u8> input, const ImageInfo& info, std::span<u8
                                              copy.image_extent.height, layers,
                                              output.subspan(output_offset));
 
-            const u32 level_size =
-                copy.image_extent.width * copy.image_extent.height * layers * bytes_per_texel;
+            const size_t level_size = static_cast<size_t>(copy.image_extent.width) *
+                                      copy.image_extent.height * layers * bytes_per_texel;
             copy.buffer_size = level_size;
             output_offset += level_size;
         } else {
             DecompressBCn(input_offset, output.subspan(output_offset), copy, info.format);
-            output_offset += copy.image_extent.width * copy.image_extent.height *
+            output_offset += static_cast<size_t>(copy.image_extent.width) *
+                             copy.image_extent.height * copy.image_extent.depth *
                              copy.image_subresource.num_layers *
                              ConvertedBytesPerBlock(info.format);
         }

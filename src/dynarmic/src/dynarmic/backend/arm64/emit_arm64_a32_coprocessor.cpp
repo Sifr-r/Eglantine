@@ -228,7 +228,7 @@ void EmitIR<IR::Opcode::A32CoprocGetTwoWords>(oaknut::CodeGenerator& code, EmitC
 
         code.MOV(Xscratch0, reinterpret_cast<u64>((*source_ptrs)[0]));
         code.MOV(Xscratch1, reinterpret_cast<u64>((*source_ptrs)[1]));
-        code.LDR(Xvalue, Xscratch0);
+        code.LDR(Xvalue->toW(), Xscratch0);
         code.LDR(Wscratch1, Xscratch1);
         code.BFI(Xvalue, Xscratch1, 32, 32);
 

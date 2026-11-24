@@ -155,12 +155,9 @@ Result GetInfo(Core::System& system, u64* result, InfoType info_id_type, Handle 
                 *result = 0;
             }
             R_SUCCEED();
-        case InfoType::AliasRegionExtraSize: {
-            R_UNLESS(info_sub_id == 0, ResultInvalidCombination);
-            KProcess* current_process = GetCurrentProcessPointer(system.Kernel());
-            *result = current_process->GetPageTable().GetAliasRegionExtraSize();
+        case InfoType::AliasRegionExtraSize:
+            *result = process->GetPageTable().GetAliasRegionExtraSize();
             R_SUCCEED();
-        }
         default:
             break;
         }

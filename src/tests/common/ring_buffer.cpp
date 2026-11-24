@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <numeric>
 #include <thread>
@@ -87,12 +88,21 @@ TEST_CASE("RingBuffer: Threaded Test", "[common]") {
         value[1] += 2;
     };
 
-    std::thread producer{[&] {
+    std::atomic<bool> failed{false};
+    std::atomic<std::size_t> push_size_errors{0};
+    std::atomic<std::size_t> pop_size_errors{0};
+    std::atomic<std::size_t> pop_value_errors{0};
+
+    std::jthread producer{[&] {
         std::array<char, 2> value = {seed, seed};
         std::size_t i = 0;
-        while (i < count) {
+        while (i < count && !failed.load(std::memory_order_acquire)) {
             if (const std::size_t c = buf.Push(&value[0], 2); c > 0) {
-                REQUIRE(c == 2U);
+                if (c != 2U) {
+                    push_size_errors.fetch_add(1, std::memory_order_relaxed);
+                    failed.store(true, std::memory_order_release);
+                    break;
+                }
                 i++;
                 next_value(value);
             } else {
@@ -102,14 +112,21 @@ TEST_CASE("RingBuffer: Threaded Test", "[common]") {
         }
     }};
 
-    std::thread consumer{[&] {
+    std::jthread consumer{[&] {
         std::array<char, 2> value = {seed, seed};
         std::size_t i = 0;
-        while (i < count) {
+        while (i < count && !failed.load(std::memory_order_acquire)) {
             if (const std::vector<char> v = buf.Pop(2); v.size() > 0) {
-                REQUIRE(v.size() == 2U);
-                REQUIRE(v[0] == value[0]);
-                REQUIRE(v[1] == value[1]);
+                if (v.size() != 2U) {
+                    pop_size_errors.fetch_add(1, std::memory_order_relaxed);
+                    failed.store(true, std::memory_order_release);
+                    break;
+                }
+                if (v[0] != value[0] || v[1] != value[1]) {
+                    pop_value_errors.fetch_add(1, std::memory_order_relaxed);
+                    failed.store(true, std::memory_order_release);
+                    break;
+                }
                 i++;
                 next_value(value);
             } else {
@@ -122,6 +139,9 @@ TEST_CASE("RingBuffer: Threaded Test", "[common]") {
     producer.join();
     consumer.join();
 
+    REQUIRE(push_size_errors.load(std::memory_order_relaxed) == 0U);
+    REQUIRE(pop_size_errors.load(std::memory_order_relaxed) == 0U);
+    REQUIRE(pop_value_errors.load(std::memory_order_relaxed) == 0U);
     REQUIRE(buf.Size() == 0U);
     printf("RingBuffer: Threaded Test: full: %zu, empty: %zu\n", full, empty);
 }

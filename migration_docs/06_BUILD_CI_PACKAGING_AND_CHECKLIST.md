@@ -1,6 +1,17 @@
-# CI, packaging and migration checklist
+# Historical CI, packaging and migration checklist
 
-The standalone Rust workspace contains one crate, `eglantine_ampere_core`. The CMake helper exists, but the emulator build and its CI workflows do not yet invoke it. Use the Phase 1A runbook for local parity checks. The gates below apply when a phase introduces its first build or runtime dependency. [Phase 1A integration and parity](01_PHASE1A_RUST_AMPERE_PARITY.md)
+This checklist records the original rollout plan, when the standalone workspace contained only `eglantine_ampere_core`. Current target names and switches live in the [architecture ledger](../ARCHITECTURE.md#first-party-language-and-domain-ownership). Use [Phase 0](00_PREREQUISITES_AND_BASELINE.md) for fresh local evidence.
+
+## Current entry points
+
+| Area | Source and verification |
+|---|---|
+| Native build | The [root build](../CMakeLists.txt) and [Cargo helper](../CMakeModules/AddRustCrate.cmake) build and link the unified Rust archive. Confirm the target triple, linker and runtime in each supported toolchain configuration. |
+| CI | The [Linux test workflow](../.github/workflows/test-linux.yml) runs Cargo tests. Check platform build and release jobs separately for packaging evidence. |
+| Nix | The [package derivation](../nix/package.nix) declares Cargo build inputs, uses the lockfile and enables offline Cargo. Test the selected system and PGO variant when changing that wiring. |
+| Source and release checks | The [architecture ledger](../ARCHITECTURE.md#source-and-release-checks) links the live workflow and tools. The [header checker tests](../tools/ci/test_license_header.py) cover accepted and missing SPDX headers for the source types considered in this proposal. |
+
+The remaining sections preserve the proposed gates and original file matrix. They do not specify current dependencies or implementation work.
 
 ## 1. CI integration gates
 
@@ -19,7 +30,7 @@ Keep the existing C++ build usable with the new language disabled. A green Cargo
 
 The flake exposes `eglantine` and `eglantine-pgo` for x86-64 Linux, AArch64 Linux and AArch64 Darwin. Its default development shell is defined for Linux. [Flake outputs](../flake.nix) · [Development shell](../shell.nix)
 
-1. In Phase 1A, add Cargo and rustc as native build tools for the enabled feature in the package derivation. The current lockfile contains only the workspace crate. When external crates are added, make their locked sources available as Nix build inputs before invoking Cargo. [Package derivation](../nix/package.nix) · [Cargo lockfile](../rust/Cargo.lock)
+1. The Phase 1A proposal added Cargo and rustc as native build tools. The lockfile originally contained only the prototype crate. If external crates are added, make their locked sources available as Nix build inputs before invoking Cargo. [Package derivation](../nix/package.nix) · [Cargo lockfile](../rust/Cargo.lock)
 2. Wire the CMake target before enabling `EGLANTINE_RUST_OFFLINE`. The helper passes `--offline --frozen` to Cargo. Build with the Nix sandbox enabled to verify that Cargo needs no network during compilation. Nix may fetch declared inputs before the build. [CMake helper](../CMakeModules/AddRustCrate.cmake)
 3. For the host system, run `nix build -L .#eglantine` and, when testing the PGO variant, `nix build -L .#eglantine-pgo`. Record the system and enabled feature for each build.
 4. Add Slang or ISPC as host tools when their phases land. Keep runtime libraries in the target dependency set. If the same tool is added to the CPM manifest, make the Nix dependency resolver use the packaged tool. [CPM dependency resolver](../nix/build-eden-emulator.nix)
@@ -30,9 +41,9 @@ The license script selects source files by extension. When introducing Rust, Sla
 
 Record each implemented module's responsibility and fallback in the architecture ledger when it lands. [Architecture ledger](../ARCHITECTURE.md)
 
-## 4. File matrix
+## 4. Original file matrix
 
-**DONE** identifies an existing prototype file. **NEW** and **EDIT** identify proposed work, and **VERIFY** identifies existing behavior to exercise. Phase-specific runbooks describe the acceptance checks. Treat observed test counts as results from a particular revision.
+The status entries apply to the original proposal. **DONE** identified a prototype file at that point. **NEW** and **EDIT** identified proposed work, and **VERIFY** identified behavior to exercise. Paths in this matrix include files that were proposed, renamed or removed. See the phase guides for current source links and verification.
 
 ### A. Root, Build Modules, Nix & CI
 | Path | Phase | Status | Summary of Work |

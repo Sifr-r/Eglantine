@@ -253,7 +253,9 @@ void Module::Interface::ThrowFatalWithCpuContext(HLERequestContext& ctx) {
     FatalInfo info{};
 
     ASSERT_MSG(fatal_info.size() == sizeof(FatalInfo), "Invalid fatal info buffer size!");
-    std::memcpy(&info, fatal_info.data(), sizeof(FatalInfo));
+    if (!fatal_info.empty()) {
+        std::memcpy(&info, fatal_info.data(), (std::min)(fatal_info.size(), sizeof(FatalInfo)));
+    }
 
     ThrowFatalError(system, error_code, fatal_type, info);
     IPC::ResponseBuilder rb{ctx, 2};

@@ -117,7 +117,7 @@ void EmitIR<IR::Opcode::LogicalShiftLeft32>(biscuit::Assembler& as, EmitContext&
         as.MV(Xresult, biscuit::zero);
         as.MV(Xcarry_out, biscuit::zero);
     } else {
-        as.ANDI(Xcarry_out, Xresult, 1);
+        as.ANDI(Xcarry_out, Xoperand, 1);
         as.MV(Xresult, biscuit::zero);
     }
 }

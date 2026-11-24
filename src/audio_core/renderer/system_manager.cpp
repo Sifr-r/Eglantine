@@ -61,8 +61,8 @@ bool SystemManager::Add(System& system_) {
         std::scoped_lock l{mutex1};
         if (systems.empty())
             InitializeUnsafe();
+        systems.push_back(&system_);
     }
-    systems.push_back(&system_);
     return true;
 }
 

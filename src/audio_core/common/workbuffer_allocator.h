@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <algorithm>
+#include <limits>
 #include <span>
 
 #include "common/alignment.h"
@@ -28,26 +30,36 @@ public:
      */
     template <typename T>
     std::span<T> Allocate(u64 count, u64 alignment) {
-        u64 out{0};
-        u64 byte_size{count * sizeof(T)};
-
-        if (byte_size > 0) {
-            auto current{buffer + offset};
-            auto aligned_buffer{Common::AlignUp(current, alignment)};
-            if (aligned_buffer + byte_size <= buffer + size) {
-                out = aligned_buffer;
-                offset = byte_size - buffer + aligned_buffer;
-            } else {
-                LOG_ERROR(
-                    Service_Audio,
-                    "Allocated buffer was too small to hold new alloc.\nAllocator size={:08X}, "
-                    "offset={:08X}.\nAttempting to allocate {:08X} with alignment={:02X}",
-                    size, offset, byte_size, alignment);
-                count = 0;
-            }
+        if (count == 0) {
+            return {};
         }
 
-        return std::span<T>(reinterpret_cast<T*>(out), count);
+        constexpr u64 max_count = (std::min<u64>)(
+            (std::numeric_limits<u64>::max)() / sizeof(T),
+            (std::numeric_limits<std::size_t>::max)());
+        if (count > max_count) {
+            LOG_ERROR(Service_Audio,
+                      "Allocation count overflow.\nAllocator size={:08X}, offset={:08X}.\n"
+                      "Attempting to allocate {} elements of size {:08X} with alignment={:02X}",
+                      size, offset, count, sizeof(T), alignment);
+            return {};
+        }
+
+        const u64 byte_size{count * sizeof(T)};
+        const u64 pad = AlignmentPadding(alignment);
+        const u64 remaining = size - offset;
+
+        if (pad <= remaining && byte_size <= remaining - pad) {
+            const u64 out = buffer + offset + pad;
+            offset += pad + byte_size;
+            return std::span<T>(reinterpret_cast<T*>(out), static_cast<std::size_t>(count));
+        }
+
+        LOG_ERROR(Service_Audio,
+                  "Allocated buffer was too small to hold new alloc.\nAllocator size={:08X}, "
+                  "offset={:08X}.\nAttempting to allocate {:08X} with alignment={:02X}",
+                  size, offset, byte_size, alignment);
+        return {};
     }
 
     /**
@@ -56,9 +68,9 @@ public:
      * @param alignment - The required starting alignment.
      */
     void Align(u64 alignment) {
-        auto current{buffer + offset};
-        auto aligned_buffer{Common::AlignUp(current, alignment)};
-        offset = 0 - buffer + aligned_buffer;
+        const u64 pad = AlignmentPadding(alignment);
+        const u64 remaining = size - offset;
+        offset = pad > remaining ? size : offset + pad;
     }
 
     /**
@@ -89,6 +101,13 @@ public:
     }
 
 private:
+    u64 AlignmentPadding(u64 alignment) const noexcept {
+        const u64 align = alignment > 0 ? alignment : 1;
+        const u64 current = buffer + offset;
+        const u64 mod = align > 1 ? (current % align) : 0;
+        return mod == 0 ? 0 : (align - mod);
+    }
+
     /// The buffer into which we are allocating.
     u64 buffer;
     /// Size of the buffer we're allocating to.

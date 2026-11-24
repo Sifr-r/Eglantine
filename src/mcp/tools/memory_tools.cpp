@@ -15,6 +15,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <thread>
 
 #include <fmt/format.h>
@@ -472,27 +473,69 @@ public:
     /// Returns 0 and sets `error` when the server is shutting down or the watch limit is reached.
     u32 Add(Core::System& system, Timeline* timeline, u64 address, ValueType type,
             std::string label, std::string& error) {
-        std::scoped_lock lock{mutex};
-        // Checked under the lock Shutdown takes: a watch added after shutdown began would start
-        // a sampler that nothing joins.
-        if (ServerStopping()) {
-            error = "the MCP server is stopping";
-            return 0;
-        }
-        if (watches.size() >= kMaxWatches) {
-            error = fmt::format("at most {} watches", kMaxWatches);
-            return 0;
-        }
-        const u32 id = next_id++;
-        watches.push_back({id, address, type, std::move(label)});
-        if (!thread.joinable() || stopped) {
-            if (thread.joinable()) {
-                thread.join();
+        std::scoped_lock cb_lock{cb_mutex};
+        bool need_cb_refresh = false;
+        {
+            std::scoped_lock state_lock{mutex};
+            // Checked under the lock Shutdown takes: a watch added after shutdown began would
+            // start a sampler that nothing joins.
+            if (ServerStopping()) {
+                error = "the MCP server is stopping";
+                return 0;
             }
-            stopped = false;
-            thread = std::jthread([this, &system, timeline](std::stop_token stop) {
-                Run(stop, system, timeline);
-            });
+            if (!system.IsPoweredOn() || system.IsShuttingDown() ||
+                system.GetEmulationStopToken().stop_requested()) {
+                error = "no game is running";
+                return 0;
+            }
+            if (watches.size() >= kMaxWatches) {
+                error = fmt::format("at most {} watches", kMaxWatches);
+                return 0;
+            }
+            need_cb_refresh = !thread.joinable() || stopped || !emulation_stop_cb.has_value();
+        }
+
+        if (need_cb_refresh) {
+            emulation_stop_cb.reset();
+            emulation_stop_cb.emplace(system.GetEmulationStopToken(), EmulationStopHandler{this});
+        }
+
+        u32 id = 0;
+        {
+            std::scoped_lock join_lock{join_mutex};
+            std::jthread stale_thread;
+            {
+                std::scoped_lock state_lock{mutex};
+                if (!thread.joinable() || stopped) {
+                    stale_thread = std::move(thread);
+                }
+            }
+            if (stale_thread.joinable()) {
+                stale_thread.request_stop();
+                stale_thread.join();
+            }
+
+            std::scoped_lock state_lock{mutex};
+            if (ServerStopping()) {
+                error = "the MCP server is stopping";
+            } else if (!system.IsPoweredOn() || system.IsShuttingDown() ||
+                       system.GetEmulationStopToken().stop_requested()) {
+                error = "no game is running";
+            } else if (watches.size() >= kMaxWatches) {
+                error = fmt::format("at most {} watches", kMaxWatches);
+            } else {
+                id = next_id++;
+                watches.push_back({id, address, type, std::move(label)});
+                if (!thread.joinable()) {
+                    stopped = false;
+                    thread = std::jthread([this, &system, timeline](std::stop_token stop) {
+                        Run(stop, system, timeline);
+                    });
+                }
+            }
+        }
+        if (id == 0 && need_cb_refresh) {
+            emulation_stop_cb.reset();
         }
         return id;
     }
@@ -517,12 +560,33 @@ public:
 
     /// Server shutdown: drops the watches and ends the sampling thread.
     void Shutdown() {
+        std::scoped_lock cb_lock{cb_mutex};
+        StopWorker();
+        emulation_stop_cb.reset();
+    }
+
+    /// Stops and joins the sampling thread if it is still running.
+    ~WatchSampler() {
+        StopWorker();
+        emulation_stop_cb.reset();
+    }
+
+private:
+    struct EmulationStopHandler {
+        WatchSampler* self;
+        void operator()() const {
+            self->StopWorker();
+        }
+    };
+
+    void StopWorker() {
+        std::scoped_lock join_lock{join_mutex};
         std::jthread finished;
         {
-            std::scoped_lock lock{mutex};
+            std::scoped_lock state_lock{mutex};
             watches.clear();
             finished = std::move(thread);
-            stopped = false;
+            stopped = true;
         }
         if (finished.joinable()) {
             finished.request_stop();
@@ -530,15 +594,6 @@ public:
         }
     }
 
-    /// Stops and joins the sampling thread if it is still running.
-    ~WatchSampler() {
-        if (thread.joinable()) {
-            thread.request_stop();
-            thread.join();
-        }
-    }
-
-private:
     /// Sampling thread body: polls every 2 ms for a new presented frame, then reads each watch
     /// under the lock and posts changes. Unreadable addresses are skipped. Clears the watches and
     /// exits (setting `stopped`) when none are left or the system powers off.
@@ -552,7 +607,8 @@ private:
             }
             last_frame = frame;
             std::scoped_lock lock{mutex};
-            if (watches.empty() || !system.IsPoweredOn()) {
+            if (watches.empty() || !system.IsPoweredOn() || system.IsShuttingDown() ||
+                system.ApplicationProcess() == nullptr) {
                 watches.clear();
                 stopped = true;
                 return;
@@ -583,11 +639,14 @@ private:
         }
     }
 
+    std::mutex cb_mutex;
+    std::mutex join_mutex;
     std::mutex mutex;
     std::vector<Watch> watches;
     u32 next_id = 1;
     bool stopped = true;
     std::jthread thread;
+    std::optional<std::stop_callback<EmulationStopHandler>> emulation_stop_cb;
 };
 
 /// watch_add: adds a watch on a mapped address (at most 256) and returns its id.

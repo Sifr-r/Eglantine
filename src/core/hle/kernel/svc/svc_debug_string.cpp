@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <condition_variable>
 #include <mutex>
 #include <optional>
@@ -11,8 +12,10 @@
 #include <thread>
 
 #include "core/core.h"
+#include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/svc.h"
+#include "core/hle/kernel/svc_results.h"
 #include "core/memory.h"
 
 namespace Kernel::Svc {
@@ -20,9 +23,19 @@ namespace Kernel::Svc {
 /// Used to output a message on a debug hardware unit - does nothing on a retail unit
 Result OutputDebugString(Core::System& system, u64 address, u64 len) {
     R_SUCCEED_IF(len == 0);
-    std::string msg_buffer(len, 0);
-    GetCurrentMemory(system.Kernel()).ReadBlock(address, msg_buffer.data(), len);
-    LOG_INFO(Debug_Emulated, "{}", msg_buffer);
+    R_UNLESS(address < address + len, ResultInvalidCurrentMemory);
+    R_UNLESS(GetCurrentProcess(system.Kernel()).GetPageTable().Contains(address, len),
+             ResultInvalidCurrentMemory);
+
+    constexpr u64 MaxDebugStringSize = 64 * 1024;
+    const std::size_t read_len = static_cast<std::size_t>((std::min)(len, MaxDebugStringSize));
+    std::string msg_buffer(read_len, 0);
+    GetCurrentMemory(system.Kernel()).ReadBlock(address, msg_buffer.data(), read_len);
+    if (len > MaxDebugStringSize) {
+        LOG_INFO(Debug_Emulated, "{}... [truncated {} bytes]", msg_buffer, len - read_len);
+    } else {
+        LOG_INFO(Debug_Emulated, "{}", msg_buffer);
+    }
     R_SUCCEED();
 }
 

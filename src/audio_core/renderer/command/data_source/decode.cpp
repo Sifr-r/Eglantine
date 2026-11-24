@@ -4,8 +4,10 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
-#include <vector>
+#include <cmath>
+#include <limits>
 
 #include "audio_core/renderer/command/data_source/decode.h"
 #include "audio_core/renderer/command/resample/resample.h"
@@ -34,27 +36,42 @@ static u32 DecodePcm(Core::Memory::Memory& memory, std::span<s16> out_buffer, co
         return 0;
     }
 
-    if (req.start_offset >= req.end_offset) {
+    if (req.start_offset >= req.end_offset || req.offset >= req.end_offset - req.start_offset) {
         return 0;
     }
 
-    auto samples_to_decode{
-        (std::min)(req.samples_to_read, req.end_offset - req.start_offset - req.offset)};
-    u32 channel_count{static_cast<u32>(req.channel_count)};
+    const u32 samples_to_decode = std::min({req.samples_to_read,
+                                          req.end_offset - req.start_offset - req.offset,
+                                          static_cast<u32>(out_buffer.size())});
+    if (samples_to_decode == 0) {
+        return 0;
+    }
+    const u32 channel_count = static_cast<u32>(req.channel_count);
+    const u64 frame_size = channel_count * sizeof(T);
+    const u64 start_byte = (u64{req.start_offset} + req.offset) * frame_size;
+    const u64 end_byte = start_byte + samples_to_decode * frame_size;
+    if (end_byte > req.buffer_size ||
+        req.buffer > (std::numeric_limits<CpuAddr>::max)() - end_byte) {
+        return 0;
+    }
+    const VAddr source{req.buffer + start_byte};
+    const auto float_to_pcm = [](f32 sample) -> s16 {
+        if (std::isnan(sample)) {
+            return 0;
+        }
+        return static_cast<s16>(std::clamp(sample * max, static_cast<f32>(min),
+                                           static_cast<f32>(max)));
+    };
 
     switch (req.channel_count) {
     default: {
-        const VAddr source{req.buffer +
-                           (((req.start_offset + req.offset) * channel_count) * sizeof(T))};
-        const u64 size{channel_count * samples_to_decode};
+        const u64 size{u64{channel_count} * samples_to_decode};
 
         Core::Memory::CpuGuestMemory<T, Core::Memory::GuestMemoryFlags::UnsafeRead> samples(
             memory, source, size);
         if constexpr (std::is_floating_point_v<T>) {
             for (u32 i = 0; i < samples_to_decode; i++) {
-                auto sample{static_cast<s32>(samples[i * channel_count + req.target_channel] *
-                                             (std::numeric_limits<s16>::max)())};
-                out_buffer[i] = static_cast<s16>(std::clamp(sample, min, max));
+                out_buffer[i] = float_to_pcm(samples[i * channel_count + req.target_channel]);
             }
         } else {
             for (u32 i = 0; i < samples_to_decode; i++) {
@@ -70,15 +87,12 @@ static u32 DecodePcm(Core::Memory::Memory& memory, std::span<s16> out_buffer, co
             return 0;
         }
 
-        const VAddr source{req.buffer + ((req.start_offset + req.offset) * sizeof(T))};
         Core::Memory::CpuGuestMemory<T, Core::Memory::GuestMemoryFlags::UnsafeRead> samples(
             memory, source, samples_to_decode);
 
         if constexpr (std::is_floating_point_v<T>) {
             for (u32 i = 0; i < samples_to_decode; i++) {
-                auto sample{static_cast<s32>(samples[i * channel_count + req.target_channel] *
-                                             (std::numeric_limits<s16>::max)())};
-                out_buffer[i] = static_cast<s16>(std::clamp(sample, min, max));
+                out_buffer[i] = float_to_pcm(samples[i]);
             }
         } else {
             std::memcpy(out_buffer.data(), samples.data(), samples_to_decode * sizeof(s16));
@@ -102,36 +116,35 @@ static u32 DecodeAdpcm(Core::Memory::Memory& memory, std::span<s16> out_buffer, 
         return 0;
     }
 
-    if (req.end_offset < req.start_offset) {
+    if (req.end_offset <= req.start_offset || req.offset >= req.end_offset - req.start_offset) {
         return 0;
     }
 
-    auto end{(req.end_offset % SamplesPerFrame) + NibblesPerFrame * (req.end_offset / SamplesPerFrame)};
-    if (req.end_offset % SamplesPerFrame) {
-        end += 3;
-    } else {
-        end += 1;
-    }
-
-    if (req.buffer_size < end / 2) {
-        return 0;
-    }
-
-    auto start_pos{req.start_offset + req.offset};
-    auto samples_to_process{(std::min)(req.end_offset - start_pos, req.samples_to_read)};
+    const u32 start_pos = req.start_offset + req.offset;
+    const u32 samples_to_process = std::min({req.end_offset - start_pos, req.samples_to_read,
+                                           static_cast<u32>(out_buffer.size())});
     if (samples_to_process == 0) {
         return 0;
     }
 
     auto samples_to_read = samples_to_process;
     auto samples_remaining_in_frame = start_pos % SamplesPerFrame;
-    auto position_in_frame = (start_pos / SamplesPerFrame) * NibblesPerFrame + samples_remaining_in_frame;
+    u64 position_in_frame = u64{start_pos / SamplesPerFrame} * NibblesPerFrame +
+                            samples_remaining_in_frame;
     if (samples_remaining_in_frame) {
         position_in_frame += 2;
     }
 
-    const auto size{(std::max)((samples_to_process / 8U) * SamplesPerFrame, 8U)};
-    Core::Memory::CpuGuestMemory<u8, Core::Memory::GuestMemoryFlags::UnsafeRead> wavebuffer(memory, req.buffer + position_in_frame / 2, size);
+    const u32 last_sample = start_pos + samples_to_process - 1;
+    const u64 end_byte = u64{last_sample / SamplesPerFrame} * (NibblesPerFrame / 2) +
+                         (last_sample % SamplesPerFrame) / 2 + 2;
+    if (end_byte > req.buffer_size ||
+        req.buffer > (std::numeric_limits<CpuAddr>::max)() - end_byte) {
+        return 0;
+    }
+    const u64 start_byte = position_in_frame / 2;
+    Core::Memory::CpuGuestMemory<u8, Core::Memory::GuestMemoryFlags::UnsafeRead> wavebuffer(
+        memory, req.buffer + start_byte, end_byte - start_byte);
 
     auto context = req.adpcm_context;
     auto header = context->header;
@@ -152,9 +165,9 @@ static u32 DecodeAdpcm(Core::Memory::Memory& memory, std::span<s16> out_buffer, 
     };
     auto const decode_sample = [&](const s32 code) -> s16 {
         const auto xn = code * (1 << scale);
-        const auto prediction = coeff0 * yn0 + coeff1 * yn1;
-        const auto sample = ((xn << 11) + 0x400 + prediction) >> 11;
-        const auto saturated = std::clamp<s32>(sample, -0x8000, 0x7FFF);
+        const s64 prediction = s64{coeff0} * yn0 + s64{coeff1} * yn1;
+        const s64 sample = (s64{xn} * 0x800 + 0x400 + prediction) >> 11;
+        const auto saturated = std::clamp<s64>(sample, -0x8000, 0x7FFF);
         yn1 = yn0;
         return yn0 = s16(saturated);
     };
@@ -221,179 +234,196 @@ void DecodeFromWaveBuffers(Core::Memory::Memory& memory, const DecodeFromWaveBuf
         index = (index + 1) % MaxWaveBuffers;
         consumed++;
     };
-    auto& voice_state{*args.voice_state};
-    auto remaining_sample_count{args.sample_count};
-    auto fraction{voice_state.fraction};
-
-    const auto sample_rate_ratio{Common::FixedPoint<49, 15>(
-        (f32)args.source_sample_rate / (f32)args.target_sample_rate * (f32)args.pitch)};
-    const auto size_required{fraction + remaining_sample_count * sample_rate_ratio};
-
-    if (size_required < 0) {
+    const u32 samples_to_write = args.sample_count;
+    if (samples_to_write == 0) {
+        return;
+    }
+    constexpr std::array<u32, 3> history_sizes{4, 8, 4};
+    const size_t quality = static_cast<size_t>(args.src_quality);
+    if (samples_to_write > args.output.size() || quality >= history_sizes.size() ||
+        args.target_sample_rate == 0 || args.channel_count <= 0 ||
+        args.channel_count > static_cast<s8>(MaxChannels) || args.channel < 0 ||
+        args.channel >= args.channel_count || args.wave_buffers.size() != MaxWaveBuffers) {
+        LOG_ERROR(Service_Audio, "Invalid waveform decode parameters");
         return;
     }
 
-    // 0 -> 4, 1 -> 8, 2 -> 4
-    auto pitch = u32((0x040804ul >> (u32(args.src_quality) * 8)) & 0xfful);
-    if (u32(pitch + size_required.to_int_floor()) > TempBufferSize) {
+    const f32 ratio = static_cast<f32>(args.source_sample_rate) /
+                      static_cast<f32>(args.target_sample_rate) * args.pitch;
+    if (!std::isfinite(ratio) || ratio <= 0.0f || ratio > TempBufferSize) {
+        LOG_ERROR(Service_Audio, "Invalid waveform sample rate ratio {}", ratio);
+        return;
+    }
+    using SamplePosition = Common::FixedPoint<49, 15>;
+    const SamplePosition sample_rate_ratio{ratio};
+    auto& voice_state = *args.voice_state;
+    auto fraction = voice_state.fraction;
+    if (sample_rate_ratio == 0 || fraction < 0 || fraction >= 1) {
+        LOG_ERROR(Service_Audio, "Invalid waveform sample rate ratio or sample position");
+        return;
+    }
+    const u32 history_size = history_sizes[quality];
+    const auto size_required = SamplePosition::from_base(
+        fraction.to_raw() + samples_to_write * sample_rate_ratio.to_raw());
+    if (size_required >= TempBufferSize - history_size + 1) {
+        LOG_ERROR(Service_Audio, "Waveform decode exceeds the temporary sample buffer");
+        return;
+    }
+    const u32 samples_to_read = size_required.to_uint_floor();
+    if (args.IsVoicePitchAndSrcSkippedSupported && samples_to_read > args.output.size()) {
+        LOG_ERROR(Service_Audio, "Waveform decode exceeds the output sample buffer");
         return;
     }
 
-    auto max_remaining_sample_count{
-        ((Common::FixedPoint<17, 15>(TempBufferSize) - fraction) / sample_rate_ratio)
-            .to_uint_floor()};
-    max_remaining_sample_count = (std::min)(max_remaining_sample_count, remaining_sample_count);
+    std::array<s16, 16> coefficients{};
+    if (args.sample_format == SampleFormat::Adpcm &&
+        (args.data_size > sizeof(coefficients) ||
+         (args.data_size != 0 &&
+          !memory.ReadBlockUnsafe(args.data_address, coefficients.data(), args.data_size)))) {
+        LOG_ERROR(Service_Audio, "Invalid ADPCM coefficient data");
+        return;
+    }
 
     auto wavebuffers_consumed{voice_state.wave_buffers_consumed};
     auto wavebuffer_index{voice_state.wave_buffer_index};
     auto played_sample_count{voice_state.played_sample_count};
 
-    bool is_buffer_starved{false};
     u32 offset{voice_state.offset};
 
-    auto output_buffer = args.output;
+    const auto output_buffer = args.output;
     std::array<s16, TempBufferSize> temp_buffer{};
 
-    while (remaining_sample_count > 0) {
-        const auto samples_to_write{(std::min)(remaining_sample_count, max_remaining_sample_count)};
-        const auto samples_to_read{
-            (fraction + samples_to_write * sample_rate_ratio).to_uint_floor()};
+    u32 temp_buffer_pos{0};
 
-        u32 temp_buffer_pos{0};
+    if (!args.IsVoicePitchAndSrcSkippedSupported) {
+        for (u32 i = 0; i < history_size; i++) {
+            temp_buffer[i] = voice_state.sample_history[i];
+        }
+        temp_buffer_pos = history_size;
+    }
 
-        if (!args.IsVoicePitchAndSrcSkippedSupported) {
-            for (u32 i = 0; i < pitch; i++) {
-                temp_buffer[i] = voice_state.sample_history[i];
-            }
-            temp_buffer_pos = pitch;
+    u32 samples_read{0};
+    while (samples_read < samples_to_read) {
+        if (wavebuffer_index >= MaxWaveBuffers) {
+            LOG_ERROR(Service_Audio, "Invalid wavebuffer index! {}", wavebuffer_index);
+            wavebuffer_index = 0;
+            wavebuffers_consumed = MaxWaveBuffers;
+            voice_state.wave_buffer_valid.fill(false);
         }
 
-        u32 samples_read{0};
-        while (samples_read < samples_to_read) {
-            if (wavebuffer_index >= MaxWaveBuffers) {
-                LOG_ERROR(Service_Audio, "Invalid wavebuffer index! {}", wavebuffer_index);
-                wavebuffer_index = 0;
-                wavebuffers_consumed = MaxWaveBuffers;
-                voice_state.wave_buffer_valid.fill(false);
-            }
-
-            if (!voice_state.wave_buffer_valid[wavebuffer_index]) {
-                is_buffer_starved = true;
-                break;
-            }
-
-            auto& wavebuffer = args.wave_buffers[wavebuffer_index];
-            if (offset == 0 && args.sample_format == SampleFormat::Adpcm && wavebuffer.context != 0) {
-                memory.ReadBlockUnsafe(wavebuffer.context, &voice_state.adpcm_context, wavebuffer.context_size);
-            }
-
-            auto start_offset{wavebuffer.start_offset};
-            auto end_offset{wavebuffer.end_offset};
-
-            if (wavebuffer.loop && voice_state.loop_count > 0 &&
-                wavebuffer.loop_start_offset <= wavebuffer.loop_end_offset) {
-                start_offset = wavebuffer.loop_start_offset;
-                end_offset = wavebuffer.loop_end_offset;
-            }
-
-            DecodeArg decode_arg{
-                .buffer{wavebuffer.buffer},
-                .buffer_size{wavebuffer.buffer_size},
-                .start_offset{start_offset},
-                .end_offset{end_offset},
-                .channel_count{args.channel_count},
-                .coefficients{},
-                .adpcm_context{nullptr},
-                .target_channel{args.channel},
-                .offset{offset},
-                .samples_to_read{samples_to_read - samples_read},
-            };
-
-            s32 samples_decoded{0};
-
-            switch (args.sample_format) {
-            case SampleFormat::PcmInt16:
-                samples_decoded = DecodePcm<s16>(
-                    memory, {&temp_buffer[temp_buffer_pos], TempBufferSize - temp_buffer_pos},
-                    decode_arg);
-                break;
-
-            case SampleFormat::PcmFloat:
-                samples_decoded = DecodePcm<f32>(
-                    memory, {&temp_buffer[temp_buffer_pos], TempBufferSize - temp_buffer_pos},
-                    decode_arg);
-                break;
-
-            case SampleFormat::Adpcm: {
-                decode_arg.adpcm_context = &voice_state.adpcm_context;
-                memory.ReadBlockUnsafe(args.data_address, &decode_arg.coefficients, args.data_size);
-                samples_decoded = DecodeAdpcm( memory, {&temp_buffer[temp_buffer_pos], TempBufferSize - temp_buffer_pos}, decode_arg);
-            } break;
-
-            default:
-                LOG_ERROR(Service_Audio, "Invalid sample format to decode {}",
-                          static_cast<u32>(args.sample_format));
-                samples_decoded = 0;
-                break;
-            }
-
-            played_sample_count += samples_decoded;
-            samples_read += samples_decoded;
-            temp_buffer_pos += samples_decoded;
-            offset += samples_decoded;
-
-            if (samples_decoded && offset < end_offset - start_offset) {
-                continue;
-            }
-
-            offset = 0;
-            if (wavebuffer.loop) {
-                voice_state.loop_count++;
-                if (wavebuffer.loop_count >= 0 &&
-                    (voice_state.loop_count > wavebuffer.loop_count || samples_decoded == 0)) {
-                    EndWaveBuffer(voice_state, wavebuffer, wavebuffer_index, played_sample_count,
-                                  wavebuffers_consumed);
-                }
-
-                if (samples_decoded == 0) {
-                    is_buffer_starved = true;
-                    break;
-                }
-
-                if (args.IsVoicePlayedSampleCountResetAtLoopPointSupported) {
-                    played_sample_count = 0;
-                }
-            } else {
-                EndWaveBuffer(voice_state, wavebuffer, wavebuffer_index, played_sample_count,
-                              wavebuffers_consumed);
-            }
-        }
-
-        if (args.IsVoicePitchAndSrcSkippedSupported) {
-            if (samples_read > output_buffer.size()) {
-                LOG_ERROR(Service_Audio, "Attempting to write past the end of output buffer!");
-            }
-            for (u32 i = 0; i < samples_read; i++) {
-                output_buffer[i] = temp_buffer[i];
-            }
-        } else {
-            std::memset(&temp_buffer[temp_buffer_pos], 0,
-                        (samples_to_read - samples_read) * sizeof(s16));
-
-            Resample(output_buffer, temp_buffer, sample_rate_ratio, fraction, samples_to_write,
-                     args.src_quality);
-
-            std::memcpy(voice_state.sample_history.data(), &temp_buffer[samples_to_read],
-                        pitch * sizeof(s16));
-        }
-
-        remaining_sample_count -= samples_to_write;
-        if (remaining_sample_count != 0 && is_buffer_starved) {
-            LOG_ERROR(Service_Audio, "Samples remaining but buffer is starving??");
+        if (!voice_state.wave_buffer_valid[wavebuffer_index]) {
             break;
         }
 
-        output_buffer = output_buffer.subspan(samples_to_write);
+        auto& wavebuffer = args.wave_buffers[wavebuffer_index];
+        if (offset == 0 && args.sample_format == SampleFormat::Adpcm &&
+            wavebuffer.context != 0 && wavebuffer.context_size != 0) {
+            auto context = voice_state.adpcm_context;
+            if (wavebuffer.context_size > sizeof(context) ||
+                !memory.ReadBlockUnsafe(wavebuffer.context, &context, wavebuffer.context_size)) {
+                LOG_ERROR(Service_Audio, "Invalid ADPCM wave buffer context");
+                EndWaveBuffer(voice_state, wavebuffer, wavebuffer_index, played_sample_count,
+                              wavebuffers_consumed);
+                continue;
+            }
+            voice_state.adpcm_context = context;
+        }
+
+        auto start_offset{wavebuffer.start_offset};
+        auto end_offset{wavebuffer.end_offset};
+
+        if (wavebuffer.loop && voice_state.loop_count > 0 &&
+            wavebuffer.loop_start_offset <= wavebuffer.loop_end_offset) {
+            start_offset = wavebuffer.loop_start_offset;
+            end_offset = wavebuffer.loop_end_offset;
+        }
+
+        DecodeArg decode_arg{
+            .buffer{wavebuffer.buffer},
+            .buffer_size{wavebuffer.buffer_size},
+            .start_offset{start_offset},
+            .end_offset{end_offset},
+            .channel_count{args.channel_count},
+            .coefficients{coefficients},
+            .adpcm_context{nullptr},
+            .target_channel{args.channel},
+            .offset{offset},
+            .samples_to_read{samples_to_read - samples_read},
+        };
+
+        u32 samples_decoded{0};
+
+        switch (args.sample_format) {
+        case SampleFormat::PcmInt16:
+            samples_decoded = DecodePcm<s16>(
+                memory, {temp_buffer.data() + temp_buffer_pos, TempBufferSize - temp_buffer_pos},
+                decode_arg);
+            break;
+
+        case SampleFormat::PcmFloat:
+            samples_decoded = DecodePcm<f32>(
+                memory, {temp_buffer.data() + temp_buffer_pos, TempBufferSize - temp_buffer_pos},
+                decode_arg);
+            break;
+
+        case SampleFormat::Adpcm: {
+            decode_arg.adpcm_context = &voice_state.adpcm_context;
+            samples_decoded = DecodeAdpcm(
+                memory, {temp_buffer.data() + temp_buffer_pos, TempBufferSize - temp_buffer_pos},
+                decode_arg);
+        } break;
+
+        default:
+            LOG_ERROR(Service_Audio, "Invalid sample format to decode {}",
+                      static_cast<u32>(args.sample_format));
+            samples_decoded = 0;
+            break;
+        }
+
+        played_sample_count += samples_decoded;
+        samples_read += samples_decoded;
+        temp_buffer_pos += samples_decoded;
+        offset += samples_decoded;
+
+        if (samples_decoded && offset < end_offset - start_offset) {
+            continue;
+        }
+
+        offset = 0;
+        if (wavebuffer.loop) {
+            voice_state.loop_count++;
+            if (wavebuffer.loop_count >= 0 &&
+                (voice_state.loop_count > wavebuffer.loop_count || samples_decoded == 0)) {
+                EndWaveBuffer(voice_state, wavebuffer, wavebuffer_index, played_sample_count,
+                              wavebuffers_consumed);
+            }
+
+            if (samples_decoded == 0) {
+                break;
+            }
+
+            if (args.IsVoicePlayedSampleCountResetAtLoopPointSupported) {
+                played_sample_count = 0;
+            }
+        } else {
+            EndWaveBuffer(voice_state, wavebuffer, wavebuffer_index, played_sample_count,
+                          wavebuffers_consumed);
+        }
+    }
+
+    if (args.IsVoicePitchAndSrcSkippedSupported) {
+        for (u32 i = 0; i < samples_read; i++) {
+            output_buffer[i] = temp_buffer[i];
+        }
+    } else {
+        std::memset(temp_buffer.data() + temp_buffer_pos, 0,
+                    (samples_to_read - samples_read) * sizeof(s16));
+
+        Resample(output_buffer, temp_buffer, sample_rate_ratio, fraction, samples_to_write,
+                 args.src_quality);
+
+        std::memcpy(voice_state.sample_history.data(), temp_buffer.data() + samples_to_read,
+                    history_size * sizeof(s16));
     }
 
     voice_state.wave_buffers_consumed = wavebuffers_consumed;

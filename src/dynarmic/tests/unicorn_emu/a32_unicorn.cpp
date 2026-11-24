@@ -274,7 +274,7 @@ void A32Unicorn<TestEnvironment>::InterruptHook(uc_engine* /*uc*/, u32 int_numbe
 }
 
 template<class TestEnvironment>
-bool A32Unicorn<TestEnvironment>::UnmappedMemoryHook(uc_engine* uc, uc_mem_type /*type*/, u32 start_address, int size, u64 /*value*/, void* user_data) {
+bool A32Unicorn<TestEnvironment>::UnmappedMemoryHook(uc_engine* uc, uc_mem_type /*type*/, u64 start_address, int size, s64 /*value*/, void* user_data) {
     auto* this_ = static_cast<A32Unicorn*>(user_data);
 
     const auto generate_page = [&](u32 base_address) {
@@ -306,8 +306,8 @@ bool A32Unicorn<TestEnvironment>::UnmappedMemoryHook(uc_engine* uc, uc_mem_type 
         return addr >= start || addr <= end;      // ttttt]ffffff[ttttt
     };
 
-    const u32 start_address_page = start_address & ~u32(0xFFF);
-    const u32 end_address = start_address + size - 1;
+    const u32 start_address_page = static_cast<u32>(start_address) & ~u32(0xFFF);
+    const u32 end_address = static_cast<u32>(start_address) + static_cast<u32>(size) - 1;
 
     u32 current_address = start_address_page;
     do {
@@ -319,9 +319,9 @@ bool A32Unicorn<TestEnvironment>::UnmappedMemoryHook(uc_engine* uc, uc_mem_type 
 }
 
 template<class TestEnvironment>
-bool A32Unicorn<TestEnvironment>::MemoryWriteHook(uc_engine* /*uc*/, uc_mem_type /*type*/, u32 start_address, int size, u64 value, void* user_data) {
+bool A32Unicorn<TestEnvironment>::MemoryWriteHook(uc_engine* /*uc*/, uc_mem_type /*type*/, u64 start_address, int size, s64 value, void* user_data) {
     auto* this_ = static_cast<A32Unicorn*>(user_data);
-    this_->testenv.MemoryWrite(start_address, value, size);
+    this_->testenv.MemoryWrite(static_cast<u32>(start_address), static_cast<u64>(value), static_cast<size_t>(size));
     return true;
 }
 

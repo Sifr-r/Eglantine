@@ -4,6 +4,9 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <cstring>
+
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_client_port.h"
@@ -13,19 +16,30 @@
 #include "core/hle/kernel/k_port.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
+#include "core/memory.h"
 
 namespace Kernel::Svc {
 
+namespace {
+
+bool CopyPortNameFromUser(Core::Memory::Memory& memory, u64 user_name,
+                          std::array<char, KObjectName::NameLengthMax>& out_name) {
+    const std::string string_name = memory.ReadCString(user_name, KObjectName::NameLengthMax);
+    if (string_name.size() >= KObjectName::NameLengthMax) {
+        return false;
+    }
+    out_name.fill('\0');
+    std::memcpy(out_name.data(), string_name.data(), string_name.size());
+    return true;
+}
+
+} // namespace
+
 Result ConnectToNamedPort(Core::System& system, Handle* out, u64 user_name) {
-    // Copy the provided name from user memory to kernel memory.
-    auto string_name =
-        GetCurrentMemory(system.Kernel()).ReadCString(user_name, KObjectName::NameLengthMax);
-
+    // Copy the provided name from user memory to kernel memory and validate its length.
     std::array<char, KObjectName::NameLengthMax> name{};
-    std::strncpy(name.data(), string_name.c_str(), KObjectName::NameLengthMax - 1);
-
-    // Validate that the name is valid.
-    R_UNLESS(name[sizeof(name) - 1] == '\x00', ResultOutOfRange);
+    R_UNLESS(CopyPortNameFromUser(GetCurrentMemory(system.Kernel()), user_name, name),
+             ResultOutOfRange);
 
     // Get the current handle table.
     auto& handle_table = GetCurrentProcess(system.Kernel()).GetHandleTable();
@@ -123,17 +137,12 @@ Result ConnectToPort(Core::System& system, Handle* out, Handle port) {
 }
 
 Result ManageNamedPort(Core::System& system, Handle* out_server_handle, uint64_t user_name, int32_t max_sessions) {
-    // Copy the provided name from user memory to kernel memory.
-    auto string_name =
-        GetCurrentMemory(system.Kernel()).ReadCString(user_name, KObjectName::NameLengthMax);
-
-    // Copy the provided name from user memory to kernel memory.
-    std::array<char, KObjectName::NameLengthMax> name{};
-    std::strncpy(name.data(), string_name.c_str(), KObjectName::NameLengthMax - 1);
-
     // Validate that sessions and name are valid.
     R_UNLESS(max_sessions >= 0, ResultOutOfRange);
-    R_UNLESS(name[sizeof(name) - 1] == '\x00', ResultOutOfRange);
+
+    std::array<char, KObjectName::NameLengthMax> name{};
+    R_UNLESS(CopyPortNameFromUser(GetCurrentMemory(system.Kernel()), user_name, name),
+             ResultOutOfRange);
 
     if (max_sessions > 0) {
         // Get the current handle table.

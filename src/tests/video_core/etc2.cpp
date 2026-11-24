@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <span>
 #include <vector>
 
@@ -635,5 +637,45 @@ TEST_CASE("ETC2 rejects truncated input", "[video_core][textures][etc2]") {
 
     for (const u8 byte : output) {
         REQUIRE(byte == 0xcd);
+    }
+}
+
+TEST_CASE("ETC2 RGBA decoding throughput", "[.etc2_bench]") {
+    constexpr size_t MiB = 1024 * 1024;
+    constexpr u8 FirstAlpha = 64;
+    constexpr u8 SecondAlpha = 192;
+    const auto first = MakePairBlock(MakeAlphaOrEacBlock(FirstAlpha, 1, 13, 4), TModeBlock());
+    const auto second = MakePairBlock(MakeAlphaOrEacBlock(SecondAlpha, 1, 13, 4), 0);
+
+    for (const u32 side : {256U, 1024U}) {
+        const size_t pixels = static_cast<size_t>(side) * side;
+        std::vector<u8> input(pixels / BlockPixels * first.size());
+        for (size_t offset = 0; offset < input.size(); offset += first.size() + second.size()) {
+            std::copy(first.begin(), first.end(), input.begin() + offset);
+            std::copy(second.begin(), second.end(), input.begin() + offset + first.size());
+        }
+        std::vector<u8> output(pixels * BytesPerTexel(Format::RGBA));
+        const auto decode = [&] {
+            Tegra::Texture::ETC2::Decompress(input, Format::RGBA, side, side, 1, output);
+        };
+        decode();
+
+        const size_t iterations = 64 * MiB / output.size();
+        const auto start = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < iterations; ++i) {
+            decode();
+        }
+        const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
+        const double mib_per_second = static_cast<double>(output.size() * iterations) / MiB /
+                                      elapsed.count();
+        std::printf("etc2_bench backend=%s side=%u seconds=%.6f MiB_s=%.2f\n",
+                    Tegra::Texture::ETC2::IsIspcEnabled() ? "ispc" : "cpp", side,
+                    elapsed.count(), mib_per_second);
+
+        const std::array<u8, 4> first_texel{221, 17, 136, FirstAlpha};
+        const std::array<u8, 4> second_texel{2, 2, 2, SecondAlpha};
+        REQUIRE(std::equal(first_texel.begin(), first_texel.end(), output.begin()));
+        REQUIRE(std::equal(second_texel.begin(), second_texel.end(), output.begin() + 4 * 4));
+        REQUIRE(output.back() == SecondAlpha);
     }
 }

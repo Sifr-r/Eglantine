@@ -26,6 +26,7 @@
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
+#include "video_core/renderer_vulkan/vk_query_copy.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -306,6 +307,9 @@ public:
             if (True(query->flags & VideoCommon::QueryFlagBits::IsInvalidated)) {
                 continue;
             }
+            if (query->size_slots == 0) {
+                continue;
+            }
             if (accumulation_since_last_sync || query->size_slots > 1) {
                 if (!has_multi_queries) {
                     has_multi_queries = true;
@@ -314,13 +318,18 @@ public:
                 sync_value_slot = 1;
             }
             query->flags |= VideoCommon::QueryFlagBits::IsHostSynced;
-            auto loc_data = offsets[query->start_bank_id];
+            size_t end_bank_id = query->start_bank_id;
+            size_t end_slot = query->start_slot;
+            ApplyBankOp(query, [&](SamplesQueryBank* bank, size_t start, size_t amount) {
+                end_bank_id = bank->GetIndex();
+                end_slot = start + amount - 1;
+            });
+            const auto loc_data = offsets[end_bank_id];
             sync_values_stash[sync_value_slot].emplace_back(HostSyncValues{
                 .address = query->guest_address,
                 .size = SamplesQueryBank::QUERY_SIZE,
                 .offset =
-                    loc_data.second + (query->start_slot - loc_data.first + query->size_slots - 1) *
-                                          SamplesQueryBank::QUERY_SIZE,
+                    loc_data.second + (end_slot - loc_data.first) * SamplesQueryBank::QUERY_SIZE,
             });
         }
 
@@ -439,23 +448,45 @@ private:
     TextureCache& texture_cache;
     template <bool is_ordered, typename Func>
     void ApplyBanksWideOp(std::vector<size_t>& queries, Func&& func) {
-        std::conditional_t<is_ordered, std::map<size_t, std::pair<size_t, size_t>>,
-                           ::Common::unordered_map<size_t, std::pair<size_t, size_t>>>
-            indexer;
-        for (auto q : queries) {
-            auto* query = GetQuery(q);
-            ApplyBankOp(query, [&indexer](SamplesQueryBank* bank, size_t start, size_t amount) {
-                auto id_ = bank->GetIndex();
-                auto pair = indexer.try_emplace(id_, (std::numeric_limits<size_t>::max)(),
-                                                (std::numeric_limits<size_t>::min)());
-                auto& current_pair = pair.first->second;
-                current_pair.first = (std::min)(current_pair.first, start);
-                current_pair.second = (std::max)(current_pair.second, amount + start);
-            });
-        }
-        for (auto& cont : indexer) {
-            func(&bank_pool.GetBank(cont.first), cont.second.first,
-                 cont.second.second - cont.second.first);
+        if constexpr (is_ordered) {
+            std::vector<std::pair<size_t, std::pair<size_t, size_t>>> ordered;
+            ::Common::unordered_map<size_t, size_t> bank_positions;
+            for (auto q : queries) {
+                auto* query = GetQuery(q);
+                ApplyBankOp(query, [&](SamplesQueryBank* bank, size_t start, size_t amount) {
+                    const size_t bank_id = bank->GetIndex();
+                    const auto [it, inserted] =
+                        bank_positions.try_emplace(bank_id, ordered.size());
+                    if (inserted) {
+                        ordered.emplace_back(bank_id,
+                                             std::pair<size_t, size_t>{start, start + amount});
+                    } else {
+                        auto& range = ordered[it->second].second;
+                        range.first = (std::min)(range.first, start);
+                        range.second = (std::max)(range.second, start + amount);
+                    }
+                });
+            }
+            for (const auto& [bank_id, range] : ordered) {
+                func(&bank_pool.GetBank(bank_id), range.first, range.second - range.first);
+            }
+        } else {
+            ::Common::unordered_map<size_t, std::pair<size_t, size_t>> indexer;
+            for (auto q : queries) {
+                auto* query = GetQuery(q);
+                ApplyBankOp(query, [&indexer](SamplesQueryBank* bank, size_t start, size_t amount) {
+                    auto id_ = bank->GetIndex();
+                    auto pair = indexer.try_emplace(id_, (std::numeric_limits<size_t>::max)(),
+                                                    (std::numeric_limits<size_t>::min)());
+                    auto& current_pair = pair.first->second;
+                    current_pair.first = (std::min)(current_pair.first, start);
+                    current_pair.second = (std::max)(current_pair.second, amount + start);
+                });
+            }
+            for (auto& cont : indexer) {
+                func(&bank_pool.GetBank(cont.first), cont.second.first,
+                     cont.second.second - cont.second.first);
+            }
         }
     }
 
@@ -1696,11 +1727,17 @@ void QueryCacheRuntime::SyncValues(std::span<SyncValuesType> values, VkBuffer ba
         src_buffer = base_src_buffer;
     }
 
+    for (auto& copies : impl->copies_setup) {
+        copies = NonOverlappingQueryCopies(copies);
+    }
+
     impl->scheduler.RequestOutsideRenderPassOperationContext();
     impl->scheduler.Record([src_buffer, dst_buffers = std::move(impl->buffers_to_upload_to), vk_copies = std::move(impl->copies_setup)](vk::CommandBuffer cmdbuf) {
         size_t size = dst_buffers.size();
         for (size_t i = 0; i < size; i++) {
-            cmdbuf.CopyBuffer(src_buffer, dst_buffers[i].first, vk_copies[i]);
+            if (!vk_copies[i].empty()) {
+                cmdbuf.CopyBuffer(src_buffer, dst_buffers[i].first, vk_copies[i]);
+            }
         }
     });
 }

@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <QDialog>
 
 namespace InputCommon {
@@ -12,6 +15,7 @@ class InputSubsystem;
 } // namespace InputCommon
 
 namespace Core::HID {
+enum class ControllerTriggerType;
 class HIDCore;
 class EmulatedController;
 } // namespace Core::HID
@@ -29,6 +33,9 @@ public:
     ~ConfigureRingController() override;
 
     void ApplyConfiguration();
+
+signals:
+    void ControllerUpdateRequested(Core::HID::ControllerTriggerType type);
 
 private:
     void changeEvent(QEvent* event) override;
@@ -86,7 +93,7 @@ private:
     InputCommon::InputSubsystem* input_subsystem;
     Core::HID::EmulatedController* emulated_controller;
 
-    bool is_ring_enabled{};
+    std::atomic<bool> is_ring_enabled{false};
     bool is_controller_set{};
     int callback_key;
 

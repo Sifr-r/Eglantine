@@ -304,21 +304,28 @@ struct NcaFsHeader {
     }
 
     Result GetHashTargetOffset(s64* out) const {
+        R_UNLESS(out != nullptr, ResultNullptrArgument);
         switch (this->hash_type) {
         case HashType::HierarchicalIntegrityHash:
-        case HashType::HierarchicalIntegritySha3Hash:
-            *out = this->hash_data.integrity_meta_info.level_hash_info
-                       .info[this->hash_data.integrity_meta_info.level_hash_info.max_layers - 2]
-                       .offset;
+        case HashType::HierarchicalIntegritySha3Hash: {
+            const u32 max_layers = this->hash_data.integrity_meta_info.level_hash_info.max_layers;
+            R_UNLESS(static_cast<u32>(IntegrityMinLayerCount) <= max_layers &&
+                         max_layers <= static_cast<u32>(IntegrityMaxLayerCount),
+                     ResultInvalidNcaHierarchicalIntegrityVerificationLayerCount);
+            *out = this->hash_data.integrity_meta_info.level_hash_info.info[max_layers - 2].offset;
             R_SUCCEED();
+        }
         case HashType::HierarchicalSha256Hash:
-        case HashType::HierarchicalSha3256Hash:
+        case HashType::HierarchicalSha3256Hash: {
+            const s32 layer_count = this->hash_data.hierarchical_sha256_data.hash_layer_count;
+            R_UNLESS(1 <= layer_count &&
+                         layer_count <=
+                             static_cast<s32>(HashData::HierarchicalSha256Data::HashLayerCountMax),
+                     ResultInvalidHierarchicalSha256LayerCount);
             *out =
-                this->hash_data.hierarchical_sha256_data
-                    .hash_layer_region[this->hash_data.hierarchical_sha256_data.hash_layer_count -
-                                       1]
-                    .offset;
+                this->hash_data.hierarchical_sha256_data.hash_layer_region[layer_count - 1].offset;
             R_SUCCEED();
+        }
         default:
             R_THROW(ResultInvalidNcaFsHeader);
         }

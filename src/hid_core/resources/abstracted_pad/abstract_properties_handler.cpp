@@ -54,12 +54,12 @@ Result NpadAbstractPropertiesHandler::IncrementRefCounter() {
 
     const auto npad_index = NpadIdTypeToIndex(npad_id_type);
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
-        auto* data = applet_resource_holder->applet_resource->GetAruidData(aruid_index);
-        auto& internal_state =
-            data->shared_memory_format->npad.npad_entry[npad_index].internal_state;
-        if (!data->flag.is_assigned) {
+        auto* data = applet_resource_holder->applet_resource->GetAruidDataByIndex(aruid_index);
+        if (data == nullptr || !data->flag.is_assigned || data->shared_memory_format == nullptr) {
             continue;
         }
+        auto& internal_state =
+            data->shared_memory_format->npad.npad_entry[npad_index].internal_state;
         internal_state.fullkey_lifo.buffer_count = 0;
         internal_state.handheld_lifo.buffer_count = 0;
         internal_state.joy_dual_lifo.buffer_count = 0;
@@ -116,8 +116,9 @@ Result NpadAbstractPropertiesHandler::DecrementRefCounter() {
 Result NpadAbstractPropertiesHandler::ActivateNpadUnknown0x88(u64 aruid) {
     const auto npad_index = NpadIdTypeToIndex(npad_id_type);
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
-        auto* data = applet_resource_holder->applet_resource->GetAruidData(aruid_index);
-        if (!data->flag.is_assigned || data->aruid != aruid) {
+        auto* data = applet_resource_holder->applet_resource->GetAruidDataByIndex(aruid_index);
+        if (data == nullptr || !data->flag.is_assigned || data->shared_memory_format == nullptr ||
+            data->aruid != aruid) {
             continue;
         }
         UpdateDeviceProperties(aruid, data->shared_memory_format->npad.npad_entry[npad_index]);
@@ -141,8 +142,8 @@ void NpadAbstractPropertiesHandler::UpdateFooterAttributes() {
 void NpadAbstractPropertiesHandler::UpdateAllDeviceProperties() {
     const auto npad_index = NpadIdTypeToIndex(npad_id_type);
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
-        auto* data = applet_resource_holder->applet_resource->GetAruidData(aruid_index);
-        if (data == nullptr || !data->flag.is_assigned) {
+        auto* data = applet_resource_holder->applet_resource->GetAruidDataByIndex(aruid_index);
+        if (data == nullptr || !data->flag.is_assigned || data->shared_memory_format == nullptr) {
             continue;
         }
         auto& npad_entry = data->shared_memory_format->npad.npad_entry[npad_index];

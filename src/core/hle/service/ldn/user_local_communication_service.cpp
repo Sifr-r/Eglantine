@@ -69,12 +69,13 @@ IUserLocalCommunicationService::IUserLocalCommunicationService(Core::System& sys
 
 IUserLocalCommunicationService::~IUserLocalCommunicationService() {
     if (is_initialized) {
-        if (auto room_member = Network::GetRoomMember().lock()) {
-            room_member->Unbind(ldn_packet_received);
-        }
+        Finalize();
+    } else {
+        lan_discovery.Finalize();
     }
 
     service_context.CloseEvent(state_change_event);
+    state_change_event = nullptr;
 }
 
 Result IUserLocalCommunicationService::GetState(Out<State> out_state) {
@@ -177,6 +178,9 @@ Result IUserLocalCommunicationService::Scan(
              channel, scan_filter.flag, scan_filter.network_type);
 
     R_UNLESS(!out_network_info.empty(), ResultBadInput);
+    const bool has_ssid_filter =
+        (static_cast<u32>(scan_filter.flag) & static_cast<u32>(ScanFilterFlag::Ssid)) != 0;
+    R_UNLESS(!has_ssid_filter || scan_filter.ssid.length <= SsidLengthMax, ResultBadInput);
     R_RETURN(lan_discovery.Scan(out_network_info, *network_count, scan_filter));
 }
 
@@ -186,7 +190,10 @@ Result IUserLocalCommunicationService::ScanPrivate(
     LOG_INFO(Service_LDN, "called, channel={}, filter_scan_flag={}, filter_network_type={}",
              channel, scan_filter.flag, scan_filter.network_type);
 
-    R_UNLESS(out_network_info.empty(), ResultBadInput);
+    R_UNLESS(!out_network_info.empty(), ResultBadInput);
+    const bool has_ssid_filter =
+        (static_cast<u32>(scan_filter.flag) & static_cast<u32>(ScanFilterFlag::Ssid)) != 0;
+    R_UNLESS(!has_ssid_filter || scan_filter.ssid.length <= SsidLengthMax, ResultBadInput);
     R_RETURN(lan_discovery.Scan(out_network_info, *network_count, scan_filter));
 }
 
@@ -304,11 +311,13 @@ Result IUserLocalCommunicationService::Initialize(ClientProcessId aruid) {
 
 Result IUserLocalCommunicationService::Finalize() {
     LOG_INFO(Service_LDN, "called");
-    if (auto room_member = Network::GetRoomMember().lock()) {
-        room_member->Unbind(ldn_packet_received);
-    }
+    if (is_initialized) {
+        if (auto room_member = Network::GetRoomMember().lock()) {
+            room_member->Unbind(ldn_packet_received);
+        }
 
-    is_initialized = false;
+        is_initialized = false;
+    }
 
     R_RETURN(lan_discovery.Finalize());
 }
@@ -323,7 +332,9 @@ void IUserLocalCommunicationService::OnLDNPacketReceived(const Network::LDNPacke
 }
 
 void IUserLocalCommunicationService::OnEventFired() {
-    state_change_event->Signal(system.Kernel());
+    if (state_change_event != nullptr) {
+        state_change_event->Signal(system.Kernel());
+    }
 }
 
 } // namespace Service::LDN

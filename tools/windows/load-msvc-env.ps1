@@ -4,8 +4,14 @@
 $osArch = $env:PROCESSOR_ARCHITECTURE
 
 switch ($osArch) {
-    "AMD64" { $arch = "x64" }
-    "ARM64" { $arch = "arm64" }
+    "AMD64" {
+        $arch = "x64"
+        $vcToolsComponent = "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+    }
+    "ARM64" {
+        $arch = "arm64"
+        $vcToolsComponent = "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+    }
     default {
         Write-Error "load-msvc-env.ps1: Unsupported architecture: $osArch"
         exit 1
@@ -19,10 +25,10 @@ if (!(Test-Path $vswhere)) {
     exit 1
 }
 
-$vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+$vs = & $vswhere -latest -products * -requires $vcToolsComponent -property installationPath
 
-if (-not $vs) {
-    Write-Error "load-msvc-env.ps1: Visual Studio (with Desktop development with C++) not found"
+if ($LASTEXITCODE -ne 0 -or -not $vs) {
+    Write-Error "load-msvc-env.ps1: Visual Studio (with $vcToolsComponent) not found"
     exit 1
 }
 
@@ -33,10 +39,24 @@ if (!(Test-Path $bat)) {
     exit 1
 }
 
-cmd /c "`"$bat`" $arch && set" | ForEach-Object {
-    if ($_ -match "^(.*?)=(.*)$") {
+$envOutput = cmd /c "`"$bat`" $arch && set"
+if ($LASTEXITCODE -ne 0) {
+    $exitCode = $LASTEXITCODE
+    Write-Error "load-msvc-env.ps1: vcvarsall.bat failed for $arch with exit code $exitCode"
+    exit $exitCode
+}
+
+$appliedCount = 0
+$envOutput | ForEach-Object {
+    if ($_ -match "^([^=]+)=(.*)$") {
         [Environment]::SetEnvironmentVariable($matches[1], $matches[2], 'Process')
+        $appliedCount++
     }
+}
+
+if ($appliedCount -eq 0) {
+    Write-Error "load-msvc-env.ps1: vcvarsall.bat produced no environment variables for $arch"
+    exit 1
 }
 
 Write-Host "load-msvc-env.ps1: MSVC environment loaded for $arch ($vs)"

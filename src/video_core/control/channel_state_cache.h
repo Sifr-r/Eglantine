@@ -113,6 +113,9 @@ public:
     Tegra::MemoryManager* GetFromID(size_t id) const {
         std::unique_lock<std::mutex> lk(config_mutex);
         const auto ref = address_spaces.find(id);
+        if (ref == address_spaces.end()) {
+            return nullptr;
+        }
         return ref->second.gpu_memory;
     }
 

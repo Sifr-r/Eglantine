@@ -16,6 +16,7 @@
 #include "common/fs/path_util.h"
 #include "common/settings.h"
 #include "frontend_common/config.h"
+#include "frontend_common/sentry_crash_reporter.h"
 #include "startup_checks.h"
 #include "yuzu/nx2_switches.h"
 
@@ -201,8 +202,12 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    Frontend::SentryCrashReporter crash_reporter;
+    crash_reporter.Start(Frontend::SentryFrontend::Qt);
 #ifdef YUZU_CRASH_DUMPS
-    Breakpad::InstallCrashHandler();
+    if (!crash_reporter.IsActive()) {
+        Breakpad::InstallCrashHandler();
+    }
 #endif
 
     // Init settings params

@@ -8,9 +8,23 @@ import glob, os, re, sys
 import numpy as np
 from PIL import Image
 
+def frame_id(path):
+    m = re.search(r"frame-(\d+)", os.path.basename(path))
+    if not m:
+        raise ValueError(f"unexpected frame filename: {path}")
+    return int(m.group(1))
+
+
+if len(sys.argv) < 2:
+    print("Usage: flash_scan.py <burst dir> [out sheet]", file=sys.stderr)
+    sys.exit(1)
+
 d = sys.argv[1]
-files = sorted(glob.glob(os.path.join(d, "nx2-frame-*.tga")), key=lambda f: int(re.findall(r"frame-(\d+)", f)[0]))
-ids = [int(re.findall(r"frame-(\d+)", f)[0]) for f in files]
+files = sorted(glob.glob(os.path.join(d, "nx2-frame-*.tga")), key=frame_id)
+if len(files) < 2:
+    print(f"Need at least 2 nx2-frame-*.tga frames in {d}, found {len(files)}", file=sys.stderr)
+    sys.exit(1)
+ids = [frame_id(f) for f in files]
 L = []
 for f in files:
     im = np.asarray(Image.open(f).convert("RGB").resize((320, 180)), dtype=np.float32) / 255

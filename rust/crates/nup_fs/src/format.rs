@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const HEADER_MAGIC: [u8; 4] = *b"NUP\x01";
 pub const TOC_MAGIC_BYTES: [u8; 4] = *b"TOC\x01";
@@ -283,4 +284,20 @@ fn hex_nibble(b: u8) -> Result<u8, String> {
         b'A'..=b'F' => Ok(b - b'A' + 10),
         _ => Err("malformed hex".to_string()),
     }
+}
+
+pub(crate) fn is_cancelled(
+    cancel: Option<&AtomicBool>,
+    cancel_poll: Option<&dyn Fn() -> bool>,
+) -> bool {
+    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        return true;
+    }
+    if cancel_poll.is_some_and(|poll| poll()) {
+        if let Some(flag) = cancel {
+            flag.store(true, Ordering::Relaxed);
+        }
+        return true;
+    }
+    false
 }

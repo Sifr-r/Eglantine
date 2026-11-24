@@ -32,6 +32,14 @@ static void emit(const char* text, size_t size) {
     (void)!write(STDERR_FILENO, text, size);
 }
 
+static void emit_bounded(const char* text, size_t capacity, int written) {
+    if (written <= 0 || capacity == 0) {
+        return;
+    }
+    const size_t len = (size_t)written;
+    emit(text, len < capacity ? len : capacity - 1);
+}
+
 static void on_fatal_signal(int sig, siginfo_t* info, void* context) {
     (void)context;
     static volatile sig_atomic_t entered;
@@ -45,7 +53,7 @@ static void on_fatal_signal(int sig, siginfo_t* info, void* context) {
                            "\n=== crashtrace: %s (signal %d) si_code=%d addr=%p tid=%ld thread=%s ===\n",
                            strsignal(sig), sig, info->si_code, info->si_addr,
                            (long)syscall(SYS_gettid), name);
-    emit(head, (size_t)n);
+    emit_bounded(head, sizeof head, n);
 
     // One line per frame: module, module-relative address (what addr2line wants), symbol if known.
     void* frames[64];
@@ -61,7 +69,7 @@ static void on_fatal_signal(int sig, siginfo_t* info, void* context) {
         } else {
             len = snprintf(line, sizeof line, "#%02d ?? [%p]\n", i, frames[i]);
         }
-        emit(line, (size_t)len);
+        emit_bounded(line, sizeof line, len);
     }
     emit("=== end crashtrace ===\n", 24);
 

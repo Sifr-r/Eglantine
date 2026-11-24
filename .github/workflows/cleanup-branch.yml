@@ -24,6 +24,9 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
       - name: Remove the branch release
         if: github.event_name == 'pull_request' || github.event_name == 'delete'

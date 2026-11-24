@@ -139,6 +139,7 @@ class Host1x;
 
 class MemoryManager;
 struct NativeMacroContext;
+struct NativeQmdStateTable;
 
 class GPU final {
 public:
@@ -164,6 +165,7 @@ public:
 
     [[nodiscard]] std::shared_ptr<NativeMacroContext> GetOrCreateNativeMacroContext();
     [[nodiscard]] std::shared_ptr<NativeMacroContext> GetNativeMacroContext() const;
+    [[nodiscard]] std::shared_ptr<NativeQmdStateTable> GetOrCreateNativeQmdTable();
 
     void BindChannel(s32 channel_id);
 

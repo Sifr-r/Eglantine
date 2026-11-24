@@ -111,7 +111,7 @@ u32 DynamicDescriptorSizeShift(const IR::U32& dynamic_offset) {
 
 u32 DynamicDescriptorCount(u32 base_offset, u32 size_shift, u32 max_descriptors) {
     auto const descriptor_limit = (std::max)(1U, max_descriptors);
-    auto const max_cbuf_bytes = 16 * descriptor_limit;
+    constexpr u32 max_cbuf_bytes = 16U * DESCRIPTOR_MAX_COUNT;
     if (size_shift >= 31 || base_offset >= max_cbuf_bytes)
         return 1;
     auto const stride = 1U << size_shift;
@@ -119,7 +119,7 @@ u32 DynamicDescriptorCount(u32 base_offset, u32 size_shift, u32 max_descriptors)
     if (available < DESCRIPTOR_SIZE)
         return 1;
     auto const available_count = 1U + (available - DESCRIPTOR_SIZE) / stride;
-    return std::min(descriptor_limit, available_count);
+    return (std::min)(descriptor_limit, available_count);
 }
 
 u32 SaturatingSub(u32 lhs, u32 rhs) {
@@ -133,22 +133,60 @@ template <typename T>
     });
 }
 
-u32 DynamicSampledTextureCap(const Info& info, const HostTranslateInfo& host_info, u32 dynamic_arrays) {
-    auto const sampled_limit = (std::max)(1U, std::min(host_info.max_per_stage_descriptor_sampled_images,
-                                                       host_info.max_descriptor_set_sampled_images));
+u32 CountConstantBufferDescriptors(const Info& info, const IR::Program& program) {
+    if (!info.constant_buffer_descriptors.empty()) {
+        return NumDescriptors(info.constant_buffer_descriptors);
+    }
+    if (info.uses_cbuf_indirect) {
+        return static_cast<u32>(Info::MAX_INDIRECT_CBUFS);
+    }
+    u32 cbuf_mask = info.constant_buffer_mask;
+    for (const IR::Block* const block : program.post_order_blocks) {
+        for (const IR::Inst& inst : block->Instructions()) {
+            switch (inst.GetOpcode()) {
+            case IR::Opcode::GetCbufU8:
+            case IR::Opcode::GetCbufS8:
+            case IR::Opcode::GetCbufU16:
+            case IR::Opcode::GetCbufS16:
+            case IR::Opcode::GetCbufU32:
+            case IR::Opcode::GetCbufF32:
+            case IR::Opcode::GetCbufU32x2: {
+                const IR::Value cbuf_index{inst.Arg(0)};
+                if (!cbuf_index.IsImmediate()) {
+                    return static_cast<u32>(Info::MAX_INDIRECT_CBUFS);
+                }
+                const u32 bank = cbuf_index.U32();
+                if (bank < 32) {
+                    cbuf_mask |= 1U << bank;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+    }
+    return static_cast<u32>(std::popcount(cbuf_mask));
+}
+
+u32 DynamicSampledTextureCap(const Info& info, const HostTranslateInfo& host_info,
+                             u32 dynamic_arrays, u32 cbuf_count) {
+    auto const sampled_limit =
+        (std::max)(1U, (std::min)(host_info.max_per_stage_descriptor_sampled_images,
+                                  host_info.max_descriptor_set_sampled_images));
     auto const resource_limit = (std::max)(1U, host_info.max_per_stage_resources);
     if (dynamic_arrays > 0) {
-        auto const sampled_static_count = StaticDescriptorCount(info.texture_buffer_descriptors) + StaticDescriptorCount(info.texture_descriptors);
+        auto const sampled_static_count =
+            NumDescriptors(info.texture_buffer_descriptors) +
+            StaticDescriptorCount(info.texture_descriptors);
         auto const resource_static_count =
-            NumDescriptors(info.constant_buffer_descriptors)
-            + NumDescriptors(info.storage_buffers_descriptors)
-            + sampled_static_count + NumDescriptors(info.image_buffer_descriptors)
-            + NumDescriptors(info.image_descriptors);
+            cbuf_count + NumDescriptors(info.storage_buffers_descriptors) + sampled_static_count +
+            NumDescriptors(info.image_buffer_descriptors) + NumDescriptors(info.image_descriptors);
         auto const sampled_budget = SaturatingSub(sampled_limit, sampled_static_count);
         auto const resource_budget = SaturatingSub(resource_limit, resource_static_count);
         auto const sampled_cap = sampled_budget / dynamic_arrays;
         auto const resource_cap = resource_budget / dynamic_arrays;
-        return (std::max)(1U, (std::min)(sampled_cap, resource_cap));
+        return (std::max)(1U, (std::min)({DESCRIPTOR_MAX_COUNT, sampled_cap, resource_cap}));
     }
     return (std::min)({DESCRIPTOR_MAX_COUNT, sampled_limit, resource_limit});
 }
@@ -251,15 +289,45 @@ bool IsStorageImageOpcode(IR::Opcode opcode) {
 }
 
 u32 DynamicSampledTextureArrayCount(const TextureInstVector& to_replace) {
-    u32 count{};
-    for (const TextureInst& inst : to_replace) {
-        const auto flags{inst.inst->Flags<IR::TextureInstInfo>()};
-        if (inst.cbuf.count > 1 && !IsStorageImageOpcode(IndexedInstruction(*inst.inst)) &&
-            flags.type != TextureType::Buffer) {
-            ++count;
+    std::vector<TextureDescriptor> unique_arrays;
+    for (const TextureInst& tex_inst : to_replace) {
+        const auto flags{tex_inst.inst->Flags<IR::TextureInstInfo>()};
+        if (tex_inst.cbuf.count <= 1 || IsStorageImageOpcode(tex_inst.inst->GetOpcode()) ||
+            flags.type == TextureType::Buffer) {
+            continue;
+        }
+        const auto& cbuf{tex_inst.cbuf};
+        const u32 size_shift{DynamicDescriptorSizeShift(cbuf.dynamic_offset)};
+        const bool is_depth{flags.is_depth != 0};
+        const auto matches = [&](const TextureDescriptor& existing) {
+            return flags.type == existing.type && is_depth == existing.is_depth &&
+                   cbuf.has_secondary == existing.has_secondary &&
+                   cbuf.index == existing.cbuf_index && cbuf.offset == existing.cbuf_offset &&
+                   cbuf.shift_left == existing.shift_left &&
+                   cbuf.secondary_index == existing.secondary_cbuf_index &&
+                   cbuf.secondary_offset == existing.secondary_cbuf_offset &&
+                   cbuf.secondary_shift_left == existing.secondary_shift_left &&
+                   cbuf.count == existing.count && size_shift == existing.size_shift &&
+                   cbuf.handle_program == existing.handle_program;
+        };
+        if (std::ranges::find_if(unique_arrays, matches) == unique_arrays.end()) {
+            unique_arrays.push_back(TextureDescriptor{
+                .type = flags.type,
+                .is_depth = is_depth,
+                .has_secondary = cbuf.has_secondary,
+                .cbuf_index = cbuf.index,
+                .cbuf_offset = cbuf.offset,
+                .shift_left = cbuf.shift_left,
+                .secondary_cbuf_index = cbuf.secondary_index,
+                .secondary_cbuf_offset = cbuf.secondary_offset,
+                .secondary_shift_left = cbuf.secondary_shift_left,
+                .count = cbuf.count,
+                .size_shift = size_shift,
+                .handle_program = cbuf.handle_program,
+            });
         }
     }
-    return count;
+    return static_cast<u32>(unique_arrays.size());
 }
 
 bool IsBindless(const IR::Inst& inst) {
@@ -1201,7 +1269,6 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
         program.info.texture_descriptors,
         program.info.image_descriptors,
     };
-    const u32 sampled_dynamic_cap = DynamicSampledTextureCap(program.info, host_info, DynamicSampledTextureArrayCount(to_replace));
     bool has_last_is_integer{false};
     u32 last_cbuf_index{};
     u32 last_cbuf_offset{};
@@ -1233,15 +1300,14 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                 texture_inst.inst->Flags<IR::TextureInstInfo>().type.Value());
         }
     }
-    for (TextureInst& texture_inst : to_replace) {
-        // TODO: Handle arrays
+    std::vector<bool> is_multisample_flags(to_replace.size(), false);
+    std::vector<bool> is_rect_sample_flags(to_replace.size(), false);
+    for (size_t i = 0; i < to_replace.size(); ++i) {
+        const TextureInst& texture_inst{to_replace[i]};
         IR::Inst* const inst{texture_inst.inst};
         inst->ReplaceOpcode(IndexedInstruction(*inst));
-
         const auto& cbuf{texture_inst.cbuf};
         auto flags{inst->Flags<IR::TextureInstInfo>()};
-        bool is_multisample{false};
-        bool is_rect_sample{false};
         switch (inst->GetOpcode()) {
         case IR::Opcode::ImageQueryDimensions:
             if (const auto it{handle_program_types.find(cbuf.handle_program)};
@@ -1257,12 +1323,12 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                 break;
             }
             // Normalized once the descriptor is known (below).
-            is_rect_sample = ReadTextureTypeCached(env, cbuf) == TextureType::Color2DRect;
+            is_rect_sample_flags[i] = ReadTextureTypeCached(env, cbuf) == TextureType::Color2DRect;
             break;
         case IR::Opcode::ImageFetch:
             if (flags.type == TextureType::Color2D || flags.type == TextureType::Color2DRect ||
                 flags.type == TextureType::ColorArray2D) {
-                is_multisample = !inst->Arg(4).IsEmpty();
+                is_multisample_flags[i] = !inst->Arg(4).IsEmpty();
             } else {
                 inst->SetArg(4, IR::U32{});
             }
@@ -1275,13 +1341,29 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                 // the rasterizer robustness handle it
                 // This happens on Fire Emblem: Three Houses
                 flags.type.Assign(TextureType::Buffer);
+                inst->SetFlags(flags);
             }
             break;
         default:
             break;
         }
+    }
+    const auto is_dynamic_sampled_texture = [](const TextureInst& texture_inst) {
+        const auto flags{texture_inst.inst->Flags<IR::TextureInstInfo>()};
+        return texture_inst.cbuf.count > 1 &&
+               !IsStorageImageOpcode(texture_inst.inst->GetOpcode()) &&
+               flags.type != TextureType::Buffer;
+    };
+    const auto emit_descriptor = [&](size_t i, u32 dynamic_cap) {
+        TextureInst& texture_inst{to_replace[i]};
+        IR::Inst* const inst{texture_inst.inst};
+        const auto& cbuf{texture_inst.cbuf};
+        auto flags{inst->Flags<IR::TextureInstInfo>()};
+        const bool is_multisample{is_multisample_flags[i]};
+        const bool is_rect_sample{is_rect_sample_flags[i]};
         u32 index;
-        u32 size_shift = cbuf.count > 1 ? DynamicDescriptorSizeShift(cbuf.dynamic_offset) : DESCRIPTOR_SIZE_SHIFT;
+        const u32 size_shift{
+            cbuf.count > 1 ? DynamicDescriptorSizeShift(cbuf.dynamic_offset) : DESCRIPTOR_SIZE_SHIFT};
         u32 count = cbuf.count;
         switch (inst->GetOpcode()) {
         case IR::Opcode::ImageRead:
@@ -1346,7 +1428,7 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                     .handle_program = cbuf.handle_program,
                 });
             } else {
-                count = std::min(count, sampled_dynamic_cap);
+                count = (std::min)(count, dynamic_cap);
                 // Depth-compare sampling returns a float in Vulkan, so its image must be float
                 // even when a garbage or unknown descriptor reads as an integer format.
                 static const bool depth_float_fix{Common::EnvGate("EGLANTINE_DEPTH_FLOAT_FIX")};
@@ -1394,27 +1476,115 @@ void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo
                 PatchTexelFetch(*texture_inst.block, *texture_inst.inst, pixel_format);
             }
         }
+    };
+    // Emit storage images, texture buffers, and static sampled textures before computing the
+    // dynamic sampled texture budget so descriptor limits reflect committed resources.
+    for (size_t i = 0; i < to_replace.size(); ++i) {
+        if (!is_dynamic_sampled_texture(to_replace[i])) {
+            emit_descriptor(i, DESCRIPTOR_MAX_COUNT);
+        }
+    }
+    const u32 sampled_dynamic_cap =
+        DynamicSampledTextureCap(program.info, host_info, DynamicSampledTextureArrayCount(to_replace),
+                                 CountConstantBufferDescriptors(program.info, program));
+    for (size_t i = 0; i < to_replace.size(); ++i) {
+        if (is_dynamic_sampled_texture(to_replace[i])) {
+            emit_descriptor(i, sampled_dynamic_cap);
+        }
     }
 }
 
 void JoinTextureInfo(Info& base, Info& source) {
+    std::vector<u32> program_remap;
+    if (!source.handle_programs.empty()) {
+        std::vector<u32> storage_remap;
+        storage_remap.reserve(source.storage_buffers_descriptors.size());
+        for (const auto& src_desc : source.storage_buffers_descriptors) {
+            const auto storage_it{std::find_if(
+                base.storage_buffers_descriptors.begin(), base.storage_buffers_descriptors.end(),
+                [&src_desc](const auto& existing) {
+                    return src_desc.cbuf_index == existing.cbuf_index &&
+                           src_desc.cbuf_offset == existing.cbuf_offset &&
+                           src_desc.count == existing.count &&
+                           src_desc.indirect_offset == existing.indirect_offset;
+                })};
+            if (storage_it != base.storage_buffers_descriptors.end()) {
+                storage_remap.push_back(
+                    static_cast<u32>(storage_it - base.storage_buffers_descriptors.begin()));
+            } else {
+                storage_remap.push_back(static_cast<u32>(storage_remap.size()));
+            }
+        }
+
+        program_remap.reserve(source.handle_programs.size());
+        for (const auto& program : source.handle_programs) {
+            std::vector<u32> remapped{program};
+            for (size_t pc = 0; pc < remapped.size();) {
+                const HandleOp op{static_cast<HandleOp>(remapped[pc++])};
+                switch (op) {
+                case HandleOp::Cbuf:
+                    if (pc + 2 <= remapped.size()) {
+                        pc += 2;
+                    } else {
+                        pc = remapped.size();
+                    }
+                    break;
+                case HandleOp::Storage:
+                    if (pc < remapped.size()) {
+                        const u32 old_binding{remapped[pc]};
+                        if (old_binding < storage_remap.size()) {
+                            remapped[pc] = storage_remap[old_binding];
+                        }
+                        ++pc;
+                    }
+                    break;
+                case HandleOp::Immediate:
+                case HandleOp::CbufDynamic:
+                case HandleOp::Tee:
+                case HandleOp::Load:
+                    if (pc < remapped.size()) {
+                        ++pc;
+                    }
+                    break;
+                default:
+                    break;
+                }
+            }
+            const auto program_it{
+                std::find(base.handle_programs.begin(), base.handle_programs.end(), remapped)};
+            if (program_it != base.handle_programs.end()) {
+                program_remap.push_back(
+                    static_cast<u32>(program_it - base.handle_programs.begin()));
+            } else {
+                program_remap.push_back(static_cast<u32>(base.handle_programs.size()));
+                base.handle_programs.push_back(std::move(remapped));
+            }
+        }
+    }
+
     Descriptors descriptors{
         base.texture_buffer_descriptors,
         base.image_buffer_descriptors,
         base.texture_descriptors,
         base.image_descriptors,
     };
-    for (auto& desc : source.texture_buffer_descriptors) {
-        descriptors.Add(desc);
+    const auto remap_handle_program{[&program_remap](auto desc) {
+        if (desc.handle_program != ~0U && desc.handle_program < program_remap.size()) {
+            desc.handle_program = program_remap[desc.handle_program];
+        }
+        return desc;
+    }};
+    for (const auto& desc : source.texture_buffer_descriptors) {
+        descriptors.Add(remap_handle_program(desc));
     }
-    for (auto& desc : source.image_buffer_descriptors) {
-        descriptors.Add(desc);
+    for (const auto& desc : source.image_buffer_descriptors) {
+        descriptors.Add(remap_handle_program(desc));
     }
-    for (auto& desc : source.texture_descriptors) {
-        descriptors.Add(desc);
+    for (const auto& desc : source.texture_descriptors) {
+        descriptors.Add(remap_handle_program(desc));
     }
-    for (auto& desc : source.image_descriptors) {
-        descriptors.Add(desc);
+    for (const auto& desc : source.image_descriptors) {
+        descriptors.Add(remap_handle_program(desc));
     }
 }
 

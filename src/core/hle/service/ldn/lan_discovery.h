@@ -52,6 +52,7 @@ protected:
     NodeStatus status;
     s8 node_id;
     LANDiscovery* discovery;
+    Ipv4Address local_ip{};
 };
 
 class LANDiscovery {

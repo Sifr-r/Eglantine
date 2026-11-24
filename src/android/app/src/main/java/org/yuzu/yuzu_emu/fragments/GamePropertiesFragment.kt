@@ -631,6 +631,9 @@ class GamePropertiesFragment : Fragment() {
                     }
 
                     withContext(Dispatchers.Main) {
+                        if (!isAdded) {
+                            return@withContext
+                        }
                         if (savesFolderFile == null) {
                             MessageDialogFragment.newInstance(
                                 requireActivity(),
@@ -646,14 +649,11 @@ class GamePropertiesFragment : Fragment() {
                         ).show()
                         homeViewModel.reloadPropertiesList(true)
                     }
-
-                    cacheSaveDir.deleteRecursively()
+                    Unit
                 } catch (e: Exception) {
-                    Toast.makeText(
-                        YuzuApplication.appContext,
-                        getString(R.string.fatal_error),
-                        Toast.LENGTH_LONG
-                    ).show()
+                    YuzuApplication.appContext.getString(R.string.fatal_error)
+                } finally {
+                    cacheSaveDir.deleteRecursively()
                 }
             }.show(parentFragmentManager, ProgressDialogFragment.TAG)
         }
@@ -674,16 +674,25 @@ class GamePropertiesFragment : Fragment() {
             R.string.save_files_exporting,
             false
         ) { _, _ ->
+            val appContext = YuzuApplication.appContext
             val saveLocation = args.game.saveDir
-            val zipResult = FileUtil.zipFromInternalStorage(
-                File(saveLocation),
-                saveLocation.replaceAfterLast("/", ""),
-                BufferedOutputStream(requireContext().contentResolver.openOutputStream(result)),
-                compression = false
-            )
+            val zipResult = try {
+                appContext.contentResolver.openOutputStream(result)?.use { rawOut ->
+                    BufferedOutputStream(rawOut).use { bufferedOut ->
+                        FileUtil.zipFromInternalStorage(
+                            File(saveLocation),
+                            saveLocation.replaceAfterLast("/", ""),
+                            bufferedOut,
+                            compression = false
+                        )
+                    }
+                } ?: TaskState.Failed
+            } catch (_: Exception) {
+                TaskState.Failed
+            }
             return@newInstance when (zipResult) {
-                TaskState.Completed -> getString(R.string.export_success)
-                TaskState.Cancelled, TaskState.Failed -> getString(R.string.export_failed)
+                TaskState.Completed -> appContext.getString(R.string.export_success)
+                TaskState.Cancelled, TaskState.Failed -> appContext.getString(R.string.export_failed)
             }
         }.show(parentFragmentManager, ProgressDialogFragment.TAG)
     }

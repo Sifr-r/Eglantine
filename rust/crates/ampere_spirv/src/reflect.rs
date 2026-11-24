@@ -364,7 +364,7 @@ impl ShaderInfo {
             cbuf_index,
             cbuf_offset,
             count: 1,
-            indirect_offset: 0,
+            indirect_offset: u32::MAX,
             is_written: written,
         });
         Some(idx)

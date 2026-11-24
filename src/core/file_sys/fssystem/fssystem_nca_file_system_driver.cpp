@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
+
 #include "core/file_sys/fssystem/fssystem_aes_ctr_counter_extended_storage.h"
 #include "core/file_sys/fssystem/fssystem_aes_ctr_storage.h"
 #include "core/file_sys/fssystem/fssystem_aes_xts_storage.h"
@@ -487,7 +489,7 @@ Result NcaFileSystemDriver::CreateAesXtsStorage(VirtualFile* out, VirtualFile ba
     R_UNLESS(aligned_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
 
     // Set the out storage.
-    *out = std::move(xts_storage);
+    *out = std::move(aligned_storage);
     R_SUCCEED();
 }
 
@@ -736,51 +738,55 @@ Result NcaFileSystemDriver::CreateSparseStorageWithVerification(
     // Create the sparse storage.
     std::shared_ptr<SparseStorage> sparse_storage;
     if (header.entry_count != 0) {
-        // Create the body substorage.
-        VirtualFile body_substorage;
-        R_TRY(this->CreateBodySubStorage(
-            std::addressof(body_substorage), sparse_info.physical_offset,
-            Common::AlignUp<s64>(static_cast<s64>(meta_data_hash_data_info.offset) +
-                                     static_cast<s64>(meta_data_hash_data_info.size),
-                                 NcaHeader::CtrBlockSize)));
-
         // Check the meta data hash type.
         if (meta_data_hash_type != NcaFsHeader::MetaDataHashType::HierarchicalIntegrity) {
-            LOG_ERROR(Loader, "Sparse meta hash type {} not supported for verification; mounting sparse data WITHOUT verification (temporary).", static_cast<int>(meta_data_hash_type));
+            LOG_ERROR(Loader,
+                      "Sparse meta hash type {} not supported for verification; mounting sparse "
+                      "data WITHOUT verification (temporary).",
+                      static_cast<int>(meta_data_hash_type));
 
+            VirtualFile body_substorage;
             R_TRY(this->CreateBodySubStorage(std::addressof(body_substorage),
                                              sparse_info.physical_offset,
                                              sparse_info.GetPhysicalSize()));
 
-            // Create sparse core directly (no meta verification)
-            std::shared_ptr<SparseStorage> sparse_storage_fallback;
-            R_TRY(this->CreateSparseStorageCore(std::addressof(sparse_storage_fallback),
-                                                body_substorage, sparse_info.GetPhysicalSize(),
-                                                /*meta_storage*/ body_substorage, // dummy; not used
-                                                sparse_info, false));
+            VirtualFile meta_storage;
+            R_TRY(this->CreateSparseStorageMetaStorage(
+                std::addressof(meta_storage), body_substorage, sparse_info.physical_offset,
+                upper_iv, sparse_info));
 
-            if (out_sparse_storage)
-                *out_sparse_storage = sparse_storage_fallback;
-            *out_fs_data_offset = fs_offset;
-            *out = std::move(sparse_storage_fallback);
-            R_SUCCEED();
+            if (out_meta_storage != nullptr) {
+                *out_meta_storage = meta_storage;
+            }
+
+            R_TRY(this->CreateSparseStorageCore(
+                std::addressof(sparse_storage), body_substorage, sparse_info.GetPhysicalSize(),
+                std::move(meta_storage), sparse_info, false));
+        } else {
+            // Create the body substorage.
+            VirtualFile body_substorage;
+            R_TRY(this->CreateBodySubStorage(
+                std::addressof(body_substorage), sparse_info.physical_offset,
+                Common::AlignUp<s64>(static_cast<s64>(meta_data_hash_data_info.offset) +
+                                         static_cast<s64>(meta_data_hash_data_info.size),
+                                     NcaHeader::CtrBlockSize)));
+
+            // Create the meta storage.
+            VirtualFile meta_storage;
+            R_TRY(this->CreateSparseStorageMetaStorageWithVerification(
+                std::addressof(meta_storage), out_layer_info_storage, body_substorage,
+                sparse_info.physical_offset, upper_iv, sparse_info, meta_data_hash_data_info));
+
+            // Potentially set the output meta storage.
+            if (out_meta_storage != nullptr) {
+                *out_meta_storage = meta_storage;
+            }
+
+            // Create the sparse storage.
+            R_TRY(this->CreateSparseStorageCore(
+                std::addressof(sparse_storage), body_substorage, sparse_info.GetPhysicalSize(),
+                std::move(meta_storage), sparse_info, false));
         }
-
-        // Create the meta storage.
-        VirtualFile meta_storage;
-        R_TRY(this->CreateSparseStorageMetaStorageWithVerification(
-            std::addressof(meta_storage), out_layer_info_storage, body_substorage,
-            sparse_info.physical_offset, upper_iv, sparse_info, meta_data_hash_data_info));
-
-        // Potentially set the output meta storage.
-        if (out_meta_storage != nullptr) {
-            *out_meta_storage = meta_storage;
-        }
-
-        // Create the sparse storage.
-        R_TRY(this->CreateSparseStorageCore(std::addressof(sparse_storage), body_substorage,
-                                            sparse_info.GetPhysicalSize(), std::move(meta_storage),
-                                            sparse_info, false));
     } else {
         // If there are no entries, there's nothing to actually do.
         sparse_storage = std::make_shared<SparseStorage>();
@@ -1120,35 +1126,60 @@ Result NcaFileSystemDriver::CreatePatchMetaStorage(
     R_SUCCEED();
 }
 
-Result NcaFileSystemDriver::CreateSha3Storage(
+namespace {
+
+template <typename VerificationStorage>
+Result CreateHierarchicalShaStorage(
     VirtualFile* out, VirtualFile base_storage,
     const NcaFsHeader::HashData::HierarchicalSha256Data& hash_data) {
     ASSERT(out != nullptr);
     ASSERT(base_storage != nullptr);
 
-    using VerificationStorage = HierarchicalSha3Storage;
-
-    R_UNLESS(Common::IsPowerOfTwo(hash_data.hash_block_size),
+    R_UNLESS(hash_data.hash_block_size > 0 && Common::IsPowerOfTwo(hash_data.hash_block_size) &&
+                 static_cast<size_t>(hash_data.hash_block_size) >= VerificationStorage::HashSize,
              ResultInvalidHierarchicalSha256BlockSize);
     R_UNLESS(hash_data.hash_layer_count == VerificationStorage::LayerCount - 1,
              ResultInvalidHierarchicalSha256LayerCount);
 
     const auto& hash_region = hash_data.hash_layer_region[0];
     const auto& data_region = hash_data.hash_layer_region[1];
+    const s64 hash_offset = hash_region.offset.Get();
+    const s64 hash_size = hash_region.size.Get();
+    const s64 data_offset = data_region.offset.Get();
+    const s64 data_size = data_region.size.Get();
+    const u64 base_size = base_storage->GetSize();
 
-    constexpr s32 CacheBlockCount = 2;
-    const auto hash_buffer_size = static_cast<size_t>(hash_region.size);
-    const auto cache_buffer_size = CacheBlockCount * hash_data.hash_block_size;
-    const auto total_buffer_size = hash_buffer_size + cache_buffer_size;
+    R_UNLESS(hash_offset >= 0 && hash_size >= 0 && data_offset >= 0 && data_size >= 0,
+             ResultNcaBaseStorageOutOfRangeC);
+    const u64 hash_offset_u64 = static_cast<u64>(hash_offset);
+    const u64 hash_size_u64 = static_cast<u64>(hash_size);
+    const u64 data_offset_u64 = static_cast<u64>(data_offset);
+    const u64 data_size_u64 = static_cast<u64>(data_size);
+
+    R_UNLESS(hash_offset_u64 <= base_size && hash_size_u64 <= base_size - hash_offset_u64,
+             ResultNcaBaseStorageOutOfRangeC);
+    R_UNLESS(data_offset_u64 <= base_size && data_size_u64 <= base_size - data_offset_u64,
+             ResultNcaBaseStorageOutOfRangeC);
+    R_UNLESS(hash_size <= hash_data.hash_block_size, ResultInvalidHierarchicalSha256BlockSize);
+
+    constexpr size_t CacheBlockCount = 2;
+    constexpr u64 max_size_t = (std::numeric_limits<size_t>::max)();
+    const u64 block_size_u64 = static_cast<u64>(hash_data.hash_block_size);
+    R_UNLESS(hash_size_u64 <= max_size_t && hash_offset_u64 <= max_size_t &&
+                 data_size_u64 <= max_size_t && data_offset_u64 <= max_size_t &&
+                 block_size_u64 <= max_size_t / CacheBlockCount,
+             ResultAllocationMemoryFailedInNcaFileSystemDriverI);
+
+    const size_t hash_buffer_size = static_cast<size_t>(hash_size_u64);
+    const size_t cache_buffer_size = CacheBlockCount * static_cast<size_t>(block_size_u64);
+    R_UNLESS(hash_buffer_size <= max_size_t - cache_buffer_size,
+             ResultAllocationMemoryFailedInNcaFileSystemDriverI);
+    const size_t total_buffer_size = hash_buffer_size + cache_buffer_size;
 
     auto buffer_hold_storage = std::make_shared<MemoryResourceBufferHoldStorage>(
         std::move(base_storage), total_buffer_size);
     R_UNLESS(buffer_hold_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
     R_UNLESS(buffer_hold_storage->IsValid(), ResultAllocationMemoryFailedInNcaFileSystemDriverI);
-
-    s64 base_size = buffer_hold_storage->GetSize();
-    R_UNLESS(hash_region.offset + hash_region.size <= base_size, ResultNcaBaseStorageOutOfRangeC);
-    R_UNLESS(data_region.offset + data_region.size <= base_size, ResultNcaBaseStorageOutOfRangeC);
 
     auto master_hash_storage =
         std::make_shared<ArrayVfsFile<sizeof(Hash)>>(hash_data.fs_data_master_hash.value);
@@ -1158,80 +1189,34 @@ Result NcaFileSystemDriver::CreateSha3Storage(
 
     std::array<VirtualFile, VerificationStorage::LayerCount> layer_storages{
         std::make_shared<OffsetVfsFile>(master_hash_storage, sizeof(Hash), 0),
-        std::make_shared<OffsetVfsFile>(buffer_hold_storage, hash_region.size, hash_region.offset),
-        std::make_shared<OffsetVfsFile>(buffer_hold_storage, data_region.size, data_region.offset),
+        std::make_shared<OffsetVfsFile>(buffer_hold_storage, hash_buffer_size,
+                                        static_cast<size_t>(hash_offset_u64)),
+        std::make_shared<OffsetVfsFile>(buffer_hold_storage, static_cast<size_t>(data_size_u64),
+                                        static_cast<size_t>(data_offset_u64)),
     };
 
     R_TRY(verification_storage->Initialize(layer_storages.data(), VerificationStorage::LayerCount,
-                                           hash_data.hash_block_size,
+                                           static_cast<size_t>(block_size_u64),
                                            buffer_hold_storage->GetBuffer(), hash_buffer_size));
 
     *out = std::move(verification_storage);
     R_SUCCEED();
 }
 
+} // namespace
+
+Result NcaFileSystemDriver::CreateSha3Storage(
+    VirtualFile* out, VirtualFile base_storage,
+    const NcaFsHeader::HashData::HierarchicalSha256Data& hash_data) {
+    R_RETURN(CreateHierarchicalShaStorage<HierarchicalSha3Storage>(
+        out, std::move(base_storage), hash_data));
+}
+
 Result NcaFileSystemDriver::CreateSha256Storage(
     VirtualFile* out, VirtualFile base_storage,
     const NcaFsHeader::HashData::HierarchicalSha256Data& hash_data) {
-    // Validate preconditions.
-    ASSERT(out != nullptr);
-    ASSERT(base_storage != nullptr);
-
-    // Define storage types.
-    using VerificationStorage = HierarchicalSha256Storage;
-
-    // Validate the hash data.
-    R_UNLESS(Common::IsPowerOfTwo(hash_data.hash_block_size),
-             ResultInvalidHierarchicalSha256BlockSize);
-    R_UNLESS(hash_data.hash_layer_count == VerificationStorage::LayerCount - 1,
-             ResultInvalidHierarchicalSha256LayerCount);
-
-    // Get the regions.
-    const auto& hash_region = hash_data.hash_layer_region[0];
-    const auto& data_region = hash_data.hash_layer_region[1];
-
-    // Determine buffer sizes.
-    constexpr s32 CacheBlockCount = 2;
-    const auto hash_buffer_size = static_cast<size_t>(hash_region.size);
-    const auto cache_buffer_size = CacheBlockCount * hash_data.hash_block_size;
-    const auto total_buffer_size = hash_buffer_size + cache_buffer_size;
-
-    // Make a buffer holder storage.
-    auto buffer_hold_storage = std::make_shared<MemoryResourceBufferHoldStorage>(
-        std::move(base_storage), total_buffer_size);
-    R_UNLESS(buffer_hold_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
-    R_UNLESS(buffer_hold_storage->IsValid(), ResultAllocationMemoryFailedInNcaFileSystemDriverI);
-
-    // Get storage size.
-    s64 base_size = buffer_hold_storage->GetSize();
-
-    // Check that we're within range.
-    R_UNLESS(hash_region.offset + hash_region.size <= base_size, ResultNcaBaseStorageOutOfRangeC);
-    R_UNLESS(data_region.offset + data_region.size <= base_size, ResultNcaBaseStorageOutOfRangeC);
-
-    // Create the master hash storage.
-    auto master_hash_storage =
-        std::make_shared<ArrayVfsFile<sizeof(Hash)>>(hash_data.fs_data_master_hash.value);
-
-    // Make the verification storage.
-    auto verification_storage = std::make_shared<VerificationStorage>();
-    R_UNLESS(verification_storage != nullptr, ResultAllocationMemoryFailedAllocateShared);
-
-    // Make layer storages.
-    std::array<VirtualFile, VerificationStorage::LayerCount> layer_storages{
-        std::make_shared<OffsetVfsFile>(master_hash_storage, sizeof(Hash), 0),
-        std::make_shared<OffsetVfsFile>(buffer_hold_storage, hash_region.size, hash_region.offset),
-        std::make_shared<OffsetVfsFile>(buffer_hold_storage, data_region.size, data_region.offset),
-    };
-
-    // Initialize the verification storage.
-    R_TRY(verification_storage->Initialize(layer_storages.data(), VerificationStorage::LayerCount,
-                                           hash_data.hash_block_size,
-                                           buffer_hold_storage->GetBuffer(), hash_buffer_size));
-
-    // Set the output.
-    *out = std::move(verification_storage);
-    R_SUCCEED();
+    R_RETURN(CreateHierarchicalShaStorage<HierarchicalSha256Storage>(
+        out, std::move(base_storage), hash_data));
 }
 
 Result NcaFileSystemDriver::CreateIntegrityVerificationStorage(

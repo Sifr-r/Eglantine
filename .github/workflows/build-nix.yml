@@ -86,7 +86,7 @@ jobs:
           persist-credentials: false
 
       - name: Check Nix flake inputs
-        uses: DeterminateSystems/flake-checker-action@v14
+        uses: DeterminateSystems/flake-checker-action@786422608c7bded2bbc9741ad9f91356842bf520 # v14
 
   build:
     name: nix-${{ matrix.system }}${{ matrix.pgo && '-pgo' || '' }}
@@ -145,7 +145,7 @@ jobs:
           head -v GIT-COMMIT GIT-REFSPEC GIT-TAG GIT-RELEASE GIT-NIGHTLY GIT-DISPLAY GIT-DISPLAY-STORE 2> /dev/null || true
 
       - name: Install Nix
-        uses: cachix/install-nix-action@v31
+        uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
         with:
           # Avoids GitHub API rate limits when the flake fetches nixpkgs.
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
@@ -211,7 +211,7 @@ jobs:
 
       - name: Cachix
         if: vars.CACHIX_CACHE != ''
-        uses: cachix/cachix-action@v17
+        uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
         with:
           name: ${{ vars.CACHIX_CACHE }}
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}

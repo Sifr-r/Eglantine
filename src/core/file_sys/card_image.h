@@ -133,7 +133,7 @@ private:
     VirtualFile file;
     GamecardHeader header{};
 
-    Loader::ResultStatus status;
+    Loader::ResultStatus status{};
     Loader::ResultStatus program_nca_status;
 
     std::vector<VirtualDir> partitions;
@@ -142,7 +142,7 @@ private:
     std::shared_ptr<NCA> program;
     std::vector<std::shared_ptr<NCA>> ncas;
 
-    u64 update_normal_partition_end;
+    u64 update_normal_partition_end{};
 
     Core::Crypto::KeyManager& keys;
 };

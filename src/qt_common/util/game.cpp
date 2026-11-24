@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <string>
+
 #include "qt_common/util/game.h"
 
 #include "common/fs/fs.h"
@@ -337,10 +339,13 @@ void RemoveCacheStorage(u64 program_id) {
     const auto nand_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::NANDDir);
     auto vfs_nand_dir =
         vfs->OpenDirectory(Common::FS::PathToUTF8String(nand_dir), FileSys::OpenMode::Read);
+    if (vfs_nand_dir == nullptr) {
+        return;
+    }
 
     const auto cache_storage_path = FileSys::SaveDataFactory::GetFullPath(
         {}, vfs_nand_dir, FileSys::SaveDataSpaceId::User, FileSys::SaveDataType::Cache,
-        0 /* program_id */, {}, 0);
+        program_id, {}, 0);
 
     const auto path = Common::FS::ConcatPathSafe(nand_dir, cache_storage_path);
 
@@ -444,11 +449,7 @@ void CreateShortcut(const std::string& game_path, const u64 program_id,
     }
 
     const std::string illegal_chars = "<>:\"/\\|?*.";
-    for (auto it = game_title.rbegin(); it != game_title.rend(); ++it) {
-        if (illegal_chars.find(*it) != std::string::npos) {
-            game_title.erase(it.base() - 1);
-        }
-    }
+    std::erase_if(game_title, [&](char c) { return illegal_chars.find(c) != std::string::npos; });
 
     const QString qgame_title = QString::fromStdString(game_title);
 

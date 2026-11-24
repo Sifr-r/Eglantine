@@ -621,8 +621,8 @@ void IHidSystemServer::EnableAppletToGetSixAxisSensor(HLERequestContext& ctx) {
     LOG_INFO(Service_HID, "called, is_enabled={}, applet_resource_user_id={}",
              parameters.is_enabled, parameters.applet_resource_user_id);
 
-    GetResourceManager()->EnableTouchScreen(parameters.applet_resource_user_id,
-                                            parameters.is_enabled);
+    GetResourceManager()->EnableSixAxisSensor(parameters.applet_resource_user_id,
+                                              parameters.is_enabled);
 
     IPC::ResponseBuilder rb{ctx, 2};
     rb.Push(ResultSuccess);
@@ -746,7 +746,7 @@ void IHidSystemServer::AcquireConnectionTriggerTimeoutEvent(HLERequestContext& c
 
     IPC::ResponseBuilder rb{ctx, 2, 1};
     rb.Push(ResultSuccess);
-    rb.PushCopyObjects(ctx, acquire_device_registered_event->GetReadableEvent());
+    rb.PushCopyObjects(ctx, acquire_connection_trigger_timeout_event->GetReadableEvent());
 }
 
 void IHidSystemServer::AcquireDeviceRegisteredEventForControllerSupport(HLERequestContext& ctx) {

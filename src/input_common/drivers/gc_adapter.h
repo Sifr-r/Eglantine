@@ -4,7 +4,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -87,9 +89,9 @@ private:
     void UpdateStateButtons(std::size_t port, u8 b1, u8 b2);
     void UpdateStateAxes(std::size_t port, const AdapterPayload& adapter_payload);
 
-    void AdapterInputThread(std::stop_token stop_token);
+    void AdapterThread(std::stop_token stop_token);
 
-    void AdapterScanThread(std::stop_token stop_token);
+    void RunInputLoop(std::stop_token stop_token);
 
     bool IsPayloadCorrect(const AdapterPayload& adapter_payload, s32 payload_size);
 
@@ -116,14 +118,10 @@ private:
 
     Common::Input::ButtonNames GetUIButtonName(const Common::ParamPackage& params) const;
 
-    std::unique_ptr<LibUSBDeviceHandle> usb_adapter_handle;
-    std::array<GCController, 4> pads;
-
-    std::jthread adapter_input_thread;
-    std::jthread adapter_scan_thread;
-    bool restart_scan_thread{};
-
     std::unique_ptr<LibUSBContext> libusb_ctx;
+    std::unique_ptr<LibUSBDeviceHandle> usb_adapter_handle;
+    mutable std::mutex pads_mutex;
+    std::array<GCController, 4> pads;
 
     u8 input_endpoint{0};
     u8 output_endpoint{0};
@@ -131,7 +129,9 @@ private:
     u8 output_error_counter{0};
     int vibration_counter{0};
 
-    bool rumble_enabled{true};
+    std::atomic<bool> rumble_enabled{true};
     bool vibration_changed{true};
+
+    std::jthread adapter_thread;
 };
 } // namespace InputCommon

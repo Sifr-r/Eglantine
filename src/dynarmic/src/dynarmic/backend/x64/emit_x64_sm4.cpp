@@ -6,6 +6,8 @@
  * SPDX-License-Identifier: 0BSD
  */
 
+#include <bit>
+
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/emit_x64.h"
 #include "dynarmic/ir/microinstruction.h"
@@ -53,7 +55,7 @@ void EmitX64::EmitSM4AccessSubstitutionBox(EmitContext& ctx, IR::Inst* inst) {
     const Xbyak::Reg tmp1 = ctx.reg_alloc.ScratchGpr(code);
     // return subtitution_box[index * 1];
     code.movzx(tmp0.cvt32(), tmp0.cvt8());
-    code.lea(tmp1, code.ptr[std::addressof(substitution_box)]);
+    code.mov(tmp1, std::bit_cast<u64>(std::addressof(substitution_box)));
     code.movzx(tmp1, code.byte[tmp1 + tmp0 * 1]);
     ctx.reg_alloc.DefineValue(code, inst, tmp1);
 }

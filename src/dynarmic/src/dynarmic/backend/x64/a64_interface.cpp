@@ -20,6 +20,7 @@
 #include "dynarmic/common/llvm_disassemble.h"
 #include <bit>
 
+#include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 #include "dynarmic/backend/x64/a64_jitstate.h"
 #include "dynarmic/backend/x64/block_of_code.h"
@@ -113,10 +114,11 @@ public:
     }
 
     void InvalidateCacheRange(u64 start_address, size_t length) {
+        if (length == 0) {
+            return;
+        }
         std::unique_lock lock{invalidation_mutex};
-        const auto end_address = static_cast<u64>(start_address + length - 1);
-        const auto range = boost::icl::discrete_interval<u64>::closed(start_address, end_address);
-        invalid_cache_ranges.add(range);
+        invalid_cache_ranges.add(Backend::MakeClosedCacheRange<u64>(start_address, length));
         HaltExecution(HaltReason::CacheInvalidation);
     }
 
@@ -253,8 +255,9 @@ private:
         constexpr size_t MINIMUM_REMAINING_CODESIZE = 1 * 1024 * 1024;
         if (block_of_code.SpaceRemaining() < MINIMUM_REMAINING_CODESIZE) {
             // Immediately evacuate cache
+            std::unique_lock lock{invalidation_mutex};
             invalidate_entire_cache = true;
-            PerformRequestedCacheInvalidation(HaltReason::CacheInvalidation);
+            PerformRequestedCacheInvalidationLocked();
         }
         block_of_code.EnsureMemoryCommitted(MINIMUM_REMAINING_CODESIZE);
 
@@ -279,23 +282,26 @@ private:
     void PerformRequestedCacheInvalidation(HaltReason hr) {
         if (Has(hr, HaltReason::CacheInvalidation)) {
             std::unique_lock lock{invalidation_mutex};
-
-            ClearHalt(HaltReason::CacheInvalidation);
-
-            if (!invalidate_entire_cache && invalid_cache_ranges.empty()) {
-                return;
-            }
-
-            jit_state.ResetRSB();
-            if (invalidate_entire_cache) {
-                block_of_code.ClearCache();
-                emitter.ClearCache();
-            } else {
-                emitter.InvalidateCacheRanges(invalid_cache_ranges);
-            }
-            invalid_cache_ranges.clear();
-            invalidate_entire_cache = false;
+            PerformRequestedCacheInvalidationLocked();
         }
+    }
+
+    void PerformRequestedCacheInvalidationLocked() {
+        ClearHalt(HaltReason::CacheInvalidation);
+
+        if (!invalidate_entire_cache && invalid_cache_ranges.empty()) {
+            return;
+        }
+
+        jit_state.ResetRSB();
+        if (invalidate_entire_cache) {
+            block_of_code.ClearCache();
+            emitter.ClearCache();
+        } else {
+            emitter.InvalidateCacheRanges(invalid_cache_ranges);
+        }
+        invalid_cache_ranges.clear();
+        invalidate_entire_cache = false;
     }
 
     IR::Block ir_block = {LocationDescriptor(0, FP::FPCR(0), false)};

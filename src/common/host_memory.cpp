@@ -872,6 +872,7 @@ public:
         auto* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
         if (ptr == MAP_FAILED) {
             LOG_CRITICAL(HW_Memory, "Failed to allocate fallback buffer with size {:#x}, {}", size, strerror(errno));
+            return nullptr;
         }
         return ptr;
     }
@@ -1004,7 +1005,8 @@ HostMemory::HostMemory(size_t backing_size_, size_t virtual_size_)
     granules = std::make_unique<std::atomic<u8>[]>(num_granules);
 #if defined(__OPENORBIS__) || defined(__managarm__)
     LOG_WARNING(HW_Memory, "Platform doesn't support fastmem");
-    backing_base = static_cast<u8*>(mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    void* const raw_backing = mmap(nullptr, backing_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    backing_base = raw_backing == MAP_FAILED ? nullptr : static_cast<u8*>(raw_backing);
     virtual_base = nullptr;
 #else
     const size_t aligned_backing_size = AlignUp(backing_size, PageAlignment);

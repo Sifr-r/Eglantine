@@ -79,6 +79,8 @@ Result IAudioOutManager::OpenAudioOutAuto(
         R_THROW(ResultUnknown);
     }
 
+    std::scoped_lock l{impl->mutex};
+
     size_t new_session_id{};
     R_TRY(impl->LinkToManager());
     R_TRY(impl->AcquireSessionId(new_session_id));

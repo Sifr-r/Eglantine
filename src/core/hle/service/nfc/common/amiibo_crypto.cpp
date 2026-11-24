@@ -156,6 +156,10 @@ HashSeed GetSeed(const NTAG215File& data) {
 }
 
 std::vector<u8> GenerateInternalKey(const InternalKey& key, const HashSeed& seed) {
+    if (key.magic_length > sizeof(key.magic_bytes)) {
+        LOG_ERROR(Service_NFP, "Invalid InternalKey magic_length={}", key.magic_length);
+        return {};
+    }
     const std::size_t seedPart1Len = sizeof(key.magic_bytes) - key.magic_length;
     const std::size_t string_size = key.type_string.size();
     std::vector<u8> output(string_size + seedPart1Len);
@@ -296,6 +300,11 @@ bool LoadKeys(InternalKey& locked_secret, InternalKey& unfixed_info) {
     }
     if (keys_file.Read(locked_secret) != 1) {
         LOG_ERROR(Service_NFP, "Failed to read locked-secret");
+        return false;
+    }
+    if (unfixed_info.magic_length > sizeof(unfixed_info.magic_bytes) ||
+        locked_secret.magic_length > sizeof(locked_secret.magic_bytes)) {
+        LOG_ERROR(Service_NFP, "Invalid magic_length in key file");
         return false;
     }
 

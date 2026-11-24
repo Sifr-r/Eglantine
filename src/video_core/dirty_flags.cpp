@@ -26,7 +26,7 @@ void SetupDirtyVertexBuffers(Maxwell3D::DirtyState::Tables& tables) {
 
         FillBlock(tables, array_offset, num_array, VertexBuffer0 + i, VertexBuffers);
         FillBlock(tables, 0x600 / sizeof(u32) + i * 2, 2, VertexBuffer0 + i, VertexBuffers);
-        FillBlock(tables, limit_offset, NUM(vertex_stream_limits), VertexBuffer0 + i,
+        FillBlock(tables, limit_offset, NUM(vertex_stream_limits[0]), VertexBuffer0 + i,
                   VertexBuffers);
     }
 }

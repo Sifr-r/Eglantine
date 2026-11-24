@@ -478,12 +478,23 @@ private:
         // Validate pre-conditions.
         ASSERT(this->IsLockedByCurrentThread());
 
-        if (virt_addr > (1ULL << m_address_space_width)) {
+        if (virt_addr >= (1ULL << m_address_space_width)) {
+            return false;
+        }
+
+        const size_t page_index = static_cast<size_t>(GetInteger(virt_addr) >> PageBits);
+        if (page_index >= this->GetImpl().entries.size()) {
+            return false;
+        }
+
+        const auto raw = this->GetImpl().entries[page_index].Raw();
+        const uintptr_t paddr = Common::PageTable::PageEntryData::ExtractPointer(raw, true);
+        if (static_cast<Common::PageType>(raw.type) == Common::PageType::Unmapped || paddr == 0) {
             return false;
         }
 
         *out = m_system.DeviceMemory().GetPhysicalAddr(
-            this->GetImpl().entries[GetInteger(virt_addr) >> PageBits].Pointer(true) + GetInteger(virt_addr));
+            paddr + static_cast<uintptr_t>(GetInteger(virt_addr)));
 
         return true;
     }

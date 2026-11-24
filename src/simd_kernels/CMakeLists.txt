@@ -9,7 +9,6 @@ add_ispc_kernel(simd_kernels
         tex_etc2.ispc
         tex_astc_scan.ispc
         tex_swizzle.ispc
-        audio_mix.ispc
 )
 
 if(NOT TARGET eglantine::simd_kernels)

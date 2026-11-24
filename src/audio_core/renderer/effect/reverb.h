@@ -4,6 +4,8 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
+#include <memory>
 #include <vector>
 
 #include "audio_core/common/common.h"
@@ -66,20 +68,21 @@ public:
 
     struct ReverbDelayLine {
         void Initialize(const s32 delay_time, const f32 decay_rate) {
-            buffer.resize(delay_time + 1, 0);
-            buffer_end = &buffer[delay_time];
-            output = &buffer[0];
+            const s32 clamped_delay{delay_time > 0 ? delay_time : 0};
+            buffer.resize(static_cast<size_t>(clamped_delay) + 1, 0);
+            buffer_end = buffer.data() + clamped_delay;
+            output = buffer.data();
             decay = decay_rate;
-            sample_count_max = delay_time;
-            SetDelay(delay_time);
+            sample_count_max = clamped_delay;
+            SetDelay(clamped_delay);
         }
 
         void SetDelay(const s32 delay_time) {
-            if (sample_count_max < delay_time) {
+            if (sample_count_max < delay_time || delay_time < 0 || buffer.empty()) {
                 return;
             }
             sample_count = delay_time;
-            input = &buffer[0];
+            input = buffer.data();
         }
 
         Common::FixedPoint<50, 14> Tick(const Common::FixedPoint<50, 14> sample) {
@@ -95,10 +98,13 @@ public:
         }
 
         Common::FixedPoint<50, 14> Read() const {
-            return *output;
+            return output != nullptr ? *output : Common::FixedPoint<50, 14>{0};
         }
 
         void Write(const Common::FixedPoint<50, 14> sample) {
+            if (input == nullptr || buffer_end == nullptr || buffer.empty()) {
+                return;
+            }
             *input = sample;
             input++;
             if (input >= buffer_end) {
@@ -107,9 +113,15 @@ public:
         }
 
         Common::FixedPoint<50, 14> TapOut(const s32 index) const {
+            if (input == nullptr || buffer.empty() || sample_count <= 0) {
+                return 0;
+            }
             auto out{input - (index + 1)};
             if (out < buffer.data()) {
                 out += sample_count;
+            }
+            if (out < buffer.data() || out >= buffer.data() + buffer.size()) {
+                return 0;
             }
             return *out;
         }
@@ -117,26 +129,41 @@ public:
         s32 sample_count{};
         s32 sample_count_max{};
         std::vector<Common::FixedPoint<50, 14>> buffer{};
-        Common::FixedPoint<50, 14>* buffer_end;
+        Common::FixedPoint<50, 14>* buffer_end{};
         Common::FixedPoint<50, 14>* input{};
         Common::FixedPoint<50, 14>* output{};
         Common::FixedPoint<50, 14> decay{};
     };
 
     struct State {
-        ReverbDelayLine pre_delay_line;
-        ReverbDelayLine center_delay_line;
-        std::array<s32, MaxDelayTaps> early_delay_times;
-        std::array<Common::FixedPoint<50, 14>, MaxDelayTaps> early_gains;
-        s32 pre_delay_time;
-        std::array<ReverbDelayLine, MaxDelayLines> decay_delay_lines;
-        std::array<ReverbDelayLine, MaxDelayLines> fdn_delay_lines;
-        std::array<Common::FixedPoint<50, 14>, MaxDelayLines> hf_decay_gain;
-        std::array<Common::FixedPoint<50, 14>, MaxDelayLines> hf_decay_prev_gain;
-        std::array<Common::FixedPoint<50, 14>, MaxDelayLines> prev_feedback_output;
+        ReverbDelayLine pre_delay_line{};
+        ReverbDelayLine center_delay_line{};
+        std::array<s32, MaxDelayTaps> early_delay_times{};
+        std::array<Common::FixedPoint<50, 14>, MaxDelayTaps> early_gains{};
+        s32 pre_delay_time{};
+        std::array<ReverbDelayLine, MaxDelayLines> decay_delay_lines{};
+        std::array<ReverbDelayLine, MaxDelayLines> fdn_delay_lines{};
+        std::array<Common::FixedPoint<50, 14>, MaxDelayLines> hf_decay_gain{};
+        std::array<Common::FixedPoint<50, 14>, MaxDelayLines> hf_decay_prev_gain{};
+        std::array<Common::FixedPoint<50, 14>, MaxDelayLines> prev_feedback_output{};
+        bool unk_initialized{};
+        Common::FixedPoint<50, 14> unk_value{};
     };
     static_assert(sizeof(State) <= sizeof(EffectInfoBase::State),
                   "ReverbInfo::State is too large!");
+    static_assert(alignof(State) <= alignof(std::max_align_t),
+                  "ReverbInfo::State alignment exceeds EffectInfoBase::state!");
+
+    ReverbInfo() {
+        std::construct_at(reinterpret_cast<State*>(state.data()));
+    }
+
+    ReverbInfo(const ReverbInfo&) = delete;
+    ReverbInfo& operator=(const ReverbInfo&) = delete;
+
+    ~ReverbInfo() override {
+        std::destroy_at(reinterpret_cast<State*>(state.data()));
+    }
 
     /**
      * Update the info with new parameters, version 1.

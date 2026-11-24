@@ -122,13 +122,24 @@ object CustomSettingsHandler {
             }
         }
 
+        var resolvedCustomSettings = customSettings
+
         // Check for driver requirements if activity and driverViewModel are provided
         if (activity != null && driverViewModel != null) {
             val rawDriverPath = extractDriverPath(customSettings)
-            if (rawDriverPath != null) {
+            if (!rawDriverPath.isNullOrBlank()) {
                 // Normalize to local storage path (we only store drivers under driverStoragePath)
                 val driverFilename = rawDriverPath.substringAfterLast('/')
                     .substringAfterLast('\\')
+                    .trim()
+                if (driverFilename.isEmpty() ||
+                    driverFilename == "." ||
+                    driverFilename == ".." ||
+                    driverFilename.contains('\u0000')
+                ) {
+                    Log.error("[CustomSettingsHandler] Invalid driver path in custom settings: $rawDriverPath")
+                    return null
+                }
                 val localDriverPath = "${GpuDriverHelper.driverStoragePath}$driverFilename"
                 Log.info("[CustomSettingsHandler] Custom settings specify driver: $rawDriverPath (normalized: $localDriverPath)")
 
@@ -174,7 +185,9 @@ object CustomSettingsHandler {
                         .create()
 
                     withContext(Dispatchers.Main) {
-                        progressDialog.show()
+                        if (!activity.isFinishing && !activity.isDestroyed) {
+                            progressDialog.show()
+                        }
                     }
 
                     try {
@@ -195,7 +208,9 @@ object CustomSettingsHandler {
                         progressJob.cancel()
 
                         withContext(Dispatchers.Main) {
-                            progressDialog.dismiss()
+                            if (!activity.isFinishing && !activity.isDestroyed && progressDialog.isShowing) {
+                                progressDialog.dismiss()
+                            }
                         }
 
                         if (driverUri == null) {
@@ -214,12 +229,15 @@ object CustomSettingsHandler {
                             return null
                         }
 
-                        // Verify the downloaded driver (from normalized local path)
-                        val installedFile = File(localDriverPath)
-                        val metadata = GpuDriverHelper.getMetadataFromZip(installedFile)
+                        // Verify the downloaded driver from the actual installed path
+                        val installedDriverPath = driverUri.path ?: localDriverPath
+                        val installedFile = File(installedDriverPath)
+                        val metadata = withContext(Dispatchers.IO) {
+                            GpuDriverHelper.getMetadataFromZip(installedFile)
+                        }
                         if (metadata.name == null) {
                             Log.error(
-                                "[CustomSettingsHandler] Downloaded driver is invalid: $localDriverPath"
+                                "[CustomSettingsHandler] Downloaded driver is invalid: $installedDriverPath"
                             )
                             Toast.makeText(
                                 activity,
@@ -228,7 +246,7 @@ object CustomSettingsHandler {
                                     game.title,
                                     activity.getString(
                                         R.string.invalid_driver_file,
-                                        driverFile.name
+                                        installedFile.name
                                     )
                                 ),
                                 Toast.LENGTH_LONG
@@ -236,8 +254,12 @@ object CustomSettingsHandler {
                             return null
                         }
 
-                        // Add to driver list
-                        driverViewModel.onDriverAdded(Pair(localDriverPath, metadata))
+                        // Add to driver list and update INI driver_path to the installed path
+                        driverViewModel.onDriverAdded(Pair(installedDriverPath, metadata))
+                        resolvedCustomSettings = updateDriverPathInSettings(
+                            resolvedCustomSettings,
+                            installedDriverPath
+                        )
                         Log.info(
                             "[CustomSettingsHandler] Successfully downloaded and installed driver: ${metadata.name}"
                         )
@@ -246,13 +268,15 @@ object CustomSettingsHandler {
                             activity,
                             activity.getString(
                                 R.string.successfully_installed,
-                                metadata.name ?: driverFile.name
+                                metadata.name ?: installedFile.name
                             ),
                             Toast.LENGTH_SHORT
                         ).show()
                     } catch (e: Exception) {
                         withContext(Dispatchers.Main) {
-                            progressDialog.dismiss()
+                            if (!activity.isFinishing && !activity.isDestroyed && progressDialog.isShowing) {
+                                progressDialog.dismiss()
+                            }
                         }
                         Log.error("[CustomSettingsHandler] Error downloading driver: ${e.message}")
                         Toast.makeText(
@@ -271,7 +295,9 @@ object CustomSettingsHandler {
                     }
                 } else {
                     // Driver exists, verify it's valid
-                    val metadata = GpuDriverHelper.getMetadataFromZip(driverFile)
+                    val metadata = withContext(Dispatchers.IO) {
+                        GpuDriverHelper.getMetadataFromZip(driverFile)
+                    }
                     if (metadata.name == null) {
                         Log.error("[CustomSettingsHandler] Invalid driver file: $localDriverPath")
                         Toast.makeText(
@@ -285,13 +311,17 @@ object CustomSettingsHandler {
                         ).show()
                         return null
                     }
+                    resolvedCustomSettings = updateDriverPathInSettings(
+                        resolvedCustomSettings,
+                        localDriverPath
+                    )
                     Log.info("[CustomSettingsHandler] Driver verified: ${metadata.name}")
                 }
             }
         }
 
         // Only write the config file after all checks pass
-        if (!writeConfigFile(game, customSettings)) {
+        if (!writeConfigFile(game, resolvedCustomSettings)) {
             Log.error("[CustomSettingsHandler] Failed to write config file")
             activity?.let {
                 Toast.makeText(
@@ -335,14 +365,13 @@ object CustomSettingsHandler {
         Log.info("[CustomSettingsHandler] Searching for game with title ID: $titleId")
         // Convert hex title ID to decimal for comparison with programId
         val programIdDecimal = try {
-            titleId.toLong(16).toString()
+            titleId.toULong(16).toString()
         } catch (e: NumberFormatException) {
             Log.error("[CustomSettingsHandler] Invalid title ID format: $titleId")
             return null
         }
 
-        // Expected hex format with "0" prefix
-        val expectedHex = "0${titleId.uppercase()}"
+        val expectedHex = titleId.uppercase().padStart(16, '0')
         // First check cached games for fast lookup
         GameHelper.cachedGameList.find { game ->
             game.programId == programIdDecimal ||
@@ -470,5 +499,24 @@ object CustomSettingsHandler {
         }
 
         return null
+    }
+
+    private fun updateDriverPathInSettings(customSettings: String, newDriverPath: String): String {
+        val lines = customSettings.lines()
+        var inGpuDriverSection = false
+        var updated = false
+        val result = lines.map { line ->
+            val trimmed = line.trim()
+            if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+                inGpuDriverSection = trimmed == "[GpuDriver]"
+                line
+            } else if (inGpuDriverSection && trimmed.startsWith("driver_path=")) {
+                updated = true
+                "driver_path=$newDriverPath"
+            } else {
+                line
+            }
+        }
+        return if (updated) result.joinToString("\n") else customSettings
     }
 }

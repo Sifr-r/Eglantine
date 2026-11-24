@@ -17,7 +17,7 @@
 namespace Service::Nvidia::Devices {
 
 nvhost_nvdec::nvhost_nvdec(Core::System& system_, NvCore::Container& core_)
-    : nvhost_nvdec_common{system_, core_, NvCore::ChannelType::NvDec} {}
+    : nvhost_nvdec_common{system_, core_, NvCore::ChannelType::NvDec, Kind} {}
 nvhost_nvdec::~nvhost_nvdec() = default;
 
 NvResult nvhost_nvdec::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> input,
@@ -26,6 +26,9 @@ NvResult nvhost_nvdec::Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> in
     case 0x0:
         switch (command.cmd) {
         case 0x01:
+            if (input.size() < sizeof(IoctlSubmit)) {
+                return NvResult::InvalidSize;
+            }
             return WrapFixedVariable(this, &nvhost_nvdec::Submit, input, output, fd);
         case 0x02:
             return WrapFixed(this, &nvhost_nvdec::GetSyncpoint, input, output);

@@ -1,8 +1,8 @@
 # Phase 0 — Establish a reproducible baseline
 
-Run these steps from the repository root before integrating a migration phase. Record the revision (`git log -1 --oneline`), relevant local changes (`git diff` and `git status --short`), OS, architecture, compiler, build type and feature settings with the results. Keep unrelated work in place. A baseline applies to the exact working tree and inputs you measured.
+Use this procedure from the repository root to compare the reference and candidate builds. Record the revision (`git log -1 --oneline`), relevant local changes (`git diff` and `git status --short`), OS, architecture, compiler, build type and feature settings with the results. Keep unrelated work in place. A baseline applies to the exact working tree and inputs you measured. The [architecture ledger](../ARCHITECTURE.md#first-party-language-and-domain-ownership) describes the current feature switches and ownership.
 
-## Build the reference and the prototype
+## Build the reference and candidate
 
 Use the repository’s configured CMake build directory. The target names are the same on Windows and Unix. [Project instructions](../AGENTS.md)
 
@@ -10,14 +10,14 @@ Use the repository’s configured CMake build directory. The target names are th
 cmake --build build --target yuzu yuzu-cmd tests --parallel
 ```
 
-For Phase 1A, also record `rustc -vV` and `cargo --version`. The standalone workspace uses the standard library and its checked-in lockfile. Run both commands from the repository root:
+For a Rust comparison, also record `rustc -vV` and `cargo --version`. Run these checks against the [workspace](../rust/Cargo.toml) with its checked-in lockfile:
 
 ```sh
 cargo test --manifest-path rust/Cargo.toml --locked --offline
 cargo build --manifest-path rust/Cargo.toml --release --locked --offline
 ```
 
-Use a Rust target compatible with the C++ compiler, architecture and runtime when linking the harness. On Windows, run MSVC commands from a matching Visual Studio developer shell. The CMake helper’s target-selection rules and the outstanding MSYS2 and cross-build checks are described in [Phase 1A](01_PHASE1A_RUST_AMPERE_PARITY.md). Later phases introduce their own prerequisites. See the [platform build checklist](06_BUILD_CI_PACKAGING_AND_CHECKLIST.md) before enabling a new dependency in packaging.
+Use a Rust target compatible with the C++ compiler, architecture and runtime when linking the harness. On Windows, run MSVC commands from a matching Visual Studio developer shell. Check the exact target and linker selection in the [CMake helper](../CMakeModules/AddRustCrate.cmake). See the [platform build checklist](06_BUILD_CI_PACKAGING_AND_CHECKLIST.md) before enabling a dependency in packaging.
 
 ## Run the checks for the affected subsystem
 
@@ -50,5 +50,5 @@ python -I tools/nx2/lab_ctl.py -d "$diagDir" stop
 
 - Keep game files, credentials, shader binaries, frame dumps and local profiling artifacts out of release inputs. [Release path checker](../tools/ci/check_release_paths.py)
 - Before each commit, run `python -I tools/nx2/catalog.py status`. Exit 1 means local entries need merging. Follow the repository’s separate catalogue commit procedure and include only program metadata. [Catalogue instructions](../AGENTS.md)
-- Use the project SPDX headers for new source files. The packaging checklist identifies the extensions that need checker support as new languages are introduced. [Header checker](../tools/ci/license-header.sh)
-- Review the coding and AI contribution policies before submission. Human authors review their changes, write their commit and PR text, and disclose AI assistance in both. [Coding guidelines](../docs/content/policies/Coding.mdx) · [AI policy](../docs/content/policies/AI.mdx)
+- Use the project SPDX headers for new source files. Check the supported extensions and regression cases in the [header checker](../tools/ci/license-header.sh) and [its tests](../tools/ci/test_license_header.py).
+- Review the coding and AI contribution policies before submission, and make sure changes are reviewed and tested. [Coding guidelines](../docs/content/policies/Coding.md) · [AI policy](../docs/content/policies/AI.md)

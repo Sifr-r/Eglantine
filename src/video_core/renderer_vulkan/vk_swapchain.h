@@ -33,6 +33,12 @@ public:
         u32 height);
     ~Swapchain();
 
+    enum class AcquireResult : u32 {
+        Success,
+        OutOfDate,
+        Unavailable,
+    };
+
     /// Creates (or recreates) the swapchain with a given size.
     void Create(
         VkSurfaceKHR_T* surface,
@@ -41,14 +47,19 @@ public:
 
     /// Acquires the next image in the swapchain, waits as needed.
     /// `may_flush`: false on the async present thread (see Scheduler::Wait).
-    bool AcquireNextImage(bool may_flush = true);
+    AcquireResult AcquireNextImage(bool may_flush = true);
 
     /// Presents the rendered image to the swapchain.
     void Present(VkSemaphore render_semaphore);
 
+    /// Returns true when the swapchain has backing images ready for acquisition.
+    bool HasImages() const noexcept {
+        return swapchain && !images.empty();
+    }
+
     /// Returns true when the swapchain needs to be recreated.
     bool NeedsRecreation() const {
-        return IsSubOptimal() || NeedsPresentModeUpdate();
+        return !HasImages() || IsOutDated() || IsSubOptimal() || NeedsPresentModeUpdate();
     }
 
     /// Returns true when the swapchain is outdated.

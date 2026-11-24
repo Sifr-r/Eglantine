@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <charconv>
 #include <string>
 
 #include <jni.h>
@@ -31,19 +32,29 @@ static void ResetFxChainToGlobal() {
 static void ResetFxChainToGlobal() {}
 #endif
 
-template <typename T>
-Settings::Setting<T>* getSetting(JNIEnv* env, jstring jkey) {
+static int parseEnumValue(const std::string& str) {
+    int parsed = -1;
+    std::from_chars(str.data(), str.data() + str.size(), parsed);
+    return parsed;
+}
+
+static Settings::BasicSetting* getBasicSetting(JNIEnv* env, jstring jkey) {
     auto key = Common::Android::GetJString(env, jkey);
-    auto basic_setting = Settings::values.linkage.by_key[key];
-    if (basic_setting != 0) {
-        return static_cast<Settings::Setting<T>*>(basic_setting);
+    if (auto it = Settings::values.linkage.by_key.find(key);
+        it != Settings::values.linkage.by_key.end() && it->second != nullptr) {
+        return it->second;
     }
-    auto basic_android_setting = AndroidSettings::values.linkage.by_key[key];
-    if (basic_android_setting != 0) {
-        return static_cast<Settings::Setting<T>*>(basic_android_setting);
+    if (auto it = AndroidSettings::values.linkage.by_key.find(key);
+        it != AndroidSettings::values.linkage.by_key.end() && it->second != nullptr) {
+        return it->second;
     }
     LOG_ERROR(Frontend, "[Android Native] Could not find setting - {}", key);
     return nullptr;
+}
+
+template <typename T>
+Settings::Setting<T>* getSetting(JNIEnv* env, jstring jkey) {
+    return static_cast<Settings::Setting<T>*>(getBasicSetting(env, jkey));
 }
 
 extern "C" {
@@ -59,11 +70,24 @@ void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_unloadGlobalConfig(JNIEnv* env, 
 }
 
 void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_reloadGlobalConfig(JNIEnv* env, jobject obj) {
+    if (global_config == nullptr) {
+        return;
+    }
+    const bool is_running = EmulationSession::GetInstance().IsRunning();
+    Settings::RestoreGlobalState(is_running);
+    if (!is_running) {
+        for (const auto& reset : AndroidSettings::values.linkage.restore_functions) {
+            reset();
+        }
+    }
     global_config->AndroidConfig::ReloadAllValues();
     ResetFxChainToGlobal();
 }
 
 void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_saveGlobalConfig(JNIEnv* env, jobject obj) {
+    if (global_config == nullptr) {
+        return;
+    }
     global_config->AndroidConfig::SaveAllValues();
 }
 
@@ -83,6 +107,9 @@ jboolean Java_org_yuzu_yuzu_1emu_utils_NativeConfig_isPerGameConfigLoaded(JNIEnv
 }
 
 void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_savePerGameConfig(JNIEnv* env, jobject obj) {
+    if (per_game_config == nullptr) {
+        return;
+    }
     per_game_config->AndroidConfig::SaveAllValues();
 }
 
@@ -110,20 +137,32 @@ void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_setBoolean(JNIEnv* env, jobject 
 
 jbyte Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getByte(JNIEnv* env, jobject obj, jstring jkey,
                                                          jboolean needGlobal) {
-    auto setting = getSetting<u8>(env, jkey);
-    if (setting == nullptr) {
+    auto* basic_setting = getBasicSetting(env, jkey);
+    if (basic_setting == nullptr) {
         return -1;
     }
-    return setting->GetValue(static_cast<bool>(needGlobal));
+    if (basic_setting->IsEnum()) {
+        const auto value_str =
+            static_cast<bool>(needGlobal) ? basic_setting->ToStringGlobal()
+                                          : basic_setting->ToString();
+        return static_cast<jbyte>(parseEnumValue(value_str));
+    }
+    auto* setting = static_cast<Settings::Setting<u8>*>(basic_setting);
+    return static_cast<jbyte>(setting->GetValue(static_cast<bool>(needGlobal)));
 }
 
 void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_setByte(JNIEnv* env, jobject obj, jstring jkey,
                                                         jbyte value) {
-    auto setting = getSetting<u8>(env, jkey);
-    if (setting == nullptr) {
+    auto* basic_setting = getBasicSetting(env, jkey);
+    if (basic_setting == nullptr) {
         return;
     }
-    setting->SetValue(value);
+    if (basic_setting->IsEnum()) {
+        basic_setting->LoadString(std::to_string(static_cast<int>(value)));
+        return;
+    }
+    auto* setting = static_cast<Settings::Setting<u8>*>(basic_setting);
+    setting->SetValue(static_cast<u8>(value));
 }
 
 jshort Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getShort(JNIEnv* env, jobject obj, jstring jkey,
@@ -165,20 +204,32 @@ void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_setUnsignedShort(JNIEnv* env, jo
 
 jint Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getInt(JNIEnv* env, jobject obj, jstring jkey,
                                                        jboolean needGlobal) {
-    auto setting = getSetting<int>(env, jkey);
-    if (setting == nullptr) {
+    auto* basic_setting = getBasicSetting(env, jkey);
+    if (basic_setting == nullptr) {
         return -1;
     }
-    return setting->GetValue(needGlobal);
+    if (basic_setting->IsEnum()) {
+        const auto value_str =
+            static_cast<bool>(needGlobal) ? basic_setting->ToStringGlobal()
+                                          : basic_setting->ToString();
+        return static_cast<jint>(parseEnumValue(value_str));
+    }
+    auto* setting = static_cast<Settings::Setting<int>*>(basic_setting);
+    return static_cast<jint>(setting->GetValue(static_cast<bool>(needGlobal)));
 }
 
 void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_setInt(JNIEnv* env, jobject obj, jstring jkey,
                                                        jint value) {
-    auto setting = getSetting<int>(env, jkey);
-    if (setting == nullptr) {
+    auto* basic_setting = getBasicSetting(env, jkey);
+    if (basic_setting == nullptr) {
         return;
     }
-    setting->SetValue(value);
+    if (basic_setting->IsEnum()) {
+        basic_setting->LoadString(std::to_string(static_cast<int>(value)));
+        return;
+    }
+    auto* setting = static_cast<Settings::Setting<int>*>(basic_setting);
+    setting->SetValue(static_cast<int>(value));
 }
 
 jfloat Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getFloat(JNIEnv* env, jobject obj, jstring jkey,
@@ -210,11 +261,11 @@ jlong Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getLong(JNIEnv* env, jobject ob
 
 void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_setLong(JNIEnv* env, jobject obj, jstring jkey,
                                                         jlong value) {
-    auto setting = getSetting<long>(env, jkey);
+    auto setting = getSetting<s64>(env, jkey);
     if (setting == nullptr) {
         return;
     }
-    setting->SetValue(value);
+    setting->SetValue(static_cast<s64>(value));
 }
 
 jstring Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getString(JNIEnv* env, jobject obj, jstring jkey,
@@ -238,7 +289,7 @@ void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_setString(JNIEnv* env, jobject o
 
 jboolean Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getIsRuntimeModifiable(JNIEnv* env, jobject obj,
                                                                            jstring jkey) {
-    auto setting = getSetting<std::string>(env, jkey);
+    auto* setting = getBasicSetting(env, jkey);
     if (setting != nullptr) {
         return setting->RuntimeModifiable();
     }
@@ -247,7 +298,7 @@ jboolean Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getIsRuntimeModifiable(JNIEn
 
 jstring Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getPairedSettingKey(JNIEnv* env, jobject obj,
                                                                        jstring jkey) {
-    auto setting = getSetting<std::string>(env, jkey);
+    auto* setting = getBasicSetting(env, jkey);
     if (setting == nullptr) {
         return Common::Android::ToJString(env, "");
     }
@@ -260,7 +311,7 @@ jstring Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getPairedSettingKey(JNIEnv* e
 
 jboolean Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getIsSwitchable(JNIEnv* env, jobject obj,
                                                                     jstring jkey) {
-    auto setting = getSetting<std::string>(env, jkey);
+    auto* setting = getBasicSetting(env, jkey);
     if (setting != nullptr) {
         return setting->Switchable();
     }
@@ -269,7 +320,7 @@ jboolean Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getIsSwitchable(JNIEnv* env,
 
 jboolean Java_org_yuzu_yuzu_1emu_utils_NativeConfig_usingGlobal(JNIEnv* env, jobject obj,
                                                                 jstring jkey) {
-    auto setting = getSetting<std::string>(env, jkey);
+    auto* setting = getBasicSetting(env, jkey);
     if (setting != nullptr) {
         return setting->UsingGlobal();
     }
@@ -278,7 +329,7 @@ jboolean Java_org_yuzu_yuzu_1emu_utils_NativeConfig_usingGlobal(JNIEnv* env, job
 
 void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_setGlobal(JNIEnv* env, jobject obj, jstring jkey,
                                                           jboolean global) {
-    auto setting = getSetting<std::string>(env, jkey);
+    auto* setting = getBasicSetting(env, jkey);
     if (setting != nullptr) {
         setting->SetGlobal(static_cast<bool>(global));
     }
@@ -286,7 +337,7 @@ void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_setGlobal(JNIEnv* env, jobject o
 
 jboolean Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getIsSaveable(JNIEnv* env, jobject obj,
                                                                   jstring jkey) {
-    auto setting = getSetting<std::string>(env, jkey);
+    auto* setting = getBasicSetting(env, jkey);
     if (setting != nullptr) {
         return setting->Save();
     }
@@ -295,7 +346,7 @@ jboolean Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getIsSaveable(JNIEnv* env, j
 
 jstring Java_org_yuzu_yuzu_1emu_utils_NativeConfig_getDefaultToString(JNIEnv* env, jobject obj,
                                                                       jstring jkey) {
-    auto setting = getSetting<std::string>(env, jkey);
+    auto* setting = getBasicSetting(env, jkey);
     if (setting != nullptr) {
         return Common::Android::ToJString(env, setting->DefaultToString());
     }
@@ -572,6 +623,9 @@ void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_setInputSettings(JNIEnv* env, jo
 }
 
 void Java_org_yuzu_yuzu_1emu_utils_NativeConfig_saveControlPlayerValues(JNIEnv* env, jobject obj) {
+    if (per_game_config == nullptr) {
+        return;
+    }
     Settings::values.players.SetGlobal(false);
 
     // Clear all controls from the config in case the user reverted back to globals

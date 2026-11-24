@@ -7,6 +7,9 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstring>
+
 #include "common/alignment.h"
 #include "core/file_sys/fssystem/fssystem_integrity_verification_storage.h"
 
@@ -61,29 +64,41 @@ size_t IntegrityVerificationStorage::Read(u8* buffer, size_t size, size_t offset
 
     // Validate arguments.
     ASSERT(buffer != nullptr);
+    if (buffer == nullptr) {
+        return 0;
+    }
 
     // Validate the offset.
-    s64 data_size = m_data_storage->GetSize();
-    ASSERT(offset <= static_cast<size_t>(data_size));
+    const s64 data_size = static_cast<s64>(m_data_storage->GetSize());
+    if (data_size <= 0 || offset >= static_cast<size_t>(data_size)) {
+        return 0;
+    }
 
     // Validate the access range.
     ASSERT(R_SUCCEEDED(IStorage::CheckAccessRange(
         offset, size, Common::AlignUp(data_size, static_cast<size_t>(m_verification_block_size)))));
 
     // Determine the read extents.
+    const size_t remaining = static_cast<size_t>(data_size) - offset;
     size_t read_size = size;
-    if (static_cast<s64>(offset + read_size) > data_size) {
+    if (read_size > remaining) {
         // Determine the padding sizes.
-        s64 padding_offset = data_size - offset;
-        size_t padding_size = static_cast<size_t>(
-            m_verification_block_size - (padding_offset & (m_verification_block_size - 1)));
-        ASSERT(static_cast<s64>(padding_size) < m_verification_block_size);
+        const size_t padding_offset = remaining;
+        const size_t block_offset =
+            padding_offset & static_cast<size_t>(m_verification_block_size - 1);
+        const size_t unpadded_tail =
+            block_offset != 0
+                ? static_cast<size_t>(m_verification_block_size) - block_offset
+                : 0;
+        const size_t padding_size = (std::min)(unpadded_tail, size - padding_offset);
 
         // Clear the padding.
-        std::memset(static_cast<u8*>(buffer) + padding_offset, 0, padding_size);
+        if (padding_size > 0) {
+            std::memset(buffer + padding_offset, 0, padding_size);
+        }
 
         // Set the new in-bounds size.
-        read_size = static_cast<size_t>(data_size - offset);
+        read_size = remaining;
     }
 
     // Perform the read.

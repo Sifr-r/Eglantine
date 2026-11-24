@@ -4,7 +4,13 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstring>
+#include <limits>
 #include <memory>
+#include <optional>
+#include <unordered_set>
+#include <vector>
 
 #include "common/assert.h"
 #include "common/common_types.h"
@@ -66,64 +72,103 @@ struct RomFSTraversalContext {
 };
 
 template <typename EntryType, auto Member>
-std::pair<EntryType, std::string> GetEntry(const RomFSTraversalContext& ctx, size_t offset) {
-    const size_t entry_end = offset + sizeof(EntryType);
+std::optional<std::pair<EntryType, std::string>> GetEntry(const RomFSTraversalContext& ctx,
+                                                          size_t offset) {
     const std::vector<u8>& vec = ctx.*Member;
     const size_t size = vec.size();
+    if (offset > size || sizeof(EntryType) > size - offset) {
+        return std::nullopt;
+    }
+
+    const size_t entry_end = offset + sizeof(EntryType);
     const u8* data = vec.data();
     EntryType entry{};
-
-    if (entry_end > size) {
-        return {};
-    }
     std::memcpy(&entry, data + offset, sizeof(EntryType));
 
-    const size_t name_length = (std::min)(entry_end + entry.name_length, size) - entry_end;
+    const size_t name_length =
+        (std::min)(static_cast<size_t>(entry.name_length), size - entry_end);
     std::string name(reinterpret_cast<const char*>(data + entry_end), name_length);
 
-    return {entry, std::move(name)};
+    return std::make_pair(entry, std::move(name));
 }
 
-std::pair<DirectoryEntry, std::string> GetDirectoryEntry(const RomFSTraversalContext& ctx,
-                                                         size_t directory_offset) {
+std::optional<std::pair<DirectoryEntry, std::string>> GetDirectoryEntry(
+    const RomFSTraversalContext& ctx, size_t directory_offset) {
     return GetEntry<DirectoryEntry, &RomFSTraversalContext::directory_meta>(ctx, directory_offset);
 }
 
-std::pair<FileEntry, std::string> GetFileEntry(const RomFSTraversalContext& ctx,
-                                               size_t file_offset) {
+std::optional<std::pair<FileEntry, std::string>> GetFileEntry(const RomFSTraversalContext& ctx,
+                                                              size_t file_offset) {
     return GetEntry<FileEntry, &RomFSTraversalContext::file_meta>(ctx, file_offset);
 }
 
 void ProcessFile(const RomFSTraversalContext& ctx, u32 this_file_offset,
-                 std::shared_ptr<VectorVfsDirectory>& parent) {
+                 std::shared_ptr<VectorVfsDirectory>& parent,
+                 std::unordered_set<u32>& visited_files) {
+    constexpr u64 max_size_t = (std::numeric_limits<std::size_t>::max)();
     while (this_file_offset != ROMFS_ENTRY_EMPTY) {
+        if (!visited_files.insert(this_file_offset).second) {
+            break;
+        }
         auto entry = GetFileEntry(ctx, this_file_offset);
+        if (!entry) {
+            break;
+        }
 
-        parent->AddFile(std::make_shared<OffsetVfsFile>(ctx.file, entry.first.size,
-                                                        entry.first.offset + ctx.header.data_offset,
-                                                        std::move(entry.second)));
+        const u64 file_offset = entry->first.offset;
+        const u64 file_size = entry->first.size;
+        if (file_offset <= (std::numeric_limits<u64>::max)() - ctx.header.data_offset) {
+            const u64 abs_offset = file_offset + ctx.header.data_offset;
+            if (abs_offset <= max_size_t && file_size <= max_size_t) {
+                parent->AddFile(std::make_shared<OffsetVfsFile>(
+                    ctx.file, static_cast<std::size_t>(file_size),
+                    static_cast<std::size_t>(abs_offset), std::move(entry->second)));
+            }
+        }
 
-        this_file_offset = entry.first.sibling;
+        this_file_offset = entry->first.sibling;
     }
 }
 
-void ProcessDirectory(const RomFSTraversalContext& ctx, u32 this_dir_offset,
-                      std::shared_ptr<VectorVfsDirectory>& parent) {
-    while (this_dir_offset != ROMFS_ENTRY_EMPTY) {
-        auto entry = GetDirectoryEntry(ctx, this_dir_offset);
-        auto current = std::make_shared<VectorVfsDirectory>(
-            std::vector<VirtualFile>{}, std::vector<VirtualDir>{}, entry.second);
+void ProcessDirectory(const RomFSTraversalContext& ctx, u32 root_dir_offset,
+                      std::shared_ptr<VectorVfsDirectory>& root_parent) {
+    struct PendingDir {
+        u32 offset;
+        std::shared_ptr<VectorVfsDirectory> parent;
+    };
 
-        if (entry.first.child_file != ROMFS_ENTRY_EMPTY) {
-            ProcessFile(ctx, entry.first.child_file, current);
+    std::unordered_set<u32> visited_dirs;
+    std::unordered_set<u32> visited_files;
+    std::vector<PendingDir> stack;
+    stack.push_back({root_dir_offset, root_parent});
+
+    while (!stack.empty()) {
+        auto [this_dir_offset, parent] = std::move(stack.back());
+        stack.pop_back();
+
+        while (this_dir_offset != ROMFS_ENTRY_EMPTY) {
+            if (!visited_dirs.insert(this_dir_offset).second) {
+                break;
+            }
+            auto entry = GetDirectoryEntry(ctx, this_dir_offset);
+            if (!entry) {
+                break;
+            }
+
+            auto current = std::make_shared<VectorVfsDirectory>(
+                std::vector<VirtualFile>{}, std::vector<VirtualDir>{}, std::move(entry->second));
+
+            if (entry->first.child_file != ROMFS_ENTRY_EMPTY) {
+                ProcessFile(ctx, entry->first.child_file, current, visited_files);
+            }
+
+            if (entry->first.child_dir != ROMFS_ENTRY_EMPTY) {
+                stack.push_back({entry->first.child_dir, current});
+            }
+
+            parent->AddDirectory(std::move(current));
+            this_dir_offset = entry->first.sibling;
         }
-
-        if (entry.first.child_dir != ROMFS_ENTRY_EMPTY) {
-            ProcessDirectory(ctx, entry.first.child_dir, current);
-        }
-
-        parent->AddDirectory(current);
-        this_dir_offset = entry.first.sibling;
     }
 }
 } // Anonymous namespace
@@ -144,10 +189,25 @@ VirtualDir ExtractRomFS(VirtualFile file) {
         return nullptr;
     }
 
+    const u64 file_size = file->GetSize();
+    constexpr u64 max_size_t = (std::numeric_limits<std::size_t>::max)();
+    const auto is_valid_range = [file_size, max_size_t](const TableLocation& loc) {
+        return loc.offset <= file_size && loc.size <= file_size - loc.offset &&
+               loc.size <= max_size_t;
+    };
+    if (!is_valid_range(ctx.header.directory_meta) || !is_valid_range(ctx.header.file_meta)) {
+        return nullptr;
+    }
+
     ctx.file = file;
-    ctx.directory_meta =
-        file->ReadBytes(ctx.header.directory_meta.size, ctx.header.directory_meta.offset);
-    ctx.file_meta = file->ReadBytes(ctx.header.file_meta.size, ctx.header.file_meta.offset);
+    ctx.directory_meta = file->ReadBytes(static_cast<std::size_t>(ctx.header.directory_meta.size),
+                                         static_cast<std::size_t>(ctx.header.directory_meta.offset));
+    ctx.file_meta = file->ReadBytes(static_cast<std::size_t>(ctx.header.file_meta.size),
+                                    static_cast<std::size_t>(ctx.header.file_meta.offset));
+    if (ctx.directory_meta.size() != ctx.header.directory_meta.size ||
+        ctx.file_meta.size() != ctx.header.file_meta.size) {
+        return nullptr;
+    }
 
     ProcessDirectory(ctx, 0, root_container);
 
@@ -155,7 +215,6 @@ VirtualDir ExtractRomFS(VirtualFile file) {
         return root;
     }
 
-    ASSERT(false);
     return nullptr;
 }
 

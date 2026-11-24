@@ -7,6 +7,9 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <span>
 #include <tuple>
 #include <utility>
 
@@ -1164,15 +1167,28 @@ Result KServerSession::ReceiveRequest(KernelCore& kernel, uintptr_t server_messa
         // HLE request.
         if (!client_message) {
             client_message = GetInteger(client_thread->GetTlsAddress());
+            client_buffer_size = IPC::COMMAND_BUFFER_LENGTH * sizeof(u32);
         }
         Core::Memory::Memory& memory{client_thread->GetOwnerProcess()->GetMemory()};
-        u32* cmd_buf{reinterpret_cast<u32*>(memory.GetPointer(client_message))};
-        *out_context =
-            std::make_shared<Service::HLERequestContext>(kernel, memory, this, client_thread);
-        (*out_context)->SetSessionRequestManager(manager);
-        (*out_context)->PopulateFromIncomingCommandBuffer(cmd_buf);
-        // We succeeded.
-        R_SUCCEED();
+        std::array<u32, IPC::COMMAND_BUFFER_LENGTH> command_buffer;
+        const auto words = std::span{command_buffer}.first(
+            std::min(command_buffer.size(), client_buffer_size / sizeof(u32)));
+        if (words.empty()) {
+            result = ResultInvalidSize;
+        } else if (!memory.ReadBlock(client_message, words.data(), words.size_bytes())) {
+            result = ResultInvalidAddress;
+        } else {
+            auto context =
+                std::make_shared<Service::HLERequestContext>(kernel, memory, this, client_thread);
+            context->SetSessionRequestManager(manager);
+            result = context->PopulateFromIncomingCommandBuffer(words);
+            if (R_SUCCEEDED(result)) {
+                *out_context = std::move(context);
+            }
+        }
+        if (R_FAILED(result)) {
+            LOG_DEBUG(IPC, "Rejected invalid HLE request (result {:#x})", result.raw);
+        }
     } else {
         result = ReceiveMessage(kernel, recv_list_broken, server_message, server_buffer_size,
                                 server_message_paddr, *client_thread, client_message,

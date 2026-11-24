@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -196,5 +197,6 @@ private:
     std::vector<TASCommand> record_commands{};
     size_t current_command{0};
     TASCommand last_input{}; // only used for recording
+    mutable std::mutex tas_mutex;
 };
 } // namespace InputCommon::TasInput

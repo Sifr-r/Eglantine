@@ -286,8 +286,24 @@ class InstallableFragment : Fragment() {
                     if (files != null) {
                         for (file in files) {
                             if (file.isDirectory) {
-                                val baseSaveDir =
-                                    NativeLibrary.getSavePath(BigInteger(file.name, 16).toString())
+                                val titleId = try {
+                                    if (file.name.isNotEmpty() &&
+                                        file.name.all {
+                                            it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F'
+                                        }
+                                    ) {
+                                        BigInteger(file.name, 16).toString()
+                                    } else {
+                                        null
+                                    }
+                                } catch (_: NumberFormatException) {
+                                    null
+                                }
+                                if (titleId == null) {
+                                    failedImports++
+                                    continue
+                                }
+                                val baseSaveDir = NativeLibrary.getSavePath(titleId)
                                 if (baseSaveDir.isEmpty()) {
                                     failedImports++
                                     continue
@@ -305,6 +321,9 @@ class InstallableFragment : Fragment() {
                     }
 
                     withContext(Dispatchers.Main) {
+                        if (!isAdded) {
+                            return@withContext
+                        }
                         if (successfulImports == 0) {
                             MessageDialogFragment.newInstance(
                                 requireActivity(),
@@ -343,14 +362,11 @@ class InstallableFragment : Fragment() {
                             descriptionString = successString
                         ).show(parentFragmentManager, MessageDialogFragment.TAG)
                     }
-
-                    cacheSaveDir.deleteRecursively()
+                    Unit
                 } catch (e: Exception) {
-                    Toast.makeText(
-                        YuzuApplication.appContext,
-                        getString(R.string.fatal_error),
-                        Toast.LENGTH_LONG
-                    ).show()
+                    YuzuApplication.appContext.getString(R.string.fatal_error)
+                } finally {
+                    cacheSaveDir.deleteRecursively()
                 }
             }.show(parentFragmentManager, ProgressDialogFragment.TAG)
         }
@@ -367,41 +383,52 @@ class InstallableFragment : Fragment() {
             R.string.save_files_exporting,
             false
         ) { _, _ ->
-            val cacheSaveDir = File("${requireContext().cacheDir.path}/saves/")
+            val appContext = YuzuApplication.appContext
+            val cacheSaveDir = File("${appContext.cacheDir.path}/saves/")
             cacheSaveDir.mkdir()
 
-            val oldSaveDataFolder = File(
-                NativeConfig.getSaveDir() +
-                    NativeLibrary.getDefaultProfileSaveDataRoot(false)
-            )
-            if (oldSaveDataFolder.exists()) {
-                oldSaveDataFolder.copyRecursively(cacheSaveDir)
-            }
+            try {
+                val oldSaveDataFolder = File(
+                    NativeConfig.getSaveDir() +
+                        NativeLibrary.getDefaultProfileSaveDataRoot(false)
+                )
+                if (oldSaveDataFolder.exists()) {
+                    oldSaveDataFolder.copyRecursively(cacheSaveDir)
+                }
 
-            val futureSaveDataFolder = File(
-                NativeConfig.getSaveDir() +
-                    NativeLibrary.getDefaultProfileSaveDataRoot(true)
-            )
-            if (futureSaveDataFolder.exists()) {
-                futureSaveDataFolder.copyRecursively(cacheSaveDir)
-            }
+                val futureSaveDataFolder = File(
+                    NativeConfig.getSaveDir() +
+                        NativeLibrary.getDefaultProfileSaveDataRoot(true)
+                )
+                if (futureSaveDataFolder.exists()) {
+                    futureSaveDataFolder.copyRecursively(cacheSaveDir)
+                }
 
-            val saveFilesTotal = cacheSaveDir.listFiles()?.size ?: 0
-            if (saveFilesTotal == 0) {
+                val saveFilesTotal = cacheSaveDir.listFiles()?.size ?: 0
+                if (saveFilesTotal == 0) {
+                    return@newInstance appContext.getString(R.string.no_save_data_found)
+                }
+
+                val zipResult = try {
+                    appContext.contentResolver.openOutputStream(result)?.use { rawOut ->
+                        BufferedOutputStream(rawOut).use { bufferedOut ->
+                            FileUtil.zipFromInternalStorage(
+                                cacheSaveDir,
+                                cacheSaveDir.path,
+                                bufferedOut
+                            )
+                        }
+                    } ?: TaskState.Failed
+                } catch (_: Exception) {
+                    TaskState.Failed
+                }
+
+                return@newInstance when (zipResult) {
+                    TaskState.Completed -> appContext.getString(R.string.export_success)
+                    TaskState.Cancelled, TaskState.Failed -> appContext.getString(R.string.export_failed)
+                }
+            } finally {
                 cacheSaveDir.deleteRecursively()
-                return@newInstance getString(R.string.no_save_data_found)
-            }
-
-            val zipResult = FileUtil.zipFromInternalStorage(
-                cacheSaveDir,
-                cacheSaveDir.path,
-                BufferedOutputStream(requireContext().contentResolver.openOutputStream(result))
-            )
-            cacheSaveDir.deleteRecursively()
-
-            return@newInstance when (zipResult) {
-                TaskState.Completed -> getString(R.string.export_success)
-                TaskState.Cancelled, TaskState.Failed -> getString(R.string.export_failed)
             }
         }.show(parentFragmentManager, ProgressDialogFragment.TAG)
     }

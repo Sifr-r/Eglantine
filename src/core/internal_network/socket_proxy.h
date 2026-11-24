@@ -10,6 +10,7 @@
 
 #include <condition_variable>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <vector>
 #include <queue>
@@ -114,6 +115,7 @@ private:
     u32 receive_timeout = 0;
     bool is_bound = false;
     SockAddrIn local_endpoint{};
+    std::optional<SockAddrIn> remote_endpoint;
     bool blocking = true;
     std::queue<ProxyPacket> received_packets;
     std::size_t front_read_offset = 0; ///< Bytes of the front TCP packet that were already read

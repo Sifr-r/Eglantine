@@ -24,12 +24,18 @@ class GpuUnswizzleDialogFragment : DialogFragment() {
         super.onCreate(savedInstanceState)
         position = requireArguments().getInt(POSITION)
 
-        if (settingsViewModel.clickedItem == null) dismiss()
+        if (settingsViewModel.clickedItem !is GpuUnswizzleSetting) {
+            dismiss()
+            return
+        }
     }
 
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
+        val item = settingsViewModel.clickedItem as? GpuUnswizzleSetting ?: run {
+            dismissAllowingStateLoss()
+            return super.onCreateDialog(savedInstanceState)
+        }
         binding = DialogGpuUnswizzleBinding.inflate(LayoutInflater.from(requireContext()))
-        val item = settingsViewModel.clickedItem as GpuUnswizzleSetting
 
         // Setup texture size dropdown
         val textureSizeEntries = resources.getStringArray(item.textureSizeChoicesId)

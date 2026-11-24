@@ -561,9 +561,16 @@ std::string SaveDataFactory::GetUserGameSaveDataRoot(u128 user_id, bool future) 
 
 SaveDataSize SaveDataFactory::ReadSaveDataSize(SaveDataType type, u64 title_id,
                                                u128 user_id) const {
+    if (dir == nullptr) {
+        return {0, 0};
+    }
+
     const auto path =
         GetFullPath(program_id, dir, SaveDataSpaceId::User, type, title_id, user_id, 0);
     const auto relative_dir = GetOrCreateDirectoryRelative(dir, path);
+    if (relative_dir == nullptr) {
+        return {0, 0};
+    }
 
     const auto size_file = relative_dir->GetFile(GetSaveDataSizeFileName());
     if (size_file == nullptr || size_file->GetSize() < sizeof(SaveDataSize)) {
@@ -580,9 +587,16 @@ SaveDataSize SaveDataFactory::ReadSaveDataSize(SaveDataType type, u64 title_id,
 
 void SaveDataFactory::WriteSaveDataSize(SaveDataType type, u64 title_id, u128 user_id,
                                         SaveDataSize new_value) const {
+    if (dir == nullptr) {
+        return;
+    }
+
     const auto path =
         GetFullPath(program_id, dir, SaveDataSpaceId::User, type, title_id, user_id, 0);
     const auto relative_dir = GetOrCreateDirectoryRelative(dir, path);
+    if (relative_dir == nullptr) {
+        return;
+    }
 
     const auto size_file = relative_dir->CreateFile(GetSaveDataSizeFileName());
     if (size_file == nullptr) {

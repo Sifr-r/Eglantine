@@ -26,6 +26,8 @@ struct UpsamplerInfo {
     u32 sample_count{};
     /// Number of channels to upsample
     u32 input_count{};
+    /// Number of mix buffers available per upsampler slice
+    u32 buffer_count{};
     /// Is this upsampler enabled?
     bool enabled{};
     /// Mix buffer indexes to be upsampled

@@ -16,7 +16,7 @@ In::In(Core::System& system_, Manager& manager_, Kernel::KEvent* event_, size_t 
 
 void In::Free() {
     std::scoped_lock l{parent_mutex};
-    manager.ReleaseSessionId(system.GetSessionId());
+    manager.ReleaseSessionIdLocked(system.GetSessionId());
 }
 
 System& In::GetSystem() {
@@ -35,6 +35,10 @@ Result In::StartSystem() {
 
 void In::StartSession() {
     std::scoped_lock l{parent_mutex};
+    StartSessionLocked();
+}
+
+void In::StartSessionLocked() {
     system.StartSession();
 }
 
@@ -54,6 +58,10 @@ Result In::AppendBuffer(const AudioInBuffer& buffer, u64 tag) {
 
 void In::ReleaseAndRegisterBuffers() {
     std::scoped_lock l{parent_mutex};
+    ReleaseAndRegisterBuffersLocked();
+}
+
+void In::ReleaseAndRegisterBuffersLocked() {
     if (system.GetState() == State::Started) {
         system.ReleaseBuffers();
         system.RegisterBuffers();

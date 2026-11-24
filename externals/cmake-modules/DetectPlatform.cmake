@@ -72,23 +72,47 @@ endif()
 ]]
 
 function(FixMsysPath target)
-    get_target_property(include_dir ${target} INTERFACE_INCLUDE_DIRECTORIES)
-
-    if (NOT (include_dir MATCHES "^/"))
+    if (NOT TARGET "${target}")
         return()
     endif()
 
-    set(root_default $ENV{MSYS2_LOCATION})
+    get_target_property(include_dir "${target}" INTERFACE_INCLUDE_DIRECTORIES)
+    if (NOT include_dir)
+        return()
+    endif()
+
+    set(has_msys_path FALSE)
+    foreach(dir IN LISTS include_dir)
+        if (dir MATCHES "^/")
+            set(has_msys_path TRUE)
+            break()
+        endif()
+    endforeach()
+    if (NOT has_msys_path)
+        return()
+    endif()
+
+    set(root_default "$ENV{MSYS2_LOCATION}")
     if (root_default STREQUAL "")
         set(root_default "C:/msys64")
     endif()
 
-    set(MSYS_ROOT_PATH ${root_default}
+    set(MSYS_ROOT_PATH "${root_default}"
         CACHE STRING "Location of the MSYS2 root")
+    file(TO_CMAKE_PATH "${MSYS_ROOT_PATH}" msys_root)
+    string(REGEX REPLACE "/+$" "" msys_root "${msys_root}")
 
-    set(include_dir "C:/msys64${include_dir}")
-    set_target_properties(${target} PROPERTIES
-        INTERFACE_INCLUDE_DIRECTORIES ${include_dir})
+    set(fixed_dirs "")
+    foreach(dir IN LISTS include_dir)
+        if (dir MATCHES "^/")
+            list(APPEND fixed_dirs "${msys_root}${dir}")
+        else()
+            list(APPEND fixed_dirs "${dir}")
+        endif()
+    endforeach()
+
+    set_target_properties("${target}" PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${fixed_dirs}")
 endfunction()
 
 # Saves linking time

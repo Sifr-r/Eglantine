@@ -73,9 +73,19 @@ class NfcReader(private val activity: Activity) {
         }
 
         val amiibo = NfcA.get(tag) ?: return
-        amiibo.connect()
+        val tagData = try {
+            amiibo.connect()
+            ntag215ReadAll(amiibo)
+        } catch (e: IOException) {
+            Log.error("[NfcReader] Failed to read NFC tag: ${e.message}")
+            null
+        } finally {
+            try {
+                amiibo.close()
+            } catch (_: IOException) {
+            }
+        } ?: return
 
-        val tagData = ntag215ReadAll(amiibo) ?: return
         NativeInput.onReadNfcTag(tagData)
 
         nfcAdapter?.ignore(
@@ -90,24 +100,32 @@ class NfcReader(private val activity: Activity) {
         val bufferSize = amiibo.maxTransceiveLength
         val tagSize = 0x21C
         val pageSize = 4
-        val lastPage = tagSize / pageSize - 1
+        if (bufferSize < pageSize) {
+            return null
+        }
+
+        val totalPages = tagSize / pageSize
+        val lastPage = totalPages - 1
+        val pagesPerRead = ((bufferSize - 1) / pageSize).coerceAtLeast(1)
         val tagData = ByteArray(tagSize)
 
         // We need to read the ntag in steps otherwise we overflow the buffer
-        for (i in 0..tagSize step bufferSize - 1) {
-            val dataStart = i / pageSize
-            var dataEnd = (i + bufferSize) / pageSize
-
-            if (dataEnd > lastPage) {
-                dataEnd = lastPage
-            }
+        var startPage = 0
+        while (startPage <= lastPage) {
+            val endPage = minOf(startPage + pagesPerRead - 1, lastPage)
+            val expectedBytes = (endPage - startPage + 1) * pageSize
 
             try {
-                val data = ntag215FastRead(amiibo, dataStart, dataEnd - 1)
-                System.arraycopy(data, 0, tagData, i, (dataEnd - dataStart) * pageSize)
-            } catch (e: IOException) {
+                val data = ntag215FastRead(amiibo, startPage, endPage)
+                if (data == null || data.size < expectedBytes) {
+                    return null
+                }
+                System.arraycopy(data, 0, tagData, startPage * pageSize, expectedBytes)
+            } catch (_: IOException) {
                 return null
             }
+
+            startPage = endPage + 1
         }
         return tagData
     }

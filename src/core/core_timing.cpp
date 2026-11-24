@@ -233,9 +233,11 @@ u64 CoreTiming::GetClockTicks() const {
         fres = fres * target / CPU_CLOCK_BASE_MHZ;
     }
     if (::Settings::values.sync_core_speed.GetValue()) {
-        auto const ticks = f64(fres);
-        auto const speed_limit = f64(Settings::SpeedLimit()) * 0.01;
-        return u64(ticks / speed_limit);
+        if (const u16 limit = Settings::SpeedLimit(); limit > 0) {
+            auto const ticks = f64(fres);
+            auto const speed_limit = f64(limit) * 0.01;
+            return u64(ticks / speed_limit);
+        }
     }
     return fres;
 }

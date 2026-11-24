@@ -27,6 +27,7 @@ class System;
 }
 
 namespace Service::PSC::Time {
+class ContextWriter;
 using ClockSourceId = Common::UUID;
 
 enum class TimeType : u8 {
@@ -135,6 +136,7 @@ struct OperationEvent : public Common::IntrusiveListBaseNode<OperationEvent> {
 
     KernelHelpers::ServiceContext m_ctx;
     Kernel::KEvent* m_event{};
+    ContextWriter* m_owner{};
 };
 
 inline std::chrono::nanoseconds ConvertToTimeSpan(s64 ticks) {

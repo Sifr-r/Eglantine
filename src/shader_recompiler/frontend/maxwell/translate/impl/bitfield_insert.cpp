@@ -22,13 +22,13 @@ void BFI(TranslatorVisitor& v, u64 insn, const IR::U32& src_a, const IR::U32& ba
 
     // Edge case conditions
     const IR::U1 exceed_offset{v.ir.IGreaterThanEqual(offset, max_size, false)};
-    const IR::U1 exceed_count{v.ir.IGreaterThan(unsafe_count, max_size, false)};
-
-    const IR::U32 remaining_size{v.ir.ISub(max_size, offset)};
+    const IR::U32 safe_offset{v.ir.Select(exceed_offset, zero, offset)};
+    const IR::U32 remaining_size{v.ir.ISub(max_size, safe_offset)};
+    const IR::U1 exceed_count{v.ir.IGreaterThan(unsafe_count, remaining_size, false)};
     const IR::U32 safe_count{v.ir.Select(exceed_count, remaining_size, unsafe_count)};
 
     const IR::U32 insert{v.X(bfi.insert_reg)};
-    IR::U32 result{v.ir.BitFieldInsert(base, insert, offset, safe_count)};
+    IR::U32 result{v.ir.BitFieldInsert(base, insert, safe_offset, safe_count)};
 
     result = IR::U32{v.ir.Select(exceed_offset, base, result)};
 

@@ -286,10 +286,12 @@ void IOFile::Open(const fs::path& path, FileAccessMode mode, FileType type, File
         const auto fd = Android::OpenContentUri(path, Android::OpenMode::Read);
         if (fd != -1) {
             file = fdopen(fd, "r");
-            const auto error_num = errno;
-            if (error_num != 0 && file == nullptr) {
+            if (file == nullptr) {
+                const auto error_num = errno;
                 LOG_ERROR(Common_Filesystem, "Error opening file: {}, error: {}", path.c_str(),
                           strerror(error_num));
+                close(fd);
+                errno = error_num;
             }
         } else {
             LOG_ERROR(Common_Filesystem, "Error opening file: {}", path.c_str());

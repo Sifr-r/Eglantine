@@ -10,6 +10,7 @@
 add_executable(tests
     core/nx2_frame_interval.cpp
     core/save_data_lifecycle.cpp
+    video_core/astc.cpp
     video_core/etc2.cpp
     video_core/upload_batch.cpp
     video_core/texture_swizzle.cpp
@@ -52,6 +53,7 @@ add_executable(tests
     core/key_code_map.cpp
     core/launch_params.cpp
     core/ldn.cpp
+    core/loader_file_formats.cpp
     core/memory_range.cpp
     core/internal_network/socket_proxy.cpp
     core/nup_writer.cpp

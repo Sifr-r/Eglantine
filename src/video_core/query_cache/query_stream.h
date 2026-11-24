@@ -7,6 +7,7 @@
 #pragma once
 
 #include <deque>
+#include <mutex>
 #include <optional>
 #include <vector>
 
@@ -110,6 +111,7 @@ public:
 
 protected:
     virtual QueryType* GetQuery(size_t query_id) override {
+        std::scoped_lock lk(slot_guard);
         if (query_id < slot_queries.size()) {
             return &slot_queries[query_id];
         }
@@ -127,17 +129,23 @@ protected:
         if (!old_queries.empty()) {
             size_t new_id = old_queries.front();
             old_queries.pop_front();
+            std::scoped_lock slot_lk(slot_guard);
             new (&slot_queries[new_id]) QueryType(std::forward<Args>(args)...);
             return new_id;
         }
+        std::scoped_lock slot_lk(slot_guard);
         size_t new_id = slot_queries.size();
         slot_queries.emplace_back(std::forward<Args>(args)...);
         return new_id;
     }
 
     void ReleaseQuery(size_t query_id) {
-
-        if (query_id < slot_queries.size()) {
+        bool valid{};
+        {
+            std::scoped_lock slot_lk(slot_guard);
+            valid = query_id < slot_queries.size();
+        }
+        if (valid) {
             old_queries.push_back(query_id);
             return;
         }
@@ -145,6 +153,7 @@ protected:
     }
 
     std::mutex guard;
+    std::mutex slot_guard;
     std::deque<QueryType> slot_queries;
     std::deque<size_t> old_queries;
 };

@@ -188,6 +188,10 @@ typedef struct EglNupParsedContainer {
     size_t child_count;
 } EglNupParsedContainer;
 
+// All `out_*` parameters are write-only output structs: callers may pass uninitialized storage
+// and do not need to zero-initialize beforehand. Prior non-empty results must be freed via the
+// corresponding `egl_nup_*free*` function before reusing the same struct across calls. When `out_*`
+// is non-null and properly aligned, failure or no-error paths initialize its fields to zero/null.
 uint8_t egl_nup_is_nup_magic(const uint8_t* bytes, size_t len, uint64_t total_size);
 
 int32_t egl_nup_container_parse(const EglNupVfsOps* vfs, EglNupParsedContainer* out_container);

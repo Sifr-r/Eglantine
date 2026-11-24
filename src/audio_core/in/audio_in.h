@@ -138,12 +138,17 @@ public:
     u64 GetPlayedSampleCount() const;
 
 private:
+    friend class Manager;
+
+    void StartSessionLocked();
+    void ReleaseAndRegisterBuffersLocked();
+
     /// Keeps the manager alive until this audio in is gone (declared first, destroyed last).
     std::shared_ptr<Manager> manager_keep_alive;
     /// The AudioIn::Manager this audio in is registered with
     Manager& manager;
     /// Manager's mutex
-    std::recursive_mutex& parent_mutex;
+    std::mutex& parent_mutex;
     /// Buffer event, signalled when buffers are ready to be released
     Kernel::KEvent* event;
     /// Main audio in system

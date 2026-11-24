@@ -57,9 +57,10 @@ public:
         device_channels = device_channels_;
         system_channels = system_channels_;
 
-        if (ctx && !OpenBackend()) {
-            device_lost = true;
-            LOG_WARNING(Audio_Sink, "Cubeb stream {} failed to open, retrying", name);
+        if (!ctx || !OpenBackend()) {
+            device_lost = ctx != nullptr;
+            LOG_WARNING(Audio_Sink, "Cubeb stream {} failed to open, playing silence instead", name);
+            StartSilentDevice();
         }
     }
 
@@ -86,6 +87,7 @@ public:
         finalized = true;
         SignalPause();
         CloseBackend();
+        StopSilentDevice();
     }
 
     /**
@@ -96,11 +98,13 @@ public:
      */
     void Start(bool resume = false) override {
         std::scoped_lock lock{backend_mutex};
-        if (!ctx || finalized || !paused) {
+        if (finalized || !paused) {
             return;
         }
         paused = false;
-        StartBackend();
+        if (ctx) {
+            StartBackend();
+        }
     }
 
     /**
@@ -139,8 +143,10 @@ public:
         device_lost = false;
         if (!OpenBackend()) {
             device_lost = true;
+            StartSilentDevice();
             return;
         }
+        StopSilentDevice();
         if (!paused) {
             StartBackend();
         }
@@ -157,6 +163,7 @@ private:
         stalled_checks = 0;
         if (stream_backend && cubeb_stream_start(stream_backend) != CUBEB_OK) {
             device_lost = true;
+            StartSilentDevice();
         }
     }
 
@@ -412,19 +419,21 @@ std::vector<std::string> ListCubebSinkDevices(bool capture) {
     cubeb* ctx;
 
 #ifdef _WIN32
-    auto com_init_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const auto com_init_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    SCOPE_EXIT {
+        if (SUCCEEDED(com_init_result)) {
+            CoUninitialize();
+        }
+    };
 #endif
 
     if (cubeb_init(&ctx, "Eden Device Enumerator", nullptr) != CUBEB_OK) {
         LOG_CRITICAL(Audio_Sink, "cubeb_init failed");
         return {};
     }
-
-#ifdef _WIN32
-    if (SUCCEEDED(com_init_result)) {
-        CoUninitialize();
-    }
-#endif
+    SCOPE_EXIT {
+        cubeb_destroy(ctx);
+    };
 
     auto type{capture ? CUBEB_DEVICE_TYPE_INPUT : CUBEB_DEVICE_TYPE_OUTPUT};
     cubeb_device_collection collection;
@@ -441,7 +450,6 @@ std::vector<std::string> ListCubebSinkDevices(bool capture) {
         cubeb_device_collection_destroy(ctx, &collection);
     }
 
-    cubeb_destroy(ctx);
     return device_list;
 }
 
@@ -450,7 +458,12 @@ u32 GetCubebLatency() {
     cubeb* ctx;
 
 #ifdef _WIN32
-    auto com_init_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const auto com_init_result = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    SCOPE_EXIT {
+        if (SUCCEEDED(com_init_result)) {
+            CoUninitialize();
+        }
+    };
 #endif
 
     // Init cubeb
@@ -459,12 +472,9 @@ u32 GetCubebLatency() {
         // Return a large latency so we choose SDL instead.
         return 10000u;
     }
-
-#ifdef _WIN32
-    if (SUCCEEDED(com_init_result)) {
-        CoUninitialize();
-    }
-#endif
+    SCOPE_EXIT {
+        cubeb_destroy(ctx);
+    };
 
     // Get min latency
     cubeb_stream_params params{};
@@ -481,7 +491,6 @@ u32 GetCubebLatency() {
         latency = TargetSampleCount * 2;
     }
     latency = (std::max)(latency, TargetSampleCount * 2);
-    cubeb_destroy(ctx);
     return latency;
 }
 

@@ -379,18 +379,26 @@ struct Memory::Impl {
     }
 
     bool CopyBlock(Common::ProcessAddress dest_addr, Common::ProcessAddress src_addr, const std::size_t size) {
-        return WalkBlock(dest_addr, size,
+        bool dest_accessible = true;
+        const bool src_accessible = WalkBlock(src_addr, size,
         [&](const std::size_t offset, const std::size_t copy_amount, const Common::ProcessAddress current_vaddr) {
             LOG_ERROR(HW_Memory, "Unmapped @ {:#016x} (start address = {:#016x}, size = {})", GetInteger(current_vaddr), GetInteger(src_addr), size);
-            ZeroBlock(dest_addr + offset, copy_amount);
+            if (!ZeroBlock(dest_addr + offset, copy_amount)) {
+                dest_accessible = false;
+            }
         },
         [&](const std::size_t offset, const std::size_t copy_amount, const u8* const ptr) {
-            WriteBlockImpl(dest_addr + offset, ptr, copy_amount, false);
+            if (!WriteBlockImpl(dest_addr + offset, ptr, copy_amount, false)) {
+                dest_accessible = false;
+            }
         },
         [&](const Common::ProcessAddress current_vaddr, const std::size_t offset, const std::size_t copy_amount, u8* const ptr) {
             HandleRasterizerDownload(GetInteger(current_vaddr), copy_amount);
-            WriteBlockImpl(dest_addr + offset, ptr, copy_amount, false);
+            if (!WriteBlockImpl(dest_addr + offset, ptr, copy_amount, false)) {
+                dest_accessible = false;
+            }
         });
+        return src_accessible && dest_accessible;
     }
 
     template <typename Callback>
@@ -934,18 +942,18 @@ struct Memory::Impl {
         VideoCommon::Nx2Spikes::Note(VideoCommon::Nx2Spikes::Event::CpuWriteSlowPath, {}, size);
         const auto* p = GetPointerImpl(
             v_address, []() {}, []() {});
-        constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
+        constexpr size_t non_core_slot = Core::Hardware::NUM_CPU_CORES;
         const size_t core = (std::min)(system.GetCurrentHostThreadID(),
-                                     sys_core); // any other calls threads go to syscore.
-        if (!gpu_device_memory) [[unlikely]] {
+                                       non_core_slot); // non-core threads share the dedicated slot
+        if (!gpu_device_memory) {
             gpu_device_memory = &system.Host1x().MemoryManager();
         }
-        // Guard on sys_core;
-        if (core == sys_core) [[unlikely]] {
+        // Guard on non-core host threads; CPU core threads exclusively own slots 0..NUM_CPU_CORES-1.
+        if (core == non_core_slot) {
             sys_core_guard.lock();
         }
         SCOPE_EXIT {
-            if (core == sys_core) [[unlikely]] {
+            if (core == non_core_slot) {
                 sys_core_guard.unlock();
             }
         };
@@ -967,7 +975,9 @@ struct Memory::Impl {
                 }
             }
             VideoCommon::Nx2Hazard::NoteGuestWrite(address, size);
-            gpu_dirty_managers[core].Collect(address, size);
+            if (core < gpu_dirty_managers.size()) {
+                gpu_dirty_managers[core].Collect(address, size);
+            }
         });
     }
 
@@ -976,18 +986,18 @@ struct Memory::Impl {
     };
 
     void InvalidateGPUMemory(u8* p, size_t size) {
-        constexpr size_t sys_core = Core::Hardware::NUM_CPU_CORES - 1;
+        constexpr size_t non_core_slot = Core::Hardware::NUM_CPU_CORES;
         const size_t core = (std::min)(system.GetCurrentHostThreadID(),
-                                     sys_core); // any other calls threads go to syscore.
-        if (!gpu_device_memory) [[unlikely]] {
+                                       non_core_slot); // non-core threads share the dedicated slot
+        if (!gpu_device_memory) {
             gpu_device_memory = &system.Host1x().MemoryManager();
         }
-        // Guard on sys_core;
-        if (core == sys_core) [[unlikely]] {
+        // Guard on non-core host threads; CPU core threads exclusively own slots 0..NUM_CPU_CORES-1.
+        if (core == non_core_slot) {
             sys_core_guard.lock();
         }
         SCOPE_EXIT {
-            if (core == sys_core) [[unlikely]] {
+            if (core == non_core_slot) {
                 sys_core_guard.unlock();
             }
         };
@@ -1006,8 +1016,8 @@ struct Memory::Impl {
     std::set<u64> armed_read_traps;
     std::atomic<size_t> armed_read_trap_count{};
     std::mutex read_trap_mutex;
-    std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES> rasterizer_write_areas{};
-    std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES> scratch_buffers{};
+    std::array<GPUDirtyState, Core::Hardware::NUM_CPU_CORES + 1> rasterizer_write_areas{};
+    std::array<Common::ScratchBuffer<u32>, Core::Hardware::NUM_CPU_CORES + 1> scratch_buffers{};
     std::span<Core::GPUDirtyMemoryManager> gpu_dirty_managers;
     std::mutex sys_core_guard;
 #ifdef __ANDROID__

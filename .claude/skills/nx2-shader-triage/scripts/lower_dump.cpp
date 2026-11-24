@@ -18,12 +18,20 @@
 using namespace Shader::Ampere;
 
 int main(int argc, char** argv) {
+    int exit_code = 0;
     for (int arg = 1; arg < argc; ++arg) {
         const std::string path = argv[arg];
         std::ifstream file(path, std::ios::binary);
+        if (!file) {
+            std::fprintf(stderr, "ERROR: failed to open %s\n", path.c_str());
+            exit_code = 1;
+            continue;
+        }
         const std::vector<char> bytes{std::istreambuf_iterator<char>(file), {}};
         std::vector<Instruction> code(bytes.size() / sizeof(Instruction));
-        std::memcpy(code.data(), bytes.data(), code.size() * sizeof(Instruction));
+        if (!code.empty()) {
+            std::memcpy(code.data(), bytes.data(), code.size() * sizeof(Instruction));
+        }
         // The dump name has no stage. Mesh programs (bound to the tessellation slot) lower plain,
         // geometry programs with geometry set: keep whichever gets furthest.
         auto lowered = LowerToMaxwell(code, LoweringOptions{.tensor = true});
@@ -51,4 +59,5 @@ int main(int argc, char** argv) {
                     lowered.error_offset, static_cast<int>(lowered.error.size()), lowered.error.data(),
                     words[0] & 0xfff, words[0], words[1], words[2], words[3]);
     }
+    return exit_code;
 }

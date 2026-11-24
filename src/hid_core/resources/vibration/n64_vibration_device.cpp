@@ -87,7 +87,7 @@ Result NpadN64VibrationDevice::SendValueInBool(bool is_vibrating) {
         if (result.IsError()) {
             return result;
         }
-        xcd_handle->SetVibration(false);
+        xcd_handle->SetVibration(volume > 0.0f && is_vibrating);
     }
     return ResultSuccess;
 }

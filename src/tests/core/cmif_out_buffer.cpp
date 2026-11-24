@@ -104,7 +104,7 @@ TEST_CASE("CMIF out buffers keep the guest bytes a short read leaves alone", "[c
                                                 std::vector<u8>(file_size, 0x11), "save.bin")};
     std::fill_n(page + BufferOffset, buffer_size, u8{0xa5});
 
-    std::array<u32_le, IPC::COMMAND_BUFFER_LENGTH> words{};
+    std::array<u32, IPC::COMMAND_BUFFER_LENGTH> words{};
     IPC::CommandHeader header{};
     header.type.Assign(IPC::CommandType::Request);
     if (map_alias) {
@@ -130,7 +130,7 @@ TEST_CASE("CMIF out buffers keep the guest bytes a short read leaves alone", "[c
 
     Service::HLERequestContext request{kernel, memory, nullptr, &client};
     request.SetSessionRequestManager(manager);
-    REQUIRE(request.PopulateFromIncomingCommandBuffer(words.data()).IsSuccess());
+    REQUIRE(request.PopulateFromIncomingCommandBuffer(words).IsSuccess());
     if (map_alias) {
         file.InvokeRequest(request);
         CHECK(request.CommandBuffer()[8] == file_size);

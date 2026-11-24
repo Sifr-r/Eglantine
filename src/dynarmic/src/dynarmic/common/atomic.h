@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "common/common_types.h"
 
 namespace Dynarmic::Atomic {
@@ -46,7 +48,7 @@ inline u32 Exchange(volatile u32* ptr, u32 value) {
 
 inline void Barrier() {
 #ifdef _MSC_VER
-    _ReadWriteBarrier();
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 #else
     __atomic_thread_fence(__ATOMIC_SEQ_CST);
 #endif

@@ -316,18 +316,20 @@ void EmitGetAttributeIndexed(EmitContext& ctx, IR::Inst& inst, ScalarS32 offset,
         read(compare_index, values);
     }};
     if (ctx.info.loads.AnyComponent(IR::Attribute::PositionX)) {
-        const u32 index{static_cast<u32>(IR::Attribute::PositionX)};
+        const u32 index{static_cast<u32>(IR::Attribute::PositionX) >> 2};
         if (IsInputArray(ctx.stage)) {
             read_swizzled(index, fmt::format("vertex_position{}", VertexIndex(ctx, vertex)));
         } else {
             read_swizzled(index, fmt::format("{}.position", ctx.attrib_name));
         }
     }
+    const u32 generic_base{static_cast<u32>(IR::Attribute::Generic0X) >> 2};
     for (u32 index = 0; index < static_cast<u32>(IR::NUM_GENERICS); ++index) {
         if (!ctx.info.loads.Generic(index)) {
             continue;
         }
-        read_swizzled(index, fmt::format("in_attr{}{}[0]", index, VertexIndex(ctx, vertex)));
+        read_swizzled(generic_base + index,
+                      fmt::format("in_attr{}{}[0]", index, VertexIndex(ctx, vertex)));
     }
     for (u32 i = 0; i < num_endifs; ++i) {
         ctx.Add("ENDIF;");
@@ -427,10 +429,12 @@ void EmitIsHelperInvocation(EmitContext& ctx, IR::Inst& inst) {
 
 void EmitSR_WScaleFactorXY(EmitContext& ctx, IR::Inst& inst) {
     LOG_WARNING(Shader, "(STUBBED) called");
+    ctx.Add("MOV.S {}.x,0x00ff0000;", inst);
 }
 
 void EmitSR_WScaleFactorZ(EmitContext& ctx, IR::Inst& inst) {
     LOG_WARNING(Shader, "(STUBBED) called");
+    ctx.Add("MOV.S {}.x,0x00ff0000;", inst);
 }
 
 void EmitYDirection(EmitContext& ctx, IR::Inst& inst) {

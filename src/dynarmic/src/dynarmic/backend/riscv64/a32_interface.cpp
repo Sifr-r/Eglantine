@@ -13,6 +13,7 @@
 #include "common/assert.h"
 #include "common/common_types.h"
 
+#include "dynarmic/backend/block_range_information.h"
 #include "dynarmic/backend/riscv64/a32_address_space.h"
 #include "dynarmic/backend/riscv64/a32_core.h"
 #include "dynarmic/backend/riscv64/a32_jitstate.h"
@@ -55,8 +56,11 @@ struct Jit::Impl final {
     }
 
     void InvalidateCacheRange(u32 start_address, size_t length) {
+        if (length == 0) {
+            return;
+        }
         std::unique_lock lock{invalidation_mutex};
-        invalid_cache_ranges.add(boost::icl::discrete_interval<u32>::closed(start_address, static_cast<u32>(start_address + length - 1)));
+        invalid_cache_ranges.add(Backend::MakeClosedCacheRange<u32>(start_address, length));
         HaltExecution(HaltReason::CacheInvalidation);
     }
 
@@ -65,7 +69,7 @@ struct Jit::Impl final {
     }
 
     void HaltExecution(HaltReason hr) {
-        Atomic::Or(&halt_reason, ~static_cast<u32>(hr));
+        Atomic::Or(&halt_reason, static_cast<u32>(hr));
     }
 
     void ClearHalt(HaltReason hr) {

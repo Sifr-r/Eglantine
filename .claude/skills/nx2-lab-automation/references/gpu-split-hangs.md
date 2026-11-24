@@ -43,13 +43,14 @@ the first-boot shader rebuild or the log before theorising.
 Lab config for a fence mode: copy `$D/qt-copy.ini` and set `gpu_fence_behavior\default=false`,
 `gpu_fence_behavior=<0 Default|1 Immediate|2 Balanced|3 Accurate>`. Pass it as an extra
 `--config` after `to_gameplay.sh` (argparse keeps the last). `eden-cli` doesn't log the settings
-dump, so confirm the mode by its effect.
+dump, so record the selected config and the resulting fence behaviour.
 
 ## Getting live stacks of a hang
 
-`ptrace_scope=1` blocks attaching to a running emulator. Launch it under gdb instead:
-`lab_ctl launch --binary <skill>/scripts/eden-gdb.sh` (pass-through for dynarmic's SIGSEGV).
-On the freeze, SIGINT the `eden-cli` pid and gdb prints every thread to `emulator.log` under
-`=====GDB-THREADS=====`. The SIGINT needs the user's approval: ask before the run, not at the
-freeze, or the instance sits frozen on their GPU. If no stacks come, work it out from the wait
-chain: who waits, what it waits for, and which thread must run for that to happen.
+If Linux ptrace policy blocks attaching, launch your owned run under GDB. Set `REPO` for the
+wrapper and add `--binary .claude/skills/nx2-lab-automation/scripts/eden-gdb.sh` to the normal
+bounded `lab_ctl.py launch` command. The wrapper passes Dynarmic's guest-memory SIGSEGV through.
+Get approval for the SIGINT before launching. On the freeze, identify the `eden-cli` inferior of
+your wrapper and signal that process. GDB prints every thread to `emulator.log` under
+`=====GDB-THREADS=====`. Finish with the usual lab cleanup. If stacks are unavailable, record
+the first stalled thread, the event it needs, and the thread responsible for making progress.

@@ -8,12 +8,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 
 #include <fmt/format.h>
 #include <fmt/ostream.h>
@@ -54,7 +56,9 @@ std::string_view GetNameOfA32Instruction(u32 instruction) {
 }
 
 std::string_view GetNameOfA64Instruction(u32 instruction) {
-    return *A64::GetName<A64::TranslatorVisitor>(instruction);
+    if (auto const decoder = A64::GetName<A64::TranslatorVisitor>(instruction))
+        return *decoder;
+    return "<null>";
 }
 
 void PrintA32Instruction(u32 instruction) {
@@ -218,12 +222,12 @@ void ExecuteA32Instruction(u32 instruction) {
         std::string line = get_line();
         if (line.length() > 2 && line[0] == '0' && line[1] == 'x')
             line = line.substr(2);
-        if (line.length() > 8)
+        if (line.empty() || line.length() > 8)
             return std::nullopt;
 
-        char* endptr;
-        const u32 value = strtol(line.c_str(), &endptr, 16);
-        if (line.c_str() + line.length() != endptr)
+        u32 value = 0;
+        const auto [ptr, ec] = std::from_chars(line.data(), line.data() + line.size(), value, 16);
+        if (ec != std::errc{} || ptr != line.data() + line.size())
             return std::nullopt;
 
         return value;
@@ -273,7 +277,7 @@ void ExecuteA32Instruction(u32 instruction) {
     }
     for (size_t i = 0; i < ext_regs.size(); ++i) {
         if (ext_regs[i] != cpu.ExtRegs()[i]) {
-            fmt::print("{:3s}: {:08x}\n", static_cast<A32::ExtReg>(i), cpu.Regs()[i]);
+            fmt::print("{:3s}: {:08x}\n", static_cast<A32::ExtReg>(i), cpu.ExtRegs()[i]);
         }
     }
     if (cpsr != cpu.Cpsr()) {
@@ -295,16 +299,22 @@ int main(int argc, char** argv) {
     }
 
     const char* const hex_instruction = [s = argv[2]] {
-        if (strlen(s) > 2 && s[0] == '0' && s[1] == 'x')
+        if (strlen(s) > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'))
             return s + 2;
         return s;
     }();
-    if (strlen(hex_instruction) > 8) {
-        fmt::print("hex string too long\n");
+    const std::string_view hex_sv{hex_instruction};
+    if (hex_sv.empty() || hex_sv.size() > 8) {
+        fmt::print("invalid hex string length\n");
         return 1;
     }
 
-    const u32 instruction = strtol(hex_instruction, nullptr, 16);
+    u32 instruction = 0;
+    const auto [ptr, ec] = std::from_chars(hex_sv.data(), hex_sv.data() + hex_sv.size(), instruction, 16);
+    if (ec != std::errc{} || ptr != hex_sv.data() + hex_sv.size()) {
+        fmt::print("invalid hex instruction\n");
+        return 1;
+    }
     if (strcmp(argv[1], "a32") == 0) {
         PrintA32Instruction(instruction);
     } else if (strcmp(argv[1], "a64") == 0) {

@@ -7,11 +7,11 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use crate::format::{
-    read_u16_le, read_u32_le, read_u64_le, sha256, ReadAt, ZstdCodec, CODEC_RAW, CODEC_ZSTD,
-    DIR_RECORD_SIZE, FILE_RECORD_SIZE, HEADER_MAGIC, MAX_DIR_DEPTH, NO_DIR,
+    is_cancelled, read_u16_le, read_u32_le, read_u64_le, sha256, ReadAt, ZstdCodec, CODEC_RAW,
+    CODEC_ZSTD, DIR_RECORD_SIZE, FILE_RECORD_SIZE, HEADER_MAGIC, MAX_DIR_DEPTH, NO_DIR,
     PACKAGE_FLAG_STANDALONE_UPDATE, PACKAGE_RECORD_SIZE, PROGRESS_STEP, READ_BUFFER_SIZE,
     SUPERBLOCK_SIZE, TOC_HEADER_SIZE, TOC_MAGIC,
 };
@@ -330,7 +330,8 @@ impl NupContainer {
                         || extent_offset < blob_offset
                         || extent_offset % 0x10 != 0
                         || extent_offset > file_size
-                        || extent_size > file_size - extent_offset))
+                        || extent_size > file_size - extent_offset
+                        || (codec == CODEC_RAW && extent_size != size)))
                 || name_offset + name_length > pool_size_u64
             {
                 return Err("invalid file record".to_string());
@@ -389,24 +390,39 @@ impl NupContainer {
             dir: usize,
             next: u32,
         }
+
+        let mut has_parent = vec![false; self.dirs.len()];
+        for node in &self.dirs {
+            let first = node.first_child as usize;
+            let end = first + node.child_count as usize;
+            for &child in &self.children[first..end] {
+                let child_idx = child as usize;
+                if child_idx < self.dirs.len() {
+                    if has_parent[child_idx] {
+                        return Err("NUP directory tree contains shared directory".to_string());
+                    }
+                    has_parent[child_idx] = true;
+                }
+            }
+        }
+
         let mut state = vec![State::Unvisited; self.dirs.len()];
-        let mut height = vec![0u32; self.dirs.len()];
         let mut stack: Vec<Frame> = Vec::new();
 
         for start in 0..self.dirs.len() {
-            if state[start] != State::Unvisited {
+            if has_parent[start] || state[start] != State::Unvisited {
                 continue;
             }
             state[start] = State::InProgress;
             stack.push(Frame { dir: start, next: 0 });
+            if stack.len() > MAX_DIR_DEPTH {
+                return Err("NUP directory tree is nested too deeply".to_string());
+            }
             while let Some(frame) = stack.last().copied() {
                 let node = &self.dirs[frame.dir];
                 if frame.next == node.child_count {
                     state[frame.dir] = State::Done;
                     stack.pop();
-                    if let Some(parent) = stack.last() {
-                        height[parent.dir] = height[parent.dir].max(height[frame.dir] + 1);
-                    }
                     continue;
                 }
                 if let Some(top) = stack.last_mut() {
@@ -420,15 +436,18 @@ impl NupContainer {
                     return Err("NUP directory tree contains a cycle".to_string());
                 }
                 if state[child] == State::Done {
-                    height[frame.dir] = height[frame.dir].max(height[child] + 1);
-                } else {
-                    state[child] = State::InProgress;
-                    stack.push(Frame { dir: child, next: 0 });
+                    return Err("NUP directory tree contains shared directory".to_string());
                 }
-                if stack.len() + (height[child] as usize) > MAX_DIR_DEPTH {
+                state[child] = State::InProgress;
+                stack.push(Frame { dir: child, next: 0 });
+                if stack.len() > MAX_DIR_DEPTH {
                     return Err("NUP directory tree is nested too deeply".to_string());
                 }
             }
+        }
+
+        if state.iter().any(|&s| s != State::Done) {
+            return Err("NUP directory tree contains a cycle".to_string());
         }
         Ok(())
     }
@@ -555,7 +574,12 @@ fn checked_name(name: &str) -> Result<(), (ExtractResult, String)> {
     }
 }
 
-fn count_dir(container: &NupContainer, dir_index: usize, files: &mut u64, bytes: &mut u64) {
+fn count_dir(
+    container: &NupContainer,
+    dir_index: usize,
+    files: &mut u64,
+    bytes: &mut u64,
+) -> Result<(), (ExtractResult, String)> {
     let node = &container.dirs[dir_index];
     let first = node.first_child as usize;
     let end = first + node.child_count as usize;
@@ -563,12 +587,23 @@ fn count_dir(container: &NupContainer, dir_index: usize, files: &mut u64, bytes:
         let child = container.children[slot] as usize;
         if child >= container.dirs.len() {
             let f = &container.files[child - container.dirs.len()];
-            *files += 1;
-            *bytes += f.size;
+            *files = files.checked_add(1).ok_or_else(|| {
+                (
+                    ExtractResult::InvalidSource,
+                    "NUP file count overflow".to_string(),
+                )
+            })?;
+            *bytes = bytes.checked_add(f.size).ok_or_else(|| {
+                (
+                    ExtractResult::InvalidSource,
+                    "NUP byte size overflow".to_string(),
+                )
+            })?;
         } else {
-            count_dir(container, child, files, bytes);
+            count_dir(container, child, files, bytes)?;
         }
     }
+    Ok(())
 }
 
 fn write_dir(
@@ -580,6 +615,7 @@ fn write_dir(
     progress: &mut PackProgress,
     progress_cb: &mut Option<&mut dyn FnMut(&PackProgress)>,
     cancel: Option<&AtomicBool>,
+    cancel_poll: Option<&dyn Fn() -> bool>,
     last_report: &mut u64,
 ) -> Result<(), (ExtractResult, String)> {
     fs::create_dir_all(dest).map_err(|e| {
@@ -595,7 +631,7 @@ fn write_dir(
 
     // Subdirectories first, then files (matches WriteDir in nup_writer.cpp).
     for slot in first..end {
-        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        if is_cancelled(cancel, cancel_poll) {
             return Err((ExtractResult::Cancelled, "cancelled".to_string()));
         }
         let child = container.children[slot] as usize;
@@ -611,13 +647,14 @@ fn write_dir(
                 progress,
                 progress_cb,
                 cancel,
+                cancel_poll,
                 last_report,
             )?;
         }
     }
 
     for slot in first..end {
-        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+        if is_cancelled(cancel, cancel_poll) {
             return Err((ExtractResult::Cancelled, "cancelled".to_string()));
         }
         let child = container.children[slot] as usize;
@@ -634,14 +671,21 @@ fn write_dir(
 
             if fnode.size > 0 {
                 if fnode.codec == CODEC_RAW {
+                    if fnode.extent_size != fnode.size {
+                        return Err((
+                            ExtractResult::InvalidSource,
+                            format!("raw extent size mismatch for {}", fnode.name),
+                        ));
+                    }
                     let mut remaining = fnode.size;
                     let mut off = 0u64;
-                    let mut buf = vec![0u8; READ_BUFFER_SIZE.min(remaining as usize)];
+                    let buf_len = remaining.min(READ_BUFFER_SIZE as u64) as usize;
+                    let mut buf = vec![0u8; buf_len];
                     while remaining > 0 {
-                        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                        if is_cancelled(cancel, cancel_poll) {
                             return Err((ExtractResult::Cancelled, "cancelled".to_string()));
                         }
-                        let chunk = (remaining as usize).min(buf.len());
+                        let chunk = remaining.min(buf.len() as u64) as usize;
                         let got = reader
                             .read_at(fnode.extent_offset + off, &mut buf[..chunk])
                             .map_err(|e| (ExtractResult::IoError, e.to_string()))?;
@@ -659,8 +703,8 @@ fn write_dir(
                         })?;
                         off += got as u64;
                         remaining -= got as u64;
-                        progress.bytes_done += got as u64;
-                        if progress.bytes_done - *last_report >= PROGRESS_STEP {
+                        progress.bytes_done = progress.bytes_done.saturating_add(got as u64);
+                        if progress.bytes_done.saturating_sub(*last_report) >= PROGRESS_STEP {
                             *last_report = progress.bytes_done;
                             if let Some(cb) = progress_cb.as_deref_mut() {
                                 cb(progress);
@@ -683,8 +727,8 @@ fn write_dir(
                             "write failed, the disk may be full".to_string(),
                         )
                     })?;
-                    progress.bytes_done += data.len() as u64;
-                    if progress.bytes_done - *last_report >= PROGRESS_STEP {
+                    progress.bytes_done = progress.bytes_done.saturating_add(data.len() as u64);
+                    if progress.bytes_done.saturating_sub(*last_report) >= PROGRESS_STEP {
                         *last_report = progress.bytes_done;
                         if let Some(cb) = progress_cb.as_deref_mut() {
                             cb(progress);
@@ -707,9 +751,23 @@ pub fn extract_nup(
     archive: &Path,
     out_dir: &Path,
     zstd: &dyn ZstdCodec,
-    mut progress_cb: Option<&mut dyn FnMut(&PackProgress)>,
+    progress_cb: Option<&mut dyn FnMut(&PackProgress)>,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), (ExtractResult, String)> {
+    extract_nup_with_cancel_poll(archive, out_dir, zstd, progress_cb, cancel, None)
+}
+
+pub(crate) fn extract_nup_with_cancel_poll(
+    archive: &Path,
+    out_dir: &Path,
+    zstd: &dyn ZstdCodec,
+    mut progress_cb: Option<&mut dyn FnMut(&PackProgress)>,
+    cancel: Option<&AtomicBool>,
+    cancel_poll: Option<&dyn Fn() -> bool>,
+) -> Result<(), (ExtractResult, String)> {
+    if is_cancelled(cancel, cancel_poll) {
+        return Err((ExtractResult::Cancelled, "cancelled".to_string()));
+    }
     let mut created = false;
     let mut claimed = false;
 
@@ -820,7 +878,7 @@ pub fn extract_nup(
                 pkg.root_dir as usize,
                 &mut progress.files_total,
                 &mut progress.bytes_total,
-            );
+            )?;
         }
 
         if let Some(cb) = progress_cb.as_deref_mut() {
@@ -838,6 +896,7 @@ pub fn extract_nup(
                 &mut progress,
                 &mut progress_cb,
                 cancel,
+                cancel_poll,
                 &mut last_report,
             )?;
         }

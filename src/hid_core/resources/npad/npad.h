@@ -192,11 +192,14 @@ private:
         u64 aruid, const Core::HID::SixAxisSensorHandle& device_handle);
     const Core::HID::SixAxisSensorProperties& GetSixaxisProperties(
         u64 aruid, const Core::HID::SixAxisSensorHandle& device_handle) const;
+    Result ValidateSixaxisAccess(u64 aruid,
+                                 const Core::HID::SixAxisSensorHandle& sixaxis_handle) const;
+    [[nodiscard]] std::unique_lock<std::recursive_mutex> LockShared() const;
 
     Core::HID::HIDCore& hid_core;
     KernelHelpers::ServiceContext& service_context;
 
-    s32 ref_counter{};
+    std::atomic<s32> ref_counter{};
     mutable std::mutex mutex;
     NPadResource npad_resource;
     AppletResourceHolder applet_resource_holder{};

@@ -58,11 +58,16 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
     : system{system_}
     , memory_manager{memory_manager_}
     , channel_state{channel_state_}
-    , signal_sync{false}
-    , synced{false}
+    , sync_state{std::make_shared<SyncState>()}
 {}
 
-DmaPusher::~DmaPusher() = default;
+DmaPusher::~DmaPusher() {
+    if (sync_state) {
+        std::scoped_lock lk{sync_state->mutex};
+        sync_state->aborted = true;
+        sync_state->cv.notify_all();
+    }
+}
 
 void DmaPusher::DispatchCalls() {
     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
@@ -138,11 +143,13 @@ bool DmaPusher::Step() {
     const CommandListHeader& header = current_command;
     dma_state.dma_get = header.addr;
 
-    if (signal_sync && !synced) {
-        std::unique_lock lk(sync_mutex);
-        sync_cv.wait(lk, [this]() { return synced; });
+    if (signal_sync) {
+        std::unique_lock lk{sync_state->mutex};
+        sync_state->cv.wait(lk, [state = sync_state.get()]() {
+            return state->synced || state->aborted;
+        });
+        sync_state->synced = false;
         signal_sync = false;
-        synced = false;
     }
 
     if (header.size > 0) {
@@ -372,15 +379,27 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
+        {
+            std::scoped_lock lk{sync_state->mutex};
+            sync_state->synced = false;
+        }
         // SignalFence invalidates the GPU caches, which can record copies into the scheduler: the
         // back's state, which a drained back still submits from in its idle hook.
-        VideoCommon::GpuSplit::Get().Run([this] {
-            rasterizer->SignalFence([this]() {
-                std::scoped_lock lk(sync_mutex);
-                synced = true;
-                sync_cv.notify_all();
-            });
-        }, VideoCommon::DrainSite::GpSyncFence);
+        VideoCommon::GpuSplit::Get().Run(
+            [rasterizer_ptr = rasterizer, raw_state = sync_state.get()] {
+                if (!rasterizer_ptr) {
+                    std::scoped_lock lk{raw_state->mutex};
+                    raw_state->synced = true;
+                    raw_state->cv.notify_all();
+                    return;
+                }
+                rasterizer_ptr->SignalFence([state = raw_state->shared_from_this()]() {
+                    std::scoped_lock lk{state->mutex};
+                    state->synced = true;
+                    state->cv.notify_all();
+                });
+            },
+            VideoCommon::DrainSite::GpSyncFence);
     }
 
     return true;

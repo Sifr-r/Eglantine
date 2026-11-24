@@ -6,8 +6,9 @@
 
 #pragma once
 
-#include <thread>
 #include <chrono>
+#include <mutex>
+#include <thread>
 
 #include "common/steady_clock.h"
 #include "common/polyfill_thread.h"
@@ -109,6 +110,7 @@ private:
 
     Common::Input::ButtonNames GetUIButtonName(const Common::ParamPackage& params) const;
 
+    mutable std::mutex mouse_mutex;
     Common::Vec<int, 2> mouse_origin;
     Common::Vec<int, 2> last_mouse_position;
     Common::Vec<float, 2> last_mouse_change;

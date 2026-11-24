@@ -17,7 +17,7 @@ EDEN_BASE_SVG="dist/icon_variations/${VARIATION}.svg"
 EDEN_BG_COLOR="dist/icon_variations/${VARIATION}_bgcolor"
 # TODO: EDEN_MONOCHROME_SVG Variation
 
-[ -f "$EDEN_BASE_SVG" ] && [ -f "$EDEN_BG_COLOR" ] || { echo "Error: missing ${VARIATION}.svg/${VARIATION}_bgcolor" >&2; exit; }
+[ -f "$EDEN_BASE_SVG" ] && [ -f "$EDEN_BG_COLOR" ] || { echo "Error: missing ${VARIATION}.svg/${VARIATION}_bgcolor" >&2; exit 1; }
 
 # Desktop / Windows / Qt icons
 

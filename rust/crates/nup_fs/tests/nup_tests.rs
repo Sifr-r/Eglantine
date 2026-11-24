@@ -7,18 +7,21 @@ extern crate eglantine_nup_fs;
 
 use std::ffi::{c_char, c_int, c_uint, c_void};
 use std::fs;
+use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use eglantine_nup_fs::ffi::{
-    egl_nup_container_free, egl_nup_container_parse, egl_nup_edit_metadata, egl_nup_extract,
-    egl_nup_free_bytes, egl_nup_free_metadata, egl_nup_free_string, egl_nup_has_resumable_journal,
-    egl_nup_is_loose_dump, egl_nup_is_nup_magic, egl_nup_pack_dump, egl_nup_probe_metadata,
-    egl_nup_probe_nup_metadata, egl_nup_read_extent, egl_nup_verify_integrity, EglNupEditResult,
-    EglNupExtractResult, EglNupFileNode, EglNupMetadata, EglNupMetadataEdit, EglNupOwnedBytes,
-    EglNupOwnedMetadata, EglNupOwnedString, EglNupPackOptions, EglNupPackResult,
-    EglNupPackageInfo, EglNupParsedContainer, EglNupVfsOps, EglNupZstdOps,
+    egl_nup_container_free, egl_nup_container_parse, egl_nup_default_archive_path,
+    egl_nup_default_extract_path, egl_nup_dump_root_from_main, egl_nup_edit_metadata,
+    egl_nup_extract, egl_nup_free_bytes, egl_nup_free_metadata, egl_nup_free_string,
+    egl_nup_has_resumable_journal, egl_nup_is_loose_dump, egl_nup_is_nup_magic, egl_nup_pack_dump,
+    egl_nup_probe_metadata, egl_nup_probe_nup_metadata, egl_nup_read_extent,
+    egl_nup_verify_integrity, EglNupEditResult, EglNupExtractResult, EglNupFileNode,
+    EglNupMetadata, EglNupMetadataEdit, EglNupOwnedBytes, EglNupOwnedMetadata, EglNupOwnedString,
+    EglNupPackOptions, EglNupPackResult, EglNupPackageInfo, EglNupParsedContainer, EglNupVfsOps,
+    EglNupZstdOps,
 };
 use eglantine_nup_fs::format::{from_hex, put_u16_le, put_u32_le, put_u64_le, to_hex};
 use eglantine_nup_fs::journal::plan_from_json;
@@ -607,6 +610,7 @@ fn ffi_roundtrip_null_safety_and_idempotent_free() {
             ),
             0
         );
+        egl_nup_free_metadata(&mut probed);
         assert_eq!(
             egl_nup_probe_nup_metadata(
                 arch_str.as_ptr().cast::<c_char>(),
@@ -708,5 +712,638 @@ fn ffi_roundtrip_null_safety_and_idempotent_free() {
         );
         egl_nup_free_string(&mut err_str);
         assert!(extract_dir.join("base/exefs/main").is_file());
+    }
+}
+
+#[test]
+fn non_destructive_pack_skips_and_cleans_journal_on_cancel_and_error() {
+    use eglantine_nup_fs::journal::{journal_path_for, part_path_for};
+
+    let tmp = TempDir::new("non_destructive_journal");
+    let dump = tmp.path().join("game");
+    build_sample_multi_dump(&dump);
+    let archive = tmp.path().join("game.nup");
+
+    let opts = PackOptions {
+        delete_sources: false,
+        ..PackOptions::default()
+    };
+
+    // Cancellation during non-destructive pack must remove both .part and .journal.
+    let cancel = AtomicBool::new(false);
+    let err = pack_dump(
+        &dump,
+        &archive,
+        &opts,
+        &MockZstd,
+        Some(&cancel),
+        Some(&mut |p| {
+            if p.files_done >= 2 {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }),
+    )
+    .expect_err("expected cancellation");
+    assert_eq!(err.0, PackResult::Cancelled);
+    assert!(!has_resumable_journal(&archive));
+    assert!(!part_path_for(&archive).exists());
+    assert!(!journal_path_for(&archive).exists());
+    assert!(dump.join("base/exefs/main").is_file());
+
+    // Error mid-write during non-destructive pack must also clean up .part and .journal.
+    let err_dump = tmp.path().join("err_game");
+    write_file_bytes(&err_dump.join("base/exefs/main"), b"MAIN");
+    write_file_bytes(&err_dump.join("base/exefs/main.npdm"), &make_npdm(0x0100_1234_5678_0000));
+    write_file_bytes(&err_dump.join("base/romfs/second.bin"), &[0x55u8; 64]);
+    let err_archive = tmp.path().join("err_game.nup");
+    let seq_opts = PackOptions {
+        delete_sources: false,
+        raw_threshold: 10,
+        ..PackOptions::default()
+    };
+    let io_err = pack_dump(
+        &err_dump,
+        &err_archive,
+        &seq_opts,
+        &MockZstd,
+        None,
+        Some(&mut |p| {
+            if p.files_done == 1 {
+                let _ = fs::remove_file(err_dump.join("base/exefs/main"));
+                let _ = fs::remove_file(err_dump.join("base/exefs/main.npdm"));
+                let _ = fs::remove_file(err_dump.join("base/romfs/second.bin"));
+            }
+        }),
+    )
+    .expect_err("expected mid-pack read error");
+    assert_eq!(io_err.0, PackResult::IoError);
+    assert!(!has_resumable_journal(&err_archive));
+    assert!(!part_path_for(&err_archive).exists());
+    assert!(!journal_path_for(&err_archive).exists());
+
+    // Adding a file before retrying must pack the updated dump freshly rather than resuming stale state.
+    write_file_bytes(&dump.join("base/romfs/added_after_cancel.bin"), b"NEW_FILE");
+    pack_dump(&dump, &archive, &opts, &MockZstd, None, None).expect("fresh retry pack_dump");
+    assert!(!has_resumable_journal(&archive));
+    assert!(dump.join("base/exefs/main").is_file());
+
+    let bytes = fs::read(&archive).unwrap();
+    verify_integrity(&SliceReader(&bytes), &MockZstd, None).expect("retried archive verifies");
+    let parsed = NupContainer::parse(&SliceReader(&bytes)).unwrap();
+    assert!(parsed
+        .files
+        .iter()
+        .any(|f| f.name == "added_after_cancel.bin"));
+}
+
+#[test]
+fn ffi_cancel_polling_without_progress_cb_and_large_stream_f0416() {
+    struct CancelAfterCalls {
+        calls: AtomicU64,
+        trigger_at: u64,
+    }
+
+    unsafe extern "C" fn poll_cancel_after(ctx: *mut c_void) -> u8 {
+        let state = &*ctx.cast::<CancelAfterCalls>();
+        let n = state.calls.fetch_add(1, Ordering::Relaxed) + 1;
+        u8::from(n >= state.trigger_at)
+    }
+
+    let tmp = TempDir::new("cancel_poll");
+    let big_dump = tmp.path().join("big_dump");
+    // 9 MiB guarantees stream_large_file loops over multiple 4 MiB chunks.
+    let big_data = vec![0x3Cu8; 9 * 1024 * 1024];
+    write_file_bytes(&big_dump.join("base/exefs/main"), &big_data);
+    write_file_bytes(
+        &big_dump.join("base/exefs/main.npdm"),
+        &make_npdm(0x0100_1234_5678_0000),
+    );
+    fs::create_dir_all(big_dump.join("base/romfs")).unwrap();
+    let archive = tmp.path().join("big.nup");
+    let dump_str = big_dump.to_str().unwrap();
+    let arch_str = archive.to_str().unwrap();
+    let zstd = mock_c_zstd_ops();
+
+    let opts = EglNupPackOptions {
+        delete_sources: 0,
+        _pad: [0; 3],
+        zstd_level: 3,
+        chunk_bytes: 64 * 1024 * 1024,
+        raw_threshold: 64 * 1024,
+        nacp_language_index: 1,
+        _pad2: 0,
+        metadata: EglNupMetadata {
+            title_name: ptr::null(),
+            title_name_len: 0,
+            icon: ptr::null(),
+            icon_len: 0,
+            display_version: ptr::null(),
+            display_version_len: 0,
+            publisher: ptr::null(),
+            publisher_len: 0,
+            localized_titles: ptr::null(),
+            localized_title_count: 0,
+        },
+    };
+
+    let mut cancel_state = CancelAfterCalls {
+        calls: AtomicU64::new(0),
+        trigger_at: 5,
+    };
+    let mut err_str = EglNupOwnedString {
+        data: ptr::null_mut(),
+        len: 0,
+    };
+    unsafe {
+        let res = egl_nup_pack_dump(
+            dump_str.as_ptr().cast::<c_char>(),
+            dump_str.len(),
+            arch_str.as_ptr().cast::<c_char>(),
+            arch_str.len(),
+            &opts,
+            &zstd,
+            None,
+            ptr::null_mut(),
+            Some(poll_cancel_after),
+            (&mut cancel_state as *mut CancelAfterCalls).cast::<c_void>(),
+            &mut err_str,
+        );
+        egl_nup_free_string(&mut err_str);
+        assert_eq!(res, EglNupPackResult::Cancelled);
+        assert_eq!(cancel_state.calls.load(Ordering::Relaxed), 5);
+    }
+
+    // Now build a valid 9 MiB NUP and verify extract and edit_metadata poll cancel_cb with progress_cb=None.
+    let valid_dump = tmp.path().join("valid_9m");
+    write_file_bytes(&valid_dump.join("base/exefs/main"), &vec![0x5Au8; 9 * 1024 * 1024]);
+    write_file_bytes(
+        &valid_dump.join("base/exefs/main.npdm"),
+        &make_npdm(0x0100_1234_5678_0000),
+    );
+    write_file_bytes(
+        &valid_dump.join("base/control.nacp"),
+        &make_nacp("Big Game", "Pub", "1.0.0"),
+    );
+    fs::create_dir_all(valid_dump.join("base/romfs")).unwrap();
+    let valid_archive = tmp.path().join("valid.nup");
+    let valid_opts = PackOptions {
+        raw_threshold: 64 * 1024,
+        ..PackOptions::default()
+    };
+    pack_dump(&valid_dump, &valid_archive, &valid_opts, &MockZstd, None, None).unwrap();
+
+    let out_dir = tmp.path().join("extract_cancelled");
+    let valid_arch_str = valid_archive.to_str().unwrap();
+    let out_str = out_dir.to_str().unwrap();
+    let mut ex_cancel = CancelAfterCalls {
+        calls: AtomicU64::new(0),
+        trigger_at: 5,
+    };
+    unsafe {
+        let res = egl_nup_extract(
+            valid_arch_str.as_ptr().cast::<c_char>(),
+            valid_arch_str.len(),
+            out_str.as_ptr().cast::<c_char>(),
+            out_str.len(),
+            &zstd,
+            None,
+            ptr::null_mut(),
+            Some(poll_cancel_after),
+            (&mut ex_cancel as *mut CancelAfterCalls).cast::<c_void>(),
+            &mut err_str,
+        );
+        egl_nup_free_string(&mut err_str);
+        assert_eq!(res, EglNupExtractResult::Cancelled);
+        assert!(ex_cancel.calls.load(Ordering::Relaxed) >= 5);
+    }
+
+    let new_title = b"Cancelled Title";
+    let raw_edit = EglNupMetadataEdit {
+        has_title_name: 1,
+        has_icon: 0,
+        has_display_version: 0,
+        has_publisher: 0,
+        has_localized_titles: 0,
+        _pad: [0; 3],
+        values: EglNupMetadata {
+            title_name: new_title.as_ptr().cast::<c_char>(),
+            title_name_len: new_title.len(),
+            icon: ptr::null(),
+            icon_len: 0,
+            display_version: ptr::null(),
+            display_version_len: 0,
+            publisher: ptr::null(),
+            publisher_len: 0,
+            localized_titles: ptr::null(),
+            localized_title_count: 0,
+        },
+    };
+    let mut ed_cancel = CancelAfterCalls {
+        calls: AtomicU64::new(0),
+        trigger_at: 3,
+    };
+    unsafe {
+        let res = egl_nup_edit_metadata(
+            valid_arch_str.as_ptr().cast::<c_char>(),
+            valid_arch_str.len(),
+            &raw_edit,
+            None,
+            ptr::null_mut(),
+            Some(poll_cancel_after),
+            (&mut ed_cancel as *mut CancelAfterCalls).cast::<c_void>(),
+            &mut err_str,
+        );
+        egl_nup_free_string(&mut err_str);
+        assert_eq!(res, EglNupEditResult::Cancelled);
+        assert!(ed_cancel.calls.load(Ordering::Relaxed) >= 3);
+    }
+}
+
+#[test]
+fn probe_dump_metadata_multibyte_product_tag_f0542() {
+    let tmp = TempDir::new("multibyte_tag");
+    let dump = tmp.path().join("dump");
+    write_file_bytes(&dump.join("base/exefs/main"), b"MAIN");
+    write_file_bytes(
+        &dump.join("base/exefs/main.npdm"),
+        &make_npdm(0x0100_1234_5678_0000),
+    );
+    write_file_bytes(
+        &dump.join("base/romfs/System/Resource/ResourceSizeTable.Product.1\u{00e9}0.rsizetable.byml"),
+        b"bad",
+    );
+    write_file_bytes(
+        &dump.join("base/romfs/GameData/GameDataList.Product.\u{3042}00.byml"),
+        b"bad",
+    );
+    let only_invalid = probe_dump_metadata(&dump, 1);
+    assert_eq!(only_invalid.display_version, "");
+
+    write_file_bytes(
+        &dump.join("base/romfs/System/Resource/ResourceSizeTable.Product.200.rsizetable.byml"),
+        b"good",
+    );
+    let valid = probe_dump_metadata(&dump, 1);
+    assert_eq!(valid.display_version, "2.0.0");
+}
+
+#[test]
+fn reject_shared_dir_dag_rootless_cycle_and_raw_extent_mismatch_f0462_f0426() {
+    fn synthetic_blob_offset(dir_count: usize, file_count: usize, child_count: usize) -> u64 {
+        let toc_len =
+            TOC_HEADER_SIZE + 0x40 + dir_count * 0x18 + file_count * 0x50 + child_count * 4;
+        ((SUPERBLOCK_SIZE + toc_len + 15) & !15usize) as u64
+    }
+
+    fn build_synthetic_nup(
+        dirs: &[(u32, u32)],
+        files: &[(u64, u64, u64, u8)],
+        children: &[u32],
+        blob_size: usize,
+    ) -> Vec<u8> {
+        let pkg_bytes = 0x40usize;
+        let dir_bytes = dirs.len() * 0x18;
+        let file_bytes = files.len() * 0x50;
+        let child_bytes = children.len() * 4;
+        let mut toc = vec![0u8; TOC_HEADER_SIZE + pkg_bytes + dir_bytes + file_bytes + child_bytes];
+        let toc_len = toc.len() as u64;
+        put_u32_le(&mut toc, 0x00, TOC_MAGIC);
+        put_u32_le(&mut toc, 0x04, 1); // 1 package -> root_dir = 0
+        put_u64_le(&mut toc, 0x08, dirs.len() as u64);
+        put_u64_le(&mut toc, 0x10, files.len() as u64);
+        put_u64_le(&mut toc, 0x18, toc_len);
+        put_u64_le(&mut toc, 0x20, 0);
+
+        let mut off = TOC_HEADER_SIZE + pkg_bytes;
+        for &(first_child, child_count) in dirs {
+            put_u32_le(&mut toc, off + 0x08, first_child);
+            put_u32_le(&mut toc, off + 0x0C, child_count);
+            off += 0x18;
+        }
+        for &(size, extent_offset, extent_size, codec) in files {
+            put_u64_le(&mut toc, off + 0x08, size);
+            put_u64_le(&mut toc, off + 0x10, extent_offset);
+            put_u64_le(&mut toc, off + 0x18, extent_size);
+            toc[off + 0x40] = codec;
+            off += 0x50;
+        }
+        for &c in children {
+            put_u32_le(&mut toc, off, c);
+            off += 4;
+        }
+
+        let blob_off = (SUPERBLOCK_SIZE + toc.len() + 15) & !15usize;
+        let total_size = blob_off + blob_size;
+        let toc_sha = sha256(&toc);
+        let mut file = vec![0u8; total_size];
+        file[..4].copy_from_slice(&HEADER_MAGIC);
+        put_u16_le(&mut file, 0x04, SUPERBLOCK_SIZE as u16);
+        put_u16_le(&mut file, 0x06, 1);
+        put_u64_le(&mut file, 0x08, SUPERBLOCK_SIZE as u64);
+        put_u64_le(&mut file, 0x10, toc.len() as u64);
+        file[0x18..0x38].copy_from_slice(&toc_sha);
+        put_u64_le(&mut file, 0x38, blob_off as u64);
+        put_u64_le(&mut file, 0x40, total_size as u64);
+        put_u32_le(&mut file, 0x48, 1);
+        file[SUPERBLOCK_SIZE..SUPERBLOCK_SIZE + toc.len()].copy_from_slice(&toc);
+        file
+    }
+
+    // F0462 (a): shared directory diamond DAG (dir 0 -> {1, 2}, dir 1 -> {3}, dir 2 -> {3}).
+    let dag = build_synthetic_nup(&[(0, 2), (2, 1), (3, 1), (0, 0)], &[], &[1, 2, 3, 3], 0);
+    assert!(
+        NupContainer::parse(&SliceReader(&dag)).is_err(),
+        "shared directory DAG must be rejected"
+    );
+
+    // F0462 (b): rootless cycle unreachable from root (dir 0 -> [], dir 1 <-> dir 2).
+    let rootless_cycle = build_synthetic_nup(&[(0, 0), (0, 1), (1, 1)], &[], &[2, 1], 0);
+    assert!(
+        NupContainer::parse(&SliceReader(&rootless_cycle)).is_err(),
+        "rootless directory cycle must be rejected"
+    );
+
+    // F0426: CODEC_RAW with extent_size != size within blob bounds must be rejected.
+    let blob_off = synthetic_blob_offset(1, 1, 1);
+    let raw_larger = build_synthetic_nup(&[(0, 1)], &[(32, blob_off, 64, 0)], &[1], 128);
+    assert!(
+        NupContainer::parse(&SliceReader(&raw_larger)).is_err(),
+        "CODEC_RAW with extent_size > size must be rejected"
+    );
+    let raw_smaller = build_synthetic_nup(&[(0, 1)], &[(64, blob_off, 32, 0)], &[1], 128);
+    assert!(
+        NupContainer::parse(&SliceReader(&raw_smaller)).is_err(),
+        "CODEC_RAW with extent_size < size must be rejected"
+    );
+    let raw_ok = build_synthetic_nup(&[(0, 1)], &[(32, blob_off, 32, 0)], &[1], 128);
+    assert!(NupContainer::parse(&SliceReader(&raw_ok)).is_ok());
+}
+
+#[test]
+fn ffi_uninitialized_out_params_and_isize_slice_bounds_f0479_f0509() {
+    fn poisoned_uninit<T>() -> MaybeUninit<T> {
+        let mut slot = MaybeUninit::<T>::uninit();
+        // SAFETY: Writing arbitrary byte pattern into uninitialized storage is valid.
+        unsafe {
+            ptr::write_bytes(slot.as_mut_ptr(), 0xAA, 1);
+        }
+        slot
+    }
+
+    let tmp = TempDir::new("ffi_uninit");
+    let dump = tmp.path().join("dump");
+    build_sample_multi_dump(&dump);
+    let archive = tmp.path().join("ffi_uninit.nup");
+    let dump_str = dump.to_str().unwrap();
+    let arch_str = archive.to_str().unwrap();
+    let main_path = dump.join("base/exefs/main");
+    let main_str = main_path.to_str().unwrap();
+    let zstd = mock_c_zstd_ops();
+
+    unsafe {
+        // F0509: lengths > isize::MAX must be rejected cleanly before from_raw_parts.
+        let dummy_byte: u8 = 0;
+        assert_eq!(
+            egl_nup_is_nup_magic(&dummy_byte, (isize::MAX as usize) + 1, 128),
+            0
+        );
+
+        // F0479: error paths with poisoned uninitialized out-params must zero-init without freeing garbage.
+        let mut bad_container = poisoned_uninit::<EglNupParsedContainer>();
+        assert_eq!(
+            egl_nup_container_parse(ptr::null(), bad_container.as_mut_ptr()),
+            -1
+        );
+        let mut bad_container = bad_container.assume_init();
+        assert!(bad_container.packages.is_null());
+        egl_nup_container_free(&mut bad_container);
+
+        let mut bad_bytes = poisoned_uninit::<EglNupOwnedBytes>();
+        assert_eq!(
+            egl_nup_read_extent(ptr::null(), &zstd, 0, 0, 0, 0, bad_bytes.as_mut_ptr()),
+            -1
+        );
+        let mut bad_bytes = bad_bytes.assume_init();
+        assert!(bad_bytes.data.is_null());
+        egl_nup_free_bytes(&mut bad_bytes);
+
+        let mut bad_root = poisoned_uninit::<EglNupOwnedString>();
+        assert_eq!(
+            egl_nup_dump_root_from_main(ptr::null(), 0, bad_root.as_mut_ptr()),
+            0
+        );
+        let mut bad_root = bad_root.assume_init();
+        assert!(bad_root.data.is_null());
+        egl_nup_free_string(&mut bad_root);
+
+        let mut bad_meta = poisoned_uninit::<EglNupOwnedMetadata>();
+        assert_eq!(
+            egl_nup_probe_metadata(ptr::null(), 0, 1, bad_meta.as_mut_ptr()),
+            -1
+        );
+        let mut bad_meta = bad_meta.assume_init();
+        assert!(bad_meta.title_name.data.is_null());
+        egl_nup_free_metadata(&mut bad_meta);
+
+        let mut bad_nup_meta = poisoned_uninit::<EglNupOwnedMetadata>();
+        assert_eq!(
+            egl_nup_probe_nup_metadata(ptr::null(), 0, bad_nup_meta.as_mut_ptr()),
+            -1
+        );
+        let mut bad_nup_meta = bad_nup_meta.assume_init();
+        assert!(bad_nup_meta.title_name.data.is_null());
+        egl_nup_free_metadata(&mut bad_nup_meta);
+
+        let mut bad_arc_path = poisoned_uninit::<EglNupOwnedString>();
+        assert_eq!(
+            egl_nup_default_archive_path(ptr::null(), 0, bad_arc_path.as_mut_ptr()),
+            -1
+        );
+        let mut bad_arc_path = bad_arc_path.assume_init();
+        assert!(bad_arc_path.data.is_null());
+        egl_nup_free_string(&mut bad_arc_path);
+
+        let mut bad_ext_path = poisoned_uninit::<EglNupOwnedString>();
+        assert_eq!(
+            egl_nup_default_extract_path(ptr::null(), 0, bad_ext_path.as_mut_ptr()),
+            -1
+        );
+        let mut bad_ext_path = bad_ext_path.assume_init();
+        assert!(bad_ext_path.data.is_null());
+        egl_nup_free_string(&mut bad_ext_path);
+
+        let mut pack_err = poisoned_uninit::<EglNupOwnedString>();
+        assert_eq!(
+            egl_nup_pack_dump(
+                ptr::null(),
+                0,
+                arch_str.as_ptr().cast::<c_char>(),
+                arch_str.len(),
+                ptr::null(),
+                &zstd,
+                None,
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                pack_err.as_mut_ptr(),
+            ),
+            EglNupPackResult::InvalidSource
+        );
+        let mut pack_err = pack_err.assume_init();
+        assert!(!pack_err.data.is_null());
+        egl_nup_free_string(&mut pack_err);
+
+        // Success paths with poisoned uninitialized out-params.
+        let mut ok_err = poisoned_uninit::<EglNupOwnedString>();
+        assert_eq!(
+            egl_nup_pack_dump(
+                dump_str.as_ptr().cast::<c_char>(),
+                dump_str.len(),
+                arch_str.as_ptr().cast::<c_char>(),
+                arch_str.len(),
+                ptr::null(),
+                &zstd,
+                None,
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                ok_err.as_mut_ptr(),
+            ),
+            EglNupPackResult::Success
+        );
+        let mut ok_err = ok_err.assume_init();
+        assert!(ok_err.data.is_null());
+        egl_nup_free_string(&mut ok_err);
+
+        let mut ok_root = poisoned_uninit::<EglNupOwnedString>();
+        assert_eq!(
+            egl_nup_dump_root_from_main(
+                main_str.as_ptr().cast::<c_char>(),
+                main_str.len(),
+                ok_root.as_mut_ptr(),
+            ),
+            1
+        );
+        let mut ok_root = ok_root.assume_init();
+        assert!(!ok_root.data.is_null());
+        egl_nup_free_string(&mut ok_root);
+
+        let mut ok_arc_path = poisoned_uninit::<EglNupOwnedString>();
+        assert_eq!(
+            egl_nup_default_archive_path(
+                dump_str.as_ptr().cast::<c_char>(),
+                dump_str.len(),
+                ok_arc_path.as_mut_ptr(),
+            ),
+            0
+        );
+        let mut ok_arc_path = ok_arc_path.assume_init();
+        assert!(!ok_arc_path.data.is_null());
+        egl_nup_free_string(&mut ok_arc_path);
+
+        let mut ok_ext_path = poisoned_uninit::<EglNupOwnedString>();
+        assert_eq!(
+            egl_nup_default_extract_path(
+                arch_str.as_ptr().cast::<c_char>(),
+                arch_str.len(),
+                ok_ext_path.as_mut_ptr(),
+            ),
+            0
+        );
+        let mut ok_ext_path = ok_ext_path.assume_init();
+        assert!(!ok_ext_path.data.is_null());
+        egl_nup_free_string(&mut ok_ext_path);
+
+        let mut ok_meta = poisoned_uninit::<EglNupOwnedMetadata>();
+        assert_eq!(
+            egl_nup_probe_metadata(
+                dump_str.as_ptr().cast::<c_char>(),
+                dump_str.len(),
+                1,
+                ok_meta.as_mut_ptr(),
+            ),
+            0
+        );
+        let mut ok_meta = ok_meta.assume_init();
+        egl_nup_free_metadata(&mut ok_meta);
+
+        let mut ok_nup_meta = poisoned_uninit::<EglNupOwnedMetadata>();
+        assert_eq!(
+            egl_nup_probe_nup_metadata(
+                arch_str.as_ptr().cast::<c_char>(),
+                arch_str.len(),
+                ok_nup_meta.as_mut_ptr(),
+            ),
+            0
+        );
+        let mut ok_nup_meta = ok_nup_meta.assume_init();
+        egl_nup_free_metadata(&mut ok_nup_meta);
+
+        let mut bytes = fs::read(&archive).unwrap();
+        let vfs = EglNupVfsOps {
+            ctx: (&mut bytes as *mut Vec<u8>).cast::<c_void>(),
+            size: bytes.len() as u64,
+            read_at: Some(vec_vfs_read_at),
+        };
+        let mut ok_container = poisoned_uninit::<EglNupParsedContainer>();
+        assert_eq!(egl_nup_container_parse(&vfs, ok_container.as_mut_ptr()), 0);
+        let mut ok_container = ok_container.assume_init();
+        assert!(ok_container.file_count > 0);
+        let f0 = &*ok_container.files;
+        let mut ok_bytes = poisoned_uninit::<EglNupOwnedBytes>();
+        assert_eq!(
+            egl_nup_read_extent(
+                &vfs,
+                &zstd,
+                f0.extent_offset,
+                f0.extent_size,
+                f0.size,
+                f0.codec,
+                ok_bytes.as_mut_ptr(),
+            ),
+            0
+        );
+        let mut ok_bytes = ok_bytes.assume_init();
+        assert_eq!(ok_bytes.len as u64, f0.size);
+        egl_nup_free_bytes(&mut ok_bytes);
+        egl_nup_container_free(&mut ok_container);
+
+        let mut edit_err = poisoned_uninit::<EglNupOwnedString>();
+        assert_eq!(
+            egl_nup_edit_metadata(
+                ptr::null(),
+                0,
+                ptr::null(),
+                None,
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                edit_err.as_mut_ptr(),
+            ),
+            EglNupEditResult::InvalidSource
+        );
+        let mut edit_err = edit_err.assume_init();
+        assert!(!edit_err.data.is_null());
+        egl_nup_free_string(&mut edit_err);
+
+        let mut extract_err = poisoned_uninit::<EglNupOwnedString>();
+        assert_eq!(
+            egl_nup_extract(
+                ptr::null(),
+                0,
+                ptr::null(),
+                0,
+                &zstd,
+                None,
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                extract_err.as_mut_ptr(),
+            ),
+            EglNupExtractResult::InvalidSource
+        );
+        let mut extract_err = extract_err.assume_init();
+        assert!(!extract_err.data.is_null());
+        egl_nup_free_string(&mut extract_err);
     }
 }

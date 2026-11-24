@@ -129,6 +129,7 @@ void Mouse::UpdateMotionInput(Common::SteadyClock::time_point timestamp) {
 }
 
 void Mouse::Move(int x, int y, int center_x, int center_y) {
+    std::scoped_lock lock{mouse_mutex};
     if (IsMousePanningEnabled()) {
         auto const mouse_change_int = Common::Vec<int, 2>(x, y) - Common::Vec<int, 2>(center_x, center_y);
         auto const mouse_change = Common::Vec<float, 2>(float(mouse_change_int[0]), float(mouse_change_int[1]));
@@ -161,6 +162,7 @@ void Mouse::Move(int x, int y, int center_x, int center_y) {
 }
 
 void Mouse::NotifyChanged() {
+    std::scoped_lock lock{mouse_mutex};
     auto const timestamp = Common::SteadyClock::Now();
     UpdateStickInput(timestamp);
     UpdateMotionInput(timestamp);
@@ -168,16 +170,19 @@ void Mouse::NotifyChanged() {
 }
 
 void Mouse::MouseMove(f32 touch_x, f32 touch_y) {
+    std::scoped_lock lock{mouse_mutex};
     SetAxis(real_mouse_identifier, mouse_axis_x, touch_x);
     SetAxis(real_mouse_identifier, mouse_axis_y, touch_y);
 }
 
 void Mouse::TouchMove(f32 touch_x, f32 touch_y) {
+    std::scoped_lock lock{mouse_mutex};
     SetAxis(touch_identifier, mouse_axis_x, touch_x);
     SetAxis(touch_identifier, mouse_axis_y, touch_y);
 }
 
 void Mouse::PressButton(int x, int y, MouseButton button) {
+    std::scoped_lock lock{mouse_mutex};
     SetButton(identifier, static_cast<int>(button), true);
 
     // Set initial analog parameters
@@ -187,16 +192,19 @@ void Mouse::PressButton(int x, int y, MouseButton button) {
 }
 
 void Mouse::PressMouseButton(MouseButton button) {
+    std::scoped_lock lock{mouse_mutex};
     SetButton(real_mouse_identifier, static_cast<int>(button), true);
 }
 
 void Mouse::PressTouchButton(f32 touch_x, f32 touch_y, MouseButton button) {
+    std::scoped_lock lock{mouse_mutex};
     SetAxis(touch_identifier, mouse_axis_x, touch_x);
     SetAxis(touch_identifier, mouse_axis_y, touch_y);
     SetButton(touch_identifier, static_cast<int>(button), true);
 }
 
 void Mouse::ReleaseButton(MouseButton button) {
+    std::scoped_lock lock{mouse_mutex};
     SetButton(identifier, static_cast<int>(button), false);
     SetButton(real_mouse_identifier, static_cast<int>(button), false);
     SetButton(touch_identifier, static_cast<int>(button), false);
@@ -213,6 +221,7 @@ void Mouse::ReleaseButton(MouseButton button) {
 }
 
 void Mouse::MouseWheelChange(int x, int y) {
+    std::scoped_lock lock{mouse_mutex};
     wheel_position[0] += x;
     wheel_position[1] += y;
     last_motion_change[2] += static_cast<f32>(y);
@@ -221,6 +230,7 @@ void Mouse::MouseWheelChange(int x, int y) {
 }
 
 void Mouse::ReleaseAllButtons() {
+    std::scoped_lock lock{mouse_mutex};
     ResetButtonState();
     button_pressed = false;
 }

@@ -49,6 +49,8 @@ public:
     explicit InfoUpdater(std::span<const u8> input, std::span<u8> output,
                          Kernel::KProcess* process_handle, BehaviorInfo& behaviour);
 
+    Result BeginUpdate(u32 memory_pool_count, u32 voice_count, u32 effect_count, u32 sink_count);
+
     /**
      * Update the voice channel resources.
      *
@@ -66,7 +68,7 @@ public:
      * @return Result code.
      */
     Result UpdateVoices(VoiceContext& voice_context, std::span<MemoryPoolInfo> memory_pools,
-                        u32 memory_pool_count);
+                        u32 memory_pool_count, s32 mix_count, u32 splitter_count);
 
     /**
      * Update effects.
@@ -145,7 +147,7 @@ public:
      * @param splitter_context - Splitter context to update.
      * @return Result code.
      */
-    Result UpdateSplitterInfo(SplitterContext& splitter_context);
+    Result UpdateSplitterInfo(SplitterContext& splitter_context, s32 mix_count);
 
     /**
      * Update renderer info.
@@ -188,21 +190,17 @@ private:
                                  std::span<MemoryPoolInfo> memory_pools, u32 memory_pool_count);
 
     /// Input buffer
-    u8 const* input;
+    const u8* input{};
     /// Input buffer start
     std::span<const u8> input_origin;
     /// Output buffer start
-    u8* output;
+    u8* output{};
     /// Output buffer start
     std::span<u8> output_origin;
     /// Input header
-    const UpdateDataHeader* in_header;
+    const UpdateDataHeader* in_header{};
     /// Output header
-    UpdateDataHeader* out_header;
-    /// Expected input size, see CheckConsumedSize
-    u64 expected_input_size;
-    /// Expected output size, see CheckConsumedSize
-    u64 expected_output_size;
+    UpdateDataHeader* out_header{};
     /// Unused
     Kernel::KProcess* process_handle;
     /// Behaviour

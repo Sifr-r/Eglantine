@@ -36,7 +36,7 @@ public:
     Result Wait(KProcessAddress addr, u64 key, u32 value, s64 timeout);
 
 private:
-    void SignalImpl(KernelCore& kernel, KThread* thread);
+    KThread* SignalImpl(KernelCore& kernel, KThread* thread);
 
 private:
     Core::System& m_system;

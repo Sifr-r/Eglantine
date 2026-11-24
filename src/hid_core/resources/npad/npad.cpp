@@ -74,13 +74,12 @@ NPad::~NPad() {
 }
 
 Result NPad::Activate() {
+    std::scoped_lock lock{mutex};
     if (ref_counter == (std::numeric_limits<s32>::max)() - 1) {
         return ResultNpadResourceOverflow;
     }
 
     if (ref_counter == 0) {
-        std::scoped_lock lock{mutex};
-
         // TODO: Activate handlers and AbstractedPad
     }
 
@@ -89,8 +88,12 @@ Result NPad::Activate() {
 }
 
 Result NPad::Activate(u64 aruid) {
+    auto shared_lock = LockShared();
     std::scoped_lock lock{mutex};
-    std::scoped_lock shared_lock{*applet_resource_holder.shared_mutex};
+
+    if (applet_resource_holder.applet_resource == nullptr) {
+        return ResultSharedMemoryNotInitialized;
+    }
 
     auto* data = applet_resource_holder.applet_resource->GetAruidData(aruid);
     auto aruid_index = applet_resource_holder.applet_resource->GetIndexFromAruid(aruid);
@@ -132,14 +135,17 @@ Result NPad::Activate(u64 aruid) {
 }
 
 Result NPad::ActivateNpadResource() {
+    std::scoped_lock lock{mutex};
     return npad_resource.Activate();
 }
 
 Result NPad::ActivateNpadResource(u64 aruid) {
+    std::scoped_lock lock{mutex};
     return npad_resource.Activate(aruid);
 }
 
 void NPad::FreeAppletResourceId(u64 aruid) {
+    std::scoped_lock lock{mutex};
     return npad_resource.FreeAppletResourceId(aruid);
 }
 
@@ -149,6 +155,13 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
         ControllerUpdate(kernel, Core::HID::ControllerTriggerType::Battery, controller_idx);
         return;
     }
+
+    if (applet_resource_holder.shared_mutex == nullptr ||
+        applet_resource_holder.applet_resource == nullptr) {
+        return;
+    }
+
+    std::scoped_lock shared_lock{*applet_resource_holder.shared_mutex};
 
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
         if (controller_idx >= controller_data[aruid_index].size()) {
@@ -162,6 +175,9 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
         }
 
         auto& controller = controller_data[aruid_index][controller_idx];
+        if (controller.device == nullptr) {
+            continue;
+        }
         const auto is_connected = controller.device->IsConnected();
         const auto npad_type = controller.device->GetNpadStyleIndex();
         const auto npad_id = controller.device->GetNpadIdType();
@@ -169,16 +185,16 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
         case Core::HID::ControllerTriggerType::Connected:
         case Core::HID::ControllerTriggerType::Disconnected:
             if (is_connected == controller.is_connected) {
-                return;
+                continue;
             }
             UpdateControllerAt(kernel, data->aruid, npad_type, npad_id, is_connected);
             break;
         case Core::HID::ControllerTriggerType::Battery: {
-            if (!controller.device->IsConnected()) {
-                return;
+            if (!is_connected) {
+                continue;
             }
             if (auto* shared_memory = controller.shared_memory; shared_memory) {
-                const auto& battery_level = controller.device->GetBattery();
+                const auto battery_level = controller.device->GetBattery();
                 shared_memory->battery_level_dual = battery_level.dual.battery_level;
                 shared_memory->battery_level_left = battery_level.left.battery_level;
                 shared_memory->battery_level_right = battery_level.right.battery_level;
@@ -195,11 +211,16 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
 
 void NPad::InitNewlyAddedController(Kernel::KernelCore& kernel, u64 aruid, Core::HID::NpadIdType npad_id) {
     auto& controller = GetControllerFromNpadIdType(aruid, npad_id);
-    if (!npad_resource.IsControllerSupported(aruid, controller.device->GetNpadStyleIndex())) {
+    const auto controller_type = controller.device->GetNpadStyleIndex();
+    bool is_supported = false;
+    {
+        std::scoped_lock lock{mutex};
+        is_supported = npad_resource.IsControllerSupported(aruid, controller_type);
+    }
+    if (!is_supported) {
         return;
     }
     LOG_DEBUG(Service_HID, "Npad connected {}", npad_id);
-    const auto controller_type = controller.device->GetNpadStyleIndex();
     const auto& body_colors = controller.device->GetColors();
     const auto& battery_level = controller.device->GetBattery();
     auto* shared_memory = controller.shared_memory;
@@ -208,6 +229,7 @@ void NPad::InitNewlyAddedController(Kernel::KernelCore& kernel, u64 aruid, Core:
         return;
     }
     if (controller_type == Core::HID::NpadStyleIndex::None) {
+        std::scoped_lock lock{mutex};
         npad_resource.SignalStyleSetUpdateEvent(kernel, aruid, npad_id);
         return;
     }
@@ -392,7 +414,10 @@ void NPad::InitNewlyAddedController(Kernel::KernelCore& kernel, u64 aruid, Core:
                                           Common::Input::PollingMode::Active);
     }
 
-    npad_resource.SignalStyleSetUpdateEvent(kernel, aruid, npad_id);
+    {
+        std::scoped_lock lock{mutex};
+        npad_resource.SignalStyleSetUpdateEvent(kernel, aruid, npad_id);
+    }
     WriteEmptyEntry(controller.shared_memory);
     hid_core.SetLastActiveController(npad_id);
     abstracted_pads[NpadIdTypeToIndex(npad_id)].Update();
@@ -492,18 +517,25 @@ void NPad::OnUpdate(Kernel::KernelCore& kernel, const Core::Timing::CoreTiming& 
     if (ref_counter == 0) {
         return;
     }
+    if (applet_resource_holder.shared_mutex == nullptr ||
+        applet_resource_holder.applet_resource == nullptr) {
+        return;
+    }
 
     std::scoped_lock lock{*applet_resource_holder.shared_mutex};
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; ++aruid_index) {
         const auto* data = applet_resource_holder.applet_resource->GetAruidDataByIndex(aruid_index);
 
-        if (data == nullptr || !data->flag.is_assigned) {
+        if (data == nullptr || !data->flag.is_assigned || data->shared_memory_format == nullptr) {
             continue;
         }
 
         bool is_set{};
         const auto aruid = data->aruid;
-        npad_resource.IsSupportedNpadStyleSet(is_set, aruid);
+        {
+            std::scoped_lock mutex_lock{mutex};
+            npad_resource.IsSupportedNpadStyleSet(is_set, aruid);
+        }
         // Wait until style is defined
         if (!is_set) {
             continue;
@@ -651,9 +683,13 @@ void NPad::OnUpdate(Kernel::KernelCore& kernel, const Core::Timing::CoreTiming& 
 }
 
 Result NPad::SetSupportedNpadStyleSet(Kernel::KernelCore& kernel, u64 aruid, Core::HID::NpadStyleSet supported_style_set) {
-    std::scoped_lock lock{mutex};
+    auto shared_lock = LockShared();
     hid_core.SetSupportedStyleTag({supported_style_set});
-    const Result result = npad_resource.SetSupportedNpadStyleSet(aruid, supported_style_set);
+    Result result{ResultSuccess};
+    {
+        std::scoped_lock lock{mutex};
+        result = npad_resource.SetSupportedNpadStyleSet(aruid, supported_style_set);
+    }
     if (result.IsSuccess()) {
         OnUpdate(kernel, {});
     }
@@ -687,12 +723,16 @@ Result NPad::GetMaskedSupportedNpadStyleSet(Kernel::KernelCore& kernel, u64 arui
 }
 
 Result NPad::SetSupportedNpadIdType(Kernel::KernelCore& kernel, u64 aruid, std::span<const Core::HID::NpadIdType> supported_npad_list) {
-    std::scoped_lock lock{mutex};
+    auto shared_lock = LockShared();
     if (supported_npad_list.size() > MaxSupportedNpadIdTypes) {
         return ResultInvalidArraySize;
     }
 
-    Result result = npad_resource.SetSupportedNpadIdType(aruid, supported_npad_list);
+    Result result{ResultSuccess};
+    {
+        std::scoped_lock lock{mutex};
+        result = npad_resource.SetSupportedNpadIdType(aruid, supported_npad_list);
+    }
 
     if (result.IsSuccess()) {
         OnUpdate(kernel, {});
@@ -712,8 +752,12 @@ Result NPad::GetNpadJoyHoldType(u64 aruid, NpadJoyHoldType& out_hold_type) const
 }
 
 Result NPad::SetNpadHandheldActivationMode(Kernel::KernelCore& kernel, u64 aruid, NpadHandheldActivationMode mode) {
-    std::scoped_lock lock{mutex};
-    Result result = npad_resource.SetNpadHandheldActivationMode(aruid, mode);
+    auto shared_lock = LockShared();
+    Result result{ResultSuccess};
+    {
+        std::scoped_lock lock{mutex};
+        result = npad_resource.SetNpadHandheldActivationMode(aruid, mode);
+    }
     if (result.IsSuccess()) {
         OnUpdate(kernel, {});
     }
@@ -726,6 +770,7 @@ Result NPad::GetNpadHandheldActivationMode(Kernel::KernelCore& kernel, u64 aruid
 }
 
 bool NPad::SetNpadMode(Kernel::KernelCore& kernel, u64 aruid, Core::HID::NpadIdType& new_npad_id, Core::HID::NpadIdType npad_id, NpadJoyDeviceType npad_device_type, NpadJoyAssignmentMode assignment_mode) {
+    auto shared_lock = LockShared();
     if (!IsNpadIdValid(npad_id)) {
         LOG_ERROR(Service_HID, "Invalid NpadIdType npad_id:{}", npad_id);
         return false;
@@ -809,6 +854,7 @@ void NPad::AddNewControllerAt(Kernel::KernelCore& kernel, u64 aruid, Core::HID::
 }
 
 void NPad::UpdateControllerAt(Kernel::KernelCore& kernel, u64 aruid, Core::HID::NpadStyleIndex type, Core::HID::NpadIdType npad_id, bool connected) {
+    auto shared_lock = LockShared();
     auto& controller = GetControllerFromNpadIdType(aruid, npad_id);
     if (!connected) {
         DisconnectNpad(kernel, aruid, npad_id);
@@ -820,6 +866,7 @@ void NPad::UpdateControllerAt(Kernel::KernelCore& kernel, u64 aruid, Core::HID::
 }
 
 Result NPad::DisconnectNpad(Kernel::KernelCore& kernel, u64 aruid, Core::HID::NpadIdType npad_id) {
+    auto shared_lock = LockShared();
     if (!IsNpadIdValid(npad_id)) {
         LOG_ERROR(Service_HID, "Invalid NpadIdType npad_id:{}", npad_id);
         return ResultInvalidNpadId;
@@ -862,7 +909,10 @@ Result NPad::DisconnectNpad(Kernel::KernelCore& kernel, u64 aruid, Core::HID::Np
     controller.is_dual_right_connected = true;
     controller.is_connected = false;
     controller.device->Disconnect();
-    npad_resource.SignalStyleSetUpdateEvent(kernel, aruid, npad_id);
+    {
+        std::scoped_lock lock{mutex};
+        npad_resource.SignalStyleSetUpdateEvent(kernel, aruid, npad_id);
+    }
     WriteEmptyEntry(shared_memory);
     return ResultSuccess;
 }
@@ -870,10 +920,12 @@ Result NPad::DisconnectNpad(Kernel::KernelCore& kernel, u64 aruid, Core::HID::Np
 Result NPad::IsFirmwareUpdateAvailableForSixAxisSensor(
     u64 aruid, const Core::HID::SixAxisSensorHandle& sixaxis_handle,
     bool& is_firmware_available) const {
-    const auto is_valid = IsSixaxisHandleValid(sixaxis_handle);
-    if (is_valid.IsError()) {
-        LOG_ERROR(Service_HID, "Invalid handle, error_code={}", is_valid.raw);
-        return is_valid;
+    auto shared_lock = LockShared();
+    std::scoped_lock lock{mutex};
+
+    const Result valid_result = ValidateSixaxisAccess(aruid, sixaxis_handle);
+    if (valid_result.IsError()) {
+        return valid_result;
     }
 
     const auto& sixaxis_properties = GetSixaxisProperties(aruid, sixaxis_handle);
@@ -883,10 +935,12 @@ Result NPad::IsFirmwareUpdateAvailableForSixAxisSensor(
 
 Result NPad::ResetIsSixAxisSensorDeviceNewlyAssigned(
     u64 aruid, const Core::HID::SixAxisSensorHandle& sixaxis_handle) {
-    const auto is_valid = IsSixaxisHandleValid(sixaxis_handle);
-    if (is_valid.IsError()) {
-        LOG_ERROR(Service_HID, "Invalid handle, error_code={}", is_valid.raw);
-        return is_valid;
+    auto shared_lock = LockShared();
+    std::scoped_lock lock{mutex};
+
+    const Result valid_result = ValidateSixaxisAccess(aruid, sixaxis_handle);
+    if (valid_result.IsError()) {
+        return valid_result;
     }
 
     auto& sixaxis_properties = GetSixaxisProperties(aruid, sixaxis_handle);
@@ -896,6 +950,7 @@ Result NPad::ResetIsSixAxisSensorDeviceNewlyAssigned(
 }
 
 Result NPad::MergeSingleJoyAsDualJoy(Kernel::KernelCore& kernel, u64 aruid, Core::HID::NpadIdType npad_id_1, Core::HID::NpadIdType npad_id_2) {
+    auto shared_lock = LockShared();
     if (!IsNpadIdValid(npad_id_1) || !IsNpadIdValid(npad_id_2)) {
         LOG_ERROR(Service_HID, "Invalid NpadIdType npad_id_1:{}, npad_id_2:{}", npad_id_1,
                   npad_id_2);
@@ -978,6 +1033,7 @@ Result NPad::StopLrAssignmentMode(u64 aruid) {
 }
 
 Result NPad::SwapNpadAssignment(Kernel::KernelCore& kernel, u64 aruid, Core::HID::NpadIdType npad_id_1, Core::HID::NpadIdType npad_id_2) {
+    auto shared_lock = LockShared();
     if (!IsNpadIdValid(npad_id_1) || !IsNpadIdValid(npad_id_2)) {
         LOG_ERROR(Service_HID, "Invalid NpadIdType npad_id_1:{}, npad_id_2:{}", npad_id_1, npad_id_2);
         return ResultInvalidNpadId;
@@ -994,11 +1050,14 @@ Result NPad::SwapNpadAssignment(Kernel::KernelCore& kernel, u64 aruid, Core::HID
     const auto is_connected_1 = controller_1->IsConnected();
     const auto is_connected_2 = controller_2->IsConnected();
 
-    if (!npad_resource.IsControllerSupported(aruid, type_index_1) && is_connected_1) {
-        return ResultNpadNotConnected;
-    }
-    if (!npad_resource.IsControllerSupported(aruid, type_index_2) && is_connected_2) {
-        return ResultNpadNotConnected;
+    {
+        std::scoped_lock lock{mutex};
+        if (!npad_resource.IsControllerSupported(aruid, type_index_1) && is_connected_1) {
+            return ResultNpadNotConnected;
+        }
+        if (!npad_resource.IsControllerSupported(aruid, type_index_2) && is_connected_2) {
+            return ResultNpadNotConnected;
+        }
     }
 
     UpdateControllerAt(kernel, aruid, type_index_2, npad_id_1, is_connected_2);
@@ -1022,6 +1081,7 @@ void NPad::SetNpadAnalogStickUseCenterClamp(u64 aruid, bool is_enabled) {
 }
 
 void NPad::ClearAllConnectedControllers() {
+    auto shared_lock = LockShared();
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
         for (auto& controller : controller_data[aruid_index]) {
             if (controller.device->IsConnected() &&
@@ -1034,6 +1094,7 @@ void NPad::ClearAllConnectedControllers() {
 }
 
 void NPad::DisconnectAllConnectedControllers() {
+    auto shared_lock = LockShared();
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
         for (auto& controller : controller_data[aruid_index]) {
             controller.device->Disconnect();
@@ -1042,6 +1103,7 @@ void NPad::DisconnectAllConnectedControllers() {
 }
 
 void NPad::ConnectAllDisconnectedControllers() {
+    auto shared_lock = LockShared();
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
         for (auto& controller : controller_data[aruid_index]) {
             if (controller.device->GetNpadStyleIndex() != Core::HID::NpadStyleIndex::None &&
@@ -1053,6 +1115,7 @@ void NPad::ConnectAllDisconnectedControllers() {
 }
 
 void NPad::ClearAllControllers() {
+    auto shared_lock = LockShared();
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
         for (auto& controller : controller_data[aruid_index]) {
             controller.device->Disconnect();
@@ -1066,8 +1129,12 @@ Core::HID::NpadButton NPad::GetAndResetPressState() {
 }
 
 Result NPad::ApplyNpadSystemCommonPolicy(Kernel::KernelCore& kernel, u64 aruid) {
-    std::scoped_lock lock{mutex};
-    const Result result = npad_resource.ApplyNpadSystemCommonPolicy(aruid, false);
+    auto shared_lock = LockShared();
+    Result result{ResultSuccess};
+    {
+        std::scoped_lock lock{mutex};
+        result = npad_resource.ApplyNpadSystemCommonPolicy(aruid, false);
+    }
     if (result.IsSuccess()) {
         OnUpdate(kernel, {});
     }
@@ -1075,8 +1142,12 @@ Result NPad::ApplyNpadSystemCommonPolicy(Kernel::KernelCore& kernel, u64 aruid) 
 }
 
 Result NPad::ApplyNpadSystemCommonPolicyFull(Kernel::KernelCore& kernel, u64 aruid) {
-    std::scoped_lock lock{mutex};
-    const Result result = npad_resource.ApplyNpadSystemCommonPolicy(aruid, true);
+    auto shared_lock = LockShared();
+    Result result{ResultSuccess};
+    {
+        std::scoped_lock lock{mutex};
+        result = npad_resource.ApplyNpadSystemCommonPolicy(aruid, true);
+    }
     if (result.IsSuccess()) {
         OnUpdate(kernel, {});
     }
@@ -1084,8 +1155,12 @@ Result NPad::ApplyNpadSystemCommonPolicyFull(Kernel::KernelCore& kernel, u64 aru
 }
 
 Result NPad::ClearNpadSystemCommonPolicy(Kernel::KernelCore& kernel, u64 aruid) {
-    std::scoped_lock lock{mutex};
-    const Result result = npad_resource.ClearNpadSystemCommonPolicy(aruid);
+    auto shared_lock = LockShared();
+    Result result{ResultSuccess};
+    {
+        std::scoped_lock lock{mutex};
+        result = npad_resource.ClearNpadSystemCommonPolicy(aruid);
+    }
     if (result.IsSuccess()) {
         OnUpdate(kernel, {});
     }
@@ -1093,18 +1168,23 @@ Result NPad::ClearNpadSystemCommonPolicy(Kernel::KernelCore& kernel, u64 aruid) 
 }
 
 void NPad::SetRevision(u64 aruid, NpadRevision revision) {
+    std::scoped_lock lock{mutex};
     npad_resource.SetNpadRevision(aruid, revision);
 }
 
 NpadRevision NPad::GetRevision(u64 aruid) {
+    std::scoped_lock lock{mutex};
     return npad_resource.GetNpadRevision(aruid);
 }
 
 Result NPad::RegisterAppletResourceUserId(u64 aruid) {
+    std::scoped_lock lock{mutex};
     return npad_resource.RegisterAppletResourceUserId(aruid);
 }
 
 void NPad::UnregisterAppletResourceUserId(u64 aruid) {
+    auto shared_lock = LockShared();
+    std::scoped_lock lock{mutex};
     // TODO: Remove this once abstract pad is emulated properly
     auto aruid_index = npad_resource.GetIndexFromAruid(aruid);
     if (aruid_index >= AruidIndexMax) {
@@ -1184,6 +1264,7 @@ const NPad::NpadControllerData& NPad::GetControllerFromNpadIdType(
 Core::HID::SixAxisSensorProperties& NPad::GetSixaxisProperties(
     u64 aruid, const Core::HID::SixAxisSensorHandle& sixaxis_handle) {
     auto& controller = GetControllerFromHandle(aruid, sixaxis_handle);
+    ASSERT(controller.shared_memory != nullptr);
     switch (sixaxis_handle.npad_type) {
     case Core::HID::NpadStyleIndex::Fullkey:
     case Core::HID::NpadStyleIndex::Pokeball:
@@ -1207,6 +1288,7 @@ Core::HID::SixAxisSensorProperties& NPad::GetSixaxisProperties(
 const Core::HID::SixAxisSensorProperties& NPad::GetSixaxisProperties(
     u64 aruid, const Core::HID::SixAxisSensorHandle& sixaxis_handle) const {
     const auto& controller = GetControllerFromHandle(aruid, sixaxis_handle);
+    ASSERT(controller.shared_memory != nullptr);
     switch (sixaxis_handle.npad_type) {
     case Core::HID::NpadStyleIndex::Fullkey:
     case Core::HID::NpadStyleIndex::Pokeball:
@@ -1227,7 +1309,41 @@ const Core::HID::SixAxisSensorProperties& NPad::GetSixaxisProperties(
     }
 }
 
+Result NPad::ValidateSixaxisAccess(
+    u64 aruid, const Core::HID::SixAxisSensorHandle& sixaxis_handle) const {
+    const auto is_valid = IsSixaxisHandleValid(sixaxis_handle);
+    if (is_valid.IsError()) {
+        LOG_ERROR(Service_HID, "Invalid handle, error_code={}", is_valid.raw);
+        return is_valid;
+    }
+    if (applet_resource_holder.applet_resource == nullptr) {
+        return ResultSharedMemoryNotInitialized;
+    }
+    const auto aruid_index = applet_resource_holder.applet_resource->GetIndexFromAruid(aruid);
+    if (aruid_index >= AruidIndexMax) {
+        LOG_ERROR(Service_HID, "Invalid aruid:{:016X}", aruid);
+        return ResultAruidNotRegistered;
+    }
+    const auto& controller = GetControllerFromHandle(aruid, sixaxis_handle);
+    if (controller.shared_memory == nullptr) {
+        LOG_WARNING(Service_HID, "shared_memory is null for aruid:{:016X}", aruid);
+        return ResultSharedMemoryNotInitialized;
+    }
+    return ResultSuccess;
+}
+
+std::unique_lock<std::recursive_mutex> NPad::LockShared() const {
+    if (applet_resource_holder.shared_mutex == nullptr) {
+        return {};
+    }
+    return std::unique_lock{*applet_resource_holder.shared_mutex};
+}
+
 AppletDetailedUiType NPad::GetAppletDetailedUiType(Core::HID::NpadIdType npad_id) {
+    auto shared_lock = LockShared();
+    if (applet_resource_holder.applet_resource == nullptr) {
+        return {};
+    }
     const auto aruid = applet_resource_holder.applet_resource->GetActiveAruid();
     const auto* shared_memory = GetControllerFromNpadIdType(aruid, npad_id).shared_memory;
     return {
@@ -1254,11 +1370,11 @@ std::size_t NPad::GetNpadCaptureButtonAssignment(std::span<Core::HID::NpadButton
 }
 
 Result NPad::SetNpadSystemExtStateEnabled(u64 aruid, bool is_enabled) {
+    auto shared_lock = LockShared();
     std::scoped_lock lock{mutex};
     const auto result = npad_resource.SetNpadSystemExtStateEnabled(aruid, is_enabled);
 
     if (result.IsSuccess()) {
-        std::scoped_lock shared_lock{*applet_resource_holder.shared_mutex};
         // TODO: abstracted_pad->EnableAppletToGetInput(aruid);
     }
 
@@ -1291,7 +1407,7 @@ std::vector<NpadVibrationBase*> NPad::GetAllVibrationDevices() {
     for (auto& abstract_pad : abstracted_pads) {
         auto* left_device = abstract_pad.GetVibrationDevice(Core::HID::DeviceIndex::Left);
         auto* right_device = abstract_pad.GetVibrationDevice(Core::HID::DeviceIndex::Right);
-        auto* n64_device = abstract_pad.GetGCVibrationDevice();
+        auto* n64_device = abstract_pad.GetN64VibrationDevice();
         auto* gc_device = abstract_pad.GetGCVibrationDevice();
 
         if (left_device != nullptr) {
@@ -1370,13 +1486,12 @@ NpadGcVibrationDevice* NPad::GetGcVibrationDevice(const Core::HID::VibrationDevi
 }
 
 void NPad::UpdateHandheldAbstractState() {
-    std::scoped_lock lock{mutex};
+    auto shared_lock = LockShared();
     abstracted_pads[NpadIdTypeToIndex(Core::HID::NpadIdType::Handheld)].Update();
 }
 
 void NPad::EnableAppletToGetInput(u64 aruid) {
-    std::scoped_lock lock{mutex};
-    std::scoped_lock shared_lock{*applet_resource_holder.shared_mutex};
+    auto shared_lock = LockShared();
 
     for (auto& abstract_pad : abstracted_pads) {
         abstract_pad.EnableAppletToGetInput(aruid);

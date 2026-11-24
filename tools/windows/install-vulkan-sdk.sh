@@ -38,7 +38,7 @@ fi
 echo "Finished installing Vulkan SDK $VULKAN_SDK_VER"
 
 # GitHub Actions integration
-if [ \"${GITHUB_ACTIONS:-false}\" = \"true\" ]; then
-    echo \"VULKAN_SDK=$VULKAN_ROOT\" >> \"$GITHUB_ENV\"
-    echo \"$VULKAN_ROOT/bin\" >> \"$GITHUB_PATH\"
+if [ "${GITHUB_ACTIONS:-false}" = "true" ]; then
+    echo "VULKAN_SDK=$VULKAN_ROOT" >> "$GITHUB_ENV"
+    echo "$VULKAN_ROOT/bin" >> "$GITHUB_PATH"
 fi

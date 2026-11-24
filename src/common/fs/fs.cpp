@@ -331,27 +331,32 @@ bool RemoveDirContentsRecursively(const fs::path& path) {
     std::error_code ec;
 
     // TODO (Morph): Replace this with recursive_directory_iterator once it's fixed in MSVC.
-    for (const auto& entry : fs::directory_iterator(path, ec)) {
-        if (ec) {
+    for (auto it = fs::directory_iterator(path, ec);
+         !ec && it != fs::directory_iterator{}; it.increment(ec)) {
+        const auto& entry = *it;
+        std::error_code entry_ec;
+        const auto status = entry.symlink_status(entry_ec);
+        if (entry_ec) {
             LOG_ERROR(Common_Filesystem,
-                      "Failed to completely enumerate the directory at path={}, ec_message={}",
-                      PathToUTF8String(path), ec.message());
-            break;
-        }
-
-        fs::remove(entry.path(), ec);
-
-        if (ec) {
-            LOG_ERROR(Common_Filesystem,
-                      "Failed to remove the filesystem object at path={}, ec_message={}",
-                      PathToUTF8String(entry.path()), ec.message());
-            break;
+                      "Failed to get the status of filesystem object at path={}, ec_message={}",
+                      PathToUTF8String(entry.path()), entry_ec.message());
+            return false;
         }
 
         // TODO (Morph): Remove this when MSVC fixes recursive_directory_iterator.
         // recursive_directory_iterator throws an exception despite passing in a std::error_code.
-        if (entry.status().type() == fs::file_type::directory) {
-            return RemoveDirContentsRecursively(entry.path());
+        if (fs::is_directory(status)) {
+            if (!RemoveDirContentsRecursively(entry.path())) {
+                return false;
+            }
+        }
+
+        fs::remove(entry.path(), entry_ec);
+        if (entry_ec) {
+            LOG_ERROR(Common_Filesystem,
+                      "Failed to remove the filesystem object at path={}, ec_message={}",
+                      PathToUTF8String(entry.path()), entry_ec.message());
+            return false;
         }
     }
 

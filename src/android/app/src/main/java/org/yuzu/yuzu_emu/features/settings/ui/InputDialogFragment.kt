@@ -45,7 +45,10 @@ class InputDialogFragment : DialogFragment() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (settingsViewModel.clickedItem == null) dismiss()
+        if (settingsViewModel.clickedItem !is InputSetting) {
+            dismiss()
+            return
+        }
 
         position = requireArguments().getInt(POSITION)
 
@@ -53,7 +56,11 @@ class InputDialogFragment : DialogFragment() {
     }
 
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
-        inputSetting = settingsViewModel.clickedItem as InputSetting
+        val setting = settingsViewModel.clickedItem as? InputSetting ?: run {
+            dismissAllowingStateLoss()
+            return super.onCreateDialog(savedInstanceState)
+        }
+        inputSetting = setting
         binding = DialogMappingBinding.inflate(layoutInflater)
 
         val builder = MaterialAlertDialogBuilder(requireContext())
@@ -137,12 +144,19 @@ class InputDialogFragment : DialogFragment() {
         inflater: LayoutInflater,
         container: ViewGroup?,
         savedInstanceState: Bundle?
-    ): View {
-        return binding.root
+    ): View? {
+        return if (::binding.isInitialized) {
+            binding.root
+        } else {
+            super.onCreateView(inflater, container, savedInstanceState)
+        }
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+        if (!::inputSetting.isInitialized || !::binding.isInitialized) {
+            return
+        }
         view.requestFocus()
         view.setOnFocusChangeListener { v, hasFocus -> if (!hasFocus) v.requestFocus() }
         dialog?.setOnKeyListener { _, _, keyEvent -> onKeyEvent(keyEvent) }
@@ -159,20 +173,21 @@ class InputDialogFragment : DialogFragment() {
             return false
         }
 
+        val device = event.device ?: return false
         val action = when (event.action) {
             KeyEvent.ACTION_DOWN -> NativeInput.ButtonState.PRESSED
             KeyEvent.ACTION_UP -> NativeInput.ButtonState.RELEASED
             else -> return false
         }
         val controllerData =
-            InputHandler.androidControllers[event.device.controllerNumber] ?: return false
+            InputHandler.androidControllers[device.controllerNumber] ?: return false
         NativeInput.onGamePadButtonEvent(
             controllerData.getGUID(),
             controllerData.getPort(),
             InputHandler.getButtonIdFromEvent(event),
             action
         )
-        onInputReceived(event.device)
+        onInputReceived(device)
         return true
     }
 
@@ -188,16 +203,17 @@ class InputDialogFragment : DialogFragment() {
         // Temp workaround for DPads that give both axis and button input. The input system can't
         // take in a specific axis direction for a binding so you lose half of the directions for a DPad.
 
+        val device = event.device ?: return false
         val controllerData =
-            InputHandler.androidControllers[event.device.controllerNumber] ?: return false
-        event.device.motionRanges.forEach {
+            InputHandler.androidControllers[device.controllerNumber] ?: return false
+        device.motionRanges.forEach {
             NativeInput.onGamePadAxisEvent(
                 controllerData.getGUID(),
                 controllerData.getPort(),
                 it.axis,
                 event.getAxisValue(it.axis)
             )
-            onInputReceived(event.device)
+            onInputReceived(device)
         }
         return true
     }
@@ -213,7 +229,7 @@ class InputDialogFragment : DialogFragment() {
     private fun setResult(params: ParamPackage, device: InputDevice) {
         NativeInput.stopMapping()
         params.set("display", "${device.name} ${params.get("port", 0)}")
-        when (val item = settingsViewModel.clickedItem as InputSetting) {
+        when (val item = settingsViewModel.clickedItem as? InputSetting ?: return) {
             is ModifierInputSetting,
             is ButtonInputSetting -> {
                 // Invert DPad up and left bindings by default

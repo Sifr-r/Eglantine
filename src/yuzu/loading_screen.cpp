@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <limits>
 #include <QBuffer>
 #include <QByteArray>
 #include <QGraphicsOpacityEffect>
@@ -165,15 +167,19 @@ void LoadingScreen::OnLoadProgress(VideoCore::LoadCallbackStage stage, std::size
         }
         // only calculate an estimate time after a second has passed since stage change
         const auto diff = duration_cast<milliseconds>(now - slow_shader_start);
-        if (diff > seconds{1}) {
-            const auto eta_mseconds =
-                static_cast<long>(static_cast<double>(total - slow_shader_first_value) /
-                                  (value - slow_shader_first_value) * diff.count());
-            estimate =
-                tr("Estimated Time %1")
-                    .arg(QTime(0, 0, 0, 0)
-                             .addMSecs(std::max<long>(eta_mseconds - diff.count() + 1000, 1000))
-                             .toString(QStringLiteral("mm:ss")));
+        if (diff > seconds{1} && value > slow_shader_first_value && total >= value) {
+            const double raw_eta = static_cast<double>(total - slow_shader_first_value) /
+                                   static_cast<double>(value - slow_shader_first_value) *
+                                   static_cast<double>(diff.count());
+            constexpr double max_eta_ms = static_cast<double>((std::numeric_limits<int>::max)());
+            const auto eta_mseconds = static_cast<long long>(std::clamp(raw_eta, 0.0, max_eta_ms));
+            const long long remaining_ms =
+                std::clamp<long long>(eta_mseconds - diff.count() + 1000, 1000,
+                                      (std::numeric_limits<int>::max)());
+            estimate = tr("Estimated Time %1")
+                           .arg(QTime(0, 0, 0, 0)
+                                    .addMSecs(static_cast<int>(remaining_ms))
+                                    .toString(QStringLiteral("mm:ss")));
         }
     }
 

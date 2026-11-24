@@ -85,10 +85,10 @@ jobs:
           save-cache: ${{ inputs.save_cache }}
 
       - name: Set up MSVC
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
 
       - name: Install Qt on Windows
-        uses: jurplel/install-qt-action@v4
+        uses: jurplel/install-qt-action@b344308e4483fc892e0d27b3cd1b173ebdd95f06 # v4.5.0
         with:
           version: "6.8.3"
           host: windows
@@ -116,7 +116,7 @@ jobs:
         run: glslangValidator --version
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -253,7 +253,7 @@ jobs:
       # toolchain that could not compile a single test program ("Detecting C compiler ABI info -
       # failed"), so the saved ~25 s is not worth a leg that dies once the cache is evicted.
       - name: Set up MSYS2
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2.34.0
         with:
           msystem: UCRT64
           update: true
@@ -365,7 +365,7 @@ jobs:
               [ -z "$source" ] && continue
               # The system DLLs ship with Windows, so they never need bundling.
               case "$source" in
-                *System32* | *SysWOW64*) continue ;;
+                *[Ss][Yy][Ss][Tt][Ee][Mm]32* | *[Ss][Yy][Ss][Ww][Oo][Ww]64*) continue ;;
               esac
               if [ ! -f "$dll" ]; then
                 cp "$source" "$dll"

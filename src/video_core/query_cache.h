@@ -139,11 +139,10 @@ public:
     void Query(GPUVAddr gpu_addr, VideoCore::QueryType type, std::optional<u64> timestamp) {
         std::unique_lock lock{mutex};
         const std::optional<VAddr> cpu_addr = gpu_memory->GpuToCpuAddress(gpu_addr);
-        ASSERT(cpu_addr);
+        ASSERT_OR_EXECUTE(cpu_addr, return;);
 
         CachedQuery* query = TryGet(*cpu_addr);
         if (!query) {
-            ASSERT_OR_EXECUTE(cpu_addr, return;);
             u8* const host_ptr = gpu_memory->GetPointer(gpu_addr);
 
             query = Register(type, *cpu_addr, host_ptr, timestamp.has_value());

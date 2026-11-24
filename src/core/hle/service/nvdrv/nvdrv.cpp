@@ -111,15 +111,10 @@ public:
 void LoopProcess(Core::System& system) {
     auto server_manager = std::make_unique<ServerManager>(system);
     auto module = std::make_shared<Module>(system);
-    server_manager->RegisterNamedService("nvdrv", std::make_shared<NVDRV>(system, module, "nvdrv"));
-
-    const auto NvdrvInterfaceFactoryForApplets = [&, module] {
-        return std::make_shared<NVDRV>(system, module, "nvdrv:a");
-    };
-
-    server_manager->RegisterNamedService("nvdrv:a", NvdrvInterfaceFactoryForApplets);
-    server_manager->RegisterNamedService("nvdrv:s", std::make_shared<NVDRV>(system, module, "nvdrv:s"));
-    server_manager->RegisterNamedService("nvdrv:t", std::make_shared<NVDRV>(system, module, "nvdrv:t"));
+    for (const char* name : {"nvdrv", "nvdrv:a", "nvdrv:s", "nvdrv:t"}) {
+        server_manager->RegisterNamedService(
+            name, [&, module, name] { return std::make_shared<NVDRV>(system, module, name); });
+    }
     server_manager->RegisterNamedService("nvmemp", std::make_shared<NVMEMP>(system));
     server_manager->RegisterNamedService("nvgem:c", std::make_shared<NVGEM_C>(system));
     server_manager->RegisterNamedService("nvgem:cd", std::make_shared<NVGEM_CD>(system));

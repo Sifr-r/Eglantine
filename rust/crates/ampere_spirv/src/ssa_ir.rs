@@ -9,9 +9,9 @@ use eglantine_ampere_rs::Instruction;
 
 use crate::coop_matrix::CoopConfig;
 use crate::decode_sm86::{
-    decode_program, AtomicOp, BoolComb, DecodedInsn, DecodedOp, FloatCmp, FloatSrc, HalfSrc,
-    IntCmp, MemBarrierScope, MemWidth, MufuOp, PredGuard, S2rSpecial, ShflMode, SrcOperand,
-    VoteMode,
+    decode_program, AtomicOp, BoolComb, CbufRef, DecodedInsn, DecodedOp, FloatCmp, FloatSrc,
+    HalfSrc, IntCmp, MemBarrierScope, MemWidth, MufuOp, PredGuard, S2rSpecial, ShflMode,
+    SrcOperand, VoteMode,
 };
 use crate::reflect::{
     Bindings, FallbackReason, Profile, ShaderInfo, SnapshotEnv, Stage, SPIRV_1_6_VERSION,
@@ -32,6 +32,9 @@ pub enum ValType {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GlslOp {
+    RoundEven,
+    Floor,
+    Ceil,
     Sin,
     Cos,
     Exp2,
@@ -107,7 +110,7 @@ pub enum SsaOp {
     HFma2 { a: ValueId, b: ValueId, c: ValueId },
     LoadSsboWord { ssbo_idx: usize, word_idx: ValueId },
     StoreSsboWord { ssbo_idx: usize, word_idx: ValueId, val: ValueId },
-    AtomicSsboWord { ssbo_idx: usize, word_idx: ValueId, op: AtomicOp, data: ValueId },
+    AtomicSsboWord { ssbo_idx: usize, word_idx: ValueId, op: AtomicOp, signed: bool, data: ValueId },
     LoadSharedWord { word_idx: ValueId },
     StoreSharedWord { word_idx: ValueId, val: ValueId },
     AtomicSharedWord { word_idx: ValueId, op: AtomicOp, data: ValueId },
@@ -286,9 +289,17 @@ impl<'a> SsaBuilder<'a> {
         self.alloc_val(blk, ValType::U32, SsaOp::ConstU32(v))
     }
 
-    fn read_pred(&mut self, blk: usize, state: &RegState, pred: PredGuard) -> ValueId {
+    fn read_pred_impl(
+        &mut self,
+        blk: usize,
+        state: &RegState,
+        is_uniform: bool,
+        pred: PredGuard,
+    ) -> ValueId {
         let base = if pred.id == 7 {
             self.true_bool
+        } else if is_uniform {
+            state.up[pred.id as usize]
         } else {
             state.p[pred.id as usize]
         };
@@ -303,6 +314,32 @@ impl<'a> SsaBuilder<'a> {
         } else {
             base
         }
+    }
+
+    fn read_pred(&mut self, blk: usize, state: &RegState, pred: PredGuard) -> ValueId {
+        self.read_pred_impl(blk, state, false, pred)
+    }
+
+    fn read_upred(&mut self, blk: usize, state: &RegState, pred: PredGuard) -> ValueId {
+        self.read_pred_impl(blk, state, true, pred)
+    }
+
+    fn accum_add_carry(
+        &mut self,
+        blk: usize,
+        sum: &mut ValueId,
+        total_carries: &mut ValueId,
+        addend: ValueId,
+    ) {
+        let next_sum = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(*sum, addend));
+        let carry = self.alloc_val(
+            blk,
+            ValType::Bool,
+            SsaOp::IntCmp { cmp: IntCmp::Lt, signed: false, a: next_sum, b: *sum },
+        );
+        let carry_u = self.select_u32_bool(blk, carry);
+        *total_carries = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(*total_carries, carry_u));
+        *sum = next_sum;
     }
 
     fn write_reg(&self, state: &mut RegState, dst: u8, val: ValueId, ptr: Option<PtrOrigin>) {
@@ -547,90 +584,249 @@ impl<'a> SsaBuilder<'a> {
             } => {
                 let modified = collect_modified_regs(body_nodes, &self.decoded);
                 let preheader = *cur_blk;
-                let header_blk = self.new_block();
-                let body_entry = self.new_block();
-                let continue_blk = self.new_block();
-                let merge_blk = self.new_block();
-
-                self.blocks[preheader].terminator = Terminator::Branch { target: header_blk };
-
-                let mut r_phis = Vec::new();
-                for &reg in &modified.r {
-                    let phi = self.alloc_val(header_blk, ValType::U32, SsaOp::Phi(Vec::new()));
-                    let init = state.r[reg as usize];
-                    state.r[reg as usize] = phi;
-                    r_phis.push((reg, phi, init));
-                }
-                let mut ur_phis = Vec::new();
-                for &ur in &modified.ur {
-                    let phi = self.alloc_val(header_blk, ValType::U32, SsaOp::Phi(Vec::new()));
-                    let init = state.ur[ur as usize];
-                    state.ur[ur as usize] = phi;
-                    ur_phis.push((ur, phi, init));
-                }
-                let mut p_phis = Vec::new();
-                for &pr in &modified.p {
-                    let phi = self.alloc_val(header_blk, ValType::Bool, SsaOp::Phi(Vec::new()));
-                    let init = state.p[pr as usize];
-                    state.p[pr as usize] = phi;
-                    p_phis.push((pr, phi, init));
-                }
-
-                self.blocks[header_blk].merge = MergeHint::Loop {
-                    merge_block: merge_blk,
-                    continue_block: continue_blk,
-                };
-                self.blocks[header_blk].terminator = Terminator::Branch { target: body_entry };
-
-                let mut body_cur = body_entry;
-                let mut body_active = true;
-                self.lower_node_seq(body_nodes, &mut body_cur, state, &mut body_active)?;
                 let _ = header_idx;
+                let saved_blocks_len = self.blocks.len();
+                let saved_next_id = self.next_id;
+                let saved_shared = self.shared_bytes_needed;
+                let saved_local = self.local_bytes_needed;
+                let saved_dyn_cbuf = self.uses_dynamic_cbuf;
+                let saved_info = self.info.clone();
+                let saved_preheader_term = self.blocks[preheader].terminator.clone();
+                let mut working_entry_state = state.clone();
 
-                if body_active {
-                    let raw_cond = self.read_pred(body_cur, state, *continue_cond);
-                    let loop_cond = if *continue_negated {
-                        self.alloc_val(body_cur, ValType::Bool, SsaOp::BoolNot(raw_cond))
+                let merge_blk = loop {
+                    *state = working_entry_state.clone();
+                    let header_blk = self.new_block();
+                    let body_entry = self.new_block();
+                    let continue_blk = self.new_block();
+                    let merge_blk = self.new_block();
+
+                    self.blocks[preheader].terminator = Terminator::Branch { target: header_blk };
+
+                    let mut r_phis = Vec::new();
+                    for &reg in &modified.r {
+                        let phi = self.alloc_val(header_blk, ValType::U32, SsaOp::Phi(Vec::new()));
+                        let init = state.r[reg as usize];
+                        state.r[reg as usize] = phi;
+                        r_phis.push((reg, phi, init));
+                    }
+                    let mut ur_phis = Vec::new();
+                    for &ur in &modified.ur {
+                        let phi = self.alloc_val(header_blk, ValType::U32, SsaOp::Phi(Vec::new()));
+                        let init = state.ur[ur as usize];
+                        state.ur[ur as usize] = phi;
+                        ur_phis.push((ur, phi, init));
+                    }
+                    let mut p_phis = Vec::new();
+                    for &pr in &modified.p {
+                        let phi = self.alloc_val(header_blk, ValType::Bool, SsaOp::Phi(Vec::new()));
+                        let init = state.p[pr as usize];
+                        state.p[pr as usize] = phi;
+                        p_phis.push((pr, phi, init));
+                    }
+                    let mut up_phis = Vec::new();
+                    for &upr in &modified.up {
+                        let phi = self.alloc_val(header_blk, ValType::Bool, SsaOp::Phi(Vec::new()));
+                        let init = state.up[upr as usize];
+                        state.up[upr as usize] = phi;
+                        up_phis.push((upr, phi, init));
+                    }
+                    let mut r_ptr_phis = Vec::new();
+                    for &reg in &modified.r {
+                        if let Some(orig) = state.r_ptr[reg as usize] {
+                            let phi = self.alloc_val(header_blk, ValType::U32, SsaOp::Phi(Vec::new()));
+                            state.r_ptr[reg as usize] = Some(PtrOrigin {
+                                byte_offset: phi,
+                                ..orig
+                            });
+                            r_ptr_phis.push((reg, phi, orig));
+                        }
+                    }
+                    let mut ur_ptr_phis = Vec::new();
+                    for &ur in &modified.ur {
+                        if let Some(orig) = state.ur_ptr[ur as usize] {
+                            let phi = self.alloc_val(header_blk, ValType::U32, SsaOp::Phi(Vec::new()));
+                            state.ur_ptr[ur as usize] = Some(PtrOrigin {
+                                byte_offset: phi,
+                                ..orig
+                            });
+                            ur_ptr_phis.push((ur, phi, orig));
+                        }
+                    }
+
+                    self.blocks[header_blk].merge = MergeHint::Loop {
+                        merge_block: merge_blk,
+                        continue_block: continue_blk,
+                    };
+                    self.blocks[header_blk].terminator = Terminator::Branch { target: body_entry };
+
+                    let mut body_cur = body_entry;
+                    let mut body_active = true;
+                    self.lower_node_seq(body_nodes, &mut body_cur, state, &mut body_active)?;
+
+                    if body_active {
+                        let bad_r: Vec<u8> = r_ptr_phis
+                            .iter()
+                            .filter_map(|&(reg, _, pre_orig)| {
+                                let ok = state.r_ptr[reg as usize].is_some_and(|post| {
+                                    post.bank == pre_orig.bank
+                                        && post.cbuf_offset == pre_orig.cbuf_offset
+                                });
+                                (!ok).then_some(reg)
+                            })
+                            .collect();
+                        let bad_ur: Vec<u8> = ur_ptr_phis
+                            .iter()
+                            .filter_map(|&(ur, _, pre_orig)| {
+                                let ok = state.ur_ptr[ur as usize].is_some_and(|post| {
+                                    post.bank == pre_orig.bank
+                                        && post.cbuf_offset == pre_orig.cbuf_offset
+                                });
+                                (!ok).then_some(ur)
+                            })
+                            .collect();
+                        if !bad_r.is_empty() || !bad_ur.is_empty() {
+                            self.blocks.truncate(saved_blocks_len);
+                            self.blocks[preheader].terminator = saved_preheader_term.clone();
+                            self.next_id = saved_next_id;
+                            self.shared_bytes_needed = saved_shared;
+                            self.local_bytes_needed = saved_local;
+                            self.uses_dynamic_cbuf = saved_dyn_cbuf;
+                            self.info = saved_info.clone();
+                            for r in bad_r {
+                                working_entry_state.r_ptr[r as usize] = None;
+                            }
+                            for ur in bad_ur {
+                                working_entry_state.ur_ptr[ur as usize] = None;
+                            }
+                            continue;
+                        }
+
+                        let raw_cond = self.read_pred(body_cur, state, *continue_cond);
+                        let loop_cond = if *continue_negated {
+                            self.alloc_val(body_cur, ValType::Bool, SsaOp::BoolNot(raw_cond))
+                        } else {
+                            raw_cond
+                        };
+                        self.blocks[body_cur].terminator = Terminator::BranchCond {
+                            cond: loop_cond,
+                            true_target: continue_blk,
+                            false_target: merge_blk,
+                        };
+                        self.blocks[continue_blk].terminator = Terminator::Branch { target: header_blk };
+
+                        for (reg, phi_id, init) in r_phis {
+                            patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, state.r[reg as usize])]);
+                        }
+                        for (ur, phi_id, init) in ur_phis {
+                            patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, state.ur[ur as usize])]);
+                        }
+                        for (pr, phi_id, init) in p_phis {
+                            patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, state.p[pr as usize])]);
+                        }
+                        for (upr, phi_id, init) in up_phis {
+                            patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, state.up[upr as usize])]);
+                        }
+                        for (reg, phi_id, init_orig) in r_ptr_phis {
+                            let back = state.r_ptr[reg as usize].expect("verified pointer provenance").byte_offset;
+                            patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init_orig.byte_offset), (continue_blk, back)]);
+                        }
+                        for (ur, phi_id, init_orig) in ur_ptr_phis {
+                            let back = state.ur_ptr[ur as usize].expect("verified pointer provenance").byte_offset;
+                            patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init_orig.byte_offset), (continue_blk, back)]);
+                        }
                     } else {
-                        raw_cond
-                    };
-                    self.blocks[body_cur].terminator = Terminator::BranchCond {
-                        cond: loop_cond,
-                        true_target: continue_blk,
-                        false_target: merge_blk,
-                    };
-                    self.blocks[continue_blk].terminator = Terminator::Branch { target: header_blk };
-
-                    for (reg, phi_id, init) in r_phis {
-                        patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, state.r[reg as usize])]);
+                        self.blocks[continue_blk].terminator = Terminator::Branch { target: header_blk };
+                        for (_reg, phi_id, init) in r_phis {
+                            patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, init)]);
+                        }
+                        for (_ur, phi_id, init) in ur_phis {
+                            patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, init)]);
+                        }
+                        for (_pr, phi_id, init) in p_phis {
+                            patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, init)]);
+                        }
+                        for (_upr, phi_id, init) in up_phis {
+                            patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, init)]);
+                        }
+                        for (_reg, phi_id, init_orig) in r_ptr_phis {
+                            patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init_orig.byte_offset), (continue_blk, init_orig.byte_offset)]);
+                        }
+                        for (_ur, phi_id, init_orig) in ur_ptr_phis {
+                            patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init_orig.byte_offset), (continue_blk, init_orig.byte_offset)]);
+                        }
+                        *active = false;
                     }
-                    for (ur, phi_id, init) in ur_phis {
-                        patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, state.ur[ur as usize])]);
-                    }
-                    for (pr, phi_id, init) in p_phis {
-                        patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, state.p[pr as usize])]);
-                    }
-                } else {
-                    self.blocks[continue_blk].terminator = Terminator::Branch { target: header_blk };
-                    for (reg, phi_id, init) in r_phis {
-                        let _ = reg;
-                        patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, init)]);
-                    }
-                    for (ur, phi_id, init) in ur_phis {
-                        let _ = ur;
-                        patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, init)]);
-                    }
-                    for (pr, phi_id, init) in p_phis {
-                        let _ = pr;
-                        patch_phi(&mut self.blocks[header_blk], phi_id, vec![(preheader, init), (continue_blk, init)]);
-                    }
-                    *active = false;
-                }
+                    break merge_blk;
+                };
 
                 *cur_blk = merge_blk;
                 Ok(())
             }
         }
+    }
+
+    fn merge_ptr_phi(
+        &mut self,
+        merge_blk: usize,
+        lb: usize,
+        left: Option<PtrOrigin>,
+        rb: usize,
+        right: Option<PtrOrigin>,
+    ) -> Option<PtrOrigin> {
+        let (Some(l), Some(r)) = (left, right) else {
+            return None;
+        };
+        if l.bank != r.bank || l.cbuf_offset != r.cbuf_offset {
+            return None;
+        }
+        let byte_offset = if l.byte_offset == r.byte_offset {
+            l.byte_offset
+        } else {
+            self.alloc_val(
+                merge_blk,
+                ValType::U32,
+                SsaOp::Phi(vec![(lb, l.byte_offset), (rb, r.byte_offset)]),
+            )
+        };
+        Some(PtrOrigin {
+            bank: l.bank,
+            cbuf_offset: l.cbuf_offset,
+            byte_offset,
+        })
+    }
+
+    fn select_ptr(
+        &mut self,
+        blk: usize,
+        cond: ValueId,
+        t_opt: Option<PtrOrigin>,
+        f_opt: Option<PtrOrigin>,
+    ) -> Option<PtrOrigin> {
+        let (Some(t), Some(f)) = (t_opt, f_opt) else {
+            return None;
+        };
+        if t.bank != f.bank || t.cbuf_offset != f.cbuf_offset {
+            return None;
+        }
+        let byte_offset = if t.byte_offset == f.byte_offset {
+            t.byte_offset
+        } else {
+            self.alloc_val(
+                blk,
+                ValType::U32,
+                SsaOp::Select {
+                    cond,
+                    t: t.byte_offset,
+                    f: f.byte_offset,
+                },
+            )
+        };
+        Some(PtrOrigin {
+            bank: t.bank,
+            cbuf_offset: t.cbuf_offset,
+            byte_offset,
+        })
     }
 
     fn merge_states(
@@ -659,9 +855,7 @@ impl<'a> SsaBuilder<'a> {
                             SsaOp::Phi(vec![(lb, ls.r[i]), (rb, rs.r[i])]),
                         );
                     }
-                    if ls.r_ptr[i].is_none() || rs.r_ptr[i].is_none() {
-                        out.r_ptr[i] = None;
-                    }
+                    out.r_ptr[i] = self.merge_ptr_phi(merge_blk, lb, ls.r_ptr[i], rb, rs.r_ptr[i]);
                 }
                 for i in 0..63 {
                     if ls.ur[i] != rs.ur[i] {
@@ -671,9 +865,8 @@ impl<'a> SsaBuilder<'a> {
                             SsaOp::Phi(vec![(lb, ls.ur[i]), (rb, rs.ur[i])]),
                         );
                     }
-                    if ls.ur_ptr[i].is_none() || rs.ur_ptr[i].is_none() {
-                        out.ur_ptr[i] = None;
-                    }
+                    out.ur_ptr[i] =
+                        self.merge_ptr_phi(merge_blk, lb, ls.ur_ptr[i], rb, rs.ur_ptr[i]);
                 }
                 for i in 0..7 {
                     if ls.p[i] != rs.p[i] {
@@ -805,6 +998,7 @@ impl<'a> SsaBuilder<'a> {
                         },
                     );
                 }
+                state.r_ptr[i] = self.select_ptr(*cur_blk, cond, state.r_ptr[i], prev.r_ptr[i]);
             }
             for i in 0..63 {
                 if state.ur[i] != prev.ur[i] {
@@ -818,6 +1012,7 @@ impl<'a> SsaBuilder<'a> {
                         },
                     );
                 }
+                state.ur_ptr[i] = self.select_ptr(*cur_blk, cond, state.ur_ptr[i], prev.ur_ptr[i]);
             }
             for i in 0..7 {
                 if state.p[i] != prev.p[i] {
@@ -828,6 +1023,17 @@ impl<'a> SsaBuilder<'a> {
                             cond,
                             t: state.p[i],
                             f: prev.p[i],
+                        },
+                    );
+                }
+                if state.up[i] != prev.up[i] {
+                    state.up[i] = self.alloc_val(
+                        *cur_blk,
+                        ValType::Bool,
+                        SsaOp::Select {
+                            cond,
+                            t: state.up[i],
+                            f: prev.up[i],
                         },
                     );
                 }
@@ -923,32 +1129,11 @@ impl<'a> SsaBuilder<'a> {
                     ValType::Bool,
                     SsaOp::IntCmp { cmp: IntCmp::Lt, signed: false, a: sum, b: va },
                 );
-                let sum_ab_c = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(sum, vc));
-                let c1 = self.alloc_val(
-                    blk,
-                    ValType::Bool,
-                    SsaOp::IntCmp { cmp: IntCmp::Lt, signed: false, a: sum_ab_c, b: sum },
-                );
-                sum = sum_ab_c;
-
-                let c0u = self.select_u32_bool(blk, c0);
-                let c1u = self.select_u32_bool(blk, c1);
-                let mut total_carries = self.alloc_val(
-                    blk,
-                    ValType::U32,
-                    SsaOp::IAdd(c0u, c1u),
-                );
+                let mut total_carries = self.select_u32_bool(blk, c0);
+                self.accum_add_carry(blk, &mut sum, &mut total_carries, vc);
 
                 if !x_mode && (neg_a || neg_b || neg_c) {
-                    let s2 = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(sum, self.one_u32));
-                    let c2 = self.alloc_val(
-                        blk,
-                        ValType::Bool,
-                        SsaOp::IntCmp { cmp: IntCmp::Lt, signed: false, a: s2, b: sum },
-                    );
-                    let c2u = self.select_u32_bool(blk, c2);
-                    total_carries = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(total_carries, c2u));
-                    sum = s2;
+                    self.accum_add_carry(blk, &mut sum, &mut total_carries, self.one_u32);
                 } else if x_mode {
                     for cin in [carry_in0, carry_in1] {
                         if cin == 15 {
@@ -957,15 +1142,7 @@ impl<'a> SsaBuilder<'a> {
                         let g = PredGuard { neg: (cin & 8) != 0, id: cin & 7 };
                         let p = self.read_pred(blk, state, g);
                         let pu = self.select_u32_bool(blk, p);
-                        let s2 = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(sum, pu));
-                        let c2 = self.alloc_val(
-                            blk,
-                            ValType::Bool,
-                            SsaOp::IntCmp { cmp: IntCmp::Lt, signed: false, a: s2, b: sum },
-                        );
-                        let c2u = self.select_u32_bool(blk, c2);
-                        total_carries = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(total_carries, c2u));
-                        sum = s2;
+                        self.accum_add_carry(blk, &mut sum, &mut total_carries, pu);
                     }
                 }
 
@@ -1005,50 +1182,46 @@ impl<'a> SsaBuilder<'a> {
                 let vc = self.eval_src(blk, state, c);
                 let va = if neg_a { self.alloc_val(blk, ValType::U32, SsaOp::BitNot(va_raw)) } else { va_raw };
                 let vb = if neg_b { self.alloc_val(blk, ValType::U32, SsaOp::BitNot(vb_raw)) } else { vb_raw };
-                let s1 = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(va, vb));
-                let c0 = self.alloc_val(blk, ValType::Bool, SsaOp::IntCmp { cmp: IntCmp::Lt, signed: false, a: s1, b: va });
-                let mut sum = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(s1, vc));
+                let mut sum = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(va, vb));
+                let c0 = self.alloc_val(
+                    blk,
+                    ValType::Bool,
+                    SsaOp::IntCmp { cmp: IntCmp::Lt, signed: false, a: sum, b: va },
+                );
+                let mut total_carries = self.select_u32_bool(blk, c0);
+                self.accum_add_carry(blk, &mut sum, &mut total_carries, vc);
                 if !x_mode && (neg_a || neg_b) {
-                    sum = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(sum, self.one_u32));
+                    self.accum_add_carry(blk, &mut sum, &mut total_carries, self.one_u32);
                 } else if x_mode && carry_in != 15 {
                     let g = PredGuard { neg: (carry_in & 8) != 0, id: carry_in & 7 };
-                    let p = self.read_pred(blk, state, g);
+                    let p = self.read_upred(blk, state, g);
                     let pu = self.select_u32_bool(blk, p);
-                    sum = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(sum, pu));
+                    self.accum_add_carry(blk, &mut sum, &mut total_carries, pu);
                 }
                 if carry_out < 7 {
-                    state.up[carry_out as usize] = c0;
+                    state.up[carry_out as usize] = self.alloc_val(
+                        blk,
+                        ValType::Bool,
+                        SsaOp::IntCmp { cmp: IntCmp::Ge, signed: false, a: total_carries, b: self.one_u32 },
+                    );
                 }
                 let ptr = self.propagate_add_ptr(blk, state, a, b, c, neg_a, neg_b, false);
                 self.write_ureg(state, dst_ur, sum, ptr);
             }
             DecodedOp::Imad { dst, a, b, c, neg_c, signed, hi, wide } => {
-                let va = self.eval_src(blk, state, a);
-                let vb = self.eval_src(blk, state, b);
-                let vc_raw = self.eval_src(blk, state, c);
-                let vc = if neg_c { self.alloc_val(blk, ValType::U32, SsaOp::INeg(vc_raw)) } else { vc_raw };
-                if wide {
-                    let prod = if signed {
-                        self.alloc_val(blk, ValType::U32, SsaOp::SMulHi(va, vb))
+                if wide || hi {
+                    let (lo_sum, hi_val) = self.lower_imad_64(blk, state, off, insn.raw_opcode, a, b, c, neg_c, signed)?;
+                    if wide {
+                        self.write_reg(state, dst, lo_sum, None);
+                        self.write_reg(state, dst.saturating_add(1), hi_val, None);
                     } else {
-                        self.alloc_val(blk, ValType::U32, SsaOp::UMulHi(va, vb))
-                    };
-                    let lo = self.alloc_val(blk, ValType::U32, SsaOp::IMul(va, vb));
-                    let lo_sum = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(lo, vc));
-                    let carry = self.alloc_val(blk, ValType::Bool, SsaOp::IntCmp { cmp: IntCmp::Lt, signed: false, a: lo_sum, b: lo });
-                    let carry_u = self.select_u32_bool(blk, carry);
-                    let hi_val = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(prod, carry_u));
-                    self.write_reg(state, dst, lo_sum, None);
-                    self.write_reg(state, dst.saturating_add(1), hi_val, None);
-                } else if hi {
-                    let prod = if signed {
-                        self.alloc_val(blk, ValType::U32, SsaOp::SMulHi(va, vb))
-                    } else {
-                        self.alloc_val(blk, ValType::U32, SsaOp::UMulHi(va, vb))
-                    };
-                    let sum = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(prod, vc));
-                    self.write_reg(state, dst, sum, None);
+                        self.write_reg(state, dst, hi_val, None);
+                    }
                 } else {
+                    let va = self.eval_src(blk, state, a);
+                    let vb = self.eval_src(blk, state, b);
+                    let vc_raw = self.eval_src(blk, state, c);
+                    let vc = if neg_c { self.alloc_val(blk, ValType::U32, SsaOp::INeg(vc_raw)) } else { vc_raw };
                     let prod = self.alloc_val(blk, ValType::U32, SsaOp::IMul(va, vb));
                     let sum = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(prod, vc));
                     let ptr = if !neg_c {
@@ -1063,24 +1236,15 @@ impl<'a> SsaBuilder<'a> {
                 }
             }
             DecodedOp::Uimad { dst_ur, a, b, c, neg_c, signed, wide } => {
-                let va = self.eval_src(blk, state, a);
-                let vb = self.eval_src(blk, state, b);
-                let vc_raw = self.eval_src(blk, state, c);
-                let vc = if neg_c { self.alloc_val(blk, ValType::U32, SsaOp::INeg(vc_raw)) } else { vc_raw };
                 if wide {
-                    let prod = if signed {
-                        self.alloc_val(blk, ValType::U32, SsaOp::SMulHi(va, vb))
-                    } else {
-                        self.alloc_val(blk, ValType::U32, SsaOp::UMulHi(va, vb))
-                    };
-                    let lo = self.alloc_val(blk, ValType::U32, SsaOp::IMul(va, vb));
-                    let lo_sum = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(lo, vc));
-                    let carry = self.alloc_val(blk, ValType::Bool, SsaOp::IntCmp { cmp: IntCmp::Lt, signed: false, a: lo_sum, b: lo });
-                    let carry_u = self.select_u32_bool(blk, carry);
-                    let hi_val = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(prod, carry_u));
+                    let (lo_sum, hi_val) = self.lower_imad_64(blk, state, off, insn.raw_opcode, a, b, c, neg_c, signed)?;
                     self.write_ureg(state, dst_ur, lo_sum, None);
                     self.write_ureg(state, dst_ur.saturating_add(1), hi_val, None);
                 } else {
+                    let va = self.eval_src(blk, state, a);
+                    let vb = self.eval_src(blk, state, b);
+                    let vc_raw = self.eval_src(blk, state, c);
+                    let vc = if neg_c { self.alloc_val(blk, ValType::U32, SsaOp::INeg(vc_raw)) } else { vc_raw };
                     let prod = self.alloc_val(blk, ValType::U32, SsaOp::IMul(va, vb));
                     let sum = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(prod, vc));
                     self.write_ureg(state, dst_ur, sum, None);
@@ -1215,16 +1379,7 @@ impl<'a> SsaBuilder<'a> {
                 let va = self.eval_src(blk, state, a);
                 let vb = self.eval_src(blk, state, b);
                 let c_val = self.alloc_val(blk, ValType::Bool, SsaOp::IntCmp { cmp, signed, a: va, b: vb });
-                let acc = if accum.id == 7 {
-                    self.true_bool
-                } else {
-                    let b_up = state.up[accum.id as usize];
-                    if accum.neg {
-                        self.alloc_val(blk, ValType::Bool, SsaOp::BoolNot(b_up))
-                    } else {
-                        b_up
-                    }
-                };
+                let acc = self.read_upred(blk, state, accum);
                 let res = match comb {
                     BoolComb::And => self.alloc_val(blk, ValType::Bool, SsaOp::BoolAnd(c_val, acc)),
                     BoolComb::Or => self.alloc_val(blk, ValType::Bool, SsaOp::BoolOr(c_val, acc)),
@@ -1480,7 +1635,7 @@ impl<'a> SsaBuilder<'a> {
                     self.write_reg(state, dst, bits, None);
                 }
             }
-            DecodedOp::F2i { dst, src, dst_signed, dst_bits, src_f16, half_lane, abs, neg, round_mode: _ } => {
+            DecodedOp::F2i { dst, src, dst_signed, dst_bits, src_f16, half_lane, abs, neg, round_mode } => {
                 let raw = self.eval_src(blk, state, src);
                 let mut f = if src_f16 {
                     let shifted = if (half_lane & 1) != 0 {
@@ -1499,21 +1654,36 @@ impl<'a> SsaBuilder<'a> {
                 if neg {
                     f = self.alloc_val(blk, ValType::F32, SsaOp::FNeg(f));
                 }
-                let conv = if dst_signed {
-                    self.alloc_val(blk, ValType::U32, SsaOp::F32ConvertToS(f))
-                } else {
-                    self.alloc_val(blk, ValType::U32, SsaOp::F32ConvertToU(f))
+                let rounded = match round_mode {
+                    0 => self.alloc_val(blk, ValType::F32, SsaOp::Glsl1(GlslOp::RoundEven, f)),
+                    1 => self.alloc_val(blk, ValType::F32, SsaOp::Glsl1(GlslOp::Floor, f)),
+                    2 => self.alloc_val(blk, ValType::F32, SsaOp::Glsl1(GlslOp::Ceil, f)),
+                    _ => f,
                 };
-                let masked = if dst_bits == 8 {
-                    let m = self.const_u32(blk, 0xff);
-                    self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(conv, m))
-                } else if dst_bits == 16 {
-                    let m = self.const_u32(blk, 0xffff);
-                    self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(conv, m))
+                let conv = if dst_signed {
+                    self.alloc_val(blk, ValType::U32, SsaOp::F32ConvertToS(rounded))
+                } else {
+                    self.alloc_val(blk, ValType::U32, SsaOp::F32ConvertToU(rounded))
+                };
+                let result = if dst_bits == 8 || dst_bits == 16 {
+                    if dst_signed {
+                        self.alloc_val(
+                            blk,
+                            ValType::U32,
+                            SsaOp::SBitFieldExtract {
+                                val: conv,
+                                offset: 0,
+                                count: u32::from(dst_bits),
+                            },
+                        )
+                    } else {
+                        let m = self.const_u32(blk, if dst_bits == 8 { 0xff } else { 0xffff });
+                        self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(conv, m))
+                    }
                 } else {
                     conv
                 };
-                self.write_reg(state, dst, masked, None);
+                self.write_reg(state, dst, result, None);
             }
             DecodedOp::F2f { dst, src, src_bits, dst_bits, half_lane, sat, abs, neg } => {
                 if src_bits == 16 && dst_bits == 32 {
@@ -1584,63 +1754,10 @@ impl<'a> SsaBuilder<'a> {
                 self.write_reg(state, dst, bits, None);
             }
             DecodedOp::Ldc { dst, bank, offset, index_reg, width } => {
-                let bank_u = u32::from(bank);
-                let base_off = u32::from(offset);
-                let count = width.word_count();
-                if index_reg.is_none() {
-                    self.info.record_cbuf_read(bank_u, base_off, count * 4);
-                    for w in 0..count {
-                        let byte_off = base_off + w * 4;
-                        let v = if let Some(imm) = self.snapshot.lookup_replacement(bank_u, byte_off) {
-                            self.const_u32(blk, imm)
-                        } else {
-                            self.alloc_val(blk, ValType::U32, SsaOp::ReadCbuf { bank: bank_u, word_offset: byte_off / 4 })
-                        };
-                        let ptr = (w == 0 && width == MemWidth::B64).then_some(PtrOrigin {
-                            bank: bank_u,
-                            cbuf_offset: base_off,
-                            byte_offset: self.zero_u32,
-                        });
-                        self.write_reg(state, dst.saturating_add(w as u8), v, ptr);
-                    }
-                } else {
-                    self.uses_dynamic_cbuf = true;
-                    self.info.uses_cbuf_indirect = true;
-                    self.info.record_cbuf_read(bank_u, base_off, 64);
-                    let idx_val = state.r[index_reg.unwrap() as usize];
-                    let base_v = self.const_u32(blk, base_off);
-                    let byte_idx = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(idx_val, base_v));
-                    for w in 0..count {
-                        let w_off = if w == 0 {
-                            byte_idx
-                        } else {
-                            let add_b = self.const_u32(blk, w * 4);
-                            self.alloc_val(blk, ValType::U32, SsaOp::IAdd(byte_idx, add_b))
-                        };
-                        let v = self.alloc_val(blk, ValType::U32, SsaOp::ReadCbufDynamic { bank: bank_u, byte_offset: w_off });
-                        self.write_reg(state, dst.saturating_add(w as u8), v, None);
-                    }
-                }
+                self.lower_ldc(blk, state, dst, false, bank, offset, index_reg, width);
             }
-            DecodedOp::Uldc { dst_ur, bank, offset, width } => {
-                let bank_u = u32::from(bank);
-                let base_off = u32::from(offset);
-                let count = width.word_count();
-                self.info.record_cbuf_read(bank_u, base_off, count * 4);
-                for w in 0..count {
-                    let byte_off = base_off + w * 4;
-                    let v = if let Some(imm) = self.snapshot.lookup_replacement(bank_u, byte_off) {
-                        self.const_u32(blk, imm)
-                    } else {
-                        self.alloc_val(blk, ValType::U32, SsaOp::ReadCbuf { bank: bank_u, word_offset: byte_off / 4 })
-                    };
-                    let ptr = (w == 0 && width == MemWidth::B64).then_some(PtrOrigin {
-                        bank: bank_u,
-                        cbuf_offset: base_off,
-                        byte_offset: self.zero_u32,
-                    });
-                    self.write_ureg(state, dst_ur.saturating_add(w as u8), v, ptr);
-                }
+            DecodedOp::Uldc { dst_ur, bank, offset, index_reg, width } => {
+                self.lower_ldc(blk, state, dst_ur, true, bank, offset, index_reg, width);
             }
             DecodedOp::Ldg { dst, base_reg, uniform_reg, imm_offset, width, reg_64bit: _, coherent, descriptor_mode } => {
                 if descriptor_mode {
@@ -1810,7 +1927,10 @@ impl<'a> SsaBuilder<'a> {
                 let res = self.alloc_val(blk, ValType::U32, SsaOp::AtomicSharedWord { word_idx, op: atom_op, data });
                 self.write_reg(state, dst, res, None);
             }
-            DecodedOp::Atomg { dst, base_reg, uniform_reg, imm_offset, src_a, op: atom_op } => {
+            DecodedOp::Atomg { dst, base_reg, uniform_reg, imm_offset, src_a, op: atom_op, signed } => {
+                if matches!(atom_op, AtomicOp::Inc | AtomicOp::Dec) {
+                    return fail("inc/dec ATOMG");
+                }
                 let Some((ssbo_idx, byte_addr)) =
                     self.resolve_global_ptr(blk, state, base_reg, uniform_reg, imm_offset, true, MemWidth::B32)
                 else {
@@ -1821,22 +1941,100 @@ impl<'a> SsaBuilder<'a> {
                 let two = self.const_u32(blk, 2);
                 let word_idx = self.alloc_val(blk, ValType::U32, SsaOp::LShr(byte_addr, two));
                 let data = if src_a == 255 { self.zero_u32 } else { state.r[src_a as usize] };
-                let res = self.alloc_val(blk, ValType::U32, SsaOp::AtomicSsboWord { ssbo_idx, word_idx, op: atom_op, data });
+                let res = self.alloc_val(
+                    blk,
+                    ValType::U32,
+                    SsaOp::AtomicSsboWord { ssbo_idx, word_idx, op: atom_op, signed, data },
+                );
                 if let Some(d) = dst {
                     self.write_reg(state, d, res, None);
                 }
             }
-            DecodedOp::Shfl { dst, pred_out, src, lane, mask: _, mode } => {
-                if !self.profile.support_vote && self.profile.supported_subgroup_stages == 0 {
+            DecodedOp::Shfl { dst, pred_out, src, lane, mask, mode } => {
+                let stage_bit = 1u32 << (self.stage as u32);
+                if (self.profile.supported_subgroup_stages & stage_bit) == 0 {
                     return fail("subgroup shuffle unsupported");
                 }
                 self.info.uses_subgroup_shuffles = true;
+                self.info.uses_subgroup_invocation_id = true;
                 let val = if src == 255 { self.zero_u32 } else { state.r[src as usize] };
-                let lane_val = self.eval_src(blk, state, lane);
-                let res = self.alloc_val(blk, ValType::U32, SsaOp::SubgroupShuffle { mode, val, lane_or_delta: lane_val });
-                self.write_reg(state, dst, res, None);
+                let c31 = self.const_u32(blk, 31);
+                let c8 = self.const_u32(blk, 8);
+                let raw_lane = self.eval_src(blk, state, lane);
+                let lane_arg = self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(raw_lane, c31));
+                let raw_mask = self.eval_src(blk, state, mask);
+                let clamp = self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(raw_mask, c31));
+                let mask_shr = self.alloc_val(blk, ValType::U32, SsaOp::LShr(raw_mask, c8));
+                let seg_mask = self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(mask_shr, c31));
+                let not_seg_mask = self.alloc_val(blk, ValType::U32, SsaOp::BitNot(seg_mask));
+                let host_lane_id = self.alloc_val(blk, ValType::U32, SsaOp::ReadBuiltin(S2rSpecial::LaneId));
+                let guest_lane_id = if self.profile.warp_size_potentially_larger_than_guest {
+                    self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(host_lane_id, c31))
+                } else {
+                    host_lane_id
+                };
+                let min_lane = self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(guest_lane_id, seg_mask));
+                let clamp_masked = self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(clamp, not_seg_mask));
+                let max_lane = self.alloc_val(blk, ValType::U32, SsaOp::BitOr(min_lane, clamp_masked));
+
+                let (src_lane, in_range) = match mode {
+                    ShflMode::Idx => {
+                        let lhs = self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(lane_arg, not_seg_mask));
+                        let s = self.alloc_val(blk, ValType::U32, SsaOp::BitOr(lhs, min_lane));
+                        let ok = self.alloc_val(blk, ValType::Bool, SsaOp::IntCmp { cmp: IntCmp::Le, signed: true, a: s, b: max_lane });
+                        (s, ok)
+                    }
+                    ShflMode::Up => {
+                        let s = self.alloc_val(blk, ValType::U32, SsaOp::ISub(guest_lane_id, lane_arg));
+                        let ok = self.alloc_val(blk, ValType::Bool, SsaOp::IntCmp { cmp: IntCmp::Ge, signed: true, a: s, b: max_lane });
+                        (s, ok)
+                    }
+                    ShflMode::Down => {
+                        let s = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(guest_lane_id, lane_arg));
+                        let ok = self.alloc_val(blk, ValType::Bool, SsaOp::IntCmp { cmp: IntCmp::Le, signed: true, a: s, b: max_lane });
+                        (s, ok)
+                    }
+                    ShflMode::Bfly => {
+                        let s = self.alloc_val(blk, ValType::U32, SsaOp::BitXor(guest_lane_id, lane_arg));
+                        let ok = self.alloc_val(blk, ValType::Bool, SsaOp::IntCmp { cmp: IntCmp::Le, signed: true, a: s, b: max_lane });
+                        (s, ok)
+                    }
+                };
+
+                let host_idx = |builder: &mut Self, guest_src: ValueId| -> ValueId {
+                    let safe = builder.alloc_val(
+                        blk,
+                        ValType::U32,
+                        SsaOp::Select { cond: in_range, t: guest_src, f: guest_lane_id },
+                    );
+                    if builder.profile.warp_size_potentially_larger_than_guest {
+                        let not31 = builder.const_u32(blk, !31u32);
+                        let part_base = builder.alloc_val(blk, ValType::U32, SsaOp::BitAnd(host_lane_id, not31));
+                        builder.alloc_val(blk, ValType::U32, SsaOp::IAdd(safe, part_base))
+                    } else {
+                        safe
+                    }
+                };
+
+                let (emit_mode, arg) = match mode {
+                    ShflMode::Idx => (ShflMode::Idx, host_idx(self, src_lane)),
+                    ShflMode::Bfly => (ShflMode::Bfly, lane_arg),
+                    ShflMode::Up | ShflMode::Down if self.profile.support_shuffle_relative => (mode, lane_arg),
+                    ShflMode::Up | ShflMode::Down => (ShflMode::Idx, host_idx(self, src_lane)),
+                };
+                let shuffled = self.alloc_val(
+                    blk,
+                    ValType::U32,
+                    SsaOp::SubgroupShuffle { mode: emit_mode, val, lane_or_delta: arg },
+                );
+                let masked = self.alloc_val(
+                    blk,
+                    ValType::U32,
+                    SsaOp::Select { cond: in_range, t: shuffled, f: val },
+                );
+                self.write_reg(state, dst, masked, None);
                 if pred_out < 7 {
-                    state.p[pred_out as usize] = self.true_bool;
+                    state.p[pred_out as usize] = in_range;
                 }
             }
             DecodedOp::Vote { dst_reg, dst_uniform, pred_out, src_pred, mode } => {
@@ -1964,6 +2162,182 @@ impl<'a> SsaBuilder<'a> {
         Ok(self.alloc_val(blk, ValType::U32, SsaOp::ReadBuiltin(special)))
     }
 
+    fn lower_imad_64(
+        &mut self,
+        blk: usize,
+        state: &RegState,
+        offset: u32,
+        raw_opcode: u32,
+        a: SrcOperand,
+        b: SrcOperand,
+        c: SrcOperand,
+        neg_c: bool,
+        signed: bool,
+    ) -> Result<(ValueId, ValueId), FallbackReason> {
+        let fail = |reason: &'static str| {
+            Err(FallbackReason {
+                offset,
+                opcode: raw_opcode,
+                reason,
+            })
+        };
+        let c_hi_op = match c {
+            SrcOperand::Zero => SrcOperand::Zero,
+            SrcOperand::Reg(r) => {
+                if (r & 1) != 0 {
+                    return fail("IMAD.WIDE/HI requires even register pair for c");
+                }
+                SrcOperand::reg(u32::from(r) + 1)
+            }
+            SrcOperand::UReg(ur) => {
+                if (ur & 1) != 0 {
+                    return fail("UIMAD.WIDE requires even uniform register pair for c");
+                }
+                SrcOperand::ureg(u32::from(ur) + 1)
+            }
+            SrcOperand::Cbuf(cb) => {
+                if cb.offset > 0xfff8 {
+                    return fail("IMAD.WIDE/HI cbuf offset overflow");
+                }
+                SrcOperand::Cbuf(CbufRef {
+                    bank: cb.bank,
+                    offset: cb.offset + 4,
+                })
+            }
+            SrcOperand::Imm32(_) => return fail("IMAD.WIDE/HI immediate c unsupported"),
+        };
+        let va = self.eval_src(blk, state, a);
+        let vb = self.eval_src(blk, state, b);
+        let vc_lo_raw = self.eval_src(blk, state, c);
+        let vc_hi_raw = self.eval_src(blk, state, c_hi_op);
+        let (vc_lo, vc_hi) = if neg_c {
+            let lo = self.alloc_val(blk, ValType::U32, SsaOp::INeg(vc_lo_raw));
+            let lo_is_zero = self.alloc_val(
+                blk,
+                ValType::Bool,
+                SsaOp::IntCmp {
+                    cmp: IntCmp::Eq,
+                    signed: false,
+                    a: vc_lo_raw,
+                    b: self.zero_u32,
+                },
+            );
+            let carry_neg = self.select_u32_bool(blk, lo_is_zero);
+            let hi_not = self.alloc_val(blk, ValType::U32, SsaOp::BitNot(vc_hi_raw));
+            let hi = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(hi_not, carry_neg));
+            (lo, hi)
+        } else {
+            (vc_lo_raw, vc_hi_raw)
+        };
+        let mul_lo = self.alloc_val(blk, ValType::U32, SsaOp::IMul(va, vb));
+        let mul_hi = if signed {
+            self.alloc_val(blk, ValType::U32, SsaOp::SMulHi(va, vb))
+        } else {
+            self.alloc_val(blk, ValType::U32, SsaOp::UMulHi(va, vb))
+        };
+        let lo_sum = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(mul_lo, vc_lo));
+        let carry = self.alloc_val(
+            blk,
+            ValType::Bool,
+            SsaOp::IntCmp {
+                cmp: IntCmp::Lt,
+                signed: false,
+                a: lo_sum,
+                b: mul_lo,
+            },
+        );
+        let carry_u = self.select_u32_bool(blk, carry);
+        let hi_partial = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(mul_hi, vc_hi));
+        let hi_val = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(hi_partial, carry_u));
+        Ok((lo_sum, hi_val))
+    }
+
+    fn lower_ldc(
+        &mut self,
+        blk: usize,
+        state: &mut RegState,
+        dst: u8,
+        is_uniform: bool,
+        bank: u8,
+        offset: u16,
+        index_reg: Option<u8>,
+        width: MemWidth,
+    ) {
+        let bank_u = u32::from(bank);
+        let base_off = u32::from(offset);
+        let count = width.word_count();
+        if let Some(idx_reg) = index_reg {
+            self.uses_dynamic_cbuf = true;
+            self.info.uses_cbuf_indirect = true;
+            self.info.record_cbuf_read(bank_u, 0, 0x10_000);
+            let idx_val = if is_uniform {
+                state.ur[idx_reg as usize]
+            } else {
+                state.r[idx_reg as usize]
+            };
+            let base_v = self.const_u32(blk, base_off);
+            let byte_idx = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(idx_val, base_v));
+            for w in 0..count {
+                let w_off = if w == 0 {
+                    byte_idx
+                } else {
+                    let add_b = self.const_u32(blk, w * 4);
+                    self.alloc_val(blk, ValType::U32, SsaOp::IAdd(byte_idx, add_b))
+                };
+                let raw = self.alloc_val(
+                    blk,
+                    ValType::U32,
+                    SsaOp::ReadCbufDynamic {
+                        bank: bank_u,
+                        byte_offset: w_off,
+                    },
+                );
+                let v = self.extract_subword(blk, raw, w_off, width);
+                let reg_dst = dst.saturating_add(w as u8);
+                if is_uniform {
+                    self.write_ureg(state, reg_dst, v, None);
+                } else {
+                    self.write_reg(state, reg_dst, v, None);
+                }
+            }
+        } else {
+            self.info.record_cbuf_read(bank_u, base_off & !3, count * 4);
+            for w in 0..count {
+                let byte_off = base_off + w * 4;
+                let word_aligned = byte_off & !3;
+                let raw = if let Some(imm) = self.snapshot.lookup_replacement(bank_u, word_aligned) {
+                    self.const_u32(blk, imm)
+                } else {
+                    self.alloc_val(
+                        blk,
+                        ValType::U32,
+                        SsaOp::ReadCbuf {
+                            bank: bank_u,
+                            word_offset: word_aligned / 4,
+                        },
+                    )
+                };
+                let v = if matches!(width, MemWidth::B32 | MemWidth::B64 | MemWidth::B128) {
+                    raw
+                } else {
+                    let byte_addr = self.const_u32(blk, byte_off);
+                    self.extract_subword(blk, raw, byte_addr, width)
+                };
+                let ptr = (w == 0 && width == MemWidth::B64).then_some(PtrOrigin {
+                    bank: bank_u,
+                    cbuf_offset: base_off,
+                    byte_offset: self.zero_u32,
+                });
+                let reg_dst = dst.saturating_add(w as u8);
+                if is_uniform {
+                    self.write_ureg(state, reg_dst, v, ptr);
+                } else {
+                    self.write_reg(state, reg_dst, v, ptr);
+                }
+            }
+        }
+    }
+
     fn select_u32_bool(&mut self, blk: usize, cond: ValueId) -> ValueId {
         self.alloc_val(
             blk,
@@ -2043,13 +2417,35 @@ impl<'a> SsaBuilder<'a> {
             _ => 1u32 << 2,
         };
         let ssbo_idx = self.info.record_ssbo(orig.bank, orig.cbuf_offset, is_written, type_mask)?;
-        let off1 = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(orig.byte_offset, reg_add));
-        let total = if imm_offset == 0 {
-            off1
-        } else {
+        let mut total = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(orig.byte_offset, reg_add));
+        let align = self.profile.min_ssbo_alignment;
+        if align > 1 && align <= (1u64 << 31) && align.is_power_of_two() {
+            let align_mask_val = (align as u32) - 1;
+            let cbuf_word_off = orig.cbuf_offset & !3;
+            if let Some(imm) = self.snapshot.lookup_replacement(orig.bank, cbuf_word_off) {
+                let align_rem = imm & align_mask_val;
+                if align_rem != 0 {
+                    let align_v = self.const_u32(blk, align_rem);
+                    total = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(total, align_v));
+                }
+            } else {
+                let ptr_lo = self.alloc_val(
+                    blk,
+                    ValType::U32,
+                    SsaOp::ReadCbuf {
+                        bank: orig.bank,
+                        word_offset: cbuf_word_off / 4,
+                    },
+                );
+                let align_mask = self.const_u32(blk, align_mask_val);
+                let align_off = self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(ptr_lo, align_mask));
+                total = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(total, align_off));
+            }
+        }
+        if imm_offset != 0 {
             let imm_v = self.const_u32(blk, imm_offset as u32);
-            self.alloc_val(blk, ValType::U32, SsaOp::IAdd(off1, imm_v))
-        };
+            total = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(total, imm_v));
+        }
         Some((ssbo_idx, total))
     }
 
@@ -2199,6 +2595,26 @@ impl<'a> SsaBuilder<'a> {
         acc
     }
 
+    fn const_u32_value(&self, id: ValueId) -> Option<u32> {
+        if id == self.zero_u32 {
+            return Some(0);
+        }
+        if id == self.one_u32 {
+            return Some(1);
+        }
+        for block in self.blocks.iter().rev() {
+            for insn in block.insns.iter().rev() {
+                if insn.id == id {
+                    if let SsaOp::ConstU32(v) = insn.op {
+                        return Some(v);
+                    }
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
     fn lower_shf(
         &mut self,
         blk: usize,
@@ -2210,42 +2626,160 @@ impl<'a> SsaBuilder<'a> {
         signed: bool,
         wrap: bool,
     ) -> ValueId {
-        let mask31 = self.const_u32(blk, 31);
-        let c32 = self.const_u32(blk, 32);
-        let mask63 = self.const_u32(blk, 63);
-        let shift = if wrap {
-            self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(shift_raw, mask31))
-        } else if hi {
-            self.alloc_val(blk, ValType::U32, SsaOp::Glsl2(GlslOp::UMin, shift_raw, c32))
-        } else {
-            self.alloc_val(blk, ValType::U32, SsaOp::Glsl2(GlslOp::UMin, shift_raw, mask63))
-        };
-
-        if right {
-            if hi {
-                // funnel right by shift on c (high 32) -> if shift == 0: c; else (c >> shift)
-                if signed {
-                    self.alloc_val(blk, ValType::U32, SsaOp::AShr(c, shift))
-                } else {
-                    self.alloc_val(blk, ValType::U32, SsaOp::LShr(c, shift))
+        if let Some(k) = self.const_u32_value(shift_raw) {
+            let eff = if wrap { k & 31 } else { k };
+            if eff == 0 {
+                return if hi { c } else { a };
+            }
+            if eff < 32 {
+                let sh_v = self.const_u32(blk, eff);
+                return match (right, hi) {
+                    (true, true) => {
+                        if signed {
+                            self.alloc_val(blk, ValType::U32, SsaOp::AShr(c, sh_v))
+                        } else {
+                            self.alloc_val(blk, ValType::U32, SsaOp::LShr(c, sh_v))
+                        }
+                    }
+                    (false, false) => self.alloc_val(blk, ValType::U32, SsaOp::Shl(a, sh_v)),
+                    (true, false) => {
+                        let inv_v = self.const_u32(blk, 32 - eff);
+                        let lo_shr = self.alloc_val(blk, ValType::U32, SsaOp::LShr(a, sh_v));
+                        let c_shl = self.alloc_val(blk, ValType::U32, SsaOp::Shl(c, inv_v));
+                        self.alloc_val(blk, ValType::U32, SsaOp::BitOr(lo_shr, c_shl))
+                    }
+                    (false, true) => {
+                        let inv_v = self.const_u32(blk, 32 - eff);
+                        let c_shl = self.alloc_val(blk, ValType::U32, SsaOp::Shl(c, sh_v));
+                        let a_shr = self.alloc_val(blk, ValType::U32, SsaOp::LShr(a, inv_v));
+                        self.alloc_val(blk, ValType::U32, SsaOp::BitOr(c_shl, a_shr))
+                    }
+                };
+            }
+            return match (right, hi) {
+                (true, true) => {
+                    if signed {
+                        let c31 = self.const_u32(blk, 31);
+                        self.alloc_val(blk, ValType::U32, SsaOp::AShr(c, c31))
+                    } else {
+                        self.zero_u32
+                    }
                 }
-            } else {
-                let is_zero = self.alloc_val(blk, ValType::Bool, SsaOp::IntCmp { cmp: IntCmp::Eq, signed: false, a: shift, b: self.zero_u32 });
-                let lo_shr = self.alloc_val(blk, ValType::U32, SsaOp::LShr(a, shift));
-                let inv_sh = self.alloc_val(blk, ValType::U32, SsaOp::ISub(c32, shift));
+                (false, false) => self.zero_u32,
+                (false, true) => a,
+                (true, false) => {
+                    if eff < 64 {
+                        let s = eff - 32;
+                        if s == 0 {
+                            c
+                        } else {
+                            let sv = self.const_u32(blk, s);
+                            if signed {
+                                self.alloc_val(blk, ValType::U32, SsaOp::AShr(c, sv))
+                            } else {
+                                self.alloc_val(blk, ValType::U32, SsaOp::LShr(c, sv))
+                            }
+                        }
+                    } else if signed {
+                        let c31 = self.const_u32(blk, 31);
+                        self.alloc_val(blk, ValType::U32, SsaOp::AShr(c, c31))
+                    } else {
+                        self.zero_u32
+                    }
+                }
+            };
+        }
+
+        let c31 = self.const_u32(blk, 31);
+        let c32 = self.const_u32(blk, 32);
+        let sh_mod = self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(shift_raw, c31));
+        let is_zero = self.alloc_val(
+            blk,
+            ValType::Bool,
+            SsaOp::IntCmp { cmp: IntCmp::Eq, signed: false, a: sh_mod, b: self.zero_u32 },
+        );
+        let raw_inv = self.alloc_val(blk, ValType::U32, SsaOp::ISub(c32, sh_mod));
+        let inv_sh = self.alloc_val(blk, ValType::U32, SsaOp::BitAnd(raw_inv, c31));
+
+        if wrap {
+            return match (right, hi) {
+                (true, true) => {
+                    if signed {
+                        self.alloc_val(blk, ValType::U32, SsaOp::AShr(c, sh_mod))
+                    } else {
+                        self.alloc_val(blk, ValType::U32, SsaOp::LShr(c, sh_mod))
+                    }
+                }
+                (true, false) => {
+                    let lo_shr = self.alloc_val(blk, ValType::U32, SsaOp::LShr(a, sh_mod));
+                    let c_shl = self.alloc_val(blk, ValType::U32, SsaOp::Shl(c, inv_sh));
+                    let comb = self.alloc_val(blk, ValType::U32, SsaOp::BitOr(lo_shr, c_shl));
+                    self.alloc_val(blk, ValType::U32, SsaOp::Select { cond: is_zero, t: a, f: comb })
+                }
+                (false, false) => self.alloc_val(blk, ValType::U32, SsaOp::Shl(a, sh_mod)),
+                (false, true) => {
+                    let c_shl = self.alloc_val(blk, ValType::U32, SsaOp::Shl(c, sh_mod));
+                    let a_shr = self.alloc_val(blk, ValType::U32, SsaOp::LShr(a, inv_sh));
+                    let comb = self.alloc_val(blk, ValType::U32, SsaOp::BitOr(c_shl, a_shr));
+                    self.alloc_val(blk, ValType::U32, SsaOp::Select { cond: is_zero, t: c, f: comb })
+                }
+            };
+        }
+
+        let ge_32 = self.alloc_val(
+            blk,
+            ValType::Bool,
+            SsaOp::IntCmp { cmp: IntCmp::Ge, signed: false, a: shift_raw, b: c32 },
+        );
+        match (right, hi) {
+            (true, true) => {
+                if signed {
+                    let sh = self.alloc_val(blk, ValType::U32, SsaOp::Glsl2(GlslOp::UMin, shift_raw, c31));
+                    self.alloc_val(blk, ValType::U32, SsaOp::AShr(c, sh))
+                } else {
+                    let base = self.alloc_val(blk, ValType::U32, SsaOp::LShr(c, sh_mod));
+                    self.alloc_val(blk, ValType::U32, SsaOp::Select { cond: ge_32, t: self.zero_u32, f: base })
+                }
+            }
+            (false, false) => {
+                let base = self.alloc_val(blk, ValType::U32, SsaOp::Shl(a, sh_mod));
+                self.alloc_val(blk, ValType::U32, SsaOp::Select { cond: ge_32, t: self.zero_u32, f: base })
+            }
+            (false, true) => {
+                let c_shl = self.alloc_val(blk, ValType::U32, SsaOp::Shl(c, sh_mod));
+                let a_shr = self.alloc_val(blk, ValType::U32, SsaOp::LShr(a, inv_sh));
+                let comb = self.alloc_val(blk, ValType::U32, SsaOp::BitOr(c_shl, a_shr));
+                let lt_32 = self.alloc_val(blk, ValType::U32, SsaOp::Select { cond: is_zero, t: c, f: comb });
+                self.alloc_val(blk, ValType::U32, SsaOp::Select { cond: ge_32, t: a, f: lt_32 })
+            }
+            (true, false) => {
+                let lo_shr = self.alloc_val(blk, ValType::U32, SsaOp::LShr(a, sh_mod));
                 let c_shl = self.alloc_val(blk, ValType::U32, SsaOp::Shl(c, inv_sh));
                 let comb = self.alloc_val(blk, ValType::U32, SsaOp::BitOr(lo_shr, c_shl));
-                self.alloc_val(blk, ValType::U32, SsaOp::Select { cond: is_zero, t: a, f: comb })
+                let lt_32 = self.alloc_val(blk, ValType::U32, SsaOp::Select { cond: is_zero, t: a, f: comb });
+                let mid = if signed {
+                    self.alloc_val(blk, ValType::U32, SsaOp::AShr(c, sh_mod))
+                } else {
+                    self.alloc_val(blk, ValType::U32, SsaOp::LShr(c, sh_mod))
+                };
+                let c64 = self.const_u32(blk, 64);
+                let ge_64 = self.alloc_val(
+                    blk,
+                    ValType::Bool,
+                    SsaOp::IntCmp { cmp: IntCmp::Ge, signed: false, a: shift_raw, b: c64 },
+                );
+                let hi_overflow = if signed {
+                    self.alloc_val(blk, ValType::U32, SsaOp::AShr(c, c31))
+                } else {
+                    self.zero_u32
+                };
+                let ge_32_res = self.alloc_val(
+                    blk,
+                    ValType::U32,
+                    SsaOp::Select { cond: ge_64, t: hi_overflow, f: mid },
+                );
+                self.alloc_val(blk, ValType::U32, SsaOp::Select { cond: ge_32, t: ge_32_res, f: lt_32 })
             }
-        } else if !hi {
-            self.alloc_val(blk, ValType::U32, SsaOp::Shl(a, shift))
-        } else {
-            let is_zero = self.alloc_val(blk, ValType::Bool, SsaOp::IntCmp { cmp: IntCmp::Eq, signed: false, a: shift, b: self.zero_u32 });
-            let c_shl = self.alloc_val(blk, ValType::U32, SsaOp::Shl(c, shift));
-            let inv_sh = self.alloc_val(blk, ValType::U32, SsaOp::ISub(c32, shift));
-            let a_shr = self.alloc_val(blk, ValType::U32, SsaOp::LShr(a, inv_sh));
-            let comb = self.alloc_val(blk, ValType::U32, SsaOp::BitOr(c_shl, a_shr));
-            self.alloc_val(blk, ValType::U32, SsaOp::Select { cond: is_zero, t: c, f: comb })
         }
     }
 }
@@ -2264,6 +2798,7 @@ struct ModifiedSet {
     r: BTreeSet<u8>,
     ur: BTreeSet<u8>,
     p: BTreeSet<u8>,
+    up: BTreeSet<u8>,
 }
 
 fn collect_modified_regs(nodes: &[CfgNode], decoded: &[DecodedInsn]) -> ModifiedSet {
@@ -2296,11 +2831,14 @@ fn collect_modified_regs(nodes: &[CfgNode], decoded: &[DecodedInsn]) -> Modified
                         | DecodedOp::Hadd2 { dst, .. }
                         | DecodedOp::Hmul2 { dst, .. }
                         | DecodedOp::Hfma2 { dst, .. }
-                        | DecodedOp::Atoms { dst, .. }
-                        | DecodedOp::Shfl { dst, .. } => {
+                        | DecodedOp::Atoms { dst, .. } => {
                             if dst < 255 {
                                 set.r.insert(dst);
                             }
+                        }
+                        DecodedOp::Shfl { dst, pred_out, .. } => {
+                            if dst < 255 { set.r.insert(dst); }
+                            if pred_out < 7 { set.p.insert(pred_out); }
                         }
                         DecodedOp::Iadd3 { dst, carry_out0, carry_out1, .. } => {
                             if dst < 255 { set.r.insert(dst); }
@@ -2336,8 +2874,16 @@ fn collect_modified_regs(nodes: &[CfgNode], decoded: &[DecodedInsn]) -> Modified
                         | DecodedOp::Uflo { dst_ur, .. } => {
                             if dst_ur < 63 { set.ur.insert(dst_ur); }
                         }
-                        DecodedOp::Uiadd3 { dst_ur, .. } | DecodedOp::Ulop3 { dst_ur, .. } => {
+                        DecodedOp::Uiadd3 { dst_ur, carry_out, .. } => {
                             if dst_ur < 63 { set.ur.insert(dst_ur); }
+                            if carry_out < 7 { set.up.insert(carry_out); }
+                        }
+                        DecodedOp::Ulop3 { dst_ur, pred_out, .. } => {
+                            if dst_ur < 63 { set.ur.insert(dst_ur); }
+                            if pred_out < 7 { set.up.insert(pred_out); }
+                        }
+                        DecodedOp::Uisetp { dst_up, .. } => {
+                            if dst_up < 7 { set.up.insert(dst_up); }
                         }
                         DecodedOp::Uimad { dst_ur, wide, .. } => {
                             if dst_ur < 63 { set.ur.insert(dst_ur); }
@@ -2368,6 +2914,7 @@ fn collect_modified_regs(nodes: &[CfgNode], decoded: &[DecodedInsn]) -> Modified
                         DecodedOp::Vote { dst_reg, dst_uniform, pred_out, .. } => {
                             if dst_uniform {
                                 if dst_reg < 63 { set.ur.insert(dst_reg); }
+                                if pred_out < 7 { set.up.insert(pred_out); }
                             } else {
                                 if dst_reg < 255 { set.r.insert(dst_reg); }
                                 if pred_out < 7 { set.p.insert(pred_out); }

@@ -10,20 +10,26 @@ namespace InputCommon {
 MappingFactory::MappingFactory() = default;
 
 void MappingFactory::BeginMapping(Polling::InputType type) {
+    std::scoped_lock lock{mutex};
     is_enabled = true;
     input_type = type;
-    input_queue.Clear();
+    input_queue = std::queue<Common::ParamPackage>{};
     first_axis = -1;
     second_axis = -1;
 }
 
 Common::ParamPackage MappingFactory::GetNextInput() {
-    Common::ParamPackage input;
-    input_queue.Pop(input);
+    std::scoped_lock lock{mutex};
+    if (input_queue.empty()) {
+        return {};
+    }
+    Common::ParamPackage input = std::move(input_queue.front());
+    input_queue.pop();
     return input;
 }
 
 void MappingFactory::RegisterInput(const MappingData& data) {
+    std::scoped_lock lock{mutex};
     if (!is_enabled) {
         return;
     }
@@ -47,9 +53,12 @@ void MappingFactory::RegisterInput(const MappingData& data) {
 }
 
 void MappingFactory::StopMapping() {
+    std::scoped_lock lock{mutex};
     is_enabled = false;
     input_type = Polling::InputType::None;
-    input_queue.Clear();
+    input_queue = std::queue<Common::ParamPackage>{};
+    first_axis = -1;
+    second_axis = -1;
 }
 
 void MappingFactory::RegisterButton(const MappingData& data) {
@@ -88,7 +97,7 @@ void MappingFactory::RegisterButton(const MappingData& data) {
     default:
         return;
     }
-    input_queue.Push(new_input);
+    input_queue.push(std::move(new_input));
 }
 
 void MappingFactory::RegisterStick(const MappingData& data) {
@@ -107,7 +116,7 @@ void MappingFactory::RegisterStick(const MappingData& data) {
         new_input.Set("threshold", 0.5f);
         new_input.Set("range", 1.0f);
         new_input.Set("deadzone", 0.0f);
-        input_queue.Push(new_input);
+        input_queue.push(std::move(new_input));
         return;
     }
 
@@ -133,7 +142,7 @@ void MappingFactory::RegisterStick(const MappingData& data) {
     default:
         return;
     }
-    input_queue.Push(new_input);
+    input_queue.push(std::move(new_input));
 }
 
 void MappingFactory::RegisterMotion(const MappingData& data) {
@@ -150,7 +159,7 @@ void MappingFactory::RegisterMotion(const MappingData& data) {
         new_input.Set("motion", 0);
         new_input.Set("pad", 1);
         new_input.Set("threshold", 0.001f);
-        input_queue.Push(new_input);
+        input_queue.push(std::move(new_input));
         return;
     }
 
@@ -186,7 +195,7 @@ void MappingFactory::RegisterMotion(const MappingData& data) {
     default:
         return;
     }
-    input_queue.Push(new_input);
+    input_queue.push(std::move(new_input));
 }
 
 bool MappingFactory::IsDriverValid(const MappingData& data) const {

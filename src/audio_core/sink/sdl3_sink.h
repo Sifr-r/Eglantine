@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -81,6 +82,7 @@ private:
     std::string input_device;
     /// Vector of streams managed by this sink
     std::vector<SinkStreamPtr> sink_streams;
+    mutable std::mutex streams_mutex;
 };
 
 /**

@@ -312,7 +312,7 @@ size_t Maxwell3D::EstimateIndexBufferSize() {
     GPUVAddr end_address = regs.index_buffer.EndAddress();
     auto const byte_size = regs.index_buffer.FormatSizeInBytes();
     auto const max_size = 1ull << (byte_size * CHAR_BIT);
-    auto const upper_cap = GetMaxCurrentVertices() * 4 * byte_size;
+    auto const upper_cap = static_cast<size_t>(GetMaxCurrentVertices()) * 4 * byte_size;
     auto const lower_cap = std::min<size_t>(size_t(end_address - start_address), upper_cap);
     return std::min<size_t>(memory_manager.GetMemoryLayoutSize(start_address, byte_size * max_size) / byte_size, lower_cap);
 }

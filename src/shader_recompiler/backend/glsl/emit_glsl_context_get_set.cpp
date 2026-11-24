@@ -44,8 +44,7 @@ std::string ChooseCbuf(EmitContext& ctx, const IR::Value& binding, std::string_v
 }
 
 void GetCbuf(EmitContext& ctx, std::string_view ret, const IR::Value& binding,
-             const IR::Value& offset, u32 num_bits, std::string_view cast = {},
-             std::string_view bit_offset = {}) {
+             const IR::Value& offset, u32 num_bits, std::string_view cast = {}) {
     const bool is_immediate{offset.IsImmediate()};
     const bool component_indexing_bug{!is_immediate && ctx.profile.has_gl_component_indexing_bug};
     if (is_immediate) {
@@ -65,9 +64,20 @@ void GetCbuf(EmitContext& ctx, std::string_view ret, const IR::Value& binding,
 
     const auto cbuf{ChooseCbuf(ctx, binding, index)};
     const auto cbuf_cast{fmt::format("{}({}{{}})", cast, cbuf)};
-    const auto extraction{num_bits == 32 ? cbuf_cast
-                                         : fmt::format("bitfieldExtract({},int({}),{})", cbuf_cast,
-                                                       bit_offset, num_bits)};
+    std::string extraction;
+    if (num_bits == 32) {
+        extraction = cbuf_cast;
+    } else {
+        std::string bit_offset;
+        if (num_bits == 8) {
+            bit_offset = is_immediate ? fmt::format("{}", (offset.U32() % 4) * 8)
+                                      : fmt::format("({}%4)*8", offset_var);
+        } else {
+            bit_offset = is_immediate ? fmt::format("{}", ((offset.U32() / 2) % 2) * 16)
+                                      : fmt::format("(({}>>1)%2)*16", offset_var);
+        }
+        extraction = fmt::format("bitfieldExtract({},int({}),{})", cbuf_cast, bit_offset, num_bits);
+    }
     if (!component_indexing_bug) {
         const auto result{fmt::format(fmt::runtime(extraction), swizzle)};
         ctx.Add("{}={};", ret, result);
@@ -84,27 +94,13 @@ void GetCbuf(EmitContext& ctx, std::string_view ret, const IR::Value& binding,
 void GetCbuf8(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding, const IR::Value& offset,
               std::string_view cast) {
     const auto ret{ctx.var_alloc.Define(inst, GlslVarType::U32)};
-    if (offset.IsImmediate()) {
-        const auto bit_offset{fmt::format("{}", (offset.U32() % 4) * 8)};
-        GetCbuf(ctx, ret, binding, offset, 8, cast, bit_offset);
-    } else {
-        const auto offset_var{ctx.var_alloc.Consume(offset)};
-        const auto bit_offset{fmt::format("({}%4)*8", offset_var)};
-        GetCbuf(ctx, ret, binding, offset, 8, cast, bit_offset);
-    }
+    GetCbuf(ctx, ret, binding, offset, 8, cast);
 }
 
 void GetCbuf16(EmitContext& ctx, IR::Inst& inst, const IR::Value& binding, const IR::Value& offset,
                std::string_view cast) {
     const auto ret{ctx.var_alloc.Define(inst, GlslVarType::U32)};
-    if (offset.IsImmediate()) {
-        const auto bit_offset{fmt::format("{}", ((offset.U32() / 2) % 2) * 16)};
-        GetCbuf(ctx, ret, binding, offset, 16, cast, bit_offset);
-    } else {
-        const auto offset_var{ctx.var_alloc.Consume(offset)};
-        const auto bit_offset{fmt::format("(({}>>1)%2)*16", offset_var)};
-        GetCbuf(ctx, ret, binding, offset, 16, cast, bit_offset);
-    }
+    GetCbuf(ctx, ret, binding, offset, 16, cast);
 }
 } // Anonymous namespace
 
@@ -446,10 +442,12 @@ void EmitIsHelperInvocation(EmitContext& ctx, IR::Inst& inst) {
 
 void EmitSR_WScaleFactorXY(EmitContext& ctx, IR::Inst& inst) {
     LOG_WARNING(Shader, "(STUBBED) called");
+    ctx.AddU32("{}=uint(0x00ff0000);", inst);
 }
 
 void EmitSR_WScaleFactorZ(EmitContext& ctx, IR::Inst& inst) {
     LOG_WARNING(Shader, "(STUBBED) called");
+    ctx.AddU32("{}=uint(0x00ff0000);", inst);
 }
 
 void EmitYDirection(EmitContext& ctx, IR::Inst& inst) {

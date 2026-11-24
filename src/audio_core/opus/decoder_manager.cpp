@@ -24,9 +24,9 @@ bool IsValidSampleRate(u32 sample_rate) {
 }
 
 bool IsValidStreamCount(u32 channel_count, u32 total_stream_count, u32 stereo_stream_count) {
-    return total_stream_count > 0 && static_cast<s32>(stereo_stream_count) >= 0 &&
+    return total_stream_count > 0 && total_stream_count <= OpusStreamCountMax &&
            stereo_stream_count <= total_stream_count &&
-           total_stream_count + stereo_stream_count <= channel_count;
+           static_cast<u64>(total_stream_count) + stereo_stream_count <= channel_count;
 }
 
 } // namespace

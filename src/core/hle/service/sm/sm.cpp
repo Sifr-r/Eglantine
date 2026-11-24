@@ -104,7 +104,10 @@ Result ServiceManager::UnregisterService(const std::string& name) {
     }
 
     registered_services.erase(iter);
-    service_ports.erase(name);
+    if (const auto port_iter = service_ports.find(name); port_iter != service_ports.end()) {
+        port_iter->second->Close(kernel);
+        service_ports.erase(port_iter);
+    }
 
     return ResultSuccess;
 }

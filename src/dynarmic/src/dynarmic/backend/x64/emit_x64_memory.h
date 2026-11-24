@@ -142,7 +142,7 @@ template<>
         if (valid_page_index_bits >= 32) {
             if (code.HasHostFeature(HostFeature::BMI2)) {
                 const Xbyak::Reg64 bit_count = ctx.reg_alloc.ScratchGpr(code);
-                code.mov(bit_count, unused_top_bits);
+                code.mov(bit_count, ctx.conf.page_table_address_space_bits);
                 code.bzhi(tmp, vaddr, bit_count);
                 code.shr(tmp, int(page_table_const_bits));
                 ctx.reg_alloc.Release(bit_count);
@@ -187,8 +187,8 @@ template<>
     }
     // check for sign bit, apply sign extension as needed
     if (ctx.conf.page_table_sign_extension) {
-        code.shl(page, *ctx.conf.page_table_sign_extension);
-        code.sar(page, *ctx.conf.page_table_sign_extension);
+        code.shl(page, 63 - int(*ctx.conf.page_table_sign_extension));
+        code.sar(page, 63 - int(*ctx.conf.page_table_sign_extension));
     }
 
     code.jz(abort, code.T_NEAR);

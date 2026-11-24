@@ -45,6 +45,7 @@ import java.io.File
 import java.io.FileOutputStream
 import androidx.core.graphics.scale
 import androidx.core.graphics.createBitmap
+import kotlin.math.roundToInt
 
 class EditUserDialogFragment : Fragment() {
     private var _binding: FragmentEditUserDialogBinding? = null
@@ -80,10 +81,13 @@ class EditUserDialogFragment : Fragment() {
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK) {
             result.data?.data?.let { uri ->
-                selectedImageUri = uri
-                loadImage(uri)
-                hasCustomImage = true
-                binding.buttonRevertImage.visibility = View.VISIBLE
+                if (loadImage(uri)) {
+                    selectedImageUri = uri
+                    selectedFirmwareAvatar = null
+                    hasCustomImage = true
+                    revertedToDefault = false
+                    binding.buttonRevertImage.visibility = View.VISIBLE
+                }
             }
         }
     }
@@ -208,7 +212,9 @@ class EditUserDialogFragment : Fragment() {
                     val scaledBitmap = selectedAvatar.scale(256, 256)
                     binding.imageUserAvatar.setImageBitmap(scaledBitmap)
                     selectedFirmwareAvatar = scaledBitmap
+                    selectedImageUri = null
                     hasCustomImage = true
+                    revertedToDefault = false
                     binding.buttonRevertImage.visibility = View.VISIBLE
                     dialog.dismiss()
                 }
@@ -281,26 +287,33 @@ class EditUserDialogFragment : Fragment() {
         imagePickerLauncher.launch(intent)
     }
 
-    private fun loadImage(uri: Uri) {
-        try {
-            val bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                val source = ImageDecoder.createSource(requireContext().contentResolver, uri)
-                ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
-                    decoder.setTargetSampleSize(1)
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                MediaStore.Images.Media.getBitmap(requireContext().contentResolver, uri)
+    private fun decodeBitmapFromUri(uri: Uri): Bitmap {
+        val resolver = requireContext().contentResolver
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val source = ImageDecoder.createSource(resolver, uri)
+            ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                decoder.setTargetSampleSize(1)
+                decoder.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
             }
+        } else {
+            @Suppress("DEPRECATION")
+            MediaStore.Images.Media.getBitmap(resolver, uri)
+        }
+    }
 
+    private fun loadImage(uri: Uri): Boolean {
+        return try {
+            val bitmap = decodeBitmapFromUri(uri)
             val croppedBitmap = centerCropBitmap(bitmap, 256, 256)
             binding.imageUserAvatar.setImageBitmap(croppedBitmap)
+            true
         } catch (e: Exception) {
             MaterialAlertDialogBuilder(requireContext())
                 .setTitle(R.string.error)
                 .setMessage(getString(R.string.profile_image_load_error, e.message))
                 .setPositiveButton(android.R.string.ok, null)
                 .show()
+            false
         }
     }
 
@@ -361,19 +374,7 @@ class EditUserDialogFragment : Fragment() {
             val bitmapToSave: Bitmap? = when {
                 selectedFirmwareAvatar != null -> selectedFirmwareAvatar
                 selectedImageUri != null -> {
-                    val bitmap = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                        val source = ImageDecoder.createSource(
-                            requireContext().contentResolver,
-                            selectedImageUri!!
-                        )
-                        ImageDecoder.decodeBitmap(source)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        MediaStore.Images.Media.getBitmap(
-                            requireContext().contentResolver,
-                            selectedImageUri
-                        )
-                    }
+                    val bitmap = decodeBitmapFromUri(selectedImageUri!!)
                     centerCropBitmap(bitmap, 256, 256)
                 }
 
@@ -406,8 +407,8 @@ class EditUserDialogFragment : Fragment() {
             targetHeight.toFloat() / sourceHeight
         )
 
-        val scaledWidth = (sourceWidth * scale).toInt()
-        val scaledHeight = (sourceHeight * scale).toInt()
+        val scaledWidth = (sourceWidth * scale).roundToInt().coerceAtLeast(targetWidth)
+        val scaledHeight = (sourceHeight * scale).roundToInt().coerceAtLeast(targetHeight)
 
         val scaledBitmap = source.scale(scaledWidth, scaledHeight)
 

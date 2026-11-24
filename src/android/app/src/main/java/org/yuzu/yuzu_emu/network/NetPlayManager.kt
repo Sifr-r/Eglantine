@@ -70,10 +70,15 @@ object NetPlayManager {
         val gameName: String
     )
 
+    @Volatile
     private var messageListener: ((Int, String) -> Unit)? = null
+
+    @Volatile
     private var adapterRefreshListener: ((Int, String) -> Unit)? = null
 
-    fun setOnMessageReceivedListener(listener: (Int, String) -> Unit) {
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    fun setOnMessageReceivedListener(listener: ((Int, String) -> Unit)?) {
         messageListener = listener
     }
 
@@ -122,7 +127,7 @@ object NetPlayManager {
         }.start()
     }
 
-    fun setOnAdapterRefreshListener(listener: (Int, String) -> Unit) {
+    fun setOnAdapterRefreshListener(listener: ((Int, String) -> Unit)?) {
         adapterRefreshListener = listener
     }
 
@@ -147,17 +152,26 @@ object NetPlayManager {
         prefs.edit { putString("NetPlayRoomPort", port) }
     }
 
+    private val chatLock = Any()
     private val chatMessages = mutableListOf<ChatMessage>()
+
+    @Volatile
     private var isChatOpen = false
 
     fun addChatMessage(message: ChatMessage) {
-        chatMessages.add(message)
+        synchronized(chatLock) {
+            chatMessages.add(message)
+        }
     }
 
-    fun getChatMessages(): List<ChatMessage> = chatMessages
+    fun getChatMessages(): List<ChatMessage> = synchronized(chatLock) {
+        chatMessages.toList()
+    }
 
     fun clearChat() {
-        chatMessages.clear()
+        synchronized(chatLock) {
+            chatMessages.clear()
+        }
     }
 
     fun setChatOpen(isOpen: Boolean) {
@@ -198,15 +212,14 @@ object NetPlayManager {
             }
         }
 
-        Handler(Looper.getMainLooper()).post {
+        mainHandler.post {
             if (!isChatOpen) {
                 // TODO(alekpop, crueter): Improve this, potentially a drawer at the top?
                 Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
             }
+            messageListener?.invoke(type, msg)
+            adapterRefreshListener?.invoke(type, msg)
         }
-
-        messageListener?.invoke(type, msg)
-        adapterRefreshListener?.invoke(type, msg)
     }
 
     private fun formatNetPlayStatus(context: Context, type: Int, msg: String): String {

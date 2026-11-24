@@ -81,6 +81,10 @@ void EmuThread::run() {
 
     // Shutdown the main emulated process
     QtCommon::system->DetachDebugger();
+    {
+        std::scoped_lock lk{QtCommon::renderer_mutex};
+        QtCommon::renderer_active.store(false, std::memory_order_release);
+    }
     QtCommon::system->ShutdownMainProcess();
 }
 

@@ -1887,7 +1887,10 @@ void EmitX64::EmitVectorLogicalVShift32(EmitContext& ctx, IR::Inst* inst) {
         code.psrld(tmp5, tmp4);
         code.pshufd(tmp4, tmp2, 245);
         code.punpckhqdq(tmp5, tmp6);
+        code.movdqa(tmp6, code.Const(xword, 0x4F80'00004F80'0000, 0x4F80'00004F80'0000));
+        code.pcmpgtd(tmp6, tmp3);
         code.cvttps2dq(tmp3, tmp3);
+        code.pand(tmp3, tmp6);
         code.shufps(tmp0, tmp5, 204);
         code.pmuludq(tmp2, tmp3);
         code.pshufd(tmp3, tmp3, 245);
@@ -4261,15 +4264,18 @@ void EmitX64::EmitVectorSignedMultiply32(EmitContext& ctx, IR::Inst* inst) {
             ctx.reg_alloc.DefineValue(code, lower_inst, lower_result);
         }
 
-        auto const result = ctx.reg_alloc.ScratchXmm(code);
+        if (upper_inst) {
+            auto const result = ctx.reg_alloc.ScratchXmm(code);
 
-        code.vpmuldq(result, x, y);
-        code.vpsrlq(x, x, 32);
-        code.vpsrlq(y, y, 32);
-        code.vpmuldq(x, x, y);
-        code.shufps(result, x, 0b11011101);
+            code.vpmuldq(result, x, y);
+            code.vpsrlq(x, x, 32);
+            code.vpsrlq(y, y, 32);
+            code.vpmuldq(x, x, y);
+            code.shufps(result, x, 0b11011101);
+            code.pshufd(result, result, 0b11011000);
 
-        ctx.reg_alloc.DefineValue(code, upper_inst, result);
+            ctx.reg_alloc.DefineValue(code, upper_inst, result);
+        }
         return;
     }
 
@@ -4288,7 +4294,6 @@ void EmitX64::EmitVectorSignedMultiply32(EmitContext& ctx, IR::Inst* inst) {
     code.pand(tmp, y);
     code.pand(sign_correction, x);
     code.paddd(sign_correction, tmp);
-    code.pand(sign_correction, code.Const(xword, 0x7FFFFFFF7FFFFFFF, 0x7FFFFFFF7FFFFFFF));
 
     // calculate unsigned multiply
     code.movdqa(tmp, x);
@@ -5999,15 +6004,18 @@ void EmitX64::EmitVectorUnsignedMultiply32(EmitContext& ctx, IR::Inst* inst) {
             ctx.reg_alloc.DefineValue(code, lower_inst, lower_result);
         }
 
-        auto const result = ctx.reg_alloc.ScratchXmm(code);
+        if (upper_inst) {
+            auto const result = ctx.reg_alloc.ScratchXmm(code);
 
-        code.vpmuludq(result, x, y);
-        code.vpsrlq(x, x, 32);
-        code.vpsrlq(y, y, 32);
-        code.vpmuludq(x, x, y);
-        code.shufps(result, x, 0b11011101);
+            code.vpmuludq(result, x, y);
+            code.vpsrlq(x, x, 32);
+            code.vpsrlq(y, y, 32);
+            code.vpmuludq(x, x, y);
+            code.shufps(result, x, 0b11011101);
+            code.pshufd(result, result, 0b11011000);
 
-        ctx.reg_alloc.DefineValue(code, upper_inst, result);
+            ctx.reg_alloc.DefineValue(code, upper_inst, result);
+        }
     } else {
         auto const x = ctx.reg_alloc.UseScratchXmm(code, args[0]);
         auto const y = ctx.reg_alloc.UseScratchXmm(code, args[1]);

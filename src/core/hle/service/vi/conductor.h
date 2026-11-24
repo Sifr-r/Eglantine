@@ -6,8 +6,8 @@
 
 #pragma once
 
+#include <map>
 #include <memory>
-#include "common/container/unordered_map.h"
 
 #include "common/common_types.h"
 #include "common/polyfill_thread.h"
@@ -49,7 +49,7 @@ private:
 private:
     Core::System& m_system;
     Container& m_container;
-    ::Common::unordered_map<u64, VsyncManager> m_vsync_managers;
+    std::map<u64, VsyncManager> m_vsync_managers;
     std::shared_ptr<Core::Timing::EventType> m_event;
     Common::Event m_signal;
     std::jthread m_thread;

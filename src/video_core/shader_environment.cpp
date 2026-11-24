@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -1637,13 +1638,43 @@ void FileEnvironment::Deserialize(std::ifstream& file, bool with_mesh_state) {
         .read(reinterpret_cast<char*>(&read_highest), sizeof(read_highest))
         .read(reinterpret_cast<char*>(&viewport_transform_state), sizeof(viewport_transform_state))
         .read(reinterpret_cast<char*>(&stage), sizeof(stage));
-    code.resize(Common::DivCeil(code_size, sizeof(u64)));
-    file.read(reinterpret_cast<char*>(code.data()), code_size);
+    if (!file) {
+        throw std::ios_base::failure("truncated shader environment header");
+    }
+    if (code_size > static_cast<u64>((std::numeric_limits<std::streamsize>::max)())) {
+        throw std::ios_base::failure("invalid shader code size");
+    }
+    const u64 num_words =
+        (code_size / sizeof(u64)) + ((code_size % sizeof(u64)) != 0 ? 1ULL : 0ULL);
+    if (num_words > code.max_size()) {
+        throw std::ios_base::failure("invalid shader code word count");
+    }
+    code.clear();
+    constexpr u64 MaxChunkBytes = 1024ULL * 1024;
+    u64 bytes_remaining = code_size;
+    u64 byte_offset = 0;
+    while (bytes_remaining > 0) {
+        const u64 chunk_bytes = (std::min)(bytes_remaining, MaxChunkBytes);
+        const u64 new_byte_total = byte_offset + chunk_bytes;
+        const u64 new_words =
+            (new_byte_total / sizeof(u64)) + ((new_byte_total % sizeof(u64)) != 0 ? 1ULL : 0ULL);
+        code.resize(static_cast<size_t>(new_words));
+        file.read(reinterpret_cast<char*>(code.data()) + byte_offset,
+                  static_cast<std::streamsize>(chunk_bytes));
+        if (!file) {
+            throw std::ios_base::failure("truncated shader code payload");
+        }
+        byte_offset = new_byte_total;
+        bytes_remaining -= chunk_bytes;
+    }
     for (size_t i = 0; i < num_texture_types; ++i) {
         u32 key;
         Shader::TextureType type;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&type), sizeof(type));
+        if (!file) {
+            throw std::ios_base::failure("truncated shader environment texture_types");
+        }
         texture_types.emplace(key, type);
     }
     for (size_t i = 0; i < num_texture_pixel_formats; ++i) {
@@ -1651,6 +1682,9 @@ void FileEnvironment::Deserialize(std::ifstream& file, bool with_mesh_state) {
         Shader::TexturePixelFormat format;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&format), sizeof(format));
+        if (!file) {
+            throw std::ios_base::failure("truncated shader environment texture_pixel_formats");
+        }
         texture_pixel_formats.emplace(key, format);
     }
     for (size_t i = 0; i < num_cbuf_values; ++i) {
@@ -1658,6 +1692,9 @@ void FileEnvironment::Deserialize(std::ifstream& file, bool with_mesh_state) {
         u32 value;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&value), sizeof(value));
+        if (!file) {
+            throw std::ios_base::failure("truncated shader environment cbuf_values");
+        }
         cbuf_values.emplace(key, value);
     }
     for (size_t i = 0; i < num_storage_pointer_types; ++i) {
@@ -1665,6 +1702,9 @@ void FileEnvironment::Deserialize(std::ifstream& file, bool with_mesh_state) {
         u8 value;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&value), sizeof(value));
+        if (!file) {
+            throw std::ios_base::failure("truncated shader environment storage_pointer_types");
+        }
         storage_pointer_types.emplace(key, value);
     }
     for (size_t i = 0; i < num_cbuf_replacement_values; ++i) {
@@ -1672,6 +1712,9 @@ void FileEnvironment::Deserialize(std::ifstream& file, bool with_mesh_state) {
         Shader::ReplaceConstant value;
         file.read(reinterpret_cast<char*>(&key), sizeof(key))
             .read(reinterpret_cast<char*>(&value), sizeof(value));
+        if (!file) {
+            throw std::ios_base::failure("truncated shader environment cbuf_replacements");
+        }
         cbuf_replacements.emplace(key, value);
     }
     if (stage == Shader::Stage::Compute) {
@@ -1961,6 +2004,9 @@ void LoadPipelines(
     }
     file.exceptions(std::ifstream::failbit);
     const auto end{file.tellg()};
+    if (end < 0) {
+        return;
+    }
     file.seekg(0, std::ios::beg);
 
     std::array<char, 8> magic_number;
@@ -2000,25 +2046,43 @@ void LoadPipelines(
         }
         return;
     }
-    while (file.tellg() != end) {
+    constexpr u32 MaxPipelineEnvs = 5;
+    while (true) {
+        const auto pos{file.tellg()};
+        if (pos == end) {
+            break;
+        }
+        if (pos < 0 || pos > end) {
+            throw std::ios_base::failure("corrupted pipeline cache offset");
+        }
         if (stop_loading.stop_requested()) {
             return;
         }
-        const auto record_begin{file.tellg()};
+        const auto record_begin{pos};
         u32 num_envs{};
         file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
-        std::vector<FileEnvironment> envs(num_envs);
-        for (FileEnvironment& env : envs) {
-            env.Deserialize(file, with_mesh_state);
+        if (num_envs == 0 || num_envs > MaxPipelineEnvs) {
+            throw std::ios_base::failure("invalid pipeline environment count");
+        }
+        std::vector<FileEnvironment> envs;
+        envs.reserve(num_envs);
+        for (u32 i = 0; i < num_envs; ++i) {
+            envs.emplace_back().Deserialize(file, with_mesh_state);
         }
         const bool is_compute{envs.front().ShaderStage() == Shader::Stage::Compute};
         if (is_compute) {
+            if (num_envs != 1) {
+                throw std::ios_base::failure("invalid compute pipeline environment count");
+            }
             load_compute(file, std::move(envs.front()));
         } else {
             load_graphics(file, std::move(envs));
         }
         if (upgrading) {
             const auto record_end{file.tellg()};
+            if (record_end < record_begin || record_end > end) {
+                throw std::ios_base::failure("invalid pipeline cache record bounds");
+            }
             std::string& record =
                 upgrade->records.emplace_back(static_cast<size_t>(record_end - record_begin), '\0');
             file.seekg(record_begin);
@@ -2027,7 +2091,7 @@ void LoadPipelines(
         }
     }
 
-} catch (const std::ios_base::failure& e) {
+} catch (const std::exception& e) {
     LOG_ERROR(Common_Filesystem, "{}", e.what());
     if (upgrade != nullptr && upgrade->from_version != 0) {
         // The records read so far are written again under the current version.

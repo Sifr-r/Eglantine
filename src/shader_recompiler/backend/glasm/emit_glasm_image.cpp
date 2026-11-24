@@ -558,23 +558,22 @@ void EmitImageGradient(EmitContext& ctx, IR::Inst& inst, const IR::Value& index,
                        const IR::Value& coord, const IR::Value& derivatives,
                        const IR::Value& offset, const IR::Value& lod_clamp) {
     const auto info{inst.Flags<IR::TextureInstInfo>()};
-    ScopedRegister dpdx, dpdy, coords;
+    ScopedRegister dpdx, dpdy;
     const bool multi_component{info.num_derivatives > 1 || info.has_lod_clamp};
     if (multi_component) {
         // Allocate this early to avoid aliasing other registers
         dpdx = ScopedRegister{ctx.reg_alloc};
         dpdy = ScopedRegister{ctx.reg_alloc};
-        if (info.num_derivatives >= 3) {
-            coords = ScopedRegister{ctx.reg_alloc};
-        }
     }
     const auto sparse_inst{PrepareSparse(inst)};
     const std::string_view sparse_mod{sparse_inst ? ".SPARSE" : ""};
     const std::string_view type{TextureType(info)};
     const std::string texture{Texture(ctx, info, index)};
-    const std::string offset_vec{GradOffset(offset)};
+    const std::string offset_vec{info.num_derivatives < 3 ? GradOffset(offset) : std::string{}};
     const Register coord_vec{ctx.reg_alloc.Consume(coord)};
     const Register derivatives_vec{ctx.reg_alloc.Consume(derivatives)};
+    const Register derivatives_2_vec{info.num_derivatives >= 3 ? ctx.reg_alloc.Consume(offset)
+                                                               : Register{}};
     const Register ret{ctx.reg_alloc.Define(inst)};
     if (multi_component) {
         ctx.Add("MOV.F {}.x,{}.x;"
@@ -583,26 +582,19 @@ void EmitImageGradient(EmitContext& ctx, IR::Inst& inst, const IR::Value& index,
                 "MOV.F {}.y,{}.w;",
                 dpdx.reg, derivatives_vec, dpdx.reg, derivatives_vec, dpdy.reg, derivatives_vec,
                 dpdy.reg, derivatives_vec);
-        Register final_coord;
         if (info.num_derivatives >= 3) {
             ctx.Add("MOV.F {}.z,{}.x;"
                     "MOV.F {}.z,{}.y;",
-                    dpdx.reg, coord_vec, dpdy.reg, coord_vec);
-            ctx.Add("MOV.F {}.x,0;"
-                    "MOV.F {}.y,0;",
-                    "MOV.F {}.z,0;", coords.reg, coords.reg, coords.reg);
-            final_coord = coords.reg;
-        } else {
-            final_coord = coord_vec;
+                    dpdx.reg, derivatives_2_vec, dpdy.reg, derivatives_2_vec);
         }
         if (info.has_lod_clamp) {
             const ScalarF32 lod_clamp_value{ctx.reg_alloc.Consume(lod_clamp)};
             ctx.Add("MOV.F {}.w,{};"
                     "TXD.F.LODCLAMP{} {},{},{},{},{},{}{};",
-                    dpdy.reg, lod_clamp_value, sparse_mod, ret, final_coord, dpdx.reg, dpdy.reg,
+                    dpdy.reg, lod_clamp_value, sparse_mod, ret, coord_vec, dpdx.reg, dpdy.reg,
                     texture, type, offset_vec);
         } else {
-            ctx.Add("TXD.F{} {},{},{},{},{},{}{};", sparse_mod, ret, final_coord, dpdx.reg,
+            ctx.Add("TXD.F{} {},{},{},{},{},{}{};", sparse_mod, ret, coord_vec, dpdx.reg,
                     dpdy.reg, texture, type, offset_vec);
         }
     } else {

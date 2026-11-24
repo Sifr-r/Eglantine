@@ -559,4 +559,26 @@ fn ffi_surface_and_null_safety() {
         0
     );
     assert_eq!(oout.active, 0);
+
+    // F0599: cal_sample_count * 3 overflow must be rejected instead of wrapping.
+    let sentinel_samples = [0i16; 3];
+    let overflow_samples = (usize::MAX / 3) + 1;
+    assert_eq!(
+        egl_sw2_gyro_mouse_process(
+            &mut gstate,
+            sentinel_samples.as_ptr(),
+            overflow_samples,
+            &irep,
+            ControllerType::Pro as u8,
+            0,
+            1,
+            1,
+            0,
+            1.0,
+            0,
+            &mut action,
+            &mut gout
+        ),
+        -1
+    );
 }

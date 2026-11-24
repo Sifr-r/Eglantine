@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <optional>
+#include <span>
 
 #include "common/common_types.h"
 #include "core/file_sys/vfs/vfs_types.h"
@@ -44,16 +45,14 @@ public:
     void WebBrowserExit(WebExitReason exit_reason, std::string last_url = "");
 
 private:
-    bool InputTLVExistsInMap(WebArgInputTLVType input_tlv_type) const;
-
-    std::optional<std::vector<u8>> GetInputTLVData(WebArgInputTLVType input_tlv_type);
+    std::optional<std::span<const u8>> GetInputTLVData(WebArgInputTLVType input_tlv_type) const;
 
     // Initializers for the various types of browser applets
     void InitializeShop();
     void InitializeLogin();
-    void InitializeOffline();
+    Result InitializeOffline();
     void InitializeShare();
-    void InitializeWeb();
+    Result InitializeWeb();
     void InitializeWifi();
     void InitializeLobby();
     void InitializeLhub();

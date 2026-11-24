@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <QWindow>
 
 #include "core/core.h"
@@ -28,6 +30,8 @@ extern std::unique_ptr<Core::System> system;
 extern std::shared_ptr<FileSys::RealVfsFilesystem> vfs;
 extern std::unique_ptr<FileSys::ManualContentProvider> provider;
 extern std::unique_ptr<EmuThread> emu_thread;
+extern std::mutex renderer_mutex;
+extern std::atomic<bool> renderer_active;
 
 extern const QStringList supported_file_extensions;
 

@@ -163,6 +163,10 @@ AppLoader_NCA::LoadResult AppLoader_NCA::Load(Kernel::KProcess& process, Core::S
 ResultStatus AppLoader_NCA::VerifyIntegrity(std::function<bool(size_t, size_t)> progress_callback) {
     using namespace Common::Literals;
 
+    if (file == nullptr) {
+        return ResultStatus::ErrorNullFile;
+    }
+
     constexpr size_t NcaFileNameWithHashLength = 36;
     constexpr size_t NcaFileNameHashLength = 32;
     constexpr size_t NcaSha256HashLength = 32;
@@ -210,6 +214,9 @@ ResultStatus AppLoader_NCA::VerifyIntegrity(std::function<bool(size_t, size_t)> 
         // Refill the buffer.
         const size_t intended_read_size = (std::min)(buffer.size(), total_size - processed_size);
         const size_t read_size = file->Read(buffer.data(), intended_read_size, processed_size);
+        if (read_size == 0 || read_size != intended_read_size) {
+            return ResultStatus::ErrorIntegrityVerificationFailed;
+        }
 
         // Update the hash function with the buffer contents.
         if (!EVP_DigestUpdate(ctx, buffer.data(), read_size)) {
@@ -220,7 +227,7 @@ ResultStatus AppLoader_NCA::VerifyIntegrity(std::function<bool(size_t, size_t)> 
         processed_size += read_size;
 
         // Call the progress function.
-        if (!progress_callback(processed_size, total_size)) {
+        if (progress_callback && !progress_callback(processed_size, total_size)) {
             return ResultStatus::ErrorIntegrityVerificationFailed;
         }
     }

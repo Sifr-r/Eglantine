@@ -102,11 +102,7 @@ public:
     T PopWait(std::stop_token stop_token) {
         if (Empty()) {
             std::unique_lock lock{cv_mutex};
-            if constexpr (with_stop_token) {
-                cv.wait(lock, stop_token, [this] { return !Empty(); });
-            } else {
-                cv.wait(lock, [this] { return !Empty(); });
-            }
+            cv.wait(lock, stop_token, [this] { return !Empty(); });
         }
         if (stop_token.stop_requested()) {
             return T{};
@@ -144,7 +140,7 @@ private:
     ElementPtr* read_ptr;
     std::atomic_size_t size{0};
     std::mutex cv_mutex;
-    std::conditional_t<with_stop_token, std::condition_variable_any, std::condition_variable> cv;
+    std::condition_variable_any cv;
 };
 
 // a simple thread-safe,

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <memory>
+
 #include "audio_core/renderer/effect/aux_.h"
 #include "audio_core/renderer/effect/biquad_filter.h"
 #include "audio_core/renderer/effect/buffer_mixer.h"
@@ -22,7 +24,9 @@ namespace AudioCore::Renderer {
  * @param type   - Type of the new effect to create.
  */
 static void ResetEffect(EffectInfoBase* effect, const EffectInfoBase::Type type) {
-    *effect = {};
+    // Destroy the active derived EffectInfo so non-trivial State members (e.g. std::vector)
+    // are properly destructed before re-constructing into the same storage.
+    std::destroy_at(effect);
 
     switch (type) {
     case EffectInfoBase::Type::Invalid:
@@ -64,6 +68,10 @@ static void ResetEffect(EffectInfoBase* effect, const EffectInfoBase::Type type)
     case EffectInfoBase::Type::Compressor:
         std::construct_at<CompressorInfo>(reinterpret_cast<CompressorInfo*>(effect));
         effect->SetType(EffectInfoBase::Type::Compressor);
+        break;
+    default:
+        std::construct_at<EffectInfoBase>(effect);
+        effect->SetType(EffectInfoBase::Type::Invalid);
         break;
     }
 }

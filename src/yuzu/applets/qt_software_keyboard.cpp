@@ -3,6 +3,8 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include <QCursor>
 #include <QKeyEvent>
 #include <QScreen>
@@ -350,7 +352,8 @@ QtSoftwareKeyboardDialog::QtSoftwareKeyboardDialog(
     ui->button_right_optional_num->setText(QChar{initialize_parameters.right_optional_symbol_key});
 
     current_text = initialize_parameters.initial_text;
-    cursor_position = initialize_parameters.initial_cursor_position;
+    cursor_position = std::clamp(initialize_parameters.initial_cursor_position, s32{0},
+                                 static_cast<s32>(current_text.size()));
 
     SetTextDrawType();
 
@@ -368,6 +371,32 @@ QtSoftwareKeyboardDialog::QtSoftwareKeyboardDialog(
     if (system.IsPoweredOn()) {
         input_interpreter = std::make_unique<InputInterpreter>(system);
     }
+
+    input_timer.setInterval(50);
+    connect(&input_timer, &QTimer::timeout, this, [this] {
+        if (!input_interpreter) {
+            return;
+        }
+        input_interpreter->PollInput();
+        HandleButtonPressedOnce<
+            Core::HID::NpadButton::A, Core::HID::NpadButton::B, Core::HID::NpadButton::X,
+            Core::HID::NpadButton::Y, Core::HID::NpadButton::StickL, Core::HID::NpadButton::StickR,
+            Core::HID::NpadButton::L, Core::HID::NpadButton::R, Core::HID::NpadButton::Plus,
+            Core::HID::NpadButton::Left, Core::HID::NpadButton::Up, Core::HID::NpadButton::Right,
+            Core::HID::NpadButton::Down, Core::HID::NpadButton::StickLLeft,
+            Core::HID::NpadButton::StickLUp, Core::HID::NpadButton::StickLRight,
+            Core::HID::NpadButton::StickLDown, Core::HID::NpadButton::StickRLeft,
+            Core::HID::NpadButton::StickRUp, Core::HID::NpadButton::StickRRight,
+            Core::HID::NpadButton::StickRDown>();
+        HandleButtonHold<
+            Core::HID::NpadButton::B, Core::HID::NpadButton::L, Core::HID::NpadButton::R,
+            Core::HID::NpadButton::Left, Core::HID::NpadButton::Up, Core::HID::NpadButton::Right,
+            Core::HID::NpadButton::Down, Core::HID::NpadButton::StickLLeft,
+            Core::HID::NpadButton::StickLUp, Core::HID::NpadButton::StickLRight,
+            Core::HID::NpadButton::StickLDown, Core::HID::NpadButton::StickRLeft,
+            Core::HID::NpadButton::StickRUp, Core::HID::NpadButton::StickRRight,
+            Core::HID::NpadButton::StickRDown>();
+    });
 }
 
 QtSoftwareKeyboardDialog::~QtSoftwareKeyboardDialog() {
@@ -465,7 +494,8 @@ void QtSoftwareKeyboardDialog::HideInlineKeyboard() {
 void QtSoftwareKeyboardDialog::InlineTextChanged(
     Core::Frontend::InlineTextParameters text_parameters) {
     current_text = text_parameters.input_text;
-    cursor_position = text_parameters.cursor_position;
+    cursor_position = std::clamp(text_parameters.cursor_position, s32{0},
+                                 static_cast<s32>(current_text.size()));
 
     SetBackspaceOkEnabled();
 }
@@ -1193,9 +1223,11 @@ void QtSoftwareKeyboardDialog::InlineKeyboardButtonClicked(QPushButton* button) 
             return;
         }
 
+        cursor_position =
+            std::clamp(cursor_position, s32{0}, static_cast<s32>(current_text.size()));
         --cursor_position;
 
-        current_text.erase(cursor_position, 1);
+        current_text.erase(static_cast<std::size_t>(cursor_position), 1);
 
         SetBackspaceOkEnabled();
 
@@ -1225,7 +1257,8 @@ void QtSoftwareKeyboardDialog::InlineTextInsertString(std::u16string_view string
         return;
     }
 
-    current_text.insert(cursor_position, string);
+    cursor_position = std::clamp(cursor_position, s32{0}, static_cast<s32>(current_text.size()));
+    current_text.insert(static_cast<std::size_t>(cursor_position), string);
 
     cursor_position += static_cast<s32>(string.size());
 
@@ -1455,6 +1488,10 @@ void QtSoftwareKeyboardDialog::MoveButtonDirection(Direction direction) {
 }
 
 void QtSoftwareKeyboardDialog::MoveTextCursorDirection(Direction direction) {
+    if (is_inline) {
+        cursor_position =
+            std::clamp(cursor_position, s32{0}, static_cast<s32>(current_text.size()));
+    }
     switch (direction) {
     case Direction::Left:
         if (is_inline) {
@@ -1494,34 +1531,13 @@ void QtSoftwareKeyboardDialog::MoveTextCursorDirection(Direction direction) {
 }
 
 void QtSoftwareKeyboardDialog::StartInputThread() {
-    input_thread = std::jthread([&](std::stop_token stoken) {
-        while (!stoken.stop_requested()) {
-            input_interpreter->PollInput();
-            HandleButtonPressedOnce<
-                Core::HID::NpadButton::A, Core::HID::NpadButton::B, Core::HID::NpadButton::X,
-                Core::HID::NpadButton::Y, Core::HID::NpadButton::StickL,
-                Core::HID::NpadButton::StickR, Core::HID::NpadButton::L, Core::HID::NpadButton::R,
-                Core::HID::NpadButton::Plus, Core::HID::NpadButton::Left, Core::HID::NpadButton::Up,
-                Core::HID::NpadButton::Right, Core::HID::NpadButton::Down,
-                Core::HID::NpadButton::StickLLeft, Core::HID::NpadButton::StickLUp,
-                Core::HID::NpadButton::StickLRight, Core::HID::NpadButton::StickLDown,
-                Core::HID::NpadButton::StickRLeft, Core::HID::NpadButton::StickRUp,
-                Core::HID::NpadButton::StickRRight, Core::HID::NpadButton::StickRDown>();
-            HandleButtonHold<Core::HID::NpadButton::B, Core::HID::NpadButton::L,
-                             Core::HID::NpadButton::R, Core::HID::NpadButton::Left,
-                             Core::HID::NpadButton::Up, Core::HID::NpadButton::Right,
-                             Core::HID::NpadButton::Down, Core::HID::NpadButton::StickLLeft,
-                             Core::HID::NpadButton::StickLUp, Core::HID::NpadButton::StickLRight,
-                             Core::HID::NpadButton::StickLDown, Core::HID::NpadButton::StickRLeft,
-                             Core::HID::NpadButton::StickRUp, Core::HID::NpadButton::StickRRight,
-                             Core::HID::NpadButton::StickRDown>();
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-    });
+    if (input_interpreter) {
+        input_timer.start();
+    }
 }
 
 void QtSoftwareKeyboardDialog::StopInputThread() {
-    input_thread.request_stop();
+    input_timer.stop();
     if (input_interpreter)
         input_interpreter->ResetButtonStates();
 }

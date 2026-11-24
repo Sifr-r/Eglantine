@@ -431,20 +431,39 @@ void CommandBuffer::GenerateUpsampleCommand(const s32 node_id, const s16 buffer_
                                             const u32 sample_count_, const u32 sample_rate_) {
     auto& cmd{GenerateStart<UpsampleCommand, CommandId::Upsample>(node_id)};
 
-    cmd.samples_buffer = memory_pool->Translate(upsampler_info.samples_pos,
-                                                upsampler_info.sample_count * sizeof(s32));
-    cmd.inputs = memory_pool->Translate(CpuAddr(upsampler_info.inputs.data()), MaxChannels);
-    cmd.buffer_count = buffer_count;
+    const u32 clamped_input_count{
+        (std::min)(input_count, (std::min)(static_cast<u32>(MaxChannels),
+                                           static_cast<u32>(inputs.size())))};
+    bool valid{buffer_count > 0 && input_count <= MaxChannels && input_count <= inputs.size()};
+
+    cmd.samples_buffer =
+        buffer_count > 0
+            ? memory_pool->Translate(upsampler_info.samples_pos,
+                                     static_cast<size_t>(buffer_count) *
+                                         upsampler_info.sample_count * sizeof(s32))
+            : 0;
+    cmd.inputs =
+        memory_pool->Translate(CpuAddr(upsampler_info.inputs.data()), MaxChannels * sizeof(s16));
+    cmd.buffer_count = buffer_count > 0 ? static_cast<u32>(buffer_count) : 0;
     cmd.unk_20 = 0;
     cmd.source_sample_count = sample_count_;
     cmd.source_sample_rate = sample_rate_;
 
-    upsampler_info.input_count = input_count;
-    for (u32 i = 0; i < input_count; i++) {
-        upsampler_info.inputs[i] = buffer_offset + inputs[i];
+    upsampler_info.input_count = clamped_input_count;
+    for (u32 i = 0; i < clamped_input_count; i++) {
+        const s16 channel{static_cast<s16>(buffer_offset + inputs[i])};
+        if (channel < 0 || channel >= buffer_count) {
+            valid = false;
+            upsampler_info.inputs[i] = 0;
+        } else {
+            upsampler_info.inputs[i] = channel;
+        }
     }
 
     cmd.upsampler_info = memory_pool->Translate(CpuAddr(&upsampler_info), sizeof(UpsamplerInfo));
+    if (!valid || cmd.samples_buffer == 0 || cmd.inputs == 0 || cmd.upsampler_info == 0) {
+        cmd.enabled = false;
+    }
 
     GenerateEnd<UpsampleCommand>(cmd);
 }
@@ -498,21 +517,51 @@ void CommandBuffer::GenerateDeviceSinkCommand(const s32 node_id, const s16 buffe
 
     cmd.session_id = session_id;
 
-    cmd.input_count = parameter.input_count;
+    const u32 clamped_input_count{(std::min)(parameter.input_count, static_cast<u32>(MaxChannels))};
+    cmd.input_count = clamped_input_count;
+    bool valid{parameter.input_count <= MaxChannels};
     s16 max_input{0};
-    for (u32 i = 0; i < parameter.input_count; i++) {
-        cmd.inputs[i] = buffer_offset + parameter.inputs[i];
-        max_input = (std::max)(max_input, cmd.inputs[i]);
+    for (u32 i = 0; i < clamped_input_count; i++) {
+        const s16 channel{static_cast<s16>(buffer_offset + parameter.inputs[i])};
+        if (channel < 0) {
+            valid = false;
+            cmd.inputs[i] = 0;
+        } else {
+            cmd.inputs[i] = channel;
+            max_input = (std::max)(max_input, channel);
+        }
     }
 
     if (state.upsampler_info != nullptr) {
-        const auto size_{state.upsampler_info->sample_count * parameter.input_count};
-        const auto size_bytes{size_ * sizeof(s32)};
-        const auto addr{memory_pool->Translate(state.upsampler_info->samples_pos, size_bytes)};
-        cmd.sample_buffer = {reinterpret_cast<s32*>(addr),
-                             (max_input + 1) * state.upsampler_info->sample_count};
+        if (clamped_input_count > 0 && state.upsampler_info->buffer_count > 0 &&
+            static_cast<u32>(max_input) >= state.upsampler_info->buffer_count) {
+            valid = false;
+        }
+        const size_t upsampler_sample_count{state.upsampler_info->sample_count};
+        const size_t total_samples{
+            upsampler_sample_count > 0 && valid
+                ? static_cast<size_t>(max_input + 1) * upsampler_sample_count
+                : 0};
+        const size_t size_bytes{total_samples * sizeof(s32)};
+        const auto addr{
+            size_bytes > 0 ? memory_pool->Translate(state.upsampler_info->samples_pos, size_bytes)
+                           : 0};
+        if (addr == 0) {
+            valid = false;
+            cmd.sample_buffer = {};
+        } else {
+            cmd.sample_buffer = {reinterpret_cast<s32*>(addr), total_samples};
+        }
     } else {
+        const size_t max_buffer_index{samples_buffer.size() / TargetSampleCount};
+        if (clamped_input_count > 0 && static_cast<size_t>(max_input) >= max_buffer_index) {
+            valid = false;
+        }
         cmd.sample_buffer = samples_buffer;
+    }
+
+    if (!valid) {
+        cmd.enabled = false;
     }
 
     GenerateEnd<DeviceSinkCommand>(cmd);
@@ -526,8 +575,9 @@ void CommandBuffer::GenerateCircularBufferSinkCommand(const s32 node_id, SinkInf
     auto state{
         *reinterpret_cast<CircularBufferSinkInfo::CircularBufferState*>(sink_info.GetState())};
 
-    cmd.input_count = parameter.input_count;
-    for (u32 i = 0; i < parameter.input_count; i++) {
+    const u32 clamped_input_count{(std::min)(parameter.input_count, static_cast<u32>(MaxChannels))};
+    cmd.input_count = clamped_input_count;
+    for (u32 i = 0; i < clamped_input_count; i++) {
         cmd.inputs[i] = buffer_offset + parameter.inputs[i];
     }
 
@@ -656,7 +706,11 @@ void CommandBuffer::GenerateLightLimiterCommand(
             cmd.effect_enabled = enabled;
             cmd.state = state_buffer;
             cmd.workbuffer = workbuffer;
+        } else {
+            cmd.enabled = false;
         }
+    } else {
+        cmd.enabled = false;
     }
 
     GenerateEnd<LightLimiterVersion1Command>(cmd);
@@ -687,7 +741,11 @@ void CommandBuffer::GenerateLightLimiterCommand(
                 cmd.result_state = 0;
             }
             cmd.workbuffer = workbuffer;
+        } else {
+            cmd.enabled = false;
         }
+    } else {
+        cmd.enabled = false;
     }
 
     GenerateEnd<LightLimiterVersion2Command>(cmd);
@@ -751,17 +809,23 @@ void CommandBuffer::GenerateCompressorCommand(s16 buffer_offset, EffectInfoBase&
         *reinterpret_cast<CompressorInfo::ParameterVersion2*>(effect_info.GetParameter())};
     auto state{reinterpret_cast<CompressorInfo::State*>(effect_info.GetStateBuffer())};
 
-    if (IsChannelCountValid(parameter.channel_count)) {
+    if (parameter.channel_count > 0 &&
+        IsChannelCountValid(static_cast<u16>(parameter.channel_count))) {
         auto state_buffer{memory_pool->Translate(CpuAddr(state), sizeof(CompressorInfo::State))};
         if (state_buffer) {
-            for (u16 channel = 0; channel < parameter.channel_count; channel++) {
+            for (s16 channel = 0; channel < parameter.channel_count; channel++) {
                 cmd.inputs[channel] = buffer_offset + parameter.inputs[channel];
                 cmd.outputs[channel] = buffer_offset + parameter.outputs[channel];
             }
             cmd.parameter = parameter;
-            cmd.workbuffer = state_buffer;
-            cmd.enabled = effect_info.IsEnabled();
+            cmd.state = state_buffer;
+            cmd.workbuffer = effect_info.GetWorkbuffer(-1);
+            cmd.effect_enabled = effect_info.IsEnabled();
+        } else {
+            cmd.enabled = false;
         }
+    } else {
+        cmd.enabled = false;
     }
 
     GenerateEnd<CompressorCommand>(cmd);

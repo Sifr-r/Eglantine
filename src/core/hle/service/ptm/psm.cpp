@@ -198,7 +198,7 @@ void PSM::GetBatteryVoltageState(HLERequestContext& ctx) {
 
 void PSM::GetBatteryAgePercentage(HLERequestContext& ctx) {
     LOG_DEBUG(Service_PTM, "(stubbed)");
-    IPC::ResponseBuilder rb{ctx, 3};
+    IPC::ResponseBuilder rb{ctx, 4};
     rb.Push(ResultSuccess);
     rb.PushRaw<f64>(1.f);
 }
@@ -239,12 +239,12 @@ void PSM::GetBatteryChargeInfoFields(HLERequestContext& ctx) {
     r.charger_type = u32(power_status.has_battery && power_status.charging
         ? ChargerType::RegularCharger : ChargerType::Unplugged);
     r.charger_input_voltage_limit = 100;
-    r.charger_input_voltage_limit = 100;
+    r.charger_input_current_limit = 100;
     r.input_current_limit = 100;
     r.boost_mode_current_limit = 100;
     r.fast_charge_current_limit = 100;
 
-    IPC::ResponseBuilder rb{ctx, 3};
+    IPC::ResponseBuilder rb{ctx, static_cast<u32>(2 + sizeof(BatteryChargeInfoFields) / sizeof(u32))};
     rb.Push(ResultSuccess);
     rb.PushRaw<BatteryChargeInfoFields>(r);
 }

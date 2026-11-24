@@ -449,6 +449,7 @@ void RememberCurrentThreadNice(pid_t tid, s32 nice_value) {
 #endif
 
 #include "common/cpu_features.h"
+
 #ifdef ARCHITECTURE_x86_64
 #ifdef _MSC_VER
 #include <intrin.h>
@@ -1109,6 +1110,23 @@ void PollThreadPolicies() {
 #endif
 }
 
+#ifdef _WIN32
+namespace {
+bool WaitForWindowsDeadline(std::atomic<bool>& is_set, std::chrono::nanoseconds deadline) {
+    const auto remaining = [deadline] {
+        return deadline - std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch());
+    };
+    while (!is_set.load(std::memory_order_acquire) &&
+           remaining() > std::chrono::nanoseconds::zero()) {
+        Common::Windows::SleepForOneTick();
+    }
+    bool expected = true;
+    return is_set.compare_exchange_strong(expected, false, std::memory_order_acq_rel);
+}
+} // namespace
+#endif
+
 #ifdef ARCHITECTURE_x86_64
 // On Linux and UNIX systems, a futex would nominally be used to cover the costs
 // the idea is that it's intuitivelly cheaper to use a direct instruction as opposed to a full futex call
@@ -1154,7 +1172,7 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
                     return false; //timeout
             }
             bool expected = true;
-            if (is_set.compare_exchange_weak(expected, false, std::memory_order_release))
+            if (is_set.compare_exchange_weak(expected, false, std::memory_order_acq_rel))
                 return true;
         }
     }
@@ -1173,14 +1191,11 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
                 continue;
             }
             bool expected = true;
-            if (is_set.compare_exchange_weak(expected, false, std::memory_order_release))
+            if (is_set.compare_exchange_weak(expected, false, std::memory_order_acq_rel))
                 return true;
         }
     }
-    while (!is_set.load() && remaining() > std::chrono::nanoseconds::zero())
-        Common::Windows::SleepForOneTick();
-    bool expected = true;
-    return is_set.compare_exchange_strong(expected, false, std::memory_order_release);
+    return WaitForWindowsDeadline(is_set, deadline);
 #else
     std::unique_lock lk{mutex};
     const auto now = std::chrono::steady_clock::now();
@@ -1195,12 +1210,11 @@ bool Event::WaitFor(const std::chrono::nanoseconds time) {
 #else
 bool Event::WaitFor(const std::chrono::nanoseconds time) {
 #ifdef _WIN32
-    auto const end = Common::g_wall_clock.GetTimeNS() + time;
-    while (!is_set.load() && end > Common::g_wall_clock.GetTimeNS())
-        Common::Windows::SleepForOneTick();
-    if (is_set.load())
-        Reset();
-    return true;
+    const auto deadline = EventWaitDeadline(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()),
+        time);
+    return WaitForWindowsDeadline(is_set, deadline);
 #else
     std::unique_lock lk{mutex};
     const auto now = std::chrono::steady_clock::now();

@@ -18,6 +18,8 @@
 #include <filesystem>
 #include <functional>
 #include <mutex>
+#include <optional>
+#include <stop_token>
 #include <thread>
 
 #include <fmt/format.h>
@@ -1169,18 +1171,63 @@ public:
         return instance;
     }
 
-    /// Starts the recording thread. Returns false if a recording is already running.
-    bool Start(ToolContext ctx, std::string name) {
-        std::scoped_lock lock{mutex};
-        if (thread.joinable()) {
+    /// Starts the recording thread. Returns false if a recording is already running or stopping.
+    bool Start(ToolContext ctx, std::string name, std::string& error) {
+        std::scoped_lock cb_lock{cb_mutex};
+        {
+            std::scoped_lock state_lock{mutex};
+            if (ServerStopping()) {
+                error = "the MCP server is stopping";
+                return false;
+            }
+            if (!ctx.GameRunning()) {
+                error = "no game is running";
+                return false;
+            }
+            if (active) {
+                error = "already recording (route_record_stop first)";
+                return false;
+            }
+        }
+
+        emulation_stop_cb.reset();
+        emulation_stop_cb.emplace(ctx.system->GetEmulationStopToken(), EmulationStopHandler{this});
+
+        bool started = false;
+        {
+            std::scoped_lock join_lock{join_mutex};
+            std::jthread stale_thread;
+            {
+                std::scoped_lock state_lock{mutex};
+                stale_thread = std::move(thread);
+            }
+            if (stale_thread.joinable()) {
+                stale_thread.request_stop();
+                stale_thread.join();
+            }
+
+            std::scoped_lock state_lock{mutex};
+            if (ServerStopping()) {
+                error = "the MCP server is stopping";
+            } else if (!ctx.GameRunning() || ctx.system->GetEmulationStopToken().stop_requested()) {
+                error = "no game is running";
+            } else if (active) {
+                error = "already recording (route_record_stop first)";
+            } else {
+                frames.clear();
+                snapshots.clear();
+                record_name = std::move(name);
+                // Taken now: the game may have closed by the time the recording is saved.
+                record_program_id = ProgramId(ctx);
+                active = true;
+                thread = std::jthread([this, ctx](std::stop_token stop) { Run(stop, ctx); });
+                started = true;
+            }
+        }
+        if (!started) {
+            emulation_stop_cb.reset();
             return false;
         }
-        frames.clear();
-        snapshots.clear();
-        record_name = std::move(name);
-        // Taken now: the game may have closed by the time the recording is saved.
-        record_program_id = ProgramId(ctx);
-        thread = std::jthread([this, ctx](std::stop_token stop) { Run(stop, ctx); });
         return true;
     }
 
@@ -1193,37 +1240,55 @@ public:
     /// Stops and returns what was recorded.
     bool Stop(std::vector<InputFrame>& out_frames, std::vector<Snapshot>& out_snapshots,
               std::string& out_name) {
-        std::jthread t;
+        std::scoped_lock cb_lock{cb_mutex};
+        StopWorker();
+        bool stopped_active = false;
         {
-            std::scoped_lock lock{mutex};
-            if (!thread.joinable()) {
-                return false;
+            std::scoped_lock state_lock{mutex};
+            if (active) {
+                active = false;
+                out_frames = std::move(frames);
+                out_snapshots = std::move(snapshots);
+                out_name = record_name;
+                stopped_active = true;
             }
-            t = std::move(thread);
         }
-        t.request_stop();
-        t.join();
-        std::scoped_lock lock{mutex};
-        out_frames = std::move(frames);
-        out_snapshots = std::move(snapshots);
-        out_name = record_name;
-        return true;
+        emulation_stop_cb.reset();
+        return stopped_active;
     }
 
     [[nodiscard]] bool Recording() {
         std::scoped_lock lock{mutex};
-        return thread.joinable();
+        return active;
     }
 
     /// Stops and joins the recording thread if it is still running.
     ~Recorder() {
-        if (thread.joinable()) {
-            thread.request_stop();
-            thread.join();
-        }
+        StopWorker();
+        emulation_stop_cb.reset();
     }
 
 private:
+    struct EmulationStopHandler {
+        Recorder* self;
+        void operator()() const {
+            self->StopWorker();
+        }
+    };
+
+    void StopWorker() {
+        std::scoped_lock join_lock{join_mutex};
+        std::jthread t;
+        {
+            std::scoped_lock state_lock{mutex};
+            t = std::move(thread);
+        }
+        if (t.joinable()) {
+            t.request_stop();
+            t.join();
+        }
+    }
+
     /// No buttons held and every stick inside the 0.25 dead zone.
     static bool Neutral(const InputFrame& f) {
         constexpr float dead = 0.25f;
@@ -1257,13 +1322,16 @@ private:
         u64 last_snapshot_ms = 0;
         bool was_neutral = true;
         u64 presses = 0;
-        while (!stop.stop_requested() && ctx.system->IsPoweredOn()) {
+        while (!stop.stop_requested() && ctx.GameRunning()) {
             std::this_thread::sleep_for(milliseconds{2});
             const u64 frame = PresentedFrames();
             if (frame == last_frame) {
                 continue;
             }
             last_frame = frame;
+            if (!ctx.GameRunning()) {
+                break;
+            }
             // Player 1, or the handheld controller when player 1 isn't connected.
             auto& hid = ctx.system->HIDCore();
             auto* controller = hid.GetEmulatedControllerByIndex(0);
@@ -1298,16 +1366,22 @@ private:
                 s.record_checkpoints = presses;
             });
         }
-        snapshot(); // the screen it ended on
+        if (!stop.stop_requested() && ctx.GameRunning()) {
+            snapshot(); // the screen it ended on
+        }
         Activity::Get().Update([&](ActivityState& s) { s.recording = false; });
     }
 
+    std::mutex cb_mutex;
+    std::mutex join_mutex;
     std::mutex mutex;
+    bool active = false;
     std::jthread thread;
     std::string record_name;
     u64 record_program_id = 0;
     std::vector<InputFrame> frames;
     std::vector<Snapshot> snapshots;
+    std::optional<std::stop_callback<EmulationStopHandler>> emulation_stop_cb;
 };
 
 /// input_sequence button names by bit position in the npad button mask.
@@ -1424,8 +1498,9 @@ json BuildRecordedRoute(const std::vector<Recorder::InputFrame>& frames,
 /// route_record_start tool: starts the Recorder thread; error if one is already recording.
 ToolResult RouteRecordStart(ToolContext& ctx, const json& args) {
     const std::string name = args.at("name").get<std::string>();
-    if (!Recorder::Get().Start(ctx, name)) {
-        return ToolResult::Error("already recording (route_record_stop first)");
+    std::string error;
+    if (!Recorder::Get().Start(ctx, name, error)) {
+        return ToolResult::Error(error);
     }
     if (ctx.timeline) {
         ctx.timeline->Push(EventKind::Input, 0, "route", "recording route " + name);

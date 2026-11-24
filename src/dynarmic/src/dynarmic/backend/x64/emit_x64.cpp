@@ -20,6 +20,7 @@
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 
+#include "dynarmic/backend/x64/abi.h"
 #include "dynarmic/backend/x64/block_of_code.h"
 #include "dynarmic/backend/x64/nzcv_util.h"
 #include "dynarmic/backend/x64/perf_map.h"
@@ -130,7 +131,7 @@ void EmitX64::EmitVerboseDebuggingOutput(RegAlloc& reg_alloc) {
     for (int i = 0; i < 16; i++) {
         code.movaps(xword[rsp + offsetof(RegisterData, xmms) + 2 * sizeof(u64) * i], Xbyak::Xmm{i});
     }
-    code.lea(rax, ptr[rsp + sizeof(RegisterData) + offsetof(StackLayout, spill)]);
+    code.lea(rax, ptr[rsp + sizeof(RegisterData) + ABI_SHADOW_SPACE + offsetof(StackLayout, spill)]);
     code.mov(qword[rsp + offsetof(RegisterData, spill)], rax);
 
     reg_alloc.EmitVerboseDebuggingOutput(code);

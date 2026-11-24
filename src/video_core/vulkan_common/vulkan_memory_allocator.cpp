@@ -115,7 +115,8 @@ MemoryCommit::MemoryCommit(MemoryCommit &&rhs) noexcept
             memory{std::exchange(rhs.memory, VK_NULL_HANDLE)},
             offset{std::exchange(rhs.offset, 0)},
             size{std::exchange(rhs.size, 0)},
-            mapped_ptr{std::exchange(rhs.mapped_ptr, nullptr)} {}
+            mapped_ptr{std::exchange(rhs.mapped_ptr, nullptr)},
+            explicit_map{std::exchange(rhs.explicit_map, false)} {}
 
 MemoryCommit &MemoryCommit::operator=(MemoryCommit &&rhs) noexcept {
     if (this != &rhs) {
@@ -126,6 +127,7 @@ MemoryCommit &MemoryCommit::operator=(MemoryCommit &&rhs) noexcept {
         offset = std::exchange(rhs.offset, 0);
         size = std::exchange(rhs.size, 0);
         mapped_ptr = std::exchange(rhs.mapped_ptr, nullptr);
+        explicit_map = std::exchange(rhs.explicit_map, false);
     }
     return *this;
 }
@@ -135,6 +137,7 @@ std::span<u8> MemoryCommit::Map()
     if (!allocation) return {};
     if (!mapped_ptr) {
         if (vmaMapMemory(allocator, allocation, &mapped_ptr) != VK_SUCCESS) return {};
+        explicit_map = true;
     }
     const size_t n = static_cast<size_t>(std::min<VkDeviceSize>(size,
                                                                 (std::numeric_limits<size_t>::max)()));
@@ -148,6 +151,7 @@ std::span<const u8> MemoryCommit::Map() const
         void *p = nullptr;
         if (vmaMapMemory(allocator, allocation, &p) != VK_SUCCESS) return {};
         const_cast<MemoryCommit *>(this)->mapped_ptr = p;
+        const_cast<MemoryCommit *>(this)->explicit_map = true;
     }
     const size_t n = static_cast<size_t>(std::min<VkDeviceSize>(size,
                                                                 (std::numeric_limits<size_t>::max)()));
@@ -156,9 +160,10 @@ std::span<const u8> MemoryCommit::Map() const
 
 void MemoryCommit::Unmap()
 {
-    if (allocation && mapped_ptr) {
+    if (allocation && explicit_map) {
         vmaUnmapMemory(allocator, allocation);
         mapped_ptr = nullptr;
+        explicit_map = false;
     }
 }
 
@@ -173,10 +178,11 @@ void MemoryCommit::Release() {
             );
         }
 
-        if (mapped_ptr) {
+        if (explicit_map) {
             vmaUnmapMemory(allocator, allocation);
-            mapped_ptr = nullptr;
+            explicit_map = false;
         }
+        mapped_ptr = nullptr;
         vmaFreeMemory(allocator, allocation);
     }
     allocation = nullptr;
@@ -184,6 +190,8 @@ void MemoryCommit::Release() {
     memory = VK_NULL_HANDLE;
     offset = 0;
     size = 0;
+    mapped_ptr = nullptr;
+    explicit_map = false;
 }
 
 MemoryAllocator::MemoryAllocator(const Device &device_)

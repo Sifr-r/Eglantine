@@ -66,6 +66,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.yuzu.yuzu_emu.HomeNavigationDirections
@@ -91,6 +92,7 @@ import org.yuzu.yuzu_emu.overlay.model.OverlayLayout
 import org.yuzu.yuzu_emu.utils.DirectoryInitialization
 import org.yuzu.yuzu_emu.utils.FileUtil
 import org.yuzu.yuzu_emu.utils.GameHelper
+import org.yuzu.yuzu_emu.utils.GameMetadata
 import org.yuzu.yuzu_emu.utils.GameIconUtils
 import org.yuzu.yuzu_emu.utils.GpuDriverHelper
 import org.yuzu.yuzu_emu.utils.InputHandler
@@ -151,6 +153,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
     private var socRunnable: Runnable? = null
     private var isAmiiboPickerOpen = false
     private var amiiboLoadJob: Job? = null
+    private var surfaceWaitJob: Job? = null
 
     private var wasInputOverlayAutoHidden = false
     private var overlayTouchActive = false
@@ -242,7 +245,7 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
             handleEmuReadyIntent(intent)
             return
         } else if (intentUri != null) {
-            intentGame = if (Game.extensions.contains(FileUtil.getExtension(intentUri))) {
+            intentGame = if (GameMetadata.gameExtensions.contains(FileUtil.getExtension(intentUri))) {
                 GameHelper.getGame(requireActivity().intent.data!!, false)
             } else {
                 null
@@ -1028,7 +1031,11 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
                         runnable
                     )
                 }
+                perfStatsRunnable = null
+                perfStatsUpdater = null
                 socRunnable?.let { runnable -> socUpdateHandler.removeCallbacks(runnable) }
+                socRunnable = null
+                socUpdater = null
                 emulationState.changeProgram(emulationViewModel.programChanged.value)
                 emulationViewModel.setProgramChanged(-1)
                 emulationViewModel.setEmulationStopped(false)
@@ -1478,8 +1485,14 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
         super.onDestroyView()
         amiiboLoadJob?.cancel()
         amiiboLoadJob = null
+        surfaceWaitJob?.cancel()
+        surfaceWaitJob = null
         perfStatsRunnable?.let { perfStatsUpdateHandler.removeCallbacks(it) }
+        perfStatsRunnable = null
+        perfStatsUpdater = null
         socRunnable?.let { socUpdateHandler.removeCallbacks(it) }
+        socRunnable = null
+        socUpdater = null
         handler.removeCallbacksAndMessages(null)
         clearPausedFrame()
         _binding?.surfaceInputOverlay?.touchEventListener = null
@@ -1527,6 +1540,10 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
 
     @SuppressLint("DefaultLocale")
     private fun updateShowStatsOverlay() {
+        perfStatsRunnable?.let { perfStatsUpdateHandler.removeCallbacks(it) }
+        perfStatsRunnable = null
+        perfStatsUpdater = null
+
         val showPerfOverlay = BooleanSetting.SHOW_PERFORMANCE_OVERLAY.getBoolean()
         binding.showStatsOverlayText.apply {
             setTextColor(
@@ -1646,12 +1663,18 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
 
                     binding.showStatsOverlayText.text = sb.toString()
                 }
-                perfStatsUpdateHandler.postDelayed(perfStatsRunnable!!, 800)
             }
-            perfStatsRunnable = Runnable { perfStatsUpdater?.invoke() }
-            perfStatsUpdateHandler.post(perfStatsRunnable!!)
-        } else {
-            perfStatsRunnable?.let { perfStatsUpdateHandler.removeCallbacks(it) }
+            val runnable = object : Runnable {
+                override fun run() {
+                    if (perfStatsRunnable !== this || _binding == null || !isAdded) {
+                        return
+                    }
+                    perfStatsUpdater?.invoke()
+                    perfStatsUpdateHandler.postDelayed(this, 800)
+                }
+            }
+            perfStatsRunnable = runnable
+            perfStatsUpdateHandler.post(runnable)
         }
     }
 
@@ -1714,6 +1737,10 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
     }
 
     private fun updateSocOverlay() {
+        socRunnable?.let { socUpdateHandler.removeCallbacks(it) }
+        socRunnable = null
+        socUpdater = null
+
         val showSOCOverlay = BooleanSetting.SHOW_SOC_OVERLAY.getBoolean()
         binding.showSocOverlayText.apply {
             setTextColor(
@@ -1796,13 +1823,18 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
                         binding.showSocOverlayText.setBackgroundResource(0)
                     }
                 }
-
-                socUpdateHandler.postDelayed(socRunnable!!, 1000)
             }
-            socRunnable = Runnable { socUpdater?.invoke() }
-            socUpdateHandler.post(socRunnable!!)
-        } else {
-            socRunnable?.let { socUpdateHandler.removeCallbacks(it) }
+            val runnable = object : Runnable {
+                override fun run() {
+                    if (socRunnable !== this || _binding == null || !isAdded) {
+                        return
+                    }
+                    socUpdater?.invoke()
+                    socUpdateHandler.postDelayed(this, 1000)
+                }
+            }
+            socRunnable = runnable
+            socUpdateHandler.post(runnable)
         }
     }
 
@@ -1920,6 +1952,9 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
         Log.debug("[EmulationFragment] Surface changed. Resolution: " + width + "x" + height)
+        if (_binding == null) {
+            return
+        }
         if (!emulationStarted) {
             emulationStarted = true
 
@@ -1928,11 +1963,11 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
                 if (!driverViewModel.isInteractionAllowed.value) {
                     Log.info("[EmulationFragment] Intent launch: waiting for driver initialization")
                     // Driver is still initializing, wait for it
-                    lifecycleScope.launch {
-                        driverViewModel.isInteractionAllowed.collect { allowed ->
-                            if (allowed && holder.surface.isValid) {
-                                emulationState.newSurface(holder.surface)
-                            }
+                    surfaceWaitJob?.cancel()
+                    surfaceWaitJob = viewLifecycleOwner.lifecycleScope.launch {
+                        driverViewModel.isInteractionAllowed.first { it }
+                        if (_binding != null && holder.surface.isValid) {
+                            emulationState.newSurface(holder.surface)
                         }
                     }
                     return
@@ -1949,6 +1984,8 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
+        surfaceWaitJob?.cancel()
+        surfaceWaitJob = null
         if (this::emulationState.isInitialized && !hasNewerEmulationFragment()) {
             emulationState.clearSurface()
         }
@@ -2486,8 +2523,8 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
     companion object {
         private val AMIIBO_MIME_TYPES =
             arrayOf("application/octet-stream", "application/x-binary", "*/*")
-        private val perfStatsUpdateHandler = Handler(Looper.myLooper()!!)
-        private val socUpdateHandler = Handler(Looper.myLooper()!!)
+        private val perfStatsUpdateHandler = Handler(Looper.getMainLooper())
+        private val socUpdateHandler = Handler(Looper.getMainLooper())
     }
 
     private fun startOverlayAutoHideTimer(seconds: Int) {

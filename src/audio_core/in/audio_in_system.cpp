@@ -116,14 +116,19 @@ Result System::Stop() {
 }
 
 bool System::AppendBuffer(const AudioInBuffer& buffer, const u64 tag) {
-    if (buffers.GetTotalBufferCount() == BufferCount) {
+    if (channel_count == 0 || buffers.GetTotalBufferCount() == BufferCount) {
+        return false;
+    }
+
+    const u64 frame_bytes = static_cast<u64>(channel_count) * sizeof(s16);
+    if (buffer.size > MaxDeviceBufferSize || buffer.size % frame_bytes != 0) {
         return false;
     }
 
     const auto timestamp{buffers.GetNextTimestamp()};
     const AudioBuffer new_buffer{
         .start_timestamp = timestamp,
-        .end_timestamp = timestamp + buffer.size / (channel_count * sizeof(s16)),
+        .end_timestamp = timestamp + buffer.size / frame_bytes,
         .played_timestamp = 0,
         .samples = buffer.samples,
         .tag = tag,

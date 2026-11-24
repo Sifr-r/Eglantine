@@ -7,14 +7,18 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <thread>
+
+#include <boost/container/small_vector.hpp>
 
 #include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_hardware_timer.h"
+#include "core/hle/kernel/k_light_lock.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_scoped_resource_reservation.h"
 #include "core/hle/kernel/k_thread.h"
@@ -300,14 +304,26 @@ Result GetThreadList(Core::System& system, s32* out_num_threads, u64 out_thread_
         R_THROW(ResultInvalidCurrentMemory);
     }
 
-    auto& memory = GetCurrentMemory(system.Kernel());
-    const auto& thread_list = current_process->GetThreadList();
-    const auto num_threads = thread_list.size();
-    const auto copy_amount = (std::min)(static_cast<std::size_t>(out_thread_ids_size), num_threads);
+    std::size_t num_threads{};
+    boost::container::small_vector<u64, 32> thread_ids;
+    {
+        KScopedLightLock lk{current_process->GetListLock()};
+        const auto& thread_list = current_process->GetThreadList();
+        num_threads = thread_list.size();
+        const auto copy_amount =
+            (std::min)(static_cast<std::size_t>(out_thread_ids_size), num_threads);
+        thread_ids.reserve(copy_amount);
 
-    auto list_iter = thread_list.cbegin();
-    for (std::size_t i = 0; i < copy_amount; ++i, ++list_iter) {
-        memory.Write64(out_thread_ids, list_iter->GetThreadId());
+        auto list_iter = thread_list.cbegin();
+        for (std::size_t i = 0; i < copy_amount && list_iter != thread_list.cend();
+             ++i, ++list_iter) {
+            thread_ids.push_back(list_iter->GetThreadId());
+        }
+    }
+
+    auto& memory = GetCurrentMemory(system.Kernel());
+    for (const u64 thread_id : thread_ids) {
+        memory.Write64(out_thread_ids, thread_id);
         out_thread_ids += sizeof(u64);
     }
 

@@ -38,8 +38,9 @@ template <const char* InvalidCharacterSet, size_t NumInvalidCharacters>
 consteval u64 MakeInvalidCharacterMask(size_t n) {
     u64 mask = 0;
     for (size_t i = 0; i < NumInvalidCharacters; ++i) {
-        if ((static_cast<u64>(InvalidCharacterSet[i]) >> 6) == n) {
-            mask |= static_cast<u64>(1) << (static_cast<u64>(InvalidCharacterSet[i]) & 0x3F);
+        const u64 uc = static_cast<u8>(InvalidCharacterSet[i]);
+        if ((uc >> 6) == n) {
+            mask |= static_cast<u64>(1) << (uc & 0x3F);
         }
     }
     return mask;
@@ -53,8 +54,8 @@ constexpr bool IsInvalidCharacterImpl(char c) {
         MakeInvalidCharacterMask<InvalidCharacterSet, NumInvalidCharacters>(2),
         MakeInvalidCharacterMask<InvalidCharacterSet, NumInvalidCharacters>(3)};
 
-    return (Masks[static_cast<u64>(c) >> 6] &
-            (static_cast<u64>(1) << (static_cast<u64>(c) & 0x3F))) != 0;
+    const u64 uc = static_cast<u8>(c);
+    return (Masks[uc >> 6] & (static_cast<u64>(1) << (uc & 0x3F))) != 0;
 }
 
 } // namespace impl

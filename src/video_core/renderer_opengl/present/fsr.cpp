@@ -71,8 +71,10 @@ GLuint FSR::Draw(ProgramManager& program_manager, GLuint texture, u32 input_imag
 
     FsrRcasCon(rcas_con.data(), sharpening);
 
-    glProgramUniform4uiv(easu_frag.handle, 0, sizeof(easu_con), easu_con.data());
-    glProgramUniform4uiv(rcas_frag.handle, 0, sizeof(rcas_con), rcas_con.data());
+    glProgramUniform4uiv(easu_frag.handle, 0, static_cast<GLsizei>(easu_con.size() / 4),
+                         easu_con.data());
+    glProgramUniform4uiv(rcas_frag.handle, 0, static_cast<GLsizei>(rcas_con.size() / 4),
+                         rcas_con.data());
 
     glFrontFace(GL_CW);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebuffer.handle);

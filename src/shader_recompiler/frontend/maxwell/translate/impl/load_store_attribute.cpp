@@ -74,19 +74,22 @@ void TranslatorVisitor::ALD(u64 insn) {
         BitField<47, 2, Size> size;
     } const ald{insn};
 
-    const u64 offset{ald.absolute_offset.Value()};
+    const s64 offset{ald.index_reg == IR::Reg::RZ
+                         ? static_cast<s64>(ald.absolute_offset.Value())
+                         : ald.relative_offset.Value()};
     if (offset % 4 != 0) {
-        throw NotImplementedException("Unaligned absolute offset {}", offset);
+        throw NotImplementedException("Unaligned attribute offset {}", offset);
     }
     const IR::U32 vertex{X(ald.vertex_reg)};
     const u32 num_elements{NumElements(ald.size)};
     if (ald.index_reg == IR::Reg::RZ) {
+        const u64 base_offset{static_cast<u64>(offset) / 4};
         for (u32 element = 0; element < num_elements; ++element) {
             if (ald.patch != 0) {
-                const IR::Patch patch{offset / 4 + element};
+                const IR::Patch patch{base_offset + element};
                 F(ald.dest_reg + static_cast<int>(element), ir.GetPatch(patch));
             } else {
-                const IR::Attribute attr{offset / 4 + element};
+                const IR::Attribute attr{base_offset + element};
                 F(ald.dest_reg + static_cast<int>(element), ir.GetAttribute(attr, vertex));
             }
         }
@@ -96,7 +99,10 @@ void TranslatorVisitor::ALD(u64 insn) {
         throw NotImplementedException("Indirect patch read");
     }
     HandleIndexed(*this, ald.index_reg, num_elements, [&](u32 element, IR::U32 final_offset) {
-        F(ald.dest_reg + static_cast<int>(element), ir.GetAttributeIndexed(final_offset, vertex));
+        const IR::U32 attr_offset{
+            offset == 0 ? final_offset
+                        : IR::U32{ir.IAdd(final_offset, ir.Imm32(static_cast<s32>(offset)))}};
+        F(ald.dest_reg + static_cast<int>(element), ir.GetAttributeIndexed(attr_offset, vertex));
     });
 }
 

@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <codecvt>
+#include <limits>
 #include <locale>
 #include <numeric>
 #include <optional>
@@ -51,6 +53,28 @@ constexpr char GDB_STUB_REPLY_EMPTY[] = "";
 static u8 CalculateChecksum(std::string_view data) {
     return std::accumulate(data.begin(), data.end(), u8{0},
                            [](u8 lhs, u8 rhs) { return static_cast<u8>(lhs + rhs); });
+}
+
+static bool ParseHexU64(std::string_view sv, u64& out) {
+    if (sv.empty()) {
+        return false;
+    }
+    u64 value{};
+    const auto [ptr, ec] = std::from_chars(sv.data(), sv.data() + sv.size(), value, 16);
+    if (ec != std::errc{} || ptr != sv.data() + sv.size()) {
+        return false;
+    }
+    out = value;
+    return true;
+}
+
+static bool ParseHexSizeT(std::string_view sv, size_t& out) {
+    u64 value{};
+    if (!ParseHexU64(sv, value) || value > (std::numeric_limits<size_t>::max)()) {
+        return false;
+    }
+    out = static_cast<size_t>(value);
+    return true;
 }
 
 static std::string EscapeGDB(std::string_view data) {
@@ -148,13 +172,19 @@ void GDBStub::ProcessData(std::vector<DebuggerAction>& actions) {
         SendStatus(GDB_STUB_ACK);
     // Otherwise, require the data to be the start of a command
     } else if (c != GDB_STUB_START) {
-        LOG_ERROR(Debug_GDBStub, "Invalid command buffer contents: {}", current_command.data());
+        LOG_ERROR(Debug_GDBStub, "Invalid command buffer contents: {}",
+                  std::string_view(current_command.data(), current_command.size()));
         current_command.clear();
         SendStatus(GDB_STUB_NACK);
     } else {
         // Continue reading until command is complete
         while (CommandEnd() == current_command.end()) {
             const auto new_data{backend.ReadFromClient()};
+            if (new_data.empty()) {
+                current_command.clear();
+                SendStatus(GDB_STUB_NACK);
+                return;
+            }
             current_command.insert(current_command.end(), new_data.begin(), new_data.end());
         }
         // Execute and respond to GDB
@@ -182,6 +212,10 @@ void GDBStub::ExecuteCommand(std::string_view packet, std::vector<DebuggerAction
 
     switch (packet[0]) {
     case 'H': {
+        if (command.empty()) {
+            SendReply(GDB_STUB_REPLY_ERR);
+            break;
+        }
         s64 thread_id = strtoll(command.data() + 1, nullptr, 16);
         Kernel::KThread* thread = thread_id >= 1 ? GetThreadByID(thread_id) : backend.GetActiveThread();
         if (thread) {
@@ -225,16 +259,26 @@ void GDBStub::ExecuteCommand(std::string_view packet, std::vector<DebuggerAction
         break;
     }
     case 'P': {
-        const auto sep = std::find(command.begin(), command.end(), '=') - command.begin() + 1;
-        const size_t reg = size_t(strtoll(command.data(), nullptr, 16));
-        arch->RegWrite(backend.GetActiveThread(), reg, std::string_view(command).substr(sep));
+        const auto sep = command.find('=');
+        size_t reg{};
+        if (sep == std::string_view::npos || !ParseHexSizeT(command.substr(0, sep), reg)) {
+            SendReply(GDB_STUB_REPLY_ERR);
+            break;
+        }
+        arch->RegWrite(backend.GetActiveThread(), reg, command.substr(sep + 1));
         SendReply(GDB_STUB_REPLY_OK);
         break;
     }
     case 'm': {
-        const auto sep{std::find(command.begin(), command.end(), ',') - command.begin() + 1};
-        const size_t addr = size_t(strtoll(command.data(), nullptr, 16));
-        const size_t size = size_t(strtoll(command.data() + sep, nullptr, 16));
+        const auto sep = command.find(',');
+        size_t addr{};
+        size_t size{};
+        if (sep == std::string_view::npos || !ParseHexSizeT(command.substr(0, sep), addr) ||
+            !ParseHexSizeT(command.substr(sep + 1), size) ||
+            !debug_process->GetMemory().IsValidVirtualAddressRange(addr, size)) {
+            SendReply(GDB_STUB_REPLY_ERR);
+            break;
+        }
 
         std::vector<u8> mem(size);
         if (debug_process->GetMemory().ReadBlock(addr, mem.data(), size)) {
@@ -248,7 +292,7 @@ void GDBStub::ExecuteCommand(std::string_view packet, std::vector<DebuggerAction
 
                 // Calculate how many bytes to write.
                 // The loop condition ensures output_offset < size.
-                const size_t n = std::min<size_t>(size - output_offset, sizeof(u32));
+                const size_t n = (std::min)(size - output_offset, sizeof(u32));
 
                 // Write the bytes to the output buffer.
                 std::memcpy(mem.data() + output_offset, &original_bytes, n);
@@ -261,14 +305,41 @@ void GDBStub::ExecuteCommand(std::string_view packet, std::vector<DebuggerAction
         break;
     }
     case 'M': {
-        const auto size_sep{std::find(command.begin(), command.end(), ',') - command.begin() + 1};
-        const auto mem_sep{std::find(command.begin(), command.end(), ':') - command.begin() + 1};
+        const auto size_sep = command.find(',');
+        if (size_sep == std::string_view::npos) {
+            SendReply(GDB_STUB_REPLY_ERR);
+            break;
+        }
+        const auto mem_sep = command.find(':', size_sep + 1);
+        if (mem_sep == std::string_view::npos) {
+            SendReply(GDB_STUB_REPLY_ERR);
+            break;
+        }
 
-        const size_t addr{size_t(strtoll(command.data(), nullptr, 16))};
-        const size_t size{size_t(strtoll(command.data() + size_sep, nullptr, 16))};
+        size_t addr{};
+        size_t size{};
+        if (!ParseHexSizeT(command.substr(0, size_sep), addr) ||
+            !ParseHexSizeT(command.substr(size_sep + 1, mem_sep - (size_sep + 1)), size)) {
+            SendReply(GDB_STUB_REPLY_ERR);
+            break;
+        }
 
-        const auto mem_substr{std::string_view(command).substr(mem_sep)};
+        const auto mem_substr = command.substr(mem_sep + 1);
+        const bool valid_hex =
+            size <= (std::numeric_limits<size_t>::max)() / 2 &&
+            mem_substr.size() == size * 2 &&
+            std::all_of(mem_substr.begin(), mem_substr.end(),
+                        [](char ch) { return std::isxdigit(static_cast<unsigned char>(ch)) != 0; });
+        if (!valid_hex) {
+            SendReply(GDB_STUB_REPLY_ERR);
+            break;
+        }
+
         const auto mem{Common::HexStringToVector(mem_substr, false)};
+        if (mem.size() != size) {
+            SendReply(GDB_STUB_REPLY_ERR);
+            break;
+        }
 
         if (debug_process->GetMemory().WriteBlock(addr, mem.data(), size)) {
             Core::InvalidateInstructionCacheRange(debug_process, addr, size);
@@ -307,14 +378,32 @@ enum class BreakpointType {
     AccessWatch = 4,
 };
 
-void GDBStub::HandleBreakpointInsert(std::string_view command) {
-    const auto type = BreakpointType(strtoll(command.data(), nullptr, 16));
-    const auto addr_sep = std::find(command.begin(), command.end(), ',') - command.begin() + 1;
-    const auto size_sep = std::find(command.begin() + addr_sep, command.end(), ',') - command.begin() + 1;
-    const size_t addr = size_t(strtoll(command.data() + addr_sep, nullptr, 16));
-    const size_t size = size_t(strtoll(command.data() + size_sep, nullptr, 16));
+static bool ParseBreakpointArgs(std::string_view sv, BreakpointType& out_type, size_t& out_addr,
+                                size_t& out_size) {
+    const auto addr_sep = sv.find(',');
+    if (addr_sep == std::string_view::npos) {
+        return false;
+    }
+    const auto size_sep = sv.find(',', addr_sep + 1);
+    if (size_sep == std::string_view::npos) {
+        return false;
+    }
+    size_t raw_type{};
+    if (!ParseHexSizeT(sv.substr(0, addr_sep), raw_type) ||
+        !ParseHexSizeT(sv.substr(addr_sep + 1, size_sep - (addr_sep + 1)), out_addr) ||
+        !ParseHexSizeT(sv.substr(size_sep + 1), out_size)) {
+        return false;
+    }
+    out_type = static_cast<BreakpointType>(raw_type);
+    return true;
+}
 
-    if (!debug_process->GetMemory().IsValidVirtualAddressRange(addr, size)) {
+void GDBStub::HandleBreakpointInsert(std::string_view command) {
+    BreakpointType type{};
+    size_t addr{};
+    size_t size{};
+    if (!ParseBreakpointArgs(command, type, addr, size) ||
+        !debug_process->GetMemory().IsValidVirtualAddressRange(addr, size)) {
         SendReply(GDB_STUB_REPLY_ERR);
         return;
     }
@@ -351,13 +440,11 @@ void GDBStub::HandleBreakpointInsert(std::string_view command) {
 }
 
 void GDBStub::HandleBreakpointRemove(std::string_view sv) {
-    const auto type = BreakpointType(strtoll(sv.data(), nullptr, 16));
-    const auto addr_sep = std::find(sv.begin(), sv.end(), ',') - sv.begin() + 1;
-    const auto size_sep = std::find(sv.begin() + addr_sep, sv.end(), ',') - sv.begin() + 1;
-    const size_t addr = size_t(strtoll(sv.data() + addr_sep, nullptr, 16));
-    const size_t size = size_t(strtoll(sv.data() + size_sep, nullptr, 16));
-
-    if (!debug_process->GetMemory().IsValidVirtualAddressRange(addr, size)) {
+    BreakpointType type{};
+    size_t addr{};
+    size_t size{};
+    if (!ParseBreakpointArgs(sv, type, addr, size) ||
+        !debug_process->GetMemory().IsValidVirtualAddressRange(addr, size)) {
         SendReply(GDB_STUB_REPLY_ERR);
         return;
     }
@@ -396,15 +483,24 @@ void GDBStub::HandleBreakpointRemove(std::string_view sv) {
 }
 
 static std::string PaginateBuffer(std::string_view buffer, std::string_view request) {
-    const auto amount{request.substr(request.find(',') + 1)};
-    const auto offset_val{static_cast<u64>(strtoll(request.data(), nullptr, 16))};
-    const auto amount_val{static_cast<u64>(strtoll(amount.data(), nullptr, 16))};
-
-    if (offset_val + amount_val > buffer.size()) {
-        return fmt::format("l{}", buffer.substr(offset_val));
-    } else {
-        return fmt::format("m{}", buffer.substr(offset_val, amount_val));
+    const auto sep = request.find(',');
+    u64 offset_val{};
+    u64 amount_val{};
+    if (sep == std::string_view::npos || !ParseHexU64(request.substr(0, sep), offset_val) ||
+        !ParseHexU64(request.substr(sep + 1), amount_val)) {
+        return GDB_STUB_REPLY_ERR;
     }
+
+    if (offset_val >= buffer.size()) {
+        return "l";
+    }
+
+    const auto offset = static_cast<size_t>(offset_val);
+    const size_t remaining = buffer.size() - offset;
+    if (amount_val > remaining) {
+        return fmt::format("l{}", buffer.substr(offset));
+    }
+    return fmt::format("m{}", buffer.substr(offset, static_cast<size_t>(amount_val)));
 }
 
 void GDBStub::HandleQuery(std::string_view sv) {
@@ -660,7 +756,7 @@ static constexpr const char* GetMemoryPermissionString(const Kernel::Svc::Memory
 }
 
 void GDBStub::HandleRcmd(const std::vector<u8>& command) {
-    std::string_view command_str{reinterpret_cast<const char*>(&command[0]), command.size()};
+    std::string_view command_str{reinterpret_cast<const char*>(command.data()), command.size()};
     std::string reply;
     auto& page_table = debug_process->GetPageTable();
     if (command_str == "fastmem" || command_str == "get fastmem") {
@@ -759,7 +855,7 @@ void GDBStub::HandleRcmd(const std::vector<u8>& command) {
         reply += "Commands: fastmem, info, mappings, handles\n";
     }
 
-    std::span<const u8> reply_span{reinterpret_cast<u8*>(&reply.front()), reply.size()};
+    std::span<const u8> reply_span{reinterpret_cast<const u8*>(reply.data()), reply.size()};
     SendReply(Common::HexToString(reply_span, false));
 }
 
@@ -774,23 +870,30 @@ Kernel::KThread* GDBStub::GetThreadByID(u64 thread_id) {
 std::vector<char>::const_iterator GDBStub::CommandEnd() const {
     // Find the end marker
     const auto end = std::find(current_command.begin(), current_command.end(), GDB_STUB_END);
-    // Require the checksum to be present
-    return (std::min)(end + 2, current_command.end());
+    // Require '#' and the two checksum bytes to be present
+    if (current_command.end() - end > 2) {
+        return end + 2;
+    }
+    return current_command.end();
 }
 
 std::optional<std::string> GDBStub::DetachCommand() {
     // Slice the string part from the beginning to the end marker
     const auto end{CommandEnd()};
+    if (end == current_command.end()) {
+        return std::nullopt;
+    }
 
     // Extract possible command data
-    std::string data(current_command.data(), end - current_command.begin() + 1);
+    std::string data(current_command.data(),
+                     static_cast<size_t>(end - current_command.begin() + 1));
 
     // Shift over the remaining contents
     current_command.erase(current_command.begin(), end + 1);
 
     // Validate received command
-    if (data[0] != GDB_STUB_START) {
-        LOG_ERROR(Debug_GDBStub, "Invalid start data: {}", data[0]);
+    if (data.size() < 4 || data[0] != GDB_STUB_START) {
+        LOG_ERROR(Debug_GDBStub, "Invalid start data: {}", data.empty() ? '?' : data[0]);
         return std::nullopt;
     }
 

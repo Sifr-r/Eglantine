@@ -17,7 +17,7 @@ void CircularBufferSinkCommand::Dump(
     string += fmt::format(
         "CircularBufferSinkCommand\n\tinput_count {} ring size {:04X} ring pos {:04X}\n\tinputs: ",
         input_count, size, pos);
-    for (u32 i = 0; i < input_count; i++) {
+    for (u32 i = 0; i < (std::min)(input_count, static_cast<u32>(MaxChannels)); i++) {
         string += fmt::format("{:02X}, ", inputs[i]);
     }
     string += "\n";
@@ -27,17 +27,35 @@ void CircularBufferSinkCommand::Process(const AudioRenderer::CommandListProcesso
     constexpr s32 min{(std::numeric_limits<s16>::min)()};
     constexpr s32 max{(std::numeric_limits<s16>::max)()};
 
+    if (input_count == 0 || input_count > MaxChannels || address == 0 ||
+        processor.sample_count > TargetSampleCount * MaxChannels) {
+        return;
+    }
+
+    const size_t write_bytes{processor.sample_count * sizeof(s16)};
+    if (size < write_bytes) {
+        return;
+    }
+
     std::array<s16, TargetSampleCount * MaxChannels> output{};
     for (u32 channel = 0; channel < input_count; channel++) {
+        if (inputs[channel] < 0 ||
+            static_cast<size_t>(inputs[channel] + 1) * processor.sample_count >
+                processor.mix_buffers.size()) {
+            continue;
+        }
+        if (pos > size - write_bytes) {
+            pos = 0;
+        }
+
         auto input{processor.mix_buffers.subspan(inputs[channel] * processor.sample_count,
                                                  processor.sample_count)};
         for (u32 sample_index = 0; sample_index < processor.sample_count; sample_index++) {
             output[sample_index] = static_cast<s16>(std::clamp(input[sample_index], min, max));
         }
 
-        processor.memory->WriteBlockUnsafe(address + pos, output.data(),
-                                           processor.sample_count * sizeof(s16));
-        pos += static_cast<u32>(processor.sample_count * sizeof(s16));
+        processor.memory->WriteBlockUnsafe(address + pos, output.data(), write_bytes);
+        pos += static_cast<u32>(write_bytes);
         if (pos >= size) {
             pos = 0;
         }

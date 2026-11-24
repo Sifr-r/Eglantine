@@ -8,10 +8,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <limits>
+#include <ranges>
 #include "common/algorithm.h"
 #include "common/assert.h"
 #include "common/logging.h"
-#include <ranges>
 #include "common/settings.h"
 #include "core/core.h"
 #include "video_core/engines/maxwell_3d.h"
@@ -40,6 +41,10 @@ void MaxwellDMA::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
 
 void MaxwellDMA::ConsumeSinkImpl(Core::System& system) {
     for (auto [method, value] : method_sink) {
+        if (method >= NUM_REGS) {
+            LOG_DEBUG(HW_GPU, "Ignoring MaxwellDMA method {:#x} past the register file", method);
+            continue;
+        }
         regs.reg_array[method] = value;
     }
     method_sink.clear();
@@ -253,7 +258,12 @@ void MaxwellDMA::CopyBlockLinearToPitch() {
     const size_t src_size =
         CalculateSize(true, bytes_per_pixel, width, height, depth, block_height, block_depth);
 
-    const size_t dst_size = dst_operand.pitch * regs.line_count;
+    const u64 dst_size_u64 = static_cast<u64>(dst_operand.pitch) * regs.line_count;
+    if (regs.pitch_out <= 0 || regs.line_count == 0 || src_size == 0 || dst_size_u64 == 0 ||
+        dst_size_u64 > (std::numeric_limits<size_t>::max)()) {
+        return;
+    }
+    const size_t dst_size = static_cast<size_t>(dst_size_u64);
 
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::SafeRead> tmp_read_buffer(
         memory_manager, src_operand.address, src_size, &read_buffer);
@@ -268,6 +278,9 @@ void MaxwellDMA::CopyBlockLinearToPitch() {
 void MaxwellDMA::CopyPitchToBlockLinear() {
     UNIMPLEMENTED_IF_MSG(regs.dst_params.block_size.width != 0, "Block width is not one");
     UNIMPLEMENTED_IF(regs.dst_params.layer != 0);
+    if (regs.pitch_in <= 0 || regs.line_count == 0) {
+        return;
+    }
 
     const bool is_remapping = regs.launch_dma.remap_enable != 0;
     const u32 num_remap_components = regs.remap_const.num_dst_components_minus_one + 1;
@@ -279,7 +292,7 @@ void MaxwellDMA::CopyPitchToBlockLinear() {
     dst_operand.params = regs.dst_params;
     dst_operand.address = regs.offset_out;
     DMA::BufferOperand src_operand;
-    src_operand.pitch = regs.pitch_in;
+    src_operand.pitch = static_cast<u32>(regs.pitch_in);
     src_operand.width = regs.line_length_in;
     src_operand.height = regs.line_count;
     src_operand.address = regs.offset_in;
@@ -315,7 +328,12 @@ void MaxwellDMA::CopyPitchToBlockLinear() {
     const u32 block_depth = dst_params.block_size.depth;
     const size_t dst_size =
         CalculateSize(true, bytes_per_pixel, width, height, depth, block_height, block_depth);
-    const size_t src_size = static_cast<size_t>(regs.pitch_in) * regs.line_count;
+    const u64 src_size_u64 = static_cast<u64>(static_cast<u32>(regs.pitch_in)) * regs.line_count;
+    if (dst_size == 0 || src_size_u64 == 0 ||
+        src_size_u64 > (std::numeric_limits<size_t>::max)()) {
+        return;
+    }
+    const size_t src_size = static_cast<size_t>(src_size_u64);
 
     GPUVAddr src_addr = regs.offset_in;
     GPUVAddr dst_addr = regs.offset_out;
@@ -327,7 +345,7 @@ void MaxwellDMA::CopyPitchToBlockLinear() {
     //  If the input is linear and the output is tiled, swizzle the input and copy it over.
     SwizzleSubrect(tmp_write_buffer, tmp_read_buffer, bytes_per_pixel, width, height, depth,
                    x_offset, dst_params.origin.y, x_elements, regs.line_count, block_height,
-                   block_depth, regs.pitch_in, memory_manager.UsesNativeTiling());
+                   block_depth, static_cast<u32>(regs.pitch_in), memory_manager.UsesNativeTiling());
 }
 
 void MaxwellDMA::CopyBlockLinearToBlockLinear() {
@@ -362,14 +380,26 @@ void MaxwellDMA::CopyBlockLinearToBlockLinear() {
         dst_x_offset >>= bpp_shift;
     }
 
+    if (regs.line_count == 0) {
+        return;
+    }
     const u32 bytes_per_pixel = base_bpp << bpp_shift;
     const size_t src_size = CalculateSize(true, bytes_per_pixel, src_width, src.height, src.depth,
                                           src.block_size.height, src.block_size.depth);
     const size_t dst_size = CalculateSize(true, bytes_per_pixel, dst_width, dst.height, dst.depth,
                                           dst.block_size.height, dst.block_size.depth);
 
-    const u32 pitch = x_elements * bytes_per_pixel;
-    const size_t mid_buffer_size = pitch * regs.line_count;
+    const u64 pitch_u64 = static_cast<u64>(x_elements) * bytes_per_pixel;
+    if (src_size == 0 || dst_size == 0 || pitch_u64 == 0 ||
+        pitch_u64 > (std::numeric_limits<u32>::max)()) {
+        return;
+    }
+    const u32 pitch = static_cast<u32>(pitch_u64);
+    const u64 mid_buffer_size_u64 = pitch_u64 * regs.line_count;
+    if (mid_buffer_size_u64 > (std::numeric_limits<size_t>::max)()) {
+        return;
+    }
+    const size_t mid_buffer_size = static_cast<size_t>(mid_buffer_size_u64);
 
     intermediate_buffer.resize_destructive(mid_buffer_size);
 

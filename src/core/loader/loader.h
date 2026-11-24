@@ -55,6 +55,15 @@ enum class FileType {
     DeconstructedRomDirectory,
 };
 
+enum class FileExtensionUse {
+    DesktopGame,
+    AndroidGame,
+    AndroidExternalContent,
+};
+
+/// Returns lowercase extensions without a leading dot for the requested frontend use.
+std::vector<std::string> GetFileExtensions(FileExtensionUse use);
+
 /**
  * Identifies the type of a supported file/container based on its structure.
  * @param file open file

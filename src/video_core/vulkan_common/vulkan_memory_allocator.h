@@ -88,6 +88,7 @@ namespace Vulkan {
         VkDeviceSize offset{};      ///< Offset of this allocation inside VkDeviceMemory
         VkDeviceSize size{};        ///< Size of the allocation
         void *mapped_ptr{};  ///< Optional persistent mapped pointer
+        bool explicit_map{}; ///< True if mapped_ptr was mapped via vmaMapMemory
     };
 
 /// Memory allocator container.

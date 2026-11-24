@@ -95,6 +95,7 @@ bool ProfileManager::RemoveProfileAtIndex(std::size_t index) {
     profiles[index] = ProfileInfo{};
     std::stable_partition(profiles.begin(), profiles.end(),
                           [](const ProfileInfo& profile) { return profile.user_uuid.IsValid(); });
+    --user_count;
 
     is_save_needed = true;
     WriteUserSaveFile();
@@ -599,9 +600,9 @@ std::vector<std::string> ProfileManager::FindOrphanedProfiles()
                         if (file.is_regular_file() || Common::FS::IsSymlink(file.path()))
                             return false;
                     }
-                } catch (const fs::filesystem_error& e) {
+                } catch (const fs::filesystem_error&) {
                     // if we get an error--no worries, just pretend it's not empty
-                    return true;
+                    return false;
                 }
 
                 return true;

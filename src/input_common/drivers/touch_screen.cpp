@@ -90,7 +90,7 @@ void TouchScreen::ClearActiveFlag() {
 
 void TouchScreen::ReleaseInactiveTouch() {
     for (const auto& finger : fingers) {
-        if (!finger.is_active) {
+        if (finger.is_enabled && !finger.is_active) {
             TouchReleased(finger.finger_id);
         }
     }

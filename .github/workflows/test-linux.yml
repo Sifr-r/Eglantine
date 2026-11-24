@@ -84,13 +84,15 @@ jobs:
 
       - name: Decide cache saving
         shell: bash
+        env:
+          SAVE_CACHE: ${{ inputs.save_cache }}
         run: |
           set -euo pipefail
           save=false
-          if [ '${{ inputs.save_cache }}' = 'true' ] ||
-             [ '${{ github.ref }}' = 'refs/heads/nx2' ] ||
-             { [ '${{ github.event_name }}' = 'push' ] &&
-               [ '${{ github.ref }}' = 'refs/heads/nx2-experimental' ]; }; then
+          if [ "$SAVE_CACHE" = 'true' ] ||
+             [ "$GITHUB_REF" = 'refs/heads/nx2' ] ||
+             { [ "$GITHUB_EVENT_NAME" = 'push' ] &&
+               [ "$GITHUB_REF" = 'refs/heads/nx2-experimental' ]; }; then
             save=true
           fi
           echo "CACHE_SAVE=$save" >> "$GITHUB_ENV"
@@ -144,7 +146,7 @@ jobs:
             libboost-fiber-dev libboost-context-dev libopus-dev libasound2-dev
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: Cache Rust build artifacts (restore and save)
         if: env.CACHE_SAVE == 'true'

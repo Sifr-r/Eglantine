@@ -498,8 +498,13 @@ std::pair<VkBuffer, VkDeviceSize> QuadIndexedPass::Assemble(
         ASSERT(false);
         return 2;
     }();
+    const u32 num_quads =
+        is_strip ? (num_vertices >= 4 ? (num_vertices - 2) / 2 : 0) : (num_vertices / 4);
+    if (num_quads == 0) {
+        return {VK_NULL_HANDLE, 0};
+    }
     const u32 input_size = num_vertices << index_shift;
-    const u32 num_tri_vertices = (is_strip ? (num_vertices - 2) / 2 : num_vertices / 4) * 6;
+    const u32 num_tri_vertices = num_quads * 6;
 
     const std::size_t staging_size = num_tri_vertices * sizeof(u32);
     const auto staging = staging_buffer_pool.Request(staging_size, MemoryUsage::DeviceLocal);
@@ -1074,7 +1079,6 @@ void BlockLinearUnswizzle3DPass::UnswizzleChunk(
                                            image.compute_unswizzle_buffer_size);
 
     const void* descriptor_data = compute_pass_descriptor_queue.UpdateData();
-    const VkDescriptorSet set = descriptor_allocator.Commit();
 
     const u32 gx = Common::DivCeil(blocks_x, 8u);
     const u32 gy = Common::DivCeil(blocks_y, 8u);
@@ -1085,16 +1089,18 @@ void BlockLinearUnswizzle3DPass::UnswizzleChunk(
         static_cast<VkDeviceSize>(blocks_x) * blocks_y * bytes_per_block;
     const VkDeviceSize barrier_size = output_slice_size * z_count;
 
-    const bool is_first_chunk = (z_start == 0);
-
     const VkBuffer out_buffer = *image.compute_unswizzle_buffer;
     const VkImage dst_image = image.Handle();
+    const bool is_initialized =
+        (dst_image != VK_NULL_HANDLE && out_buffer != VK_NULL_HANDLE)
+            ? image.ExchangeInitialization()
+            : false;
     const VkImageAspectFlags aspect = image.AspectMask();
     const u32 image_width = image.info.size.width;
     const u32 image_height = image.info.size.height;
 
-    scheduler.Record([this, set, descriptor_data, pc, gx, gy, gz, z_start, z_count,
-                      barrier_size, is_first_chunk, out_buffer, dst_image, aspect,
+    scheduler.Record([this, descriptor_data, pc, gx, gy, gz, z_start, z_count,
+                      barrier_size, is_initialized, out_buffer, dst_image, aspect,
                       image_width, image_height
                       ](vk::CommandBuffer cmdbuf) {
 
@@ -1102,6 +1108,7 @@ void BlockLinearUnswizzle3DPass::UnswizzleChunk(
             return;
         }
 
+        const VkDescriptorSet set = descriptor_allocator.Commit();
         device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, descriptor_data);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
         cmdbuf.BindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE, *layout, 0, set, {});
@@ -1125,11 +1132,15 @@ void BlockLinearUnswizzle3DPass::UnswizzleChunk(
         const VkImageMemoryBarrier pre_barrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
-            .srcAccessMask = is_first_chunk ? VkAccessFlags{} :
-                            static_cast<VkAccessFlags>(VK_ACCESS_TRANSFER_WRITE_BIT),
+            .srcAccessMask = is_initialized
+                                 ? VkAccessFlags{VK_ACCESS_SHADER_WRITE_BIT |
+                                                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                                 VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                                 VK_ACCESS_TRANSFER_WRITE_BIT}
+                                 : VkAccessFlags{},
             .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .oldLayout = is_first_chunk ? VK_IMAGE_LAYOUT_UNDEFINED :
-                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            .oldLayout =
+                is_initialized ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED,
             .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -1139,7 +1150,8 @@ void BlockLinearUnswizzle3DPass::UnswizzleChunk(
 
         // Single barrier handles both buffer and image
         cmdbuf.PipelineBarrier(
-            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            is_initialized ? vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER
+                           : VkPipelineStageFlags{VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT},
             VK_PIPELINE_STAGE_TRANSFER_BIT,
             0,
             nullptr, buffer_barrier, pre_barrier
@@ -1162,7 +1174,8 @@ void BlockLinearUnswizzle3DPass::UnswizzleChunk(
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                             VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -1173,7 +1186,8 @@ void BlockLinearUnswizzle3DPass::UnswizzleChunk(
 
         cmdbuf.PipelineBarrier(
             VK_PIPELINE_STAGE_TRANSFER_BIT,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
             0,
             nullptr, nullptr, post_barrier
         );

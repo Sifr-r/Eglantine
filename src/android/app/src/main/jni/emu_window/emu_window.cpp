@@ -23,26 +23,40 @@
 #include "jni/emu_window/emu_window.h"
 #include "jni/native.h"
 
+void EmuWindow_Android::ResetSurfaceState() {
+    m_window_width = 0.0f;
+    m_window_height = 0.0f;
+    window_info.render_surface = nullptr;
+    m_last_frame_rate_hint = -1.0f;
+    m_pending_frame_rate_hint = -1.0f;
+    m_pending_frame_rate_hint_votes = 0;
+    m_smoothed_present_rate = 0.0f;
+    m_last_frame_display_time = Clock::time_point{};
+    m_pending_frame_rate_since = Clock::time_point{};
+}
+
 void EmuWindow_Android::OnSurfaceChanged(ANativeWindow* surface) {
+    std::scoped_lock lock{m_surface_mutex};
     if (!surface) {
         LOG_INFO(Frontend, "EmuWindow_Android::OnSurfaceChanged received null surface");
-        m_window_width = 0;
-        m_window_height = 0;
-        window_info.render_surface = nullptr;
-        m_last_frame_rate_hint = -1.0f;
-        m_pending_frame_rate_hint = -1.0f;
-        m_pending_frame_rate_hint_votes = 0;
-        m_smoothed_present_rate = 0.0f;
-        m_last_frame_display_time = {};
-        m_pending_frame_rate_since = {};
+        ResetSurfaceState();
         return;
     }
 
-    m_window_width = ANativeWindow_getWidth(surface);
-    m_window_height = ANativeWindow_getHeight(surface);
+    const int32_t width = ANativeWindow_getWidth(surface);
+    const int32_t height = ANativeWindow_getHeight(surface);
+    if (width <= 0 || height <= 0) {
+        LOG_WARNING(Frontend, "EmuWindow_Android::OnSurfaceChanged invalid surface dimensions: {}x{}",
+                    width, height);
+        ResetSurfaceState();
+        return;
+    }
+
+    m_window_width = static_cast<float>(width);
+    m_window_height = static_cast<float>(height);
 
     // Ensures that we emulate with the correct aspect ratio.
-    UpdateCurrentFramebufferLayout(m_window_width, m_window_height);
+    UpdateCurrentFramebufferLayout(static_cast<u32>(width), static_cast<u32>(height));
 
     window_info.render_surface = reinterpret_cast<void*>(surface);
     UpdateFrameRateHint();
@@ -65,13 +79,21 @@ void EmuWindow_Android::OnTouchReleased(int id) {
 }
 
 void EmuWindow_Android::OnFrameDisplayed() {
-    UpdateObservedFrameRate();
-    UpdateFrameRateHint();
+    bool emit_started = false;
+    {
+        std::scoped_lock lock{m_surface_mutex};
+        UpdateObservedFrameRate();
+        UpdateFrameRateHint();
 
-    if (!m_first_frame) {
+        if (!m_first_frame) {
+            m_first_frame = true;
+            emit_started = true;
+        }
+    }
+
+    if (emit_started) {
         Common::Android::RunJNIOnFiber<void>(
             [&](JNIEnv* env) { EmulationSession::GetInstance().OnEmulationStarted(); });
-        m_first_frame = true;
     }
 }
 

@@ -14,6 +14,7 @@
 #include <deque>
 #include <mutex>
 #include <regex>
+#include <string_view>
 #include <thread>
 
 #if defined(__ANDROID__)
@@ -231,21 +232,44 @@ struct ColorConsoleBackend final : public Backend {
                 }
             }();
             auto const df = GetDirectFormatArgs(entry);
-            // more restrictive, because take for example this simple prelude:
-            // [  50.872256] Config <Info> common/settings.cpp:142:LogSettings:
-            char buffer[256];
-            auto result = fmt::format_to_n(buffer, sizeof(buffer) - 1, "\x1b{}[{:4d}.{:06d}] {} <{}> {}:{}:{}: ", color_str, df.time_seconds, df.time_fractional, df.class_name, df.level_name, entry.filename, entry.line_num, entry.function, entry.message);
-            std::fwrite(buffer, 1, (std::min)(sizeof(buffer) - 1, result.size), stdout);
-            std::fwrite(entry.message, 1, entry.message_len, stdout);
-            std::fwrite("\x1b[0m\n", 1, sizeof("\x1b[0m\n"), stdout);
+            try {
+                fmt::memory_buffer line;
+                fmt::format_to(fmt::appender(line), "\x1b{}[{:4d}.{:06d}] {} <{}> {}:{}:{}: ",
+                               color_str, df.time_seconds, df.time_fractional, df.class_name,
+                               df.level_name, entry.filename, entry.line_num, entry.function);
+                if (entry.message != nullptr && entry.message_len > 0) {
+                    line.append(entry.message, entry.message + entry.message_len);
+                }
+                constexpr std::string_view reset_suffix = "\x1b[0m\n";
+                line.append(reset_suffix.begin(), reset_suffix.end());
+                std::scoped_lock lock{mutex};
+                std::fwrite(line.data(), 1, line.size(), stdout);
+            } catch (const std::exception&) {
+                // Out of memory: drop the line rather than terminating in noexcept Write.
+            }
         }
     }
     void Flush() noexcept override {}
+    std::mutex mutex;
     std::atomic_bool enabled = false;
 #endif
 };
 
 #ifndef __OPENORBIS__
+thread_local bool file_backend_active = false;
+
+struct FileBackendReentrancyGuard {
+    explicit FileBackendReentrancyGuard(bool& flag_) noexcept : flag{flag_} {
+        flag = true;
+    }
+    ~FileBackendReentrancyGuard() {
+        flag = false;
+    }
+    FileBackendReentrancyGuard(const FileBackendReentrancyGuard&) = delete;
+    FileBackendReentrancyGuard& operator=(const FileBackendReentrancyGuard&) = delete;
+    bool& flag;
+};
+
 /// @brief Backend that writes to a file passed into the constructor
 struct FileBackend final : public Backend {
     explicit FileBackend(const std::filesystem::path filename) noexcept {
@@ -260,7 +284,7 @@ struct FileBackend final : public Backend {
     ~FileBackend() noexcept override = default;
 
     void Write(const Entry& entry) noexcept override {
-        if (!enabled)
+        if (file_backend_active || !enabled.load(std::memory_order_relaxed))
             return;
 
         auto message = FormatLogMessage(entry);
@@ -281,6 +305,11 @@ struct FileBackend final : public Backend {
                 boost::replace_all(message, username, "user");
         }
 #endif
+        FileBackendReentrancyGuard guard{file_backend_active};
+        std::scoped_lock lock{mutex};
+        if (!enabled.load(std::memory_order_relaxed))
+            return;
+
         bytes_written += file->WriteSpan(std::span<const char>{message.begin(), message.end()});
 
         // Option to log each line rather than 4k buffers
@@ -295,18 +324,23 @@ struct FileBackend final : public Backend {
             // Stop writing after the write limit is exceeded.
             // Don't close the file so we can print a stacktrace if necessary
             if (write_limit_exceeded)
-                enabled = false;
+                enabled.store(false, std::memory_order_relaxed);
             file->Flush();
         }
     }
 
     void Flush() noexcept override {
+        if (file_backend_active)
+            return;
+        FileBackendReentrancyGuard guard{file_backend_active};
+        std::scoped_lock lock{mutex};
         file->Flush();
     }
 private:
     std::optional<FS::IOFile> file;
+    std::mutex mutex;
     std::size_t bytes_written = 0;
-    bool enabled = true;
+    std::atomic_bool enabled = true;
 };
 #endif
 /// @brief Backend that keeps the last lines in memory, off unless the debug server turns it on

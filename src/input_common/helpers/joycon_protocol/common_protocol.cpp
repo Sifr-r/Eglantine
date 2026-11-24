@@ -47,6 +47,11 @@ Common::Input::DriverResult JoyconCommonProtocol::CheckDeviceAccess(
         return Common::Input::DriverResult::UnsupportedControllerType;
     }
 
+    if (hidapi_handle->handle != nullptr) {
+        SDL_hid_close(hidapi_handle->handle);
+        hidapi_handle->handle = nullptr;
+    }
+
     hidapi_handle->handle =
         SDL_hid_open(device_info->vendor_id, device_info->product_id, device_info->serial_number);
 
@@ -80,18 +85,20 @@ Common::Input::DriverResult JoyconCommonProtocol::GetSubCommandResponse(
     constexpr int timeout_mili = 66;
     constexpr int MaxTries = 10;
     int tries = 0;
+    int result = 0;
 
     do {
-        int result = SDL_hid_read_timeout(hidapi_handle->handle, reinterpret_cast<u8*>(&output),
-                                          sizeof(SubCommandResponse), timeout_mili);
+        if (tries++ > MaxTries) {
+            return Common::Input::DriverResult::Timeout;
+        }
+        output = SubCommandResponse{};
+        result = SDL_hid_read_timeout(hidapi_handle->handle, reinterpret_cast<u8*>(&output),
+                                      sizeof(SubCommandResponse), timeout_mili);
 
         if (result < 1) {
             LOG_ERROR(Input, "No response from joycon");
         }
-        if (tries++ > MaxTries) {
-            return Common::Input::DriverResult::Timeout;
-        }
-    } while (output.input_report.report_mode != ReportMode::SUBCMD_REPLY &&
+    } while (result < 1 || output.input_report.report_mode != ReportMode::SUBCMD_REPLY ||
              output.sub_command != sc);
 
     return Common::Input::DriverResult::Success;
@@ -226,18 +233,20 @@ Common::Input::DriverResult JoyconCommonProtocol::GetMCUDataResponse(ReportMode 
     constexpr int TimeoutMili = 200;
     constexpr int MaxTries = 9;
     int tries = 0;
+    int result = 0;
 
     do {
-        int result = SDL_hid_read_timeout(hidapi_handle->handle, reinterpret_cast<u8*>(&output),
-                                          sizeof(MCUCommandResponse), TimeoutMili);
+        if (tries++ > MaxTries) {
+            return Common::Input::DriverResult::Timeout;
+        }
+        output = MCUCommandResponse{};
+        result = SDL_hid_read_timeout(hidapi_handle->handle, reinterpret_cast<u8*>(&output),
+                                      sizeof(MCUCommandResponse), TimeoutMili);
 
         if (result < 1) {
             LOG_ERROR(Input, "No response from joycon attempt {}", tries);
         }
-        if (tries++ > MaxTries) {
-            return Common::Input::DriverResult::Timeout;
-        }
-    } while (output.input_report.report_mode != report_mode ||
+    } while (result < 1 || output.input_report.report_mode != report_mode ||
              output.mcu_report == MCUReport::EmptyAwaitingCmd);
 
     return Common::Input::DriverResult::Success;
@@ -268,7 +277,7 @@ Common::Input::DriverResult JoyconCommonProtocol::SendMCUData(ReportMode report_
 
     result = GetMCUDataResponse(report_mode, output);
 
-    return Common::Input::DriverResult::Success;
+    return result;
 }
 
 Common::Input::DriverResult JoyconCommonProtocol::WaitSetMCUMode(ReportMode report_mode,

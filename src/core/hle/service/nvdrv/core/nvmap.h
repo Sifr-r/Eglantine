@@ -76,6 +76,7 @@ public:
         bool allocated{}; //!< If the handle has been allocated with `Alloc`
         bool in_heap{};
         NvCore::SessionId session_id{};
+        NvCore::Container::HeapMapperId heap_mapper_id{};
 
         DAddr d_address{}; //!< The memory location in the device's AS that this handle corresponds
                            //!< to, this can also be in the nvdrv tmem
@@ -116,6 +117,7 @@ public:
         u64 size;          //!< Page-aligned handle size
         bool was_uncached; //!< If the handle was allocated as uncached
         bool can_unlock;   //!< If the address region is ready to be unlocked
+        NvCore::SessionId session_id{};
     };
 
     explicit NvMap(Container& core, Tegra::Host1x::Host1x& host1x);

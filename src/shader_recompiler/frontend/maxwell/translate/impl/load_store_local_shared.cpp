@@ -207,7 +207,7 @@ void TranslatorVisitor::STS(u64 insn) {
         ir.WriteShared(64, offset, ir.CompositeConstruct(X(reg), X(reg + 1)));
         break;
     case 128: {
-        if (!IR::IsAligned(reg, 2)) {
+        if (!IR::IsAligned(reg, 4)) {
             throw NotImplementedException("Unaligned source register {}", reg);
         }
         const IR::Value vector{ir.CompositeConstruct(X(reg), X(reg + 1), X(reg + 2), X(reg + 3))};

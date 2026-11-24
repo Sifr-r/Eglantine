@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <stop_token>
 
 namespace AudioCore {
 /**
@@ -44,6 +45,14 @@ public:
     void SetAudioEvent(Type type, bool signalled);
 
     /**
+     * Set an audio event to true or false while the caller already holds event_lock.
+     *
+     * @param type      - The manager type to signal.
+     * @param signalled - Its signal state.
+     */
+    void SetAudioEventLocked(Type type, bool signalled);
+
+    /**
      * Check if the given manager type is signalled.
      *
      * @param type - The manager type to check.
@@ -76,6 +85,17 @@ public:
     bool Wait(std::unique_lock<std::mutex>& l, std::chrono::seconds timeout);
 
     /**
+     * Wait on the manager_event with stop_token cancellation.
+     *
+     * @param l          - Lock held by the wait.
+     * @param stop_token - Stop token to abort waiting on shutdown.
+     * @param timeout    - Timeout for the wait.
+     * @return True if the wait timed out or stopped without signal, otherwise false.
+     */
+    bool Wait(std::unique_lock<std::mutex>& l, std::stop_token stop_token,
+              std::chrono::seconds timeout);
+
+    /**
      * Reset all manager events.
      */
     void ClearEvents();
@@ -84,7 +104,7 @@ private:
     /// Lock, used by the audio manager
     std::mutex event_lock;
     /// Array of events, one per system type (see Type), last event is used to terminate
-    std::array<std::atomic<bool>, 4> events_signalled;
+    std::array<std::atomic<bool>, 4> events_signalled{};
     /// Event to signal the audio manager
     std::condition_variable_any manager_event;
 };

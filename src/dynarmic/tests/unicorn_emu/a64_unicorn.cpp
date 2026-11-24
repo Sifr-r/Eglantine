@@ -189,8 +189,14 @@ bool A64Unicorn::UnmappedMemoryHook(uc_engine* uc, uc_mem_type /*type*/, u64 sta
         // printf("generate_page(%" PRIx64 ")\n", base_address);
 
         const u32 permissions = [&]() -> u32 {
-            if (base_address < this_->testenv.code_mem.size() * 4)
-                return UC_PROT_READ | UC_PROT_EXEC;
+            if (!this_->testenv.code_mem.empty()) {
+                const u64 page_end = base_address + sizeof(Page::data) - 1;
+                const u64 code_start = this_->testenv.code_mem_start_address;
+                const u64 code_end = code_start + static_cast<u64>(this_->testenv.code_mem.size()) * 4 - 1;
+                if (base_address <= code_end && code_start <= page_end) {
+                    return UC_PROT_READ | UC_PROT_EXEC;
+                }
+            }
             return UC_PROT_READ;
         }();
 

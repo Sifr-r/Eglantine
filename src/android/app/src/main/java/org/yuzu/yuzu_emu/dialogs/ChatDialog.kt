@@ -63,17 +63,23 @@ class ChatDialog(context: Context) : BottomSheetDialog(context) {
             context.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
 
         handler.post {
-            chatAdapter.notifyDataSetChanged()
+            if (!isShowing) {
+                return@post
+            }
+            chatAdapter.updateMessages(NetPlayManager.getChatMessages())
             binding.chatRecyclerView.post {
-                scrollToBottom()
+                if (isShowing) {
+                    scrollToBottom()
+                }
             }
         }
 
-        NetPlayManager.setOnMessageReceivedListener { type, message ->
-            handler.post {
-                chatAdapter.notifyDataSetChanged()
-                scrollToBottom()
+        NetPlayManager.setOnMessageReceivedListener { _, _ ->
+            if (!isShowing) {
+                return@setOnMessageReceivedListener
             }
+            chatAdapter.updateMessages(NetPlayManager.getChatMessages())
+            scrollToBottom()
         }
 
         binding.sendButton.setOnClickListener {
@@ -90,12 +96,20 @@ class ChatDialog(context: Context) : BottomSheetDialog(context) {
         applyFullscreenMode()
     }
 
-    override fun dismiss() {
+    override fun onStop() {
+        super.onStop()
+        NetPlayManager.setOnMessageReceivedListener(null)
         NetPlayManager.setChatOpen(false)
+        handler.removeCallbacksAndMessages(null)
+    }
+
+    override fun dismiss() {
+        NetPlayManager.setOnMessageReceivedListener(null)
+        NetPlayManager.setChatOpen(false)
+        handler.removeCallbacksAndMessages(null)
         super.dismiss()
     }
 
-    @SuppressLint("NotifyDataSetChanged")
     private fun sendMessage(message: String) {
         val username = StringSetting.WEB_USERNAME.getString()
         NetPlayManager.netPlaySendMessage(message)
@@ -108,7 +122,7 @@ class ChatDialog(context: Context) : BottomSheetDialog(context) {
         )
 
         NetPlayManager.addChatMessage(chatMessage)
-        chatAdapter.notifyDataSetChanged()
+        chatAdapter.updateMessages(NetPlayManager.getChatMessages())
         scrollToBottom()
     }
 
@@ -121,7 +135,9 @@ class ChatDialog(context: Context) : BottomSheetDialog(context) {
     }
 
     private fun scrollToBottom() {
-        binding.chatRecyclerView.scrollToPosition(chatAdapter.itemCount - 1)
+        if (chatAdapter.itemCount > 0) {
+            binding.chatRecyclerView.scrollToPosition(chatAdapter.itemCount - 1)
+        }
     }
 
     private fun applyFullscreenMode() {
@@ -131,8 +147,17 @@ class ChatDialog(context: Context) : BottomSheetDialog(context) {
     }
 }
 
-class ChatAdapter(private val messages: List<ChatMessage>) :
+class ChatAdapter(initialMessages: List<ChatMessage>) :
     RecyclerView.Adapter<ChatAdapter.ChatViewHolder>() {
+
+    private val messages = initialMessages.toMutableList()
+
+    @SuppressLint("NotifyDataSetChanged")
+    fun updateMessages(newMessages: List<ChatMessage>) {
+        messages.clear()
+        messages.addAll(newMessages)
+        notifyDataSetChanged()
+    }
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ChatViewHolder {
         val binding = ItemChatMessageBinding.inflate(

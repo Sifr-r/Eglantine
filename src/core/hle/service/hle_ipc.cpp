@@ -13,6 +13,7 @@
 
 #include <boost/range/algorithm_ext/erase.hpp>
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "common/common_funcs.h"
 #include "common/common_types.h"
@@ -26,6 +27,7 @@
 #include "core/hle/kernel/k_server_session.h"
 #include "core/hle/kernel/k_thread.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/kernel/svc_results.h"
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/memory.h"
@@ -48,8 +50,8 @@ bool SessionRequestManager::HasSessionRequestHandler(const HLERequestContext& co
         const auto& message_header = context.GetDomainMessageHeader();
         const auto object_id = message_header.object_id;
 
-        if (object_id > DomainHandlerCount()) {
-            LOG_CRITICAL(IPC, "object_id {} is too big!", object_id);
+        if (object_id == 0 || object_id > DomainHandlerCount()) {
+            LOG_CRITICAL(IPC, "object_id {} is invalid!", object_id);
             return false;
         }
         return !DomainHandler(object_id - 1).expired();
@@ -100,13 +102,12 @@ Result SessionRequestManager::HandleDomainSyncRequest(Kernel::KServerSession* se
     const u32 object_id{domain_message_header.object_id};
     switch (domain_message_header.command) {
     case IPC::DomainMessageHeader::CommandType::SendMessage:
-        if (object_id > this->DomainHandlerCount()) {
+        if (object_id == 0 || object_id > this->DomainHandlerCount()) {
             LOG_CRITICAL(IPC,
-                         "object_id {} is too big! This probably means a recent service call "
+                         "object_id {} is invalid! This probably means a recent service call "
                          "needed to return a new interface!",
                          object_id);
-            ASSERT(false);
-            return ResultSuccess; // Ignore error if asserts are off
+            return Kernel::ResultInvalidHandle;
         }
         if (auto strong_ptr = this->DomainHandler(object_id - 1).lock()) {
             return strong_ptr->HandleSyncRequest(*server_session, context);
@@ -117,6 +118,13 @@ Result SessionRequestManager::HandleDomainSyncRequest(Kernel::KServerSession* se
 
     case IPC::DomainMessageHeader::CommandType::CloseVirtualHandle: {
         LOG_DEBUG(IPC, "CloseVirtualHandle, object_id={:#08x}", object_id);
+
+        if (object_id == 0 || object_id > this->DomainHandlerCount()) {
+            LOG_CRITICAL(IPC, "CloseVirtualHandle invalid object_id={:#08x}", object_id);
+            IPC::ResponseBuilder rb{context, 2};
+            rb.Push(Kernel::ResultInvalidHandle);
+            return Kernel::ResultInvalidHandle;
+        }
 
         this->CloseDomainHandler(object_id - 1);
 
@@ -137,7 +145,6 @@ HLERequestContext::HLERequestContext(Kernel::KernelCore& kernel_, Core::Memory::
     , kernel{kernel_}
     , memory{memory_}
 {
-    cmd_buf[0] = 0;
     if (thread != nullptr) {
         thread->Open(kernel);
     }
@@ -149,38 +156,43 @@ HLERequestContext::~HLERequestContext() {
     }
 }
 
-void HLERequestContext::ParseCommandBuffer(u32_le* src_cmdbuf, bool incoming) {
-    IPC::RequestParser rp(src_cmdbuf);
+Result HLERequestContext::ParseCommandBuffer(u32 word_count) {
+    constexpr auto Words = [](std::size_t size) { return static_cast<u32>(size / sizeof(u32)); };
+    IPC::RequestParser rp(cmd_buf.data());
+    R_UNLESS(word_count >= Words(sizeof(IPC::CommandHeader)), Kernel::ResultInvalidSize);
     command_header = rp.PopRaw<IPC::CommandHeader>();
 
     if (command_header->IsCloseCommand()) {
-        // Close does not populate the rest of the IPC header
-        return;
+        R_SUCCEED();
     }
 
-    // If handle descriptor is present, add size of it
     if (command_header->enable_handle_descriptor) {
+        R_UNLESS(word_count - rp.GetCurrentOffset() >= Words(sizeof(IPC::HandleDescriptorHeader)),
+                 Kernel::ResultInvalidSize);
         handle_descriptor_header = rp.PopRaw<IPC::HandleDescriptorHeader>();
+        const u32 pid_words = handle_descriptor_header->send_current_pid ? 2 : 0;
+        const u32 copy_count = handle_descriptor_header->num_handles_to_copy;
+        const u32 move_count = handle_descriptor_header->num_handles_to_move;
+        R_UNLESS(pid_words + copy_count + move_count <= word_count - rp.GetCurrentOffset(),
+                 Kernel::ResultInvalidSize);
         if (handle_descriptor_header->send_current_pid) {
             pid = thread->GetOwnerProcess()->GetProcessId();
-            rp.Skip(2, false);
+            rp.Skip(pid_words, false);
         }
-        if (incoming) {
-            // Populate the object lists with the data in the IPC request.
-            for (u32 handle = 0; handle < handle_descriptor_header->num_handles_to_copy; ++handle) {
-                incoming_copy_handles.push_back(rp.Pop<Handle>());
-            }
-            for (u32 handle = 0; handle < handle_descriptor_header->num_handles_to_move; ++handle) {
-                incoming_move_handles.push_back(rp.Pop<Handle>());
-            }
-        } else {
-            // For responses we just ignore the handles, they're empty and will be populated when
-            // translating the response.
-            rp.Skip(handle_descriptor_header->num_handles_to_copy, false);
-            rp.Skip(handle_descriptor_header->num_handles_to_move, false);
+        for (u32 i = 0; i < copy_count; ++i) {
+            incoming_copy_handles.push_back(rp.Pop<Handle>());
+        }
+        for (u32 i = 0; i < move_count; ++i) {
+            incoming_move_handles.push_back(rp.Pop<Handle>());
         }
     }
 
+    const u32 descriptor_words =
+        command_header->num_buf_x_descriptors * Words(sizeof(IPC::BufferDescriptorX)) +
+        (command_header->num_buf_a_descriptors + command_header->num_buf_b_descriptors +
+         command_header->num_buf_w_descriptors) * Words(sizeof(IPC::BufferDescriptorABW));
+    R_UNLESS(descriptor_words + command_header->data_size <= word_count - rp.GetCurrentOffset(),
+             Kernel::ResultInvalidSize);
     for (u32 i = 0; i < command_header->num_buf_x_descriptors; ++i) {
         buffer_x_descriptors.push_back(rp.PopRaw<IPC::BufferDescriptorX>());
     }
@@ -194,87 +206,63 @@ void HLERequestContext::ParseCommandBuffer(u32_le* src_cmdbuf, bool incoming) {
         buffer_w_descriptors.push_back(rp.PopRaw<IPC::BufferDescriptorABW>());
     }
 
-    const auto buffer_c_offset = rp.GetCurrentOffset() + command_header->data_size;
+    const u32 raw_data_offset = rp.GetCurrentOffset();
+    const u32 buffer_c_offset = raw_data_offset + command_header->data_size;
+    const u32 c_flags = static_cast<u32>(command_header->buf_c_descriptor_flags.Value());
+    const u32 c_count = c_flags > 2 ? c_flags - 2 : (c_flags == 2 ? 1 : 0);
+    R_UNLESS(c_count * Words(sizeof(IPC::BufferDescriptorC)) <= word_count - buffer_c_offset,
+             Kernel::ResultInvalidSize);
 
+    request_argument_offset = raw_data_offset;
     if (!command_header->IsTipc()) {
-        // Padding to align to 16 bytes
-        rp.AlignWithPadding();
+        const u32 aligned_offset = Common::AlignUp(raw_data_offset, 4u);
+        R_UNLESS(aligned_offset <= buffer_c_offset, Kernel::ResultInvalidSize);
+        rp.SetCurrentOffset(aligned_offset);
 
-        if (GetManager()->IsDomain() &&
-            ((command_header->type == IPC::CommandType::Request ||
-              command_header->type == IPC::CommandType::RequestWithContext) ||
-             !incoming)) {
-            // If this is an incoming message, only CommandType "Request" has a domain header
-            // All outgoing domain messages have the domain header, if only incoming has it
-            if (incoming || domain_message_header) {
-                domain_message_header = rp.PopRaw<IPC::DomainMessageHeader>();
-            } else {
-                if (GetManager()->IsDomain()) {
-                    LOG_WARNING(IPC, "Domain request has no DomainMessageHeader!");
-                }
+        const auto request_manager = GetManager();
+        R_UNLESS(request_manager, Kernel::ResultInvalidState);
+        if (request_manager->IsDomain() &&
+            (command_header->type == IPC::CommandType::Request ||
+             command_header->type == IPC::CommandType::RequestWithContext)) {
+            R_UNLESS(buffer_c_offset - rp.GetCurrentOffset() >= Words(sizeof(IPC::DomainMessageHeader)),
+                     Kernel::ResultInvalidSize);
+            domain_message_header = rp.PopRaw<IPC::DomainMessageHeader>();
+            const u32 object_id = domain_message_header->object_id;
+            R_UNLESS(object_id != 0 && object_id <= request_manager->DomainHandlerCount(),
+                     Kernel::ResultInvalidHandle);
+            if (domain_message_header->command == IPC::DomainMessageHeader::CommandType::CloseVirtualHandle) {
+                R_SUCCEED();
             }
+            R_UNLESS(domain_message_header->command == IPC::DomainMessageHeader::CommandType::SendMessage,
+                     Kernel::ResultInvalidCombination);
         }
 
+        constexpr u32 command_id_words = Words(sizeof(u64));
+        R_UNLESS(buffer_c_offset - rp.GetCurrentOffset() >=
+                     Words(sizeof(IPC::DataPayloadHeader)) + command_id_words,
+                 Kernel::ResultInvalidSize);
         data_payload_header = rp.PopRaw<IPC::DataPayloadHeader>();
-
         data_payload_offset = rp.GetCurrentOffset();
-
-        if (domain_message_header &&
-            domain_message_header->command ==
-                IPC::DomainMessageHeader::CommandType::CloseVirtualHandle) {
-            // CloseVirtualHandle command does not have SFC* or any data
-            return;
-        }
-
-        if (incoming) {
-            ASSERT(data_payload_header->magic == Common::MakeMagic('S', 'F', 'C', 'I'));
-        } else {
-            ASSERT(data_payload_header->magic == Common::MakeMagic('S', 'F', 'C', 'O'));
-        }
+        R_UNLESS(data_payload_header->magic == Common::MakeMagic('S', 'F', 'C', 'I'),
+                 Kernel::ResultInvalidCombination);
+        command = rp.Pop<u32>();
+        request_argument_offset = data_payload_offset + command_id_words;
     }
+    request_argument_words = buffer_c_offset - request_argument_offset;
 
     rp.SetCurrentOffset(buffer_c_offset);
-
-    // For Inline buffers, the response data is written directly to buffer_c_offset
-    // and in this case we don't have any BufferDescriptorC on the request.
-    if (command_header->buf_c_descriptor_flags >
-        IPC::CommandHeader::BufferDescriptorCFlag::InlineDescriptor) {
-        if (command_header->buf_c_descriptor_flags ==
-            IPC::CommandHeader::BufferDescriptorCFlag::OneDescriptor) {
-            buffer_c_descriptors.push_back(rp.PopRaw<IPC::BufferDescriptorC>());
-        } else {
-            u32 num_buf_c_descriptors =
-                static_cast<u32>(command_header->buf_c_descriptor_flags.Value()) - 2;
-
-            // This is used to detect possible underflows, in case something is broken
-            // with the two ifs above and the flags value is == 0 || == 1.
-            ASSERT(num_buf_c_descriptors < 14);
-
-            for (u32 i = 0; i < num_buf_c_descriptors; ++i) {
-                buffer_c_descriptors.push_back(rp.PopRaw<IPC::BufferDescriptorC>());
-            }
-        }
+    for (u32 i = 0; i < c_count; ++i) {
+        buffer_c_descriptors.push_back(rp.PopRaw<IPC::BufferDescriptorC>());
     }
 
-    rp.SetCurrentOffset(data_payload_offset);
-
-    command = rp.Pop<u32_le>();
-    rp.Skip(1, false); // The command is actually an u64, but we don't use the high part.
+    R_SUCCEED();
 }
 
-Result HLERequestContext::PopulateFromIncomingCommandBuffer(u32_le* src_cmdbuf) {
+Result HLERequestContext::PopulateFromIncomingCommandBuffer(std::span<const u32> words) {
     client_handle_table = &thread->GetOwnerProcess()->GetHandleTable();
-
-    ParseCommandBuffer(src_cmdbuf, true);
-
-    if (command_header->IsCloseCommand()) {
-        // Close does not populate the rest of the IPC header
-        return ResultSuccess;
-    }
-
-    std::copy_n(src_cmdbuf, IPC::COMMAND_BUFFER_LENGTH, cmd_buf.begin());
-
-    return ResultSuccess;
+    const std::size_t word_count = std::min(words.size(), cmd_buf.size());
+    std::copy_n(words.begin(), word_count, cmd_buf.begin());
+    R_RETURN(ParseCommandBuffer(static_cast<u32>(word_count)));
 }
 
 Result HLERequestContext::WriteToOutgoingCommandBuffer() {
@@ -339,6 +327,18 @@ std::vector<u8> HLERequestContext::ReadBufferCopy(std::size_t buffer_index) cons
         memory.ReadBlock(BufferDescriptorX()[buffer_index].Address(), buffer.data(), buffer.size());
         return buffer;
     }
+}
+
+bool HLERequestContext::ReadBufferInto(std::span<std::byte> output,
+                                      std::size_t buffer_index) const {
+    const auto read = [&](const auto& descriptor) {
+        return output.size() <= descriptor.Size() &&
+               (output.empty() || memory.ReadBlock(descriptor.Address(), output.data(), output.size()));
+    };
+    if (buffer_index < buffer_a_descriptors.size() && buffer_a_descriptors[buffer_index].Size()) {
+        return read(buffer_a_descriptors[buffer_index]);
+    }
+    return buffer_index < buffer_x_descriptors.size() && read(buffer_x_descriptors[buffer_index]);
 }
 
 std::span<const u8> HLERequestContext::ReadBufferA(std::size_t buffer_index) const {

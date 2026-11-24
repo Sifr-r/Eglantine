@@ -1,13 +1,21 @@
 # Splitting the GPU thread
 
-Title 1 (Mario Kart World) is bound by one host thread, the GPU thread: ~100% busy while the
+This design and the measurements below record the October 2026 investigation. The current
+[split implementation](src/video_core/gpu_split.cpp) defaults to mode 2 for eligible Ampere
+sessions using Vulkan and can disengage when GPU or DMA accuracy settings require the front
+thread to own the caches. `EDEN_NX2_SPLIT=0` selects a single thread. Use the
+[split write tests](src/tests/video_core/split_write_tracker.cpp) with `[split_writes]`, then
+repeat a bounded gameplay comparison using the [baseline procedure](migration_docs/00_PREREQUISITES_AND_BASELINE.md#compare-a-gameplay-profile).
+
+In the recorded run, one host GPU thread limited title 1 (Mario Kart World). It was ~100% busy while the
 host GPU is 20-40% busy and the game's own CPU thread mostly polls the counter. Per second of
 3D scenes (profiled, 2026-10-29): command processing and register writes ~335 ms, macros
-~200 ms (1.3 million calls), draw setup ~345 ms (55,000 draws), compute ~70 ms. Speeding up the
-pieces (NX2_NOTES rows 123-139) took frames from ~22-38 ms to ~18-26 ms; a locked 60 fps on the
-heavy courses needs work on more than one core.
+~200 ms (1.3 million calls), draw setup ~345 ms (55,000 draws), compute ~70 ms. The changes in
+[investigation rows 123–139](NX2_NOTES.md#blockers-hit-in-order) reduced frame times from
+~22–38 ms to ~18–26 ms. The investigation then targeted work across multiple cores to reach
+60 fps on the heavy courses.
 
-## Split point: method calls
+## Original split point: method calls
 
 - **Front thread** (the current GPU thread): takes the CPU's command queue, parses GPFIFO
   entries and command lists (DmaPusher), runs macros (compiled, macro_turing_jit.h), and keeps
@@ -43,7 +51,7 @@ heavy courses needs work on more than one core.
   until the front sends the next method (a few microseconds), so even ~10,000 waits a second
   leave most of the overlap. Ceiling: front ~35-40% of the work, back ~60-65% -> ~1.4-1.6x.
 
-## Stages
+## Original rollout stages
 
 1. Instrument: count sync points per second and the front/back share precisely (zones).
 2. Ring + back thread executing method writes; the front still does everything else.
@@ -52,12 +60,13 @@ heavy courses needs work on more than one core.
    registers in a debug mode (compare on every MME_READ).
 4. Sync points; crash and screenshot tests across courses; then title 4.
 
-## Status (2026-10-29)
+## Recorded status (2026-10-29)
 
-Stages 1-3 are in (babd395, `gpu_split.h`), off by default: `EDEN_NX2_SPLIT=1` runs engine methods
-on the back, `EDEN_NX2_SPLIT=2` also runs the 3D and compute macros on the front against register
-copies. Measured in title 1 (NX2_NOTES rows 142-144): ~44,000 draws a second on one thread, ~47,400
-with stage 2, 50,000-66,500 with stage 3. The front waits ~4,000-5,000 times a second (semaphore
-acquires, MME DMA reads); the back still spends ~200 ms a second outside its zones (ring dispatch,
-method sink). Clean A/B (NX2_NOTES row 145): 1.46x throughput, frames 17% shorter; on by
-default since. The back is ~92% busy, ~53% of it draw setup: the next step is there, not the ring.
+Stages 1–3 landed with the split initially disabled (`babd395`, `gpu_split.h`).
+`EDEN_NX2_SPLIT=1` ran engine methods on the back. Mode 2 also ran the 3D and compute macros on the
+front against register copies. Title 1 measured ~44,000 draws a second on one thread, ~47,400 with
+stage 2 and 50,000–66,500 with stage 3. The front waited ~4,000–5,000 times a second for semaphore
+acquires and MME DMA reads. The back spent ~200 ms a second outside its measured zones, including
+ring dispatch and the method sink. The A/B in [investigation rows 142–145](NX2_NOTES.md#blockers-hit-in-order)
+found 1.46× throughput and 17% shorter frame times, after which the split was enabled by default.
+The back was ~92% busy, with ~53% of that time spent on draw setup, which became the next target.

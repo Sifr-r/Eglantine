@@ -777,6 +777,9 @@ bool FindGradient3DDerivatives(std::array<IR::Value, 3>& results, IR::Value coor
     }
     const auto check_through_shuffle = [](IR::Value input, IR::Value& result) {
         const IR::Value value_1{GetThroughCast(input.Resolve(), IR::Opcode::BitCastF32U32)};
+        if (value_1.IsImmediate()) {
+            return false;
+        }
         IR::Inst* const inst2{value_1.InstRecursive()};
         if (inst2->GetOpcode() == IR::Opcode::QuadBroadcast) {
             if (!inst2->Arg(1).Resolve().IsImmediate()) {
@@ -811,14 +814,23 @@ bool FindGradient3DDerivatives(std::array<IR::Value, 3>& results, IR::Value coor
     std::array<u32, 4> swizzles_mask_a{};
     std::array<u32, 4> swizzles_mask_b{};
     const auto resolve_mask = [](std::array<u32, 4>& mask_results, IR::Value mask) {
-        u32 value = mask.U32();
+        if (!mask.IsImmediate() || mask.Type() != IR::Type::U32) {
+            return false;
+        }
+        const u32 value = mask.U32();
         for (size_t i = 0; i < 4; i++) {
             mask_results[i] = (value >> (i * 2)) & 0x3;
         }
+        return true;
     };
-    resolve_mask(swizzles_mask_a, value_3);
+    if (!resolve_mask(swizzles_mask_a, value_3)) {
+        return false;
+    }
     size_t coordinate_index = 0;
     const auto resolve_pending = [&](IR::Value resolve_v) {
+        if (resolve_v.IsImmediate()) {
+            return false;
+        }
         IR::Inst* const inst_r = resolve_v.InstRecursive();
         if (inst_r->GetOpcode() != IR::Opcode::FSwizzleAdd) {
             return false;
@@ -829,8 +841,7 @@ bool FindGradient3DDerivatives(std::array<IR::Value, 3>& results, IR::Value coor
         if (!check_through_shuffle(inst_r->Arg(1).Resolve(), temporary_values[2])) {
             return false;
         }
-        resolve_mask(swizzles_mask_b, inst_r->Arg(2).Resolve());
-        return true;
+        return resolve_mask(swizzles_mask_b, inst_r->Arg(2).Resolve());
     };
     if (value_1.IsImmediate() || value_2.IsImmediate()) {
         return false;
@@ -839,8 +850,7 @@ bool FindGradient3DDerivatives(std::array<IR::Value, 3>& results, IR::Value coor
     if (resolve_pending(value_1)) {
         should_continue = check_through_shuffle(value_2, temporary_values[0]);
         coordinate_index = 0;
-    }
-    if (resolve_pending(value_2)) {
+    } else if (resolve_pending(value_2)) {
         should_continue = check_through_shuffle(value_1, temporary_values[0]);
         coordinate_index = 2;
     }
@@ -916,25 +926,43 @@ void FoldImageSampleImplicitLod(IR::Block& block, IR::Inst& inst) {
     const IR::Value coords{inst.Arg(1)};
     const IR::Value bias_lc{inst.Arg(2)};
     const IR::Value offset{inst.Arg(3)};
-    if (!offset.IsImmediate()) {
+    if (!offset.IsEmpty() || coords.IsImmediate()) {
         return;
     }
-    IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
     IR::Inst* const inst2 = coords.InstRecursive();
+    if (inst2->GetOpcode() != IR::Opcode::CompositeConstructF32x3) {
+        return;
+    }
     std::array<std::array<IR::Value, 3>, 3> results_matrix;
     for (size_t i = 0; i < 3; i++) {
         if (!FindGradient3DDerivatives(results_matrix[i], inst2->Arg(i).Resolve())) {
             return;
         }
-        ConvertDerivatives(results_matrix[i], ir);
     }
     IR::F32 lod_clamp{};
     if (info.has_lod_clamp != 0) {
-        if (!bias_lc.IsImmediate()) {
-            lod_clamp = IR::F32{bias_lc.InstRecursive()->Arg(1).Resolve()};
+        if (bias_lc.IsEmpty()) {
+            return;
+        }
+        if (info.has_bias != 0) {
+            if (bias_lc.IsImmediate()) {
+                return;
+            }
+            IR::Inst* const bias_inst = bias_lc.InstRecursive();
+            if (bias_inst->GetOpcode() != IR::Opcode::CompositeConstructF32x2) {
+                return;
+            }
+            lod_clamp = IR::F32{bias_inst->Arg(1).Resolve()};
         } else {
+            if (bias_lc.Type() != IR::Type::F32) {
+                return;
+            }
             lod_clamp = IR::F32{bias_lc};
         }
+    }
+    IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
+    for (size_t i = 0; i < 3; i++) {
+        ConvertDerivatives(results_matrix[i], ir);
     }
     IR::Value new_coords =
         ir.CompositeConstruct(results_matrix[0][0], results_matrix[1][0], results_matrix[2][0]);
@@ -1053,7 +1081,12 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
     case IR::Opcode::IMul32:
         return FoldIMul32(inst);
     case IR::Opcode::ShiftRightArithmetic32:
-        FoldWhenAllImmediates(inst, [](s32 a, s32 b) { return static_cast<u32>(a >> b); });
+        FoldWhenAllImmediates(inst, [](s32 a, u32 b) {
+            if (b >= 32) {
+                return a < 0 ? ~0U : 0U;
+            }
+            return static_cast<u32>(a >> b);
+        });
         return;
     case IR::Opcode::BitCastF32U32:
         return FoldBitCast<IR::Opcode::BitCastF32U32, f32, u32>(inst, IR::Opcode::BitCastU32F32);
@@ -1158,11 +1191,15 @@ void ConstantPropagation(Environment& env, IR::Block& block, IR::Inst& inst) {
         return;
     case IR::Opcode::BitFieldInsert:
         FoldWhenAllImmediates(inst, [](u32 base, u32 insert, u32 offset, u32 bits) {
-            if (bits >= 32 || offset >= 32) {
+            if (offset > 32 || bits > 32 - offset) {
                 throw LogicError("Undefined result in {}({}, {}, {}, {})",
                                  IR::Opcode::BitFieldInsert, base, insert, offset, bits);
             }
-            return (base & ~(~(~0u << bits) << offset)) | (insert << offset);
+            if (bits == 0) {
+                return base;
+            }
+            const u32 mask = bits == 32 ? ~0U : (1U << bits) - 1U;
+            return (base & ~(mask << offset)) | ((insert & mask) << offset);
         });
         return;
     case IR::Opcode::CompositeExtractU32x2:

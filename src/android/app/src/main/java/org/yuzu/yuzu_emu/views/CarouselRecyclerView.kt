@@ -187,14 +187,30 @@ class CarouselRecyclerView @JvmOverloads constructor(
         val lm = layoutManager as? LinearLayoutManager ?: return RecyclerView.NO_POSITION
         var minDistance = Int.MAX_VALUE
         var closestPosition = RecyclerView.NO_POSITION
-        val start = if (fullRange) 0 else lm.findFirstVisibleItemPosition()
-        val end = if (fullRange) lm.childCount - 1 else lm.findLastVisibleItemPosition()
-        for (i in start..end) {
-            val child = lm.findViewByPosition(i) ?: continue
-            val distance = kotlin.math.abs(getChildDistanceToCenter(child).toInt())
-            if (distance < minDistance) {
-                minDistance = distance
-                closestPosition = i
+        if (fullRange) {
+            for (i in 0 until lm.childCount) {
+                val child = lm.getChildAt(i) ?: continue
+                val adapterPos = getChildAdapterPosition(child)
+                if (adapterPos == RecyclerView.NO_POSITION) continue
+                val distance = kotlin.math.abs(getChildDistanceToCenter(child).toInt())
+                if (distance < minDistance) {
+                    minDistance = distance
+                    closestPosition = adapterPos
+                }
+            }
+        } else {
+            val start = lm.findFirstVisibleItemPosition()
+            val end = lm.findLastVisibleItemPosition()
+            if (start == RecyclerView.NO_POSITION || end == RecyclerView.NO_POSITION) {
+                return RecyclerView.NO_POSITION
+            }
+            for (i in start..end) {
+                val child = lm.findViewByPosition(i) ?: continue
+                val distance = kotlin.math.abs(getChildDistanceToCenter(child).toInt())
+                if (distance < minDistance) {
+                    minDistance = distance
+                    closestPosition = i
+                }
             }
         }
         return closestPosition

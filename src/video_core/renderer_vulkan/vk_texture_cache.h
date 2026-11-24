@@ -12,9 +12,11 @@
 #include <cstdlib>
 #include <chrono>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
+#include <vector>
 
 #include "video_core/texture_cache/texture_cache_base.h"
 
@@ -222,7 +224,7 @@ public:
 
     void InvalidateResolveShadow(VkImage msaa_image);
 
-    void MarkResolveShadowUpToDate(VkImage msaa_image);
+    void MarkResolveShadowUpToDate(VkImage msaa_image, VkImageView shadow_view);
 
     void EraseResolveShadow(VkImage msaa_image);
 
@@ -295,7 +297,8 @@ public:
     /// ASTC decoded on the GPU and re-compressed to BC1/BC3 there (accelerate_astc=Gpu with
     /// astc_recompression=Bc1/Bc3): decode into a temporary RGBA8 image, encode, copy.
     void TranscodeAstcToBcn(Image& image, const StagingBufferRef& map,
-                            std::span<const VideoCommon::SwizzleParameters> swizzles);
+                            std::span<const VideoCommon::SwizzleParameters> swizzles,
+                            std::span<const u32> target_layers = {});
 
     /// Temporary decode images, reusable once the GPU is past `tick`.
     struct PendingTranscode {
@@ -369,7 +372,7 @@ public:
     u64 allocation_pool_frames{};
     u32 allocation_pool_pressure_events{};
     u32 allocation_pool_pressure_frames{};
-    ::Common::unordered_map<VkImage, ResolveShadow> resolve_shadows;
+    ::Common::unordered_map<VkImage, std::vector<ResolveShadow>> resolve_shadows;
     std::vector<std::pair<u64, ResolveShadow>> pending_resolve_shadows;
     Core::System* system = nullptr;
 };
@@ -435,6 +438,9 @@ public:
     }
 
     [[nodiscard]] bool HasAspectColorBit(size_t index) const noexcept {
+        if (index >= rt_map.size() || rt_map[index] == UNBOUND_RT) {
+            return false;
+        }
         return (image_ranges.at(rt_map[index]).aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
     }
 
@@ -464,6 +470,7 @@ public:
 
 private:
     static constexpr size_t NUM_MEMOIZED_RENDER_PASS_VARIANTS = 8;
+    static constexpr size_t UNBOUND_RT = (std::numeric_limits<size_t>::max)();
 
     vk::Framebuffer framebuffer;
     VkRenderPass renderpass{};
@@ -473,11 +480,16 @@ private:
     u32 num_images = 0;
     std::array<VkImage, 9> images{};
     std::array<VkImageSubresourceRange, 9> image_ranges{};
-    std::array<size_t, NUM_RT> rt_map{};
+    std::array<size_t, NUM_RT> rt_map{
+        UNBOUND_RT, UNBOUND_RT, UNBOUND_RT, UNBOUND_RT,
+        UNBOUND_RT, UNBOUND_RT, UNBOUND_RT, UNBOUND_RT,
+    };
+    static_assert(NUM_RT == 8);
     bool has_depth{};
     bool has_stencil{};
     bool is_rescaled{};
     std::array<VkImage, 9> resolve_shadow_images{};
+    std::array<VkImageView, 9> resolve_shadow_views{};
     u32 num_resolve_shadows = 0;
     TextureCacheRuntime* runtime_ptr{nullptr};
     RenderPassKey render_pass_key{};

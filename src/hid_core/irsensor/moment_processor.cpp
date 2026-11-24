@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
+
 #include "core/core.h"
 #include "core/core_timing.h"
 #include "hid_core/frontend/emulated_controller.h"
@@ -11,6 +13,29 @@ namespace Service::IRS {
 static constexpr auto format = Core::IrSensor::ImageTransferProcessorFormat::Size40x30;
 static constexpr std::size_t ImageWidth = 40;
 static constexpr std::size_t ImageHeight = 30;
+static constexpr std::size_t RealWidth = 320;
+static constexpr std::size_t RealHeight = 240;
+
+namespace {
+Core::IrSensor::IrsRect ClampWindowOfInterest(const Core::IrSensor::IrsRect& rect) {
+    const s32 max_w = static_cast<s32>(RealWidth);
+    const s32 max_h = static_cast<s32>(RealHeight);
+    const s32 start_x = std::clamp(static_cast<s32>(rect.x), s32{0}, max_w);
+    const s32 start_y = std::clamp(static_cast<s32>(rect.y), s32{0}, max_h);
+    const s32 end_x =
+        rect.width > 0 ? std::clamp(static_cast<s32>(rect.x) + rect.width, start_x, max_w)
+                       : start_x;
+    const s32 end_y =
+        rect.height > 0 ? std::clamp(static_cast<s32>(rect.y) + rect.height, start_y, max_h)
+                        : start_y;
+    return {
+        .x = static_cast<s16>(start_x),
+        .y = static_cast<s16>(start_y),
+        .width = static_cast<s16>(end_x - start_x),
+        .height = static_cast<s16>(end_y - start_y),
+    };
+}
+} // namespace
 
 MomentProcessor::MomentProcessor(Core::System& system_, Core::IrSensor::DeviceFormat& device_format,
                                  std::size_t npad_index)
@@ -36,6 +61,11 @@ MomentProcessor::~MomentProcessor() {
 };
 
 void MomentProcessor::StartProcessor() {
+    std::scoped_lock lock{mutex};
+    StartProcessorLocked();
+}
+
+void MomentProcessor::StartProcessorLocked() {
     device.camera_status = Core::IrSensor::IrCameraStatus::Available;
     device.camera_internal_status = Core::IrSensor::IrCameraInternalStatus::Ready;
 }
@@ -49,13 +79,16 @@ void MomentProcessor::OnControllerUpdate(Core::HID::ControllerTriggerType type) 
         return;
     }
 
-    next_state = {};
-    const auto& camera_data = npad_device->GetCamera();
+    const auto camera_data = npad_device->GetCamera();
 
-    const auto window_width = static_cast<std::size_t>(current_config.window_of_interest.width);
-    const auto window_height = static_cast<std::size_t>(current_config.window_of_interest.height);
-    const auto window_start_x = static_cast<std::size_t>(current_config.window_of_interest.x);
-    const auto window_start_y = static_cast<std::size_t>(current_config.window_of_interest.y);
+    std::scoped_lock lock{mutex};
+    next_state = {};
+
+    const auto window = ClampWindowOfInterest(current_config.window_of_interest);
+    const auto window_width = static_cast<std::size_t>(window.width);
+    const auto window_height = static_cast<std::size_t>(window.height);
+    const auto window_start_x = static_cast<std::size_t>(window.x);
+    const auto window_start_y = static_cast<std::size_t>(window.y);
 
     const std::size_t block_width = window_width / Columns;
     const std::size_t block_height = window_height / Rows;
@@ -69,13 +102,13 @@ void MomentProcessor::OnControllerUpdate(Core::HID::ControllerTriggerType type) 
         }
     }
 
-    next_state.sampling_number = camera_data.sample;
+    next_state.sampling_number = static_cast<s64>(camera_data.sample);
     next_state.timestamp = system.CoreTiming().GetGlobalTimeNs().count();
     next_state.ambient_noise_level = Core::IrSensor::CameraAmbientNoiseLevel::Low;
     shared_memory->moment_lifo.WriteNextEntry(next_state);
 
     if (!IsProcessorActive()) {
-        StartProcessor();
+        StartProcessorLocked();
     }
 }
 
@@ -92,15 +125,13 @@ MomentProcessor::MomentStatistic MomentProcessor::GetStatistic(const std::vector
                                                                std::size_t width,
                                                                std::size_t height) const {
     // The actual implementation is always 320x240
-    static constexpr std::size_t RealWidth = 320;
-    static constexpr std::size_t RealHeight = 240;
     static constexpr std::size_t Threshold = 30;
     MomentStatistic statistic{};
     std::size_t active_points{};
 
     // Sum all data points on the block that meet with the threshold
-    for (std::size_t y = 0; y < width; y++) {
-        for (std::size_t x = 0; x < height; x++) {
+    for (std::size_t y = 0; y < height; y++) {
+        for (std::size_t x = 0; x < width; x++) {
             const size_t x_pos = x + start_x;
             const size_t y_pos = y + start_y;
             const auto pixel =
@@ -133,15 +164,18 @@ MomentProcessor::MomentStatistic MomentProcessor::GetStatistic(const std::vector
 }
 
 void MomentProcessor::SetConfig(Core::IrSensor::PackedMomentProcessorConfig config) {
-    current_config.camera_config.exposure_time = config.camera_config.exposure_time;
-    current_config.camera_config.gain = config.camera_config.gain;
-    current_config.camera_config.is_negative_used = config.camera_config.is_negative_used;
-    current_config.camera_config.light_target =
-        static_cast<Core::IrSensor::CameraLightTarget>(config.camera_config.light_target);
-    current_config.window_of_interest = config.window_of_interest;
-    current_config.preprocess =
-        static_cast<Core::IrSensor::MomentProcessorPreprocess>(config.preprocess);
-    current_config.preprocess_intensity_threshold = config.preprocess_intensity_threshold;
+    {
+        std::scoped_lock lock{mutex};
+        current_config.camera_config.exposure_time = config.camera_config.exposure_time;
+        current_config.camera_config.gain = config.camera_config.gain;
+        current_config.camera_config.is_negative_used = config.camera_config.is_negative_used;
+        current_config.camera_config.light_target =
+            static_cast<Core::IrSensor::CameraLightTarget>(config.camera_config.light_target);
+        current_config.window_of_interest = ClampWindowOfInterest(config.window_of_interest);
+        current_config.preprocess =
+            static_cast<Core::IrSensor::MomentProcessorPreprocess>(config.preprocess);
+        current_config.preprocess_intensity_threshold = config.preprocess_intensity_threshold;
+    }
 
     npad_device->SetCameraFormat(format);
 }

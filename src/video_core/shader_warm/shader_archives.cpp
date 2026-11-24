@@ -736,7 +736,7 @@ std::vector<Record> ParseBahs(Bytes data) {
         const u64 allocation = Le<u32>(control, 68);
         if (declared == 0 || declared % 16 || instruction_allocation % 16 ||
             !(declared <= instruction_allocation && instruction_allocation <= allocation) ||
-            code_relative + allocation > pool_size) {
+            code_relative > pool_size || allocation > pool_size - code_relative) {
             throw ArchiveError("invalid BAHS code extent");
         }
         const u64 code_offset = pool + code_relative;

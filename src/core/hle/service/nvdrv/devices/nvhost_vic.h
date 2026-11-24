@@ -12,6 +12,8 @@ namespace Service::Nvidia::Devices {
 
 class nvhost_vic final : public nvhost_nvdec_common {
 public:
+    static constexpr DeviceKind Kind = DeviceKind::NvHostVic;
+
     explicit nvhost_vic(Core::System& system_, NvCore::Container& core);
     ~nvhost_vic();
 

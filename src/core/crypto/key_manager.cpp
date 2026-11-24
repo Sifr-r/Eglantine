@@ -10,10 +10,14 @@
 #include <cctype>
 #include <fstream>
 #include <map>
+#include <memory>
+#include <optional>
 #include <sstream>
 #include <tuple>
 #include <vector>
 
+#include <openssl/bn.h>
+#include <openssl/core_names.h>
 #include <openssl/evp.h>
 
 #include "common/fs/file.h"
@@ -207,18 +211,33 @@ Ticket Ticket::Read(std::span<const u8> raw_data) {
     case SignatureType::RSA_4096_SHA1:
     case SignatureType::RSA_4096_SHA256: {
         RSA4096Ticket ticket{};
+        if (raw_data.size() < sizeof(ticket)) {
+            LOG_WARNING(Crypto, "Attempted to parse truncated RSA-4096 ticket buffer with size {}.",
+                        raw_data.size());
+            return Ticket{std::monostate()};
+        }
         std::memcpy(&ticket, raw_data.data(), sizeof(ticket));
         return Ticket{ticket};
     }
     case SignatureType::RSA_2048_SHA1:
     case SignatureType::RSA_2048_SHA256: {
         RSA2048Ticket ticket{};
+        if (raw_data.size() < sizeof(ticket)) {
+            LOG_WARNING(Crypto, "Attempted to parse truncated RSA-2048 ticket buffer with size {}.",
+                        raw_data.size());
+            return Ticket{std::monostate()};
+        }
         std::memcpy(&ticket, raw_data.data(), sizeof(ticket));
         return Ticket{ticket};
     }
     case SignatureType::ECDSA_SHA1:
     case SignatureType::ECDSA_SHA256: {
         ECDSATicket ticket{};
+        if (raw_data.size() < sizeof(ticket)) {
+            LOG_WARNING(Crypto, "Attempted to parse truncated ECDSA ticket buffer with size {}.",
+                        raw_data.size());
+            return Ticket{std::monostate()};
+        }
         std::memcpy(&ticket, raw_data.data(), sizeof(ticket));
         return Ticket{ticket};
     }
@@ -411,11 +430,15 @@ std::vector<Ticket> GetTicketblob(const Common::FS::IOFile& ticket_save) {
     }
 
     std::vector<Ticket> out;
-    for (std::size_t offset = 0; offset + 0x4 < buffer.size(); ++offset) {
+    if (buffer.size() < sizeof(RSA2048Ticket)) {
+        return out;
+    }
+
+    for (std::size_t offset = 0; offset <= buffer.size() - sizeof(RSA2048Ticket); ++offset) {
         if (buffer[offset] == 0x4 && buffer[offset + 1] == 0x0 && buffer[offset + 2] == 0x1 &&
             buffer[offset + 3] == 0x0) {
             // NOTE: Assumes ticket blob will only contain RSA-2048 tickets.
-            auto ticket = Ticket::Read(std::span{buffer.data() + offset, sizeof(RSA2048Ticket)});
+            auto ticket = Ticket::Read(std::span{buffer}.subspan(offset, sizeof(RSA2048Ticket)));
             offset += sizeof(RSA2048Ticket);
             if (ticket.IsValid()) {
                 out.push_back(ticket);
@@ -441,7 +464,11 @@ static std::array<u8, target_size> MGF1(const std::array<u8, in_size>& seed) {
     std::array<u8, in_size + 4> seed_exp{};
     std::memcpy(seed_exp.data(), seed.data(), in_size);
 
-    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    const std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx{EVP_MD_CTX_new(),
+                                                                      &EVP_MD_CTX_free};
+    if (!ctx) {
+        return {};
+    }
     const EVP_MD* sha256 = EVP_sha256();
 
     std::vector<u8> out;
@@ -453,14 +480,12 @@ static std::array<u8, target_size> MGF1(const std::array<u8, in_size>& seed) {
 
         u32 hash_len = 0;
 
-        EVP_DigestInit_ex(ctx, sha256, nullptr);
-        EVP_DigestUpdate(ctx, seed_exp.data(), seed_exp.size());
-        EVP_DigestFinal_ex(ctx, out.data() + offset, &hash_len);
+        EVP_DigestInit_ex(ctx.get(), sha256, nullptr);
+        EVP_DigestUpdate(ctx.get(), seed_exp.data(), seed_exp.size());
+        EVP_DigestFinal_ex(ctx.get(), out.data() + offset, &hash_len);
 
         ++i;
     }
-
-    EVP_MD_CTX_free(ctx);
 
     std::array<u8, target_size> target;
     std::memcpy(target.data(), out.data(), target_size);
@@ -469,17 +494,15 @@ static std::array<u8, target_size> MGF1(const std::array<u8, in_size>& seed) {
 
 template <size_t size>
 static std::optional<u64> FindTicketOffset(const std::array<u8, size>& data) {
-    u64 offset = 0;
     for (size_t i = 0x20; i < data.size() - 0x10; ++i) {
         if (data[i] == 0x1) {
-            offset = i + 1;
-            break;
+            return i + 1;
         } else if (data[i] != 0x0) {
             return std::nullopt;
         }
     }
 
-    return offset;
+    return std::nullopt;
 }
 
 std::optional<Key128> KeyManager::ParseTicketTitleKey(const Ticket& ticket) {
@@ -514,27 +537,40 @@ std::optional<Key128> KeyManager::ParseTicketTitleKey(const Ticket& ticket) {
         return std::nullopt;
     }
 
-    std::array<u8, 0x100> rsa_step;
+    std::array<u8, 0x100> rsa_step{};
     {
         // Private context for OpenSSL bignumbers
         // Inside block because I dont wanna pollute the space...
         const auto& title_key_block = ticket.GetData().title_key_block;
-        BIGNUM* D = BN_bin2bn(eticket_rsa_keypair.decryption_key.data(), int(eticket_rsa_keypair.decryption_key.size()), NULL);
-        BIGNUM* N = BN_bin2bn(eticket_rsa_keypair.modulus.data(), int(eticket_rsa_keypair.modulus.size()), NULL);
-        BIGNUM* S = BN_bin2bn(title_key_block.data(), int(title_key_block.size()), NULL);
-        BIGNUM* M = BN_new();
+        const std::unique_ptr<BIGNUM, decltype(&BN_free)> D{
+            BN_bin2bn(eticket_rsa_keypair.decryption_key.data(),
+                      static_cast<int>(eticket_rsa_keypair.decryption_key.size()), nullptr),
+            &BN_free};
+        const std::unique_ptr<BIGNUM, decltype(&BN_free)> N{
+            BN_bin2bn(eticket_rsa_keypair.modulus.data(),
+                      static_cast<int>(eticket_rsa_keypair.modulus.size()), nullptr),
+            &BN_free};
+        const std::unique_ptr<BIGNUM, decltype(&BN_free)> S{
+            BN_bin2bn(title_key_block.data(), static_cast<int>(title_key_block.size()), nullptr),
+            &BN_free};
+        const std::unique_ptr<BIGNUM, decltype(&BN_free)> M{BN_new(), &BN_free};
+        const std::unique_ptr<BN_CTX, decltype(&BN_CTX_free)> bn_ctx{BN_CTX_new(), &BN_CTX_free};
+        if (!D || !N || !S || !M || !bn_ctx) {
+            return std::nullopt;
+        }
         // M = S ^ D mod N
-        BN_mod_exp(M, S, D, N, NULL);
-        BN_bn2bin(M, rsa_step.data());
-        BN_free(D);
-        BN_free(N);
-        BN_free(S);
-        BN_free(M);
+        if (BN_mod_exp(M.get(), S.get(), D.get(), N.get(), bn_ctx.get()) != 1) {
+            return std::nullopt;
+        }
+        if (BN_bn2binpad(M.get(), rsa_step.data(), static_cast<int>(rsa_step.size())) !=
+            static_cast<int>(rsa_step.size())) {
+            return std::nullopt;
+        }
     }
 
     u8 m_0 = rsa_step[0];
-    std::array<u8, 0x20> m_1;
-    std::array<u8, 0xDF> m_2;
+    std::array<u8, 0x20> m_1{};
+    std::array<u8, 0xDF> m_2{};
     std::memcpy(m_1.data(), rsa_step.data() + 0x01, m_1.size());
     std::memcpy(m_2.data(), rsa_step.data() + 0x21, m_2.size());
 
@@ -637,6 +673,9 @@ void KeyManager::LoadFromFile(const std::filesystem::path& file_path, bool is_ti
                     }
 
                     const auto index = std::strtoul(out[0].substr(8, 2).c_str(), nullptr, 16);
+                    if (index >= keyblobs.size()) {
+                        continue;
+                    }
                     keyblobs[index] = Common::HexStringToArray<0x90>(out[1]);
                 } else if (out[0].compare(0, 18, "encrypted_keyblob_") == 0) {
                     if (!ValidCryptoRevisionString(out[0], 18, 2)) {
@@ -644,6 +683,9 @@ void KeyManager::LoadFromFile(const std::filesystem::path& file_path, bool is_ti
                     }
 
                     const auto index = std::strtoul(out[0].substr(18, 2).c_str(), nullptr, 16);
+                    if (index >= encrypted_keyblobs.size()) {
+                        continue;
+                    }
                     encrypted_keyblobs[index] = Common::HexStringToArray<0xB0>(out[1]);
                 } else if (out[0].compare(0, 20, "eticket_extended_kek") == 0) {
                     eticket_extended_kek = Common::HexStringToArray<576>(out[1]);
@@ -674,8 +716,10 @@ void KeyManager::LoadFromFile(const std::filesystem::path& file_path, bool is_ti
                     };
                     for (size_t j = 0; j < kak_names.size(); ++j) {
                         const auto& match = kak_names[j];
-                        if (out[0].compare(0, std::strlen(match), match) == 0) {
-                            const auto index = std::strtoul(out[0].substr(std::strlen(match), 2).c_str(), nullptr, 16);
+                        const std::size_t match_len = std::strlen(match);
+                        if (out[0].compare(0, match_len, match) == 0 &&
+                            ValidCryptoRevisionString(out[0], match_len, 2)) {
+                            const auto index = std::strtoul(out[0].substr(match_len, 2).c_str(), nullptr, 16);
                             s128_keys[{S128KeyType::KeyArea, index, j}] = Common::HexStringToArray<16>(out[1]);
                         }
                     }
@@ -864,20 +908,37 @@ void KeyManager::DeriveSDSeedLazy() {
     }
 }
 
-static Key128 CalculateCMAC(const u8* source, size_t size, const Key128& key) {
+static std::optional<Key128> CalculateCMAC(const u8* source, size_t size, const Key128& key) {
     Key128 out{};
 
-    static EVP_MAC* mac = EVP_MAC_fetch(nullptr, "cmac", nullptr);
-    if (!mac) return out;
+    static EVP_MAC* const mac = EVP_MAC_fetch(nullptr, "cmac", nullptr);
+    if (!mac) {
+        return std::nullopt;
+    }
 
-    static EVP_MAC_CTX* ctx = EVP_MAC_CTX_new(mac);
-    if (!ctx) return out;
+    const std::unique_ptr<EVP_MAC_CTX, decltype(&EVP_MAC_CTX_free)> ctx{
+        EVP_MAC_CTX_new(mac), &EVP_MAC_CTX_free};
+    if (!ctx) {
+        return std::nullopt;
+    }
 
-    EVP_MAC_init(ctx, key.data(), key.size() * CHAR_BIT, NULL);
-    EVP_MAC_update(ctx, source, size);
+    char cipher_name[] = "AES-128-CBC";
+    const OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string(OSSL_MAC_PARAM_CIPHER, cipher_name, 0),
+        OSSL_PARAM_construct_end(),
+    };
 
-    size_t len;
-    EVP_MAC_final(ctx, out.data(), &len, out.size());
+    if (EVP_MAC_init(ctx.get(), key.data(), key.size(), params) != 1) {
+        return std::nullopt;
+    }
+    if (EVP_MAC_update(ctx.get(), source, size) != 1) {
+        return std::nullopt;
+    }
+
+    size_t len = 0;
+    if (EVP_MAC_final(ctx.get(), out.data(), &len, out.size()) != 1 || len != out.size()) {
+        return std::nullopt;
+    }
 
     return out;
 }
@@ -946,8 +1007,8 @@ void KeyManager::DeriveBase() {
             key, GetKey(S128KeyType::Source, u64(SourceKeyType::KeyblobMAC)));
         SetKey(S128KeyType::KeyblobMAC, mac_key, i);
 
-        Key128 cmac = CalculateCMAC(encrypted_keyblobs[i].data() + 0x10, 0xA0, mac_key);
-        if (std::memcmp(cmac.data(), encrypted_keyblobs[i].data(), cmac.size()) != 0) {
+        const auto cmac = CalculateCMAC(encrypted_keyblobs[i].data() + 0x10, 0xA0, mac_key);
+        if (!cmac || std::memcmp(cmac->data(), encrypted_keyblobs[i].data(), cmac->size()) != 0) {
             continue;
         }
 

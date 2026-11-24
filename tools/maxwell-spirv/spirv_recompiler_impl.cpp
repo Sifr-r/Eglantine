@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <cstdio>
 #include <cstdlib>
 #include <sys/stat.h>
+#include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
@@ -21,7 +23,7 @@ int SpirvShaderRecompilerImpl(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    size_t cfg_offset = 0;
+    u32 cfg_offset = 0;
 
     Shader::ObjectPool<Shader::IR::Inst> inst_pool;
     Shader::ObjectPool<Shader::IR::Block> block_pool;
@@ -38,7 +40,7 @@ int SpirvShaderRecompilerImpl(int argc, char *argv[]) {
         fclose(fp);
     }
 
-    env.read_highest = env.read_lowest + env.code.size() * sizeof(u64);
+    env.read_highest = env.read_lowest + static_cast<u32>(env.code.size() * sizeof(u64));
 
     Shader::Maxwell::Flow::CFG cfg(env, cfg_blocks, cfg_offset);
 
@@ -60,9 +62,13 @@ int SpirvShaderRecompilerImpl(int argc, char *argv[]) {
     // std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
     //                            IR::Program& program, Bindings& bindings, bool optimize)
     Shader::Profile profile{};
-    Shader::RuntimeInfo runtime_info;
-    auto const spirv_pgm = Shader::Backend::SPIRV::EmitSPIRV(profile, program, true);
-    fwrite(spirv_pgm.data(), sizeof(u64), spirv_pgm.size(), stdout);
+    Shader::RuntimeInfo runtime_info{};
+    Shader::Backend::Bindings bindings{};
+    auto const spirv_pgm =
+        Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, program, bindings);
+    if (!spirv_pgm.empty()) {
+        std::fwrite(spirv_pgm.data(), sizeof(u32), spirv_pgm.size(), stdout);
+    }
 
     return EXIT_SUCCESS;
 }

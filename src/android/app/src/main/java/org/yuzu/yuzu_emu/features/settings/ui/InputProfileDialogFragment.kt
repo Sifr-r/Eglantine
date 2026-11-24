@@ -31,12 +31,20 @@ class InputProfileDialogFragment : DialogFragment() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         position = requireArguments().getInt(POSITION)
+        if (settingsViewModel.clickedItem !is InputProfileSetting) {
+            dismiss()
+            return
+        }
     }
 
     override fun onCreateDialog(savedInstanceState: Bundle?): Dialog {
+        val profileSetting = settingsViewModel.clickedItem as? InputProfileSetting ?: run {
+            dismissAllowingStateLoss()
+            return super.onCreateDialog(savedInstanceState)
+        }
         binding = DialogInputProfilesBinding.inflate(layoutInflater)
 
-        setting = settingsViewModel.clickedItem as InputProfileSetting
+        setting = profileSetting
         val options = mutableListOf<ProfileItem>().apply {
             add(
                 NewProfileItem(
@@ -100,12 +108,19 @@ class InputProfileDialogFragment : DialogFragment() {
         inflater: LayoutInflater,
         container: ViewGroup?,
         savedInstanceState: Bundle?
-    ): View {
-        return binding.root
+    ): View? {
+        return if (::binding.isInitialized) {
+            binding.root
+        } else {
+            super.onCreateView(inflater, container, savedInstanceState)
+        }
     }
 
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
+        if (!::setting.isInitialized) {
+            return
+        }
 
         settingsViewModel.shouldShowDeleteProfileDialog.collect(viewLifecycleOwner) {
             if (it.isNotEmpty()) {

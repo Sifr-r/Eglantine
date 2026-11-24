@@ -7,14 +7,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use crate::format::{
-    align_up, put_u16_le, put_u32_le, put_u64_le, read_u64_le, sha256, Sha256, ZstdCodec,
-    CODEC_RAW, CODEC_ZSTD, DEFAULT_CHUNK_BYTES, DEFAULT_RAW_THRESHOLD, DIR_RECORD_SIZE,
+    align_up, is_cancelled, put_u16_le, put_u32_le, put_u64_le, read_u64_le, sha256, Sha256,
+    ZstdCodec, CODEC_RAW, CODEC_ZSTD, DEFAULT_CHUNK_BYTES, DEFAULT_RAW_THRESHOLD, DIR_RECORD_SIZE,
     EXTENT_ALIGNMENT, FILE_RECORD_SIZE, HEADER_MAGIC, MAX_CHUNK_FILES, NO_DIR,
-    PACKAGE_FLAG_STANDALONE_UPDATE, PACKAGE_RECORD_SIZE, READ_BUFFER_SIZE, SUPERBLOCK_SIZE,
-    TOC_HEADER_SIZE, TOC_MAGIC,
+    PACKAGE_FLAG_STANDALONE_UPDATE, PACKAGE_RECORD_SIZE, PROGRESS_STEP, READ_BUFFER_SIZE,
+    SUPERBLOCK_SIZE, TOC_HEADER_SIZE, TOC_MAGIC,
 };
 pub use crate::journal::{Plan, PlanEntry, PlanPackage};
 use crate::journal::{
@@ -963,8 +963,11 @@ struct PreparedChunkFile {
     payload: Vec<u8>,
 }
 
-fn check_cancelled(cancel: Option<&AtomicBool>) -> Result<(), (PackResult, String)> {
-    if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+fn check_cancelled(
+    cancel: Option<&AtomicBool>,
+    cancel_poll: Option<&dyn Fn() -> bool>,
+) -> Result<(), (PackResult, String)> {
+    if is_cancelled(cancel, cancel_poll) {
         return Err((PackResult::Cancelled, "cancelled".to_string()));
     }
     Ok(())
@@ -1027,6 +1030,9 @@ fn stream_large_file(
     part_file: &mut File,
     write_offset: u64,
     cancel: Option<&AtomicBool>,
+    cancel_poll: Option<&dyn Fn() -> bool>,
+    base_progress: &PackProgress,
+    progress_cb: &mut Option<&mut dyn FnMut(&PackProgress)>,
 ) -> Result<(u64, [u8; 32]), (PackResult, String)> {
     let mut src = File::open(source).map_err(|e| {
         (
@@ -1041,8 +1047,9 @@ fn stream_large_file(
     let mut buf = vec![0u8; READ_BUFFER_SIZE];
     let mut hasher = Sha256::new();
     let mut total = 0u64;
+    let mut last_report = 0u64;
     loop {
-        check_cancelled(cancel)?;
+        check_cancelled(cancel, cancel_poll)?;
         let n = src.read(&mut buf).map_err(|e| {
             (
                 PackResult::IoError,
@@ -1057,6 +1064,19 @@ fn stream_large_file(
             .write_all(&buf[..n])
             .map_err(|e| (PackResult::IoError, format!("write error: {e}")))?;
         total += n as u64;
+        if total - last_report >= PROGRESS_STEP {
+            last_report = total;
+            if let Some(cb) = progress_cb.as_deref_mut() {
+                let bytes_done = base_progress.bytes_done.saturating_add(total);
+                let live_progress = PackProgress {
+                    bytes_done,
+                    bytes_total: base_progress.bytes_total.max(bytes_done),
+                    files_done: base_progress.files_done,
+                    files_total: base_progress.files_total,
+                };
+                cb(&live_progress);
+            }
+        }
     }
     Ok((total, hasher.finalize()))
 }
@@ -1159,156 +1179,153 @@ fn remove_empty_parents(mut path: &Path, dump_root: &Path) {
     }
 }
 
-/// Packs a loose Switch dump directory into a `.nup` archive (resumable via `.part` + `.journal`).
-pub fn pack_dump(
+enum PackStart {
+    Resumed(Plan, Vec<JournalExtent>),
+    Fresh(Plan, Layout),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pack_dump_write_phase<'cb>(
     dump_root: &Path,
     archive: &Path,
+    part_path: &Path,
+    journal_path: &Path,
     options: &PackOptions,
     zstd: &dyn ZstdCodec,
     cancel: Option<&AtomicBool>,
-    mut progress_cb: Option<&mut dyn FnMut(&PackProgress)>,
-) -> Result<(), (PackResult, String)> {
-    check_cancelled(cancel)?;
-    if archive.exists() {
-        return Err((
-            PackResult::IoError,
-            format!("{} already exists", archive.display()),
-        ));
-    }
-
-    let part_path = part_path_for(archive);
-    let journal_path = journal_path_for(archive);
-
-    if let Some(parent) = archive.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| {
-                (
-                    PackResult::IoError,
-                    format!("cannot create parent dir {}: {e}", parent.display()),
-                )
-            })?;
-        }
-    }
-
-    let resumed = if journal_path.is_file() && part_path.is_file() {
-        parse_journal_file(&journal_path).ok()
-    } else {
-        None
-    };
-
-    let excludes = vec![
-        normalize_cmp_path(archive),
-        normalize_cmp_path(&part_path),
-        normalize_cmp_path(&journal_path),
-    ];
-
+    cancel_poll: Option<&dyn Fn() -> bool>,
+    mut progress_cb: Option<&'cb mut dyn FnMut(&PackProgress)>,
+    start: PackStart,
+) -> Result<
+    (Plan, PackProgress, Option<&'cb mut dyn FnMut(&PackProgress)>),
+    (PackResult, String),
+> {
     let (plan, layout, mut part_file, mut journal_writer, mut completed, mut dedup_map, mut cursor) =
-        if let Some((saved_plan, saved_extents)) = resumed {
-            let layout = build_layout(&saved_plan, dump_root)
-                .map_err(|e| (PackResult::InvalidSource, format!("corrupt journal plan: {e}")))?;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&part_path)
-                .map_err(|e| (PackResult::IoError, format!("cannot reopen {}: {e}", part_path.display())))?;
-            let part_len = file
-                .metadata()
-                .map_err(|e| (PackResult::IoError, e.to_string()))?
-                .len();
+        match start {
+            PackStart::Resumed(saved_plan, saved_extents) => {
+                let layout = build_layout(&saved_plan, dump_root)
+                    .map_err(|e| (PackResult::InvalidSource, format!("corrupt journal plan: {e}")))?;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(part_path)
+                    .map_err(|e| {
+                        (
+                            PackResult::IoError,
+                            format!("cannot reopen {}: {e}", part_path.display()),
+                        )
+                    })?;
+                let part_len = file
+                    .metadata()
+                    .map_err(|e| (PackResult::IoError, e.to_string()))?
+                    .len();
 
-            let mut completed: Vec<Option<ExtentRecord>> = vec![None; layout.files.len()];
-            let mut dedup_map: HashMap<(u64, [u8; 32]), (u8, u64, u64)> = HashMap::new();
-            let mut max_end = layout.blob_offset;
+                let mut completed: Vec<Option<ExtentRecord>> = vec![None; layout.files.len()];
+                let mut dedup_map: HashMap<(u64, [u8; 32]), (u8, u64, u64)> = HashMap::new();
+                let mut max_end = layout.blob_offset;
 
-            for ext in saved_extents {
-                if ext.file_index >= completed.len() {
-                    continue;
+                for ext in saved_extents {
+                    if ext.file_index >= completed.len() {
+                        continue;
+                    }
+                    if ext.stored_size > 0 && ext.offset + ext.stored_size > part_len {
+                        continue;
+                    }
+                    if ext.stored_size > 0 {
+                        max_end = max_end.max(ext.offset + ext.stored_size);
+                    }
+                    dedup_map.insert(
+                        (ext.size, ext.sha256),
+                        (ext.codec, ext.offset, ext.stored_size),
+                    );
+                    completed[ext.file_index] = Some(ExtentRecord {
+                        codec: ext.codec,
+                        offset: ext.offset,
+                        size: ext.size,
+                        stored_size: ext.stored_size,
+                        sha256: ext.sha256,
+                    });
                 }
-                if ext.stored_size > 0 && ext.offset + ext.stored_size > part_len {
-                    continue;
+
+                if part_len < layout.blob_offset {
+                    file.set_len(layout.blob_offset)
+                        .map_err(|e| (PackResult::IoError, e.to_string()))?;
+                    max_end = layout.blob_offset;
                 }
-                if ext.stored_size > 0 {
-                    max_end = max_end.max(ext.offset + ext.stored_size);
-                }
-                dedup_map.insert(
-                    (ext.size, ext.sha256),
-                    (ext.codec, ext.offset, ext.stored_size),
-                );
-                completed[ext.file_index] = Some(ExtentRecord {
-                    codec: ext.codec,
-                    offset: ext.offset,
-                    size: ext.size,
-                    stored_size: ext.stored_size,
-                    sha256: ext.sha256,
-                });
+                let jfile = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(journal_path)
+                    .map_err(|e| (PackResult::IoError, format!("cannot open journal: {e}")))?;
+
+                (
+                    saved_plan,
+                    layout,
+                    file,
+                    Some(BufWriter::new(jfile)),
+                    completed,
+                    dedup_map,
+                    max_end,
+                )
             }
+            PackStart::Fresh(plan, layout) => {
+                let _ = fs::remove_file(part_path);
+                let _ = fs::remove_file(journal_path);
 
-            if part_len < layout.blob_offset {
-                file.set_len(layout.blob_offset)
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .read(true)
+                    .write(true)
+                    .open(part_path)
+                    .map_err(|e| {
+                        (
+                            PackResult::IoError,
+                            format!("cannot create {}: {e}", part_path.display()),
+                        )
+                    })?;
+                write_zero_pad(&mut file, layout.blob_offset)?;
+                file.flush()
                     .map_err(|e| (PackResult::IoError, e.to_string()))?;
-                max_end = layout.blob_offset;
+
+                let journal_writer = if options.delete_sources {
+                    let jfile = OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .open(journal_path)
+                        .map_err(|e| {
+                            (
+                                PackResult::IoError,
+                                format!("cannot create {}: {e}", journal_path.display()),
+                            )
+                        })?;
+                    let mut jw = BufWriter::new(jfile);
+                    writeln!(jw, "{}", plan_to_json(&plan))
+                        .and_then(|_| jw.flush())
+                        .map_err(|e| {
+                            (
+                                PackResult::IoError,
+                                format!("cannot write journal header: {e}"),
+                            )
+                        })?;
+                    Some(jw)
+                } else {
+                    None
+                };
+
+                let count = layout.files.len();
+                let blob_offset = layout.blob_offset;
+                (
+                    plan,
+                    layout,
+                    file,
+                    journal_writer,
+                    vec![None; count],
+                    HashMap::new(),
+                    blob_offset,
+                )
             }
-            let jfile = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&journal_path)
-                .map_err(|e| (PackResult::IoError, format!("cannot open journal: {e}")))?;
-
-            (
-                saved_plan,
-                layout,
-                file,
-                BufWriter::new(jfile),
-                completed,
-                dedup_map,
-                max_end,
-            )
-        } else {
-            if !is_loose_dump(dump_root) {
-                return Err((
-                    PackResult::InvalidSource,
-                    format!("not a valid loose dump: {}", dump_root.display()),
-                ));
-            }
-            let plan = Discovery::new(dump_root, excludes, options).run()?;
-            let layout = build_layout(&plan, dump_root).map_err(|e| (PackResult::InvalidSource, e))?;
-
-            let _ = fs::remove_file(&part_path);
-            let _ = fs::remove_file(&journal_path);
-
-            let mut file = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .read(true)
-                .write(true)
-                .open(&part_path)
-                .map_err(|e| (PackResult::IoError, format!("cannot create {}: {e}", part_path.display())))?;
-            write_zero_pad(&mut file, layout.blob_offset)?;
-            file.flush()
-                .map_err(|e| (PackResult::IoError, e.to_string()))?;
-
-            let jfile = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&journal_path)
-                .map_err(|e| (PackResult::IoError, format!("cannot create {}: {e}", journal_path.display())))?;
-            let mut jw = BufWriter::new(jfile);
-            writeln!(jw, "{}", plan_to_json(&plan))
-                .and_then(|_| jw.flush())
-                .map_err(|e| (PackResult::IoError, format!("cannot write journal header: {e}")))?;
-
-            let count = layout.files.len();
-            let blob_offset = layout.blob_offset;
-            (
-                plan,
-                layout,
-                file,
-                jw,
-                vec![None; count],
-                HashMap::new(),
-                blob_offset,
-            )
         };
 
     let mut progress = PackProgress {
@@ -1342,7 +1359,7 @@ pub fn pack_dump(
                          payload: Option<&[u8]>,
                          completed: &mut [Option<ExtentRecord>],
                          part_file: &mut File,
-                         journal_writer: &mut BufWriter<File>,
+                         journal_writer: &mut Option<BufWriter<File>>,
                          cursor: &mut u64,
                          dedup_map: &mut HashMap<(u64, [u8; 32]), (u8, u64, u64)>,
                          progress: &mut PackProgress,
@@ -1389,16 +1406,18 @@ pub fn pack_dump(
             );
         }
 
-        let jline = JournalExtent {
-            file_index: idx,
-            codec: final_rec.codec,
-            offset: final_rec.offset,
-            size: final_rec.size,
-            stored_size: final_rec.stored_size,
-            sha256: final_rec.sha256,
-        };
-        writeln!(journal_writer, "{}", extent_to_json(&jline))
-            .map_err(|e| (PackResult::IoError, format!("journal write failed: {e}")))?;
+        if let Some(jw) = journal_writer.as_mut() {
+            let jline = JournalExtent {
+                file_index: idx,
+                codec: final_rec.codec,
+                offset: final_rec.offset,
+                size: final_rec.size,
+                stored_size: final_rec.stored_size,
+                sha256: final_rec.sha256,
+            };
+            writeln!(jw, "{}", extent_to_json(&jline))
+                .map_err(|e| (PackResult::IoError, format!("journal write failed: {e}")))?;
+        }
 
         progress.files_done += 1;
         progress.bytes_done += final_rec.size;
@@ -1410,7 +1429,7 @@ pub fn pack_dump(
     };
 
     let flush_chunk = |part_file: &mut File,
-                       journal_writer: &mut BufWriter<File>,
+                       journal_writer: &mut Option<BufWriter<File>>,
                        pending_deletes: &mut Vec<PathBuf>,
                        chunk_source_bytes: &mut u64,
                        chunk_file_count: &mut usize|
@@ -1418,9 +1437,10 @@ pub fn pack_dump(
         part_file
             .flush()
             .map_err(|e| (PackResult::IoError, format!("flush part failed: {e}")))?;
-        journal_writer
-            .flush()
-            .map_err(|e| (PackResult::IoError, format!("flush journal failed: {e}")))?;
+        if let Some(jw) = journal_writer.as_mut() {
+            jw.flush()
+                .map_err(|e| (PackResult::IoError, format!("flush journal failed: {e}")))?;
+        }
         if options.delete_sources {
             for p in pending_deletes.drain(..) {
                 let _ = fs::remove_file(&p);
@@ -1439,7 +1459,7 @@ pub fn pack_dump(
             i += 1;
             continue;
         }
-        check_cancelled(cancel)?;
+        check_cancelled(cancel, cancel_poll)?;
 
         let file_info = &layout.files[i];
         let can_batch_parallel = worker_threads > 1
@@ -1494,7 +1514,7 @@ pub fn pack_dump(
                     });
 
                 for item in results {
-                    check_cancelled(cancel)?;
+                    check_cancelled(cancel, cancel_poll)?;
                     let prep = item?;
                     let rec = ExtentRecord {
                         codec: prep.codec,
@@ -1515,9 +1535,10 @@ pub fn pack_dump(
                         &mut progress,
                         &mut progress_cb,
                     )?;
-                    journal_writer
-                        .flush()
-                        .map_err(|e| (PackResult::IoError, e.to_string()))?;
+                    if let Some(jw) = journal_writer.as_mut() {
+                        jw.flush()
+                            .map_err(|e| (PackResult::IoError, e.to_string()))?;
+                    }
                 }
                 i = j;
                 continue;
@@ -1532,8 +1553,15 @@ pub fn pack_dump(
                     .map_err(|e| (PackResult::IoError, e.to_string()))?;
                 write_zero_pad(&mut part_file, start - cursor)?;
             }
-            let (actual_size, digest) =
-                stream_large_file(&file_info.source_path, &mut part_file, start, cancel)?;
+            let (actual_size, digest) = stream_large_file(
+                &file_info.source_path,
+                &mut part_file,
+                start,
+                cancel,
+                cancel_poll,
+                &progress,
+                &mut progress_cb,
+            )?;
             let rec = ExtentRecord {
                 codec: CODEC_RAW,
                 offset: start,
@@ -1597,9 +1625,8 @@ pub fn pack_dump(
                     &mut chunk_file_count,
                 )?;
             }
-        } else {
-            journal_writer
-                .flush()
+        } else if let Some(jw) = journal_writer.as_mut() {
+            jw.flush()
                 .map_err(|e| (PackResult::IoError, e.to_string()))?;
         }
 
@@ -1614,7 +1641,7 @@ pub fn pack_dump(
         &mut chunk_file_count,
     )?;
 
-    check_cancelled(cancel)?;
+    check_cancelled(cancel, cancel_poll)?;
 
     let final_extents: Vec<ExtentRecord> = completed
         .into_iter()
@@ -1687,8 +1714,98 @@ pub fn pack_dump(
     drop(part_file);
     drop(journal_writer);
 
-    fs::rename(&part_path, archive)
+    fs::rename(part_path, archive)
         .map_err(|e| (PackResult::IoError, format!("rename failed: {e}")))?;
+    Ok((plan, progress, progress_cb))
+}
+
+/// Packs a loose Switch dump directory into a `.nup` archive (resumable via `.part` + `.journal`).
+pub fn pack_dump(
+    dump_root: &Path,
+    archive: &Path,
+    options: &PackOptions,
+    zstd: &dyn ZstdCodec,
+    cancel: Option<&AtomicBool>,
+    progress_cb: Option<&mut dyn FnMut(&PackProgress)>,
+) -> Result<(), (PackResult, String)> {
+    pack_dump_with_cancel_poll(dump_root, archive, options, zstd, cancel, None, progress_cb)
+}
+
+pub(crate) fn pack_dump_with_cancel_poll(
+    dump_root: &Path,
+    archive: &Path,
+    options: &PackOptions,
+    zstd: &dyn ZstdCodec,
+    cancel: Option<&AtomicBool>,
+    cancel_poll: Option<&dyn Fn() -> bool>,
+    progress_cb: Option<&mut dyn FnMut(&PackProgress)>,
+) -> Result<(), (PackResult, String)> {
+    check_cancelled(cancel, cancel_poll)?;
+    if archive.exists() {
+        return Err((
+            PackResult::IoError,
+            format!("{} already exists", archive.display()),
+        ));
+    }
+
+    let part_path = part_path_for(archive);
+    let journal_path = journal_path_for(archive);
+
+    if let Some(parent) = archive.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| {
+                (
+                    PackResult::IoError,
+                    format!("cannot create parent dir {}: {e}", parent.display()),
+                )
+            })?;
+        }
+    }
+
+    let resumed = if options.delete_sources && journal_path.is_file() && part_path.is_file() {
+        parse_journal_file(&journal_path).ok()
+    } else {
+        None
+    };
+
+    let excludes = vec![
+        normalize_cmp_path(archive),
+        normalize_cmp_path(&part_path),
+        normalize_cmp_path(&journal_path),
+    ];
+
+    let start = if let Some((saved_plan, saved_extents)) = resumed {
+        PackStart::Resumed(saved_plan, saved_extents)
+    } else {
+        if !is_loose_dump(dump_root) {
+            return Err((
+                PackResult::InvalidSource,
+                format!("not a valid loose dump: {}", dump_root.display()),
+            ));
+        }
+        let plan = Discovery::new(dump_root, excludes, options).run()?;
+        let layout = build_layout(&plan, dump_root).map_err(|e| (PackResult::InvalidSource, e))?;
+        PackStart::Fresh(plan, layout)
+    };
+
+    let write_res = pack_dump_write_phase(
+        dump_root,
+        archive,
+        &part_path,
+        &journal_path,
+        options,
+        zstd,
+        cancel,
+        cancel_poll,
+        progress_cb,
+        start,
+    );
+    if write_res.is_err() && !options.delete_sources {
+        // File handles from pack_dump_write_phase are dropped before cleanup for Windows.
+        let _ = fs::remove_file(&part_path);
+        let _ = fs::remove_file(&journal_path);
+    }
+    let (plan, mut progress, progress_cb) = write_res?;
     let _ = fs::remove_file(&journal_path);
 
     if options.delete_sources {
@@ -1713,7 +1830,7 @@ pub fn pack_dump(
 
     progress.bytes_done = progress.bytes_total;
     progress.files_done = progress.files_total;
-    if let Some(cb) = progress_cb.as_deref_mut() {
+    if let Some(cb) = progress_cb {
         cb(&progress);
     }
 

@@ -14,15 +14,28 @@ void Stream::Seek(s32 offset, SeekOrigin origin) {
     if (origin == SeekOrigin::SetOrigin) {
         if (offset < 0) {
             position = 0;
-        } else if (position >= buffer.size()) {
+        } else if (static_cast<std::size_t>(offset) >= buffer.size()) {
             position = buffer.size();
         } else {
-            position = offset;
+            position = static_cast<std::size_t>(offset);
         }
     } else if (origin == SeekOrigin::FromCurrentPos) {
-        Seek(static_cast<s32>(position) + offset, SeekOrigin::SetOrigin);
+        const std::size_t current_pos = position <= buffer.size() ? position : buffer.size();
+        if (offset < 0) {
+            const std::size_t delta = static_cast<std::size_t>(-static_cast<s64>(offset));
+            position = (delta > current_pos) ? 0 : (current_pos - delta);
+        } else {
+            const std::size_t delta = static_cast<std::size_t>(offset);
+            position =
+                (delta > buffer.size() - current_pos) ? buffer.size() : (current_pos + delta);
+        }
     } else if (origin == SeekOrigin::FromEnd) {
-        Seek(static_cast<s32>(buffer.size()) - offset, SeekOrigin::SetOrigin);
+        if (offset <= 0) {
+            position = buffer.size();
+        } else {
+            const std::size_t delta = static_cast<std::size_t>(offset);
+            position = (delta > buffer.size()) ? 0 : (buffer.size() - delta);
+        }
     }
 }
 
@@ -35,11 +48,12 @@ u8 Stream::ReadByte() {
 }
 
 void Stream::WriteByte(u8 byte) {
-    if (position == buffer.size()) {
+    if (position >= buffer.size()) {
+        position = buffer.size();
         buffer.push_back(byte);
         position++;
     } else {
-        buffer.insert(buffer.begin() + position, byte);
+        buffer[position++] = byte;
     }
 }
 

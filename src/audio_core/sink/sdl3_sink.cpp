@@ -261,6 +261,10 @@ private:
 
         const std::size_t num_channels = impl->GetDeviceChannels();
         const std::size_t frame_size = num_channels;
+        if (frame_size == 0) {
+            return;
+        }
+        const std::size_t frame_size_bytes = frame_size * sizeof(s16);
 
         if (impl->type == StreamType::In) {
             const int bytes_available = SDL_GetAudioStreamAvailable(stream);
@@ -268,29 +272,41 @@ private:
                 return;
             }
 
-            std::vector<s16> input(bytes_available / static_cast<int>(sizeof(s16)));
-            const int bytes_read = SDL_GetAudioStreamData(stream, input.data(), bytes_available);
+            const std::size_t num_frames =
+                static_cast<std::size_t>(bytes_available) / frame_size_bytes;
+            if (num_frames == 0) {
+                return;
+            }
+            const int aligned_bytes = static_cast<int>(num_frames * frame_size_bytes);
+            std::vector<s16> input(num_frames * frame_size);
+            const int bytes_read = SDL_GetAudioStreamData(stream, input.data(), aligned_bytes);
             if (bytes_read <= 0) {
                 return;
             }
 
-            const std::size_t num_frames =
-                static_cast<std::size_t>(bytes_read) / sizeof(s16) / frame_size;
-            std::span<const s16> input_buffer{input.data(),
-                                              static_cast<std::size_t>(bytes_read) / sizeof(s16)};
-            impl->ProcessAudioIn(input_buffer, num_frames);
+            const std::size_t frames_read =
+                static_cast<std::size_t>(bytes_read) / frame_size_bytes;
+            if (frames_read == 0) {
+                return;
+            }
+            std::span<const s16> input_buffer{input.data(), frames_read * frame_size};
+            impl->ProcessAudioIn(input_buffer, frames_read);
         } else {
             if (additional_amount <= 0 && total_amount <= 0) {
                 return;
             }
 
             const int bytes_requested = additional_amount > 0 ? additional_amount : total_amount;
-            std::vector<s16> output(bytes_requested / static_cast<int>(sizeof(s16)));
             const std::size_t num_frames =
-                static_cast<std::size_t>(bytes_requested) / sizeof(s16) / frame_size;
+                static_cast<std::size_t>(bytes_requested) / frame_size_bytes;
+            if (num_frames == 0) {
+                return;
+            }
+            const int aligned_bytes = static_cast<int>(num_frames * frame_size_bytes);
+            std::vector<s16> output(num_frames * frame_size);
             std::span<s16> output_buffer{output.data(), output.size()};
             impl->ProcessAudioOutAndRender(output_buffer, num_frames);
-            static_cast<void>(SDL_PutAudioStreamData(stream, output.data(), bytes_requested));
+            static_cast<void>(SDL_PutAudioStreamData(stream, output.data(), aligned_bytes));
         }
     }
 
@@ -321,6 +337,7 @@ SDLSink::~SDLSink() = default;
 
 SinkStream* SDLSink::AcquireSinkStream(Core::System& system, u32 system_channels_,
                                        const std::string&, StreamType type) {
+    std::scoped_lock lock{streams_mutex};
     system_channels = system_channels_;
     SinkStreamPtr& stream = sink_streams.emplace_back(std::make_unique<SDLSinkStream>(
         device_channels, system_channels, output_device, input_device, type, system));
@@ -329,6 +346,7 @@ SinkStream* SDLSink::AcquireSinkStream(Core::System& system, u32 system_channels
 }
 
 void SDLSink::CloseStream(SinkStream* stream) {
+    std::scoped_lock lock{streams_mutex};
     for (size_t i = 0; i < sink_streams.size(); i++) {
         if (sink_streams[i].get() == stream) {
             sink_streams[i].reset();
@@ -339,14 +357,17 @@ void SDLSink::CloseStream(SinkStream* stream) {
 }
 
 void SDLSink::CloseStreams() {
+    std::scoped_lock lock{streams_mutex};
     sink_streams.clear();
 }
 
 f32 SDLSink::GetDeviceVolume() const {
+    std::scoped_lock lock{streams_mutex};
     return device_volume;
 }
 
 void SDLSink::SetDeviceVolume(f32 volume) {
+    std::scoped_lock lock{streams_mutex};
     device_volume = volume;
     for (auto& stream : sink_streams) {
         stream->SetDeviceVolume(volume);
@@ -354,6 +375,7 @@ void SDLSink::SetDeviceVolume(f32 volume) {
 }
 
 void SDLSink::SetSystemVolume(f32 volume) {
+    std::scoped_lock lock{streams_mutex};
     for (auto& stream : sink_streams) {
         stream->SetSystemVolume(volume);
     }

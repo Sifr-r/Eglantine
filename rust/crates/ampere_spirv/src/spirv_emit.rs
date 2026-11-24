@@ -118,7 +118,9 @@ const OP_CONTROL_BARRIER: u16 = 224;
 const OP_MEMORY_BARRIER: u16 = 225;
 const OP_ATOMIC_EXCHANGE: u16 = 229;
 const OP_ATOMIC_I_ADD: u16 = 234;
+const OP_ATOMIC_S_MIN: u16 = 236;
 const OP_ATOMIC_U_MIN: u16 = 237;
+const OP_ATOMIC_S_MAX: u16 = 238;
 const OP_ATOMIC_U_MAX: u16 = 239;
 const OP_ATOMIC_AND: u16 = 240;
 const OP_ATOMIC_OR: u16 = 241;
@@ -208,6 +210,9 @@ fn encode_str_words(s: &str) -> Vec<u32> {
 
 fn glsl_op_code(op: GlslOp) -> u32 {
     match op {
+        GlslOp::RoundEven => 2,
+        GlslOp::Floor => 8,
+        GlslOp::Ceil => 9,
         GlslOp::SAbs => 5,
         GlslOp::Sin => 13,
         GlslOp::Cos => 14,
@@ -1039,13 +1044,13 @@ pub fn emit_spirv_1_6(program: &SsaProgram) -> Vec<u32> {
                     push_inst(&mut m.fn_body, OP_ACCESS_CHAIN, &[ptr_ssbo_u32, ptr, var, c0, val_ids[word_idx]]);
                     push_inst(&mut m.fn_body, OP_STORE, &[ptr, val_ids[val]]);
                 }
-                SsaOp::AtomicSsboWord { ssbo_idx, word_idx, op, data } => {
+                SsaOp::AtomicSsboWord { ssbo_idx, word_idx, op, signed, data } => {
                     let var = m.ssbo_vars[ssbo_idx];
                     let ptr = m.alloc();
                     push_inst(&mut m.fn_body, OP_ACCESS_CHAIN, &[ptr_ssbo_u32, ptr, var, c0, val_ids[word_idx]]);
                     let scope = m.c_u32(SCOPE_DEVICE);
                     let sem = m.c_u32(SEM_NONE);
-                    push_inst(&mut m.fn_body, atomic_spv_op(*op), &[res_ty, res_id, ptr, scope, sem, val_ids[data]]);
+                    push_inst(&mut m.fn_body, atomic_spv_op(*op, *signed), &[res_ty, res_id, ptr, scope, sem, val_ids[data]]);
                 }
                 SsaOp::LoadSharedWord { word_idx } => {
                     let (var, ptr_ty) = m.shared_var.expect("shared_var declared when shared_bytes > 0");
@@ -1065,7 +1070,7 @@ pub fn emit_spirv_1_6(program: &SsaProgram) -> Vec<u32> {
                     push_inst(&mut m.fn_body, OP_ACCESS_CHAIN, &[ptr_ty, ptr, var, val_ids[word_idx]]);
                     let scope = m.c_u32(SCOPE_WORKGROUP);
                     let sem = m.c_u32(SEM_NONE);
-                    push_inst(&mut m.fn_body, atomic_spv_op(*op), &[res_ty, res_id, ptr, scope, sem, val_ids[data]]);
+                    push_inst(&mut m.fn_body, atomic_spv_op(*op, false), &[res_ty, res_id, ptr, scope, sem, val_ids[data]]);
                 }
                 SsaOp::LoadLocalWord { word_idx } => {
                     let (var, ptr_ty) = m.local_var.expect("local_var declared when local_bytes > 0");
@@ -1292,11 +1297,11 @@ fn compute_rpo(blocks: &[crate::ssa_ir::SsaBlock]) -> Vec<usize> {
     postorder
 }
 
-fn atomic_spv_op(op: AtomicOp) -> u16 {
+fn atomic_spv_op(op: AtomicOp, signed: bool) -> u16 {
     match op {
         AtomicOp::Add | AtomicOp::Inc | AtomicOp::Dec => OP_ATOMIC_I_ADD,
-        AtomicOp::Min => OP_ATOMIC_U_MIN,
-        AtomicOp::Max => OP_ATOMIC_U_MAX,
+        AtomicOp::Min => if signed { OP_ATOMIC_S_MIN } else { OP_ATOMIC_U_MIN },
+        AtomicOp::Max => if signed { OP_ATOMIC_S_MAX } else { OP_ATOMIC_U_MAX },
         AtomicOp::And => OP_ATOMIC_AND,
         AtomicOp::Or => OP_ATOMIC_OR,
         AtomicOp::Xor => OP_ATOMIC_XOR,

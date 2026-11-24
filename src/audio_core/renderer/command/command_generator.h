@@ -50,49 +50,7 @@ public:
      * @param params    - Input rendering parameters for numbers of voices/mixes/sinks etc.
      */
     static u64 CalculateCommandBufferSize(const BehaviorInfo& behavior,
-                                          const AudioRendererParameterInternal& params) {
-        u64 size{0};
-
-        // Effects
-        size += params.effects * sizeof(EffectInfoBase);
-
-        // Voices
-        u64 voice_size{0};
-        if (behavior.IsWaveBufferVer2Supported()) {
-            voice_size = (std::max)((std::max)(sizeof(AdpcmDataSourceVersion2Command),
-                                           sizeof(PcmInt16DataSourceVersion2Command)),
-                                  sizeof(PcmFloatDataSourceVersion2Command));
-        } else {
-            voice_size = (std::max)((std::max)(sizeof(AdpcmDataSourceVersion1Command),
-                                           sizeof(PcmInt16DataSourceVersion1Command)),
-                                  sizeof(PcmFloatDataSourceVersion1Command));
-        }
-        voice_size += sizeof(BiquadFilterCommand) * MaxBiquadFilters;
-        voice_size += sizeof(VolumeRampCommand);
-        voice_size += sizeof(MixRampGroupedCommand);
-
-        size += params.voices * (params.splitter_infos * sizeof(DepopPrepareCommand) + voice_size);
-
-        // Sub mixes
-        size += sizeof(DepopForMixBuffersCommand) +
-                (sizeof(MixCommand) * MaxMixBuffers) * MaxMixBuffers;
-
-        // Final mix
-        size += sizeof(DepopForMixBuffersCommand) + sizeof(VolumeCommand) * MaxMixBuffers;
-
-        // Splitters
-        size += params.splitter_destinations * sizeof(MixRampCommand) * MaxMixBuffers;
-
-        // Sinks
-        size +=
-            params.sinks * (std::max)(sizeof(DeviceSinkCommand), sizeof(CircularBufferSinkCommand));
-
-        // Performance
-        size += (params.effects + params.voices + params.sinks + params.sub_mixes + 1 +
-                 PerformanceManager::MaxDetailEntries) *
-                sizeof(PerformanceCommand);
-        return size;
-    }
+                                          const AudioRendererParameterInternal& params);
 
     /**
      * Get the current command buffer used to generate commands.

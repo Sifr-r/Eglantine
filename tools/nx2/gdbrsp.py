@@ -273,8 +273,8 @@ def main():
                     break
             else:
                 print("selthread: none")
-        elif op == "hits":
-            # hits <addr> <n> [memreg]: stop at addr n times, printing x0/x1/lr (and 16 bytes at
+        elif op == "hitmem":
+            # hitmem <addr> <n> [memreg]: stop at addr n times, printing x0/x1/lr (and 16 bytes at
             # memreg) each time; steps off the breakpoint before resuming.
             addr, n = int(parts[1], 16), int(parts[2])
             memreg = parts[3] if len(parts) > 3 else None

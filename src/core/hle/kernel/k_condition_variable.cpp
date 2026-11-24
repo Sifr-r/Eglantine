@@ -5,6 +5,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <limits>
+#include <boost/container/small_vector.hpp>
 
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
@@ -23,18 +25,33 @@ namespace Kernel {
 
 namespace {
 
+bool CanAccessUser32(KernelCore& kernel, KProcessAddress address) {
+    const u64 raw_addr = GetInteger(address);
+    return raw_addr <= (std::numeric_limits<u64>::max)() - sizeof(u32) &&
+           GetCurrentMemory(kernel).IsValidVirtualAddressRange(raw_addr, sizeof(u32));
+}
+
 bool ReadFromUser(KernelCore& kernel, u32* out, KProcessAddress address) {
+    if (!CanAccessUser32(kernel, address)) {
+        return false;
+    }
     *out = GetCurrentMemory(kernel).Read32(GetInteger(address));
     return true;
 }
 
 bool WriteToUser(KernelCore& kernel, KProcessAddress address, u32 val) {
+    if (!CanAccessUser32(kernel, address)) {
+        return false;
+    }
     GetCurrentMemory(kernel).Write32(GetInteger(address), val);
     return true;
 }
 
 bool UpdateLockAtomic(KernelCore& kernel, u32* out, KProcessAddress address, u32 if_zero,
                       u32 new_orr_mask) {
+    if (!CanAccessUser32(kernel, address)) {
+        return false;
+    }
     auto& monitor = GetCurrentProcess(kernel).GetExclusiveMonitor();
     const auto current_core = kernel.CurrentPhysicalCoreIndex();
 
@@ -197,7 +214,7 @@ Result KConditionVariable::WaitForAddress(KernelCore& kernel, Handle handle, KPr
     R_RETURN(cur_thread->GetWaitResult());
 }
 
-void KConditionVariable::SignalImpl(KernelCore& kernel, KThread* thread) {
+KThread* KConditionVariable::SignalImpl(KernelCore& kernel, KThread* thread) {
     // Check pre-conditions.
     ASSERT(KScheduler::IsSchedulerLockedByCurrentThread(kernel));
 
@@ -212,10 +229,8 @@ void KConditionVariable::SignalImpl(KernelCore& kernel, KThread* thread) {
         // KScopedInterruptDisable di;
 
         // TODO(bunnei): We should call CanAccessAtomic(..) here.
-        can_access = true;
-        if (can_access) {
+        can_access =
             UpdateLockAtomic(kernel, std::addressof(prev_tag), address, own_tag, Svc::HandleWaitMask);
-        }
     }
 
     if (can_access) {
@@ -230,9 +245,9 @@ void KConditionVariable::SignalImpl(KernelCore& kernel, KThread* thread) {
                 .ReleasePointerUnsafe();
 
             if (owner_thread) {
-                // Add the thread as a waiter on the owner.
+                // Add the thread as a waiter on the owner; close outside the scheduler lock.
                 owner_thread->AddWaiter(kernel, thread);
-                owner_thread->Close(kernel);
+                return owner_thread;
             } else {
                 // The lock was tagged with a thread that doesn't exist.
                 thread->EndWait(kernel, ResultInvalidState);
@@ -242,10 +257,13 @@ void KConditionVariable::SignalImpl(KernelCore& kernel, KThread* thread) {
         // If the address wasn't accessible, note so.
         thread->EndWait(kernel, ResultInvalidCurrentMemory);
     }
+
+    return nullptr;
 }
 
 void KConditionVariable::Signal(u64 cv_key, s32 count) {
     // Perform signaling.
+    boost::container::small_vector<KThread*, 8> owner_threads;
     s32 num_waiters{};
     {
         KScopedSchedulerLock sl(m_system.Kernel());
@@ -257,7 +275,10 @@ void KConditionVariable::Signal(u64 cv_key, s32 count) {
             it = m_tree.erase(it);
             target_thread->ClearConditionVariable();
 
-            this->SignalImpl(m_system.Kernel(), target_thread);
+            if (KThread* owner_thread = this->SignalImpl(m_system.Kernel(), target_thread);
+                owner_thread != nullptr) {
+                owner_threads.push_back(owner_thread);
+            }
 
             ++num_waiters;
         }
@@ -267,6 +288,10 @@ void KConditionVariable::Signal(u64 cv_key, s32 count) {
             constexpr u32 HasNoWaiterFlag = 0;
             WriteToUser(m_system.Kernel(), cv_key, HasNoWaiterFlag);
         }
+    }
+
+    for (KThread* owner_thread : owner_threads) {
+        owner_thread->Close(m_system.Kernel());
     }
 }
 

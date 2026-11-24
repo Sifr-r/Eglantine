@@ -114,9 +114,14 @@ WebService::WebResult RoomJson::Register() {
     if (result.result_code != WebService::WebResult::Code::Success) {
         return result;
     }
-    auto reply_json = nlohmann::json::parse(result.returned_data);
-    room = reply_json.get<AnnounceMultiplayerRoom::Room>();
-    room_id = reply_json.at("id").get<std::string>();
+    try {
+        auto reply_json = nlohmann::json::parse(result.returned_data);
+        room = reply_json.get<AnnounceMultiplayerRoom::Room>();
+        room_id = reply_json.at("id").get<std::string>();
+    } catch (const nlohmann::json::exception& e) {
+        LOG_ERROR(WebService, "Failed to parse room registration response: {}", e.what());
+        return WebService::WebResult{WebService::WebResult::Code::WrongContent, e.what(), ""};
+    }
     return WebService::WebResult{WebService::WebResult::Code::Success, "", room.verify_uid};
 }
 
@@ -129,18 +134,24 @@ AnnounceMultiplayerRoom::RoomList RoomJson::GetRoomList() {
     if (reply.empty()) {
         return {};
     }
-    return nlohmann::json::parse(reply).at("rooms").get<AnnounceMultiplayerRoom::RoomList>();
+    try {
+        return nlohmann::json::parse(reply).at("rooms").get<AnnounceMultiplayerRoom::RoomList>();
+    } catch (const nlohmann::json::exception& e) {
+        LOG_ERROR(WebService, "Failed to parse room list response: {}", e.what());
+        return {};
+    }
 }
 
 void RoomJson::Delete() {
     if (room_id.empty()) {
         LOG_ERROR(WebService, "Room must be registered to be deleted");
     } else {
-        // This jthread won't be destroyed until after the dtor has been ran
-        // Once the thread finishes it will stay resident on the vector -- destroyed and freed by dtor()
-        // this is still valid while in dtor, so... yeah
-        detached_tasks.emplace_back([this](std::stop_token stop_token) {
-            client.DeleteJson(fmt::format("/lobby/{}", room_id), "", false);
+        std::string target_room_id = std::move(room_id);
+        room_id.clear();
+        detached_tasks.emplace_back([target_room_id = std::move(target_room_id), host = host,
+                                     username = username, token = token](std::stop_token) {
+            Client delete_client(host, username, token);
+            delete_client.DeleteJson(fmt::format("/lobby/{}", target_room_id), "", false);
         });
     }
 }

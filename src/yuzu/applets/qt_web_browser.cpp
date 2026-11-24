@@ -11,6 +11,7 @@
 
 #ifdef YUZU_USE_QT_WEB_ENGINE
 #include <bit>
+#include <thread>
 
 #include <QApplication>
 #include <QKeyEvent>
@@ -109,6 +110,40 @@ QtNXWebEngineView::QtNXWebEngineView(QWidget* parent, Core::System& system,
             }
         },
         Qt::QueuedConnection);
+
+    input_delay_timer.setSingleShot(true);
+    input_delay_timer.setInterval(1000);
+    connect(&input_delay_timer, &QTimer::timeout, this, [this] {
+        if (finished.load()) {
+            return;
+        }
+        if (is_local) {
+            QWidget::grabKeyboard();
+            keyboard_grabbed = true;
+        }
+        input_poll_timer.start();
+    });
+
+    input_poll_timer.setInterval(50);
+    connect(&input_poll_timer, &QTimer::timeout, this, [this] {
+        input_interpreter->PollInput();
+
+        HandleWindowFooterButtonPressedOnce<
+            Core::HID::NpadButton::A, Core::HID::NpadButton::B, Core::HID::NpadButton::X,
+            Core::HID::NpadButton::Y, Core::HID::NpadButton::L, Core::HID::NpadButton::R>();
+
+        HandleWindowKeyButtonPressedOnce<
+            Core::HID::NpadButton::Left, Core::HID::NpadButton::Up,
+            Core::HID::NpadButton::Right, Core::HID::NpadButton::Down,
+            Core::HID::NpadButton::StickLLeft, Core::HID::NpadButton::StickLUp,
+            Core::HID::NpadButton::StickLRight, Core::HID::NpadButton::StickLDown>();
+
+        HandleWindowKeyButtonHold<
+            Core::HID::NpadButton::Left, Core::HID::NpadButton::Up,
+            Core::HID::NpadButton::Right, Core::HID::NpadButton::Down,
+            Core::HID::NpadButton::StickLLeft, Core::HID::NpadButton::StickLUp,
+            Core::HID::NpadButton::StickLRight, Core::HID::NpadButton::StickLDown>();
+    });
 }
 
 QtNXWebEngineView::~QtNXWebEngineView() {
@@ -290,41 +325,18 @@ void QtNXWebEngineView::SendKeyPressEvent(int key) {
 }
 
 void QtNXWebEngineView::StartInputThread() {
-    input_thread = std::jthread([&](std::stop_token stoken) {
-        // Wait for 1 second before allowing any inputs to be processed.
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-        if (is_local) {
-            QWidget::grabKeyboard();
-        }
-        while (!stoken.stop_requested()) {
-            input_interpreter->PollInput();
-
-            HandleWindowFooterButtonPressedOnce<
-                Core::HID::NpadButton::A, Core::HID::NpadButton::B, Core::HID::NpadButton::X,
-                Core::HID::NpadButton::Y, Core::HID::NpadButton::L, Core::HID::NpadButton::R>();
-
-            HandleWindowKeyButtonPressedOnce<
-                Core::HID::NpadButton::Left, Core::HID::NpadButton::Up,
-                Core::HID::NpadButton::Right, Core::HID::NpadButton::Down,
-                Core::HID::NpadButton::StickLLeft, Core::HID::NpadButton::StickLUp,
-                Core::HID::NpadButton::StickLRight, Core::HID::NpadButton::StickLDown>();
-
-            HandleWindowKeyButtonHold<
-                Core::HID::NpadButton::Left, Core::HID::NpadButton::Up,
-                Core::HID::NpadButton::Right, Core::HID::NpadButton::Down,
-                Core::HID::NpadButton::StickLLeft, Core::HID::NpadButton::StickLUp,
-                Core::HID::NpadButton::StickLRight, Core::HID::NpadButton::StickLDown>();
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-    });
+    StopInputThread();
+    input_interpreter->ResetButtonStates();
+    input_delay_timer.start();
 }
 
 void QtNXWebEngineView::StopInputThread() {
-    if (is_local) {
+    input_delay_timer.stop();
+    input_poll_timer.stop();
+    if (keyboard_grabbed) {
         QWidget::releaseKeyboard();
+        keyboard_grabbed = false;
     }
-    input_thread.request_stop();
 }
 
 void QtNXWebEngineView::LoadExtractedFonts() {

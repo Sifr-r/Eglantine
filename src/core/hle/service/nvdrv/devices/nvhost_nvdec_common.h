@@ -27,7 +27,8 @@ namespace Devices {
 class nvhost_nvdec_common : public nvdevice {
 public:
     explicit nvhost_nvdec_common(Core::System& system_, NvCore::Container& core,
-                                 NvCore::ChannelType channel_type);
+                                 NvCore::ChannelType channel_type,
+                                 DeviceKind kind_ = DeviceKind::Unknown);
     ~nvhost_nvdec_common() override;
 
 protected:

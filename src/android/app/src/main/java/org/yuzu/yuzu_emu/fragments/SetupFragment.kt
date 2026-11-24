@@ -24,6 +24,7 @@ import androidx.fragment.app.Fragment
 import androidx.fragment.app.activityViewModels
 import androidx.navigation.findNavController
 import androidx.preference.PreferenceManager
+import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2.OnPageChangeCallback
 import com.google.android.material.transition.MaterialFadeThrough
 import org.yuzu.yuzu_emu.NativeLibrary
@@ -61,7 +62,7 @@ class SetupFragment : Fragment() {
 
     private lateinit var pages: MutableList<SetupPage>
 
-    private lateinit var pageButtonCallback: SetupCallback
+    private var pageButtonCallback: SetupCallback? = null
 
     companion object {
         const val KEY_NEXT_VISIBILITY = "NextButtonVisibility"
@@ -291,7 +292,7 @@ class SetupFragment : Fragment() {
         homeViewModel.gamesDirSelected.collect(
             viewLifecycleOwner,
             resetState = { homeViewModel.setGamesDirSelected(false) }
-        ) { if (it) checkForButtonState.invoke() }
+        ) { if (it) checkForButtonState() }
 
         binding.viewPager2.apply {
             adapter = SetupAdapter(requireActivity() as AppCompatActivity, pages)
@@ -377,7 +378,8 @@ class SetupFragment : Fragment() {
         if (savedInstanceState != null) {
             val nextIsVisible = savedInstanceState.getBoolean(KEY_NEXT_VISIBILITY)
             val backIsVisible = savedInstanceState.getBoolean(KEY_BACK_VISIBILITY)
-            hasBeenWarned = savedInstanceState.getBooleanArray(KEY_HAS_BEEN_WARNED)!!
+            hasBeenWarned =
+                savedInstanceState.getBooleanArray(KEY_HAS_BEEN_WARNED) ?: BooleanArray(pages.size)
 
             if (nextIsVisible) {
                 binding.buttonNext.visibility = View.VISIBLE
@@ -400,28 +402,45 @@ class SetupFragment : Fragment() {
 
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
-        outState.putBoolean(KEY_NEXT_VISIBILITY, binding.buttonNext.isVisible)
-        outState.putBoolean(KEY_BACK_VISIBILITY, binding.buttonBack.isVisible)
-        outState.putBooleanArray(KEY_HAS_BEEN_WARNED, hasBeenWarned)
+        _binding?.let {
+            outState.putBoolean(KEY_NEXT_VISIBILITY, it.buttonNext.isVisible)
+            outState.putBoolean(KEY_BACK_VISIBILITY, it.buttonBack.isVisible)
+        }
+        if (this::hasBeenWarned.isInitialized) {
+            outState.putBooleanArray(KEY_HAS_BEEN_WARNED, hasBeenWarned)
+        }
     }
 
     override fun onDestroyView() {
         super.onDestroyView()
+        pageButtonCallback = null
         _binding = null
     }
 
-    private val checkForButtonState: () -> Unit = {
-        val page = pages[binding.viewPager2.currentItem]
+    private fun checkForButtonState() {
+        val b = _binding ?: return
+        val currentItem = b.viewPager2.currentItem
+        val page = pages[currentItem]
+        val callback = pageButtonCallback
+            ?: ((b.viewPager2.getChildAt(0) as? RecyclerView)
+                ?.findViewHolderForAdapterPosition(currentItem) as? SetupCallback)
+
+        if (callback == null) {
+            b.viewPager2.adapter = SetupAdapter(requireActivity() as AppCompatActivity, pages)
+            b.viewPager2.setCurrentItem(currentItem, false)
+            return
+        }
+
         page.pageButtons?.forEach {
             if (it.buttonState() == ButtonState.BUTTON_ACTION_COMPLETE) {
-                pageButtonCallback.onStepCompleted(
+                callback.onStepCompleted(
                     it.titleId,
                     pageFullyCompleted = false
                 )
             }
 
             if (page.pageSteps() == PageState.COMPLETE) {
-                pageButtonCallback.onStepCompleted(0, pageFullyCompleted = true)
+                callback.onStepCompleted(0, pageFullyCompleted = true)
             }
         }
     }
@@ -430,7 +449,7 @@ class SetupFragment : Fragment() {
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) {
             if (it) {
-                checkForButtonState.invoke()
+                checkForButtonState()
             }
 
             if (!it &&
@@ -449,7 +468,7 @@ class SetupFragment : Fragment() {
             if (result != null) {
                 mainActivity.processKey(result, "keys")
                 if (NativeLibrary.areKeysPresent()) {
-                    checkForButtonState.invoke()
+                    checkForButtonState()
                 }
             }
         }
@@ -459,7 +478,7 @@ class SetupFragment : Fragment() {
             if (result != null) {
                 mainActivity.processFirmware(result) {
                     if (NativeLibrary.isFirmwareAvailable()) {
-                        checkForButtonState.invoke()
+                        checkForButtonState()
                     }
                 }
             }
@@ -487,7 +506,7 @@ class SetupFragment : Fragment() {
                     )
                 }
             }.apply {
-                onDialogComplete = { checkForButtonState.invoke() }
+                onDialogComplete = { checkForButtonState() }
             }.show(parentFragmentManager, ProgressDialogFragment.TAG)
         }
 

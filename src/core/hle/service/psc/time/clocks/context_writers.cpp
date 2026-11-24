@@ -9,6 +9,15 @@
 
 namespace Service::PSC::Time {
 
+ContextWriter::~ContextWriter() {
+    std::scoped_lock l{m_mutex};
+    while (!m_operation_events.empty()) {
+        auto& operation = m_operation_events.front();
+        m_operation_events.pop_front();
+        operation.m_owner = nullptr;
+    }
+}
+
 void ContextWriter::SignalAllNodes(Kernel::KernelCore& kernel) {
     std::scoped_lock l{m_mutex};
     for (auto& operation : m_operation_events) {
@@ -18,7 +27,18 @@ void ContextWriter::SignalAllNodes(Kernel::KernelCore& kernel) {
 
 void ContextWriter::Link(OperationEvent& operation_event) {
     std::scoped_lock l{m_mutex};
-    m_operation_events.push_back(operation_event);
+    if (!operation_event.IsLinked()) {
+        operation_event.m_owner = this;
+        m_operation_events.push_back(operation_event);
+    }
+}
+
+void ContextWriter::Unlink(OperationEvent& operation_event) {
+    std::scoped_lock l{m_mutex};
+    if (operation_event.IsLinked()) {
+        m_operation_events.erase(m_operation_events.iterator_to(operation_event));
+    }
+    operation_event.m_owner = nullptr;
 }
 
 LocalSystemClockContextWriter::LocalSystemClockContextWriter(Core::System& system,

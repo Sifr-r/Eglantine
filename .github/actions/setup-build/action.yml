@@ -81,10 +81,10 @@ runs:
       run: |
         set -euo pipefail
         {
-          echo "CCACHE_DIR=${{ github.workspace }}/.ccache"
+          echo "CCACHE_DIR=${GITHUB_WORKSPACE}/.ccache"
           echo "CCACHE_MAXSIZE=1000M"
           echo "CCACHE_COMPILERCHECK=content"
-          echo "CCACHE_BASEDIR=${{ github.workspace }}"
+          echo "CCACHE_BASEDIR=${GITHUB_WORKSPACE}"
           echo "CCACHE_NOHASHDIR=true"
         } >> "$GITHUB_ENV"
 
@@ -95,11 +95,13 @@ runs:
     # instead of staying cold until it merges.
     - name: Decide cache saving
       shell: bash
+      env:
+        SAVE_CACHE: ${{ inputs.save-cache }}
       run: |
         set -euo pipefail
         save=false
-        if [ '${{ inputs.save-cache }}' = 'true' ] ||
-           [ '${{ github.ref }}' = 'refs/heads/nx2' ]; then
+        if [ "$SAVE_CACHE" = 'true' ] ||
+           [ "$GITHUB_REF" = 'refs/heads/nx2' ]; then
           save=true
         fi
         echo "CACHE_SAVE=$save" >> "$GITHUB_ENV"

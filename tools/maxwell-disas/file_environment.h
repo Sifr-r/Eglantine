@@ -17,20 +17,27 @@ public:
     FileEnvironment(const FileEnvironment&) = delete;
     void Deserialize(std::ifstream& file) {}
     [[nodiscard]] u64 ReadInstruction(u32 address) override {
-        if (address < read_lowest || address > read_highest) {
+        if (address < read_lowest || address >= read_highest) {
             std::printf("cant read %08x\n", address);
             std::abort();
         }
-        return code[(address - read_lowest) / sizeof(u64)];
+        const u32 offset = address - read_lowest;
+        const size_t index = static_cast<size_t>(offset) / sizeof(u64);
+        if ((offset % sizeof(u64)) != 0 || index >= code.size()) {
+            std::printf("cant read %08x\n", address);
+            std::abort();
+        }
+        return code[index];
     }
     [[nodiscard]] u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override { return 0; }
     [[nodiscard]] Shader::TextureType ReadTextureType(u32 handle) override {
         auto const it{texture_types.find(handle)};
-        return it->second;
+        return it != texture_types.end() ? it->second : Shader::TextureType::Color2D;
     }
     [[nodiscard]] Shader::TexturePixelFormat ReadTexturePixelFormat(u32 handle) override {
         auto const it{texture_pixel_formats.find(handle)};
-        return it->second;
+        return it != texture_pixel_formats.end() ? it->second
+                                                 : Shader::TexturePixelFormat::A8B8G8R8_UNORM;
     }
     [[nodiscard]] bool IsTexturePixelFormatInteger(u32 handle) override { return true; }
     [[nodiscard]] u32 ReadViewportTransformState() override { return viewport_transform_state; }

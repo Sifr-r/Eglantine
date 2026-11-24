@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <locale>
 #include "common/hex_util.h"
 #include "common/swap.h"
@@ -27,22 +28,22 @@ constexpr auto CHEAT_ENGINE_NS = std::chrono::nanoseconds{1000000000 / 12};
 
 std::string_view ExtractName(std::size_t& out_name_size, std::string_view data,
                              std::size_t start_index, char match) {
-    auto end_index = start_index;
-    while (data[end_index] != match) {
-        ++end_index;
-        if (end_index > data.size()) {
-            return {};
-        }
+    if (start_index >= data.size()) {
+        return {};
+    }
+
+    const auto end_index = data.find(match, start_index);
+    if (end_index == std::string_view::npos) {
+        return {};
     }
 
     out_name_size = end_index - start_index;
 
     // Clamp name if it's too big
-    if (out_name_size > sizeof(CheatDefinition::readable_name)) {
-        end_index = start_index + sizeof(CheatDefinition::readable_name);
-    }
+    const auto clamped_size =
+        (std::min)(out_name_size, sizeof(CheatDefinition::readable_name));
 
-    return data.substr(start_index, end_index - start_index);
+    return data.substr(start_index, clamped_size);
 }
 } // Anonymous namespace
 

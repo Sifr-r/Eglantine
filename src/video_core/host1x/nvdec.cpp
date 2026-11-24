@@ -30,11 +30,16 @@ Nvdec::Nvdec(Host1x& host1x_, s32 id_, u32 syncpt)
 }
 
 Nvdec::~Nvdec() {
+    Stop();
     LOG_INFO(HW_GPU, "Destroying nvdec {}", id);
     host1x.frame_queue.Close(id);
 }
 
 void Nvdec::ProcessMethod(u32 method, u32 argument) {
+    if (method >= NvdecCommon::NvdecRegisters::NUM_REGS) {
+        LOG_ERROR(HW_GPU, "Invalid Nvdec method {:#x}", method);
+        return;
+    }
     regs.reg_array[method] = argument;
 
     switch (method) {

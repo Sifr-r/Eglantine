@@ -86,8 +86,9 @@ void ShiftLeftLogical64To32(IR::Block& block, IR::Inst& inst) {
     const auto [lo, hi]{Unpack(ir, inst.Arg(0))};
     const IR::U32 shift{inst.Arg(1)};
 
-    const IR::U32 shifted_lo{ir.ShiftLeftLogical(lo, shift)};
-    const IR::U32 shifted_hi{ir.ShiftLeftLogical(hi, shift)};
+    const IR::U32 safe_shift{ir.BitwiseAnd(shift, ir.Imm32(31))};
+    const IR::U32 shifted_lo{ir.ShiftLeftLogical(lo, safe_shift)};
+    const IR::U32 shifted_hi{ir.ShiftLeftLogical(hi, safe_shift)};
 
     const IR::U32 inv_shift{ir.ISub(shift, ir.Imm32(32))};
     const IR::U1 is_long{ir.IGreaterThanEqual(inv_shift, ir.Imm32(0), true)};
@@ -96,8 +97,9 @@ void ShiftLeftLogical64To32(IR::Block& block, IR::Inst& inst) {
     const IR::U32 long_ret_lo{ir.Imm32(0)};
     const IR::U32 long_ret_hi{ir.ShiftLeftLogical(lo, inv_shift)};
 
-    const IR::U32 shift_complement{ir.ISub(ir.Imm32(32), shift)};
-    const IR::U32 lo_extract{ir.BitFieldExtract(lo, shift_complement, shift, false)};
+    const IR::U32 shift_complement{
+        ir.BitwiseAnd(ir.ISub(ir.Imm32(32), safe_shift), ir.Imm32(31))};
+    const IR::U32 lo_extract{ir.BitFieldExtract(lo, shift_complement, safe_shift, false)};
     const IR::U32 short_ret_lo{shifted_lo};
     const IR::U32 short_ret_hi{ir.BitwiseOr(shifted_hi, lo_extract)};
 
@@ -120,8 +122,9 @@ void ShiftRightLogical64To32(IR::Block& block, IR::Inst& inst) {
     const auto [lo, hi]{Unpack(ir, inst.Arg(0))};
     const IR::U32 shift{inst.Arg(1)};
 
-    const IR::U32 shifted_lo{ir.ShiftRightLogical(lo, shift)};
-    const IR::U32 shifted_hi{ir.ShiftRightLogical(hi, shift)};
+    const IR::U32 safe_shift{ir.BitwiseAnd(shift, ir.Imm32(31))};
+    const IR::U32 shifted_lo{ir.ShiftRightLogical(lo, safe_shift)};
+    const IR::U32 shifted_hi{ir.ShiftRightLogical(hi, safe_shift)};
 
     const IR::U32 inv_shift{ir.ISub(shift, ir.Imm32(32))};
     const IR::U1 is_long{ir.IGreaterThanEqual(inv_shift, ir.Imm32(0), true)};
@@ -130,11 +133,12 @@ void ShiftRightLogical64To32(IR::Block& block, IR::Inst& inst) {
     const IR::U32 long_ret_hi{ir.Imm32(0)};
     const IR::U32 long_ret_lo{ir.ShiftRightLogical(hi, inv_shift)};
 
-    const IR::U32 shift_complement{ir.ISub(ir.Imm32(32), shift)};
-    const IR::U32 short_hi_extract{ir.BitFieldExtract(hi, ir.Imm32(0), shift)};
+    const IR::U32 shift_complement{
+        ir.BitwiseAnd(ir.ISub(ir.Imm32(32), safe_shift), ir.Imm32(31))};
+    const IR::U32 short_hi_extract{ir.BitFieldExtract(hi, ir.Imm32(0), safe_shift)};
     const IR::U32 short_ret_hi{shifted_hi};
     const IR::U32 short_ret_lo{
-        ir.BitFieldInsert(shifted_lo, short_hi_extract, shift_complement, shift)};
+        ir.BitFieldInsert(shifted_lo, short_hi_extract, shift_complement, safe_shift)};
 
     const IR::U32 zero_ret_lo{lo};
     const IR::U32 zero_ret_hi{hi};
@@ -155,8 +159,9 @@ void ShiftRightArithmetic64To32(IR::Block& block, IR::Inst& inst) {
     const auto [lo, hi]{Unpack(ir, inst.Arg(0))};
     const IR::U32 shift{inst.Arg(1)};
 
-    const IR::U32 shifted_lo{ir.ShiftRightLogical(lo, shift)};
-    const IR::U32 shifted_hi{ir.ShiftRightArithmetic(hi, shift)};
+    const IR::U32 safe_shift{ir.BitwiseAnd(shift, ir.Imm32(31))};
+    const IR::U32 shifted_lo{ir.ShiftRightLogical(lo, safe_shift)};
+    const IR::U32 shifted_hi{ir.ShiftRightArithmetic(hi, safe_shift)};
 
     const IR::U32 sign_extension{ir.ShiftRightArithmetic(hi, ir.Imm32(31))};
 
@@ -167,11 +172,12 @@ void ShiftRightArithmetic64To32(IR::Block& block, IR::Inst& inst) {
     const IR::U32 long_ret_hi{sign_extension};
     const IR::U32 long_ret_lo{ir.ShiftRightArithmetic(hi, inv_shift)};
 
-    const IR::U32 shift_complement{ir.ISub(ir.Imm32(32), shift)};
-    const IR::U32 short_hi_extract(ir.BitFieldExtract(hi, ir.Imm32(0), shift));
+    const IR::U32 shift_complement{
+        ir.BitwiseAnd(ir.ISub(ir.Imm32(32), safe_shift), ir.Imm32(31))};
+    const IR::U32 short_hi_extract(ir.BitFieldExtract(hi, ir.Imm32(0), safe_shift));
     const IR::U32 short_ret_hi{shifted_hi};
     const IR::U32 short_ret_lo{
-        ir.BitFieldInsert(shifted_lo, short_hi_extract, shift_complement, shift)};
+        ir.BitFieldInsert(shifted_lo, short_hi_extract, shift_complement, safe_shift)};
 
     const IR::U32 zero_ret_lo{lo};
     const IR::U32 zero_ret_hi{hi};
@@ -253,8 +259,16 @@ void FloatToInt64To32(IR::Block& block, IR::Inst& inst, bool is_signed, size_t s
 void Lower(IR::Block& block, IR::Inst& inst) {
     switch (inst.GetOpcode()) {
     case IR::Opcode::PackUint2x32:
-    case IR::Opcode::UnpackUint2x32:
         return inst.ReplaceOpcode(IR::Opcode::Identity);
+    case IR::Opcode::UnpackUint2x32: {
+        if (inst.Arg(0).IsImmediate()) {
+            IR::IREmitter ir{block, IR::Block::InstructionList::s_iterator_to(inst)};
+            const auto [lo, hi]{Unpack(ir, inst.Arg(0))};
+            inst.ReplaceUsesWith(ir.CompositeConstruct(lo, hi));
+            return;
+        }
+        return inst.ReplaceOpcode(IR::Opcode::Identity);
+    }
     case IR::Opcode::IAdd64:
         return IAdd64To32(block, inst);
     case IR::Opcode::ISub64:

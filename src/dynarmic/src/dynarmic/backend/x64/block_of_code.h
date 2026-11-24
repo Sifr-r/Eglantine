@@ -168,6 +168,11 @@ public:
 
     bool HasHostFeature(HostFeature feature) const noexcept;
 
+#ifdef _WIN32
+    const PrologueInfo& GetRunCodePrologueInfo() const noexcept { return run_code_prologue; }
+    const PrologueInfo& GetStepCodePrologueInfo() const noexcept { return step_code_prologue; }
+#endif
+
 private:
     using RunCodeFuncType = HaltReason (*)(void*, CodePtr);
     static constexpr size_t MXCSR_ALREADY_EXITED = 1 << 0;
@@ -182,6 +187,8 @@ private:
     CodePtr code_begin = nullptr;
 #ifdef _WIN32
     size_t committed_size = 0;
+    PrologueInfo run_code_prologue;
+    PrologueInfo step_code_prologue;
 #endif
     bool prelude_complete = false;
 

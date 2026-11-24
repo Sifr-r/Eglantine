@@ -50,7 +50,7 @@ public:
         if (is_current) {
             return;
         }
-        is_current = SDL_GL_MakeCurrent(window, context) == 0;
+        is_current = SDL_GL_MakeCurrent(window, context);
     }
 
     void DoneCurrent() override {

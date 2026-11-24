@@ -227,6 +227,11 @@ void UDPClient::OnPortInfo([[maybe_unused]] Response::PortInfo data) {
 }
 
 void UDPClient::OnPadData(Response::PadData data, std::size_t client) {
+    if (client >= clients.size() || data.info.id >= PADS_PER_CLIENT) {
+        LOG_ERROR(Input, "Invalid pad id {} for client {}", data.info.id, client);
+        return;
+    }
+
     const std::size_t pad_index = (client * PADS_PER_CLIENT) + data.info.id;
 
     if (pad_index >= pads.size()) {
@@ -580,26 +585,39 @@ bool UDPClient::IsStickInverted(const Common::ParamPackage& params) {
     return true;
 }
 
-void TestCommunication(const std::string& host, u16 port, const std::function<void()>& success_callback, const std::function<void()>& failure_callback) {
-    std::thread([=] {
-        Common::Event success_event;
+CommunicationTestJob::CommunicationTestJob(const std::string& host, u16 port,
+                                           std::function<void(bool)> result_callback) {
+    worker = std::jthread([this, host, port, callback_fn = std::move(result_callback)] {
         SocketCallback callback{
             .version = [](Response::Version) {},
             .port_info = [](Response::PortInfo) {},
-            .pad_data = [&](Response::PadData) { success_event.Set(); },
+            .pad_data =
+                [this](Response::PadData) {
+                    succeeded.store(true, std::memory_order_release);
+                    complete_event.Set();
+                },
         };
         Socket socket{host, port, std::move(callback)};
         std::thread worker_thread{SocketLoop, &socket};
-        const bool result =
-            success_event.WaitUntil(std::chrono::steady_clock::now() + std::chrono::seconds(10));
+        complete_event.WaitUntil(std::chrono::steady_clock::now() + std::chrono::seconds(10));
         socket.Stop();
         worker_thread.join();
-        if (result) {
-            success_callback();
-        } else {
-            failure_callback();
+        if (!stopped.load(std::memory_order_acquire) && callback_fn) {
+            callback_fn(succeeded.load(std::memory_order_acquire));
         }
-    }).detach();
+    });
+}
+
+CommunicationTestJob::~CommunicationTestJob() {
+    Stop();
+}
+
+void CommunicationTestJob::Stop() {
+    stopped.store(true, std::memory_order_release);
+    complete_event.Set();
+    if (worker.joinable()) {
+        worker.join();
+    }
 }
 
 CalibrationConfigurationJob::CalibrationConfigurationJob(

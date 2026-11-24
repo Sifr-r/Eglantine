@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/scope_exit.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/svc.h"
@@ -94,6 +95,11 @@ Result MapProcessMemory(Core::System& system, u64 dst_address, Handle process_ha
         std::addressof(pg), src_address, size / PageSize, KMemoryState::FlagCanMapProcess,
         KMemoryState::FlagCanMapProcess, KMemoryPermission::None, KMemoryPermission::None,
         KMemoryAttribute::All, KMemoryAttribute::None));
+
+    // Close the temporary page group reference on both success and failure.
+    SCOPE_EXIT {
+        pg.Close(system.Kernel());
+    };
 
     // Map the group.
     R_RETURN(dst_pt.MapPageGroup(dst_address, pg, KMemoryState::SharedCode,

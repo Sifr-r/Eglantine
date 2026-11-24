@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "common/common_funcs.h"
 #include "common/common_types.h"
 
@@ -21,10 +23,92 @@ enum class QueryFlagBits : u32 {
 };
 DECLARE_ENUM_FLAG_OPERATORS(QueryFlagBits)
 
+class AtomicQueryFlags {
+public:
+    AtomicQueryFlags() noexcept = default;
+    AtomicQueryFlags(QueryFlagBits initial) noexcept : bits{static_cast<u32>(initial)} {}
+    AtomicQueryFlags(const AtomicQueryFlags& other) noexcept
+        : bits{other.bits.load(std::memory_order_acquire)} {}
+    AtomicQueryFlags(AtomicQueryFlags&& other) noexcept
+        : bits{other.bits.load(std::memory_order_acquire)} {}
+    ~AtomicQueryFlags() = default;
+
+    AtomicQueryFlags& operator=(const AtomicQueryFlags& other) noexcept {
+        bits.store(other.bits.load(std::memory_order_acquire), std::memory_order_release);
+        return *this;
+    }
+
+    AtomicQueryFlags& operator=(AtomicQueryFlags&& other) noexcept {
+        bits.store(other.bits.load(std::memory_order_acquire), std::memory_order_release);
+        return *this;
+    }
+
+    AtomicQueryFlags& operator=(QueryFlagBits value) noexcept {
+        bits.store(static_cast<u32>(value), std::memory_order_release);
+        return *this;
+    }
+
+    operator QueryFlagBits() const noexcept {
+        return static_cast<QueryFlagBits>(bits.load(std::memory_order_acquire));
+    }
+
+    AtomicQueryFlags& operator|=(QueryFlagBits value) noexcept {
+        bits.fetch_or(static_cast<u32>(value), std::memory_order_acq_rel);
+        return *this;
+    }
+
+    AtomicQueryFlags& operator&=(QueryFlagBits value) noexcept {
+        bits.fetch_and(static_cast<u32>(value), std::memory_order_acq_rel);
+        return *this;
+    }
+
+    AtomicQueryFlags& operator^=(QueryFlagBits value) noexcept {
+        bits.fetch_xor(static_cast<u32>(value), std::memory_order_acq_rel);
+        return *this;
+    }
+
+    friend QueryFlagBits operator&(const AtomicQueryFlags& lhs, QueryFlagBits rhs) noexcept {
+        return static_cast<QueryFlagBits>(lhs) & rhs;
+    }
+
+    friend QueryFlagBits operator&(QueryFlagBits lhs, const AtomicQueryFlags& rhs) noexcept {
+        return lhs & static_cast<QueryFlagBits>(rhs);
+    }
+
+    friend QueryFlagBits operator|(const AtomicQueryFlags& lhs, QueryFlagBits rhs) noexcept {
+        return static_cast<QueryFlagBits>(lhs) | rhs;
+    }
+
+    friend QueryFlagBits operator|(QueryFlagBits lhs, const AtomicQueryFlags& rhs) noexcept {
+        return lhs | static_cast<QueryFlagBits>(rhs);
+    }
+
+    friend QueryFlagBits operator&(const AtomicQueryFlags& lhs,
+                                   const AtomicQueryFlags& rhs) noexcept {
+        return static_cast<QueryFlagBits>(lhs) & static_cast<QueryFlagBits>(rhs);
+    }
+
+    friend QueryFlagBits operator|(const AtomicQueryFlags& lhs,
+                                   const AtomicQueryFlags& rhs) noexcept {
+        return static_cast<QueryFlagBits>(lhs) | static_cast<QueryFlagBits>(rhs);
+    }
+
+    friend bool operator==(const AtomicQueryFlags& lhs, QueryFlagBits rhs) noexcept {
+        return static_cast<QueryFlagBits>(lhs) == rhs;
+    }
+
+    friend bool operator==(const AtomicQueryFlags& lhs, const AtomicQueryFlags& rhs) noexcept {
+        return static_cast<QueryFlagBits>(lhs) == static_cast<QueryFlagBits>(rhs);
+    }
+
+private:
+    std::atomic<u32> bits{0};
+};
+
 class QueryBase {
 public:
     DAddr guest_address{};
-    QueryFlagBits flags{};
+    AtomicQueryFlags flags{};
     u64 value{};
 
 protected:

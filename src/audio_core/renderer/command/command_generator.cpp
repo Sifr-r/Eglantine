@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "audio_core/common/audio_renderer_parameter.h"
 #include "audio_core/renderer/behavior/behavior_info.h"
 #include "audio_core/renderer/command/command_buffer.h"
@@ -38,6 +40,76 @@ CommandGenerator::CommandGenerator(CommandBuffer& command_buffer_,
       effect_context{effect_context_}, sink_context{sink_context_},
       splitter_context{splitter_context_}, performance_manager{performance_manager_} {
     command_buffer.GenerateClearMixCommand(InvalidNodeId);
+}
+
+u64 CommandGenerator::CalculateCommandBufferSize(const BehaviorInfo& behavior,
+                                                 const AudioRendererParameterInternal& params) {
+    u64 size{sizeof(CommandListHeader) + sizeof(ClearMixBufferCommand)};
+
+    // Effects
+    const u64 biquad_effect_size =
+        (std::max)(sizeof(BiquadFilterCommand), sizeof(CopyMixBufferCommand)) * MaxChannels;
+    const u64 max_mix_or_aux_size = (std::max)(
+        sizeof(MixCommand) * MaxMixBuffers,
+        (std::max)(sizeof(AuxCommand) * MaxMixBuffers, sizeof(CaptureCommand) * MaxMixBuffers));
+    const u64 max_reverb_or_limiter_size =
+        (std::max)(sizeof(DelayCommand),
+                   (std::max)(sizeof(ReverbCommand),
+                              (std::max)(sizeof(I3dl2ReverbCommand),
+                                         (std::max)(sizeof(LightLimiterVersion1Command),
+                                                    (std::max)(sizeof(LightLimiterVersion2Command),
+                                                               sizeof(CompressorCommand))))));
+    const u64 effect_cmd_size = (std::max)(
+        sizeof(EffectInfoBase),
+        (std::max)(biquad_effect_size,
+                   (std::max)(max_mix_or_aux_size, max_reverb_or_limiter_size)));
+    size += u64{params.effects} * effect_cmd_size;
+
+    // Voices
+    u64 voice_size{0};
+    if (behavior.IsWaveBufferVer2Supported()) {
+        voice_size = (std::max)((std::max)(sizeof(AdpcmDataSourceVersion2Command),
+                                           sizeof(PcmInt16DataSourceVersion2Command)),
+                                sizeof(PcmFloatDataSourceVersion2Command));
+    } else {
+        voice_size = (std::max)((std::max)(sizeof(AdpcmDataSourceVersion1Command),
+                                           sizeof(PcmInt16DataSourceVersion1Command)),
+                                sizeof(PcmFloatDataSourceVersion1Command));
+    }
+    voice_size += (std::max)(sizeof(BiquadFilterCommand) * MaxBiquadFilters,
+                             sizeof(MultiTapBiquadFilterCommand));
+    voice_size += sizeof(VolumeRampCommand);
+    voice_size += (std::max)(sizeof(MixRampGroupedCommand), sizeof(MixRampCommand) * 8);
+
+    size += u64{params.voices} *
+            ((std::max)(u64{params.splitter_infos}, u64{1}) * sizeof(DepopPrepareCommand) +
+             voice_size);
+
+    // Sub mixes
+    size += u64{params.sub_mixes} *
+            (sizeof(DepopForMixBuffersCommand) +
+             (sizeof(MixCommand) * MaxMixBuffers) * MaxMixBuffers);
+
+    // Final mix
+    size += sizeof(DepopForMixBuffersCommand) + sizeof(VolumeCommand) * MaxMixBuffers;
+
+    // Splitters
+    if (params.splitter_destinations > 0) {
+        size += static_cast<u64>(params.splitter_destinations) * sizeof(MixRampCommand) *
+                MaxMixBuffers;
+    }
+
+    // Sinks
+    size += u64{params.sinks} *
+            (sizeof(DownMix6chTo2chCommand) + sizeof(UpsampleCommand) +
+             (std::max)(sizeof(DeviceSinkCommand), sizeof(CircularBufferSinkCommand)));
+
+    // Performance
+    size += 2ULL *
+            (u64{params.effects} + u64{params.voices} + u64{params.sinks} +
+             u64{params.sub_mixes} + 1 + PerformanceManager::MaxDetailEntries) *
+            sizeof(PerformanceCommand);
+    return size;
 }
 
 void CommandGenerator::GenerateDataSourceCommand(VoiceInfo& voice_info,

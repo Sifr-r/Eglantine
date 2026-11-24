@@ -7,6 +7,8 @@
 // SPDX-FileCopyrightText: 2014 Citra Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
+
 #include "common/assert.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_page_table.h"
@@ -30,6 +32,9 @@ Result KSharedMemory::Initialize(KernelCore& kernel, Core::DeviceMemory& device_
     m_owner_permission = owner_permission;
     m_user_permission = user_permission;
     m_size = Common::AlignUp(size, PageSize);
+    R_UNLESS(m_size >= size &&
+                 m_size <= static_cast<std::size_t>((std::numeric_limits<s64>::max)()),
+             ResultLimitReached);
 
     const size_t num_pages = Common::DivideUp(size, PageSize);
 
@@ -37,7 +42,8 @@ Result KSharedMemory::Initialize(KernelCore& kernel, Core::DeviceMemory& device_
     KResourceLimit* reslimit = kernel.GetSystemResourceLimit();
 
     // Reserve memory for ourselves.
-    KScopedResourceReservation memory_reservation(kernel, reslimit, LimitableResource::PhysicalMemoryMax, size);
+    KScopedResourceReservation memory_reservation(kernel, reslimit, LimitableResource::PhysicalMemoryMax,
+                                                  static_cast<s64>(m_size));
     R_UNLESS(memory_reservation.Succeeded(), ResultLimitReached);
 
     // Allocate the memory.
@@ -50,7 +56,13 @@ Result KSharedMemory::Initialize(KernelCore& kernel, Core::DeviceMemory& device_
 
     //! Insert the result into our page group.
     m_page_group.emplace(kernel, std::addressof(kernel.GetSystemSystemResource().GetBlockInfoManager()));
-    m_page_group->AddBlock(m_physical_address, num_pages);
+    if (const Result res = m_page_group->AddBlock(m_physical_address, num_pages); R_FAILED(res)) {
+        m_page_group->Finalize();
+        m_page_group.reset();
+        kernel.MemoryManager().Close(m_physical_address, num_pages);
+        m_physical_address = 0;
+        R_RETURN(res);
+    }
 
     // Commit our reservation.
     memory_reservation.Commit();

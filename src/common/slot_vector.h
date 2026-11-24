@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <limits>
 #include <numeric>
 #include <type_traits>
 #include <utility>
@@ -103,17 +104,35 @@ public:
         SlotId id;
     };
 
-    ~SlotVector() noexcept {
-        size_t index = 0;
-        for (u64 bits : stored_bitset) {
-            for (size_t bit = 0; bits; ++bit, bits >>= 1) {
-                if ((bits & 1) != 0) {
-                    values[index + bit].object.~T();
-                }
-            }
-            index += 64;
+    SlotVector() noexcept = default;
+    SlotVector(const SlotVector&) = delete;
+    SlotVector& operator=(const SlotVector&) = delete;
+
+    SlotVector(SlotVector&& other) noexcept
+        : values{std::exchange(other.values, nullptr)},
+          values_capacity{std::exchange(other.values_capacity, 0)},
+          stored_bitset{std::move(other.stored_bitset)},
+          free_list{std::move(other.free_list)} {
+        other.stored_bitset.clear();
+        other.free_list.clear();
+    }
+
+    SlotVector& operator=(SlotVector&& other) noexcept {
+        if (this == &other) {
+            return *this;
         }
-        delete[] values;
+        DestroyAll();
+        values = std::exchange(other.values, nullptr);
+        values_capacity = std::exchange(other.values_capacity, 0);
+        stored_bitset = std::move(other.stored_bitset);
+        free_list = std::move(other.free_list);
+        other.stored_bitset.clear();
+        other.free_list.clear();
+        return *this;
+    }
+
+    ~SlotVector() noexcept {
+        DestroyAll();
     }
 
     [[nodiscard]] T& operator[](SlotId id) noexcept {
@@ -223,6 +242,21 @@ private:
         delete[] values;
         values = new_values;
         values_capacity = new_capacity;
+    }
+
+    void DestroyAll() noexcept {
+        size_t index = 0;
+        for (u64 bits : stored_bitset) {
+            for (size_t bit = 0; bits; ++bit, bits >>= 1) {
+                if ((bits & 1) != 0) {
+                    values[index + bit].object.~T();
+                }
+            }
+            index += 64;
+        }
+        delete[] values;
+        values = nullptr;
+        values_capacity = 0;
     }
 
     Entry* values = nullptr;

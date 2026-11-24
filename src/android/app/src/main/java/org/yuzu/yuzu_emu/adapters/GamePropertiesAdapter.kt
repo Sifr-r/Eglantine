@@ -9,8 +9,13 @@ package org.yuzu.yuzu_emu.adapters
 import android.view.LayoutInflater
 import android.view.ViewGroup
 import androidx.core.content.res.ResourcesCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import com.google.android.material.button.MaterialButton
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import org.yuzu.yuzu_emu.R
 import org.yuzu.yuzu_emu.databinding.CardInstallableIconBinding
 import org.yuzu.yuzu_emu.databinding.CardSimpleOutlinedBinding
@@ -19,7 +24,6 @@ import org.yuzu.yuzu_emu.model.InstallableProperty
 import org.yuzu.yuzu_emu.model.SubmenuProperty
 import org.yuzu.yuzu_emu.utils.ViewUtils.marquee
 import org.yuzu.yuzu_emu.utils.ViewUtils.setVisible
-import org.yuzu.yuzu_emu.utils.collect
 import org.yuzu.yuzu_emu.viewholder.AbstractViewHolder
 
 class GamePropertiesAdapter(
@@ -59,9 +63,24 @@ class GamePropertiesAdapter(
         }
     }
 
+    override fun onViewRecycled(holder: AbstractViewHolder<GameProperty>) {
+        super.onViewRecycled(holder)
+        if (holder is SubmenuPropertyViewHolder) {
+            holder.cancelJobs()
+        }
+    }
+
     inner class SubmenuPropertyViewHolder(val binding: CardSimpleOutlinedBinding) :
         AbstractViewHolder<GameProperty>(binding) {
+        private var detailsJob: Job? = null
+
+        fun cancelJobs() {
+            detailsJob?.cancel()
+            detailsJob = null
+        }
+
         override fun bind(model: GameProperty) {
+            cancelJobs()
             val submenuProperty = model as SubmenuProperty
 
             binding.root.setOnClickListener {
@@ -84,8 +103,13 @@ class GamePropertiesAdapter(
                 binding.details.text = submenuProperty.details.invoke()
             } else if (submenuProperty.detailsFlow != null) {
                 binding.details.setVisible(true)
-                submenuProperty.detailsFlow.collect(viewLifecycle) { binding.details.text = it }
+                detailsJob = viewLifecycle.lifecycleScope.launch {
+                    viewLifecycle.repeatOnLifecycle(Lifecycle.State.CREATED) {
+                        submenuProperty.detailsFlow.collect { binding.details.text = it }
+                    }
+                }
             } else {
+                binding.details.text = ""
                 binding.details.setVisible(false)
             }
 

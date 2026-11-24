@@ -3,6 +3,19 @@
 Eglantine can expose a [Model Context Protocol](https://modelcontextprotocol.io) server so AI
 agents can inspect and drive the running emulator.
 
+## Inspect a running instance
+
+1. Check which emulator instance owns the endpoint. The running server records its URL,
+   port and PID in `<user dir>/mcp-server.json`.
+2. Connect a client with writes disabled for an inspection. Start with `status` to confirm
+   the game and build, then read `eglantine://tools/guide` or discover the live tool schemas
+   through the MCP client.
+3. Use screenshots, timeline cursors or a short `perf_sample` to gather evidence. Keep
+   named session files per agent when sharing the server.
+
+This endpoint belongs to the desktop emulator's built-in server. For a session configured
+with the separate NX2 debug server, use the [NX2 adapter](../nx2/debug_mcp.py).
+
 ## Enable
 
 The server is **off by default**. Turn it on in one of these ways:
@@ -23,6 +36,17 @@ Builds include the server unless configured with `-DENABLE_MCP_SERVER=OFF`.
 
 ## Connect
 
+From the repository root, the Python 3 client can inspect the default port:
+
+```sh
+python3 -I tools/mcp/scripts/mcp.py status
+```
+
+The client prints structured results when present. It exits 1 on a JSON-RPC error
+and 2 when a tool reports an error. Set `EGLANTINE_MCP_TOKEN` when the instance requires a
+token, and `EGLANTINE_MCP_SID_FILE` to a distinct session file for each agent. For a custom
+server port, configure the URL in your MCP client.
+
 Claude Code:
 
 ```sh
@@ -40,8 +64,9 @@ Test with `npx @modelcontextprotocol/inspector` (transport: Streamable HTTP).
 
 ## Tools
 
-W = needs *Allow Writes*; L = needs the control lease (granted automatically when no other
-agent holds it, see `acquire_control`).
+W means the tool needs *Allow Writes*. L means it needs the control lease, which is
+granted automatically when no other agent holds it. See `acquire_control` and
+`release_control` when coordinating sessions.
 
 | Tool | What it does |
 |---|---|
@@ -121,13 +146,12 @@ end the process). Either `--mcp` or `--mcp-port N` enables the server.
 
 ## Code
 
-`src/mcp/`: transport-independent protocol (`protocol.*`), tool registry and argument
+[`src/mcp/`](../../src/mcp/) owns the transport-independent protocol (`protocol.*`), tool registry and argument
 validation (`tool_registry.*`), event timeline (`timeline.*`), server/HTTP binding and extra
 endpoints (`server.*`, `dashboard.h`), tools (`tools/`, shared pieces in `tool_helpers.h`).
 Frontends implement `Mcp::Host`: `src/yuzu/mcp_host_qt.*` (Qt), `src/yuzu_cmd/mcp_host_cli.*`
 (eden-cli). Core observers the MCP plugs into: `core/debugger/trace_hooks.h` (IPC, SVC,
 crashes), `Service::g_unimplemented_hook`, `VideoCommon::Nx2Profile` snapshots.
 Per-game data: `<config>/mcp/{screens,probes,routes}/<program id>.json`.
-Unit tests: `src/tests/mcp/`. Minimal command-line client: `tools/mcp/scripts/mcp.py <tool> [json-args]`
-(set `EGLANTINE_MCP_TOKEN` when a token is configured, and `EGLANTINE_MCP_SID_FILE` per agent so
-each one gets its own session and control lease).
+See the [MCP unit tests](../../src/tests/mcp/) and
+[`mcp.py`](./scripts/mcp.py) command-line client.

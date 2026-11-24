@@ -10,6 +10,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -138,8 +139,7 @@ public:
     }
 
     SessionRequestHandlerWeakPtr DomainHandler(std::size_t index) const {
-        ASSERT_MSG(index < DomainHandlerCount(), "Unexpected handler index {}", index);
-        return domain_handlers.at(index);
+        return index < DomainHandlerCount() ? domain_handlers[index] : SessionRequestHandlerWeakPtr{};
     }
 
     void AppendDomainHandler(SessionRequestHandlerPtr&& handler) {
@@ -213,7 +213,7 @@ public:
     }
 
     /// Populates this context with data from the requesting process/thread.
-    Result PopulateFromIncomingCommandBuffer(u32_le* src_cmdbuf);
+    Result PopulateFromIncomingCommandBuffer(std::span<const u32> words);
 
     /// Writes data from this context back to the requesting process/thread.
     Result WriteToOutgoingCommandBuffer();
@@ -245,6 +245,14 @@ public:
 
     [[nodiscard]] u32 GetDataPayloadOffset() const {
         return data_payload_offset;
+    }
+
+    [[nodiscard]] u32 GetRequestArgumentOffset() const {
+        return request_argument_offset;
+    }
+
+    [[nodiscard]] std::size_t GetRequestArgumentSize() const {
+        return request_argument_words * sizeof(u32);
     }
 
     [[nodiscard]] const boost::container::static_vector<IPC::BufferDescriptorX, 16>& BufferDescriptorX() const {
@@ -282,6 +290,8 @@ public:
 
     /// Helper function to read a copy of a buffer using the appropriate buffer descriptor
     [[nodiscard]] std::vector<u8> ReadBufferCopy(std::size_t buffer_index = 0) const;
+
+    [[nodiscard]] bool ReadBufferInto(std::span<std::byte> output, std::size_t buffer_index = 0) const;
 
     /// Helper function to write a buffer using the appropriate buffer descriptor
     std::size_t WriteBuffer(const void* buffer, std::size_t size,
@@ -409,9 +419,9 @@ public:
 private:
     friend struct IPC::ResponseBuilder;
 
-    void ParseCommandBuffer(u32_le* src_cmdbuf, bool incoming);
+    Result ParseCommandBuffer(u32 word_count);
 
-    std::array<u32, IPC::COMMAND_BUFFER_LENGTH> cmd_buf;
+    std::array<u32, IPC::COMMAND_BUFFER_LENGTH> cmd_buf{};
     Kernel::KServerSession* server_session{};
     Kernel::KHandleTable* client_handle_table{};
     Kernel::KThread* thread{};
@@ -442,6 +452,8 @@ private:
     u32_le command{};
     u32 write_size{};
     u32 data_payload_offset{};
+    u32 request_argument_offset{};
+    u32 request_argument_words{};
     u32 handles_offset{};
     u32 domain_offset{};
     bool is_deferred = false;

@@ -1,11 +1,22 @@
-# Translating
+# Qt translations
 
-This directory stores translation patches (TS files) for Yuzu Qt frontend. This directory is linked with the [Eden project on Transifex](https://app.transifex.com/edenemu/eden-emulator), so you can update the translation by executing `tx pull -t -a` in the root of this repository. If you want to contribute to the translation, please go the Transifex link and submit your translation there.
+This directory holds Qt Linguist `.ts` translation sources for the desktop frontend.
+[`.tx/config`](../../.tx/config) configures `en.ts` as the English source for the Qt
+resource on Transifex. Submit translation contributions to the
+[Eden project on Transifex](https://app.transifex.com/edenemu/eden-emulator).
 
-When creating/improving translations, please keep in mind:
+Use the [translation scripts guide](../../tools/translations/README.md) to refresh the
+English source or pull a maintainer snapshot. With an authenticated Transifex CLI,
+`tx pull -t -a` from the repository root pulls translations for the resources in
+`.tx/config`, including Android strings.
 
-- You are responsible for providing accurate translations that do NOT contain illicit content or messages,
-- Many of our developers do not speak the languages you may be translating, so will only be able to help with confusions about the source language,
-- And bad-faith translations or attempts to insert illicit content may result in an immediate removal of access.
+The Qt build compiles localized `.ts` sources to `.qm` files. The English runtime
+plural rules use a separate [checked-in plural catalogue](../english_plurals/README.md).
 
-New language requests will not be honored for the time being.
+## Contribution rules
+
+- Translate accurately and keep the content appropriate.
+- Developers can clarify the source text. Review of the target language depends on the translation community.
+- Bad-faith translations or attempts to insert illicit content may result in immediate removal of access.
+
+New language requests are currently closed.

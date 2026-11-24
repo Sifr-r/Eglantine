@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "common/common_types.h"
+#include "common/scope_exit.h"
 #include "core/hle/service/nx2_gsv.h"
 #include "video_core/host1x/syncpoint_manager.h"
 
@@ -297,7 +298,7 @@ TEST_CASE("Seeded mirror registration and WithGuestValuesStable stay monotonic u
     constexpr u32 Iterations = 2000;
 
     std::atomic<bool> start{false};
-    std::thread incrementer([&] {
+    std::jthread incrementer([&] {
         while (!start.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
@@ -309,6 +310,7 @@ TEST_CASE("Seeded mirror registration and WithGuestValuesStable stay monotonic u
     start.store(true, std::memory_order_release);
     for (u32 round = 0; round < 32U; ++round) {
         std::atomic<u32> mirrored_value{0};
+        std::atomic<bool> monotonic{true};
         u32 seeded_value = 0;
         bool seeded = false;
         const auto handle = manager->RegisterGuestMirror(
@@ -319,10 +321,15 @@ TEST_CASE("Seeded mirror registration and WithGuestValuesStable stay monotonic u
                         seeded_value = value;
                     }
                     const u32 prev = mirrored_value.exchange(value, std::memory_order_acq_rel);
-                    REQUIRE(value >= prev);
+                    if (value < prev) {
+                        monotonic.store(false, std::memory_order_release);
+                    }
                 }
             },
             true);
+        SCOPE_EXIT {
+            manager->UnregisterGuestMirror(handle);
+        };
         REQUIRE(handle != SyncpointManager::InvalidGuestMirrorHandle);
         REQUIRE(seeded);
 
@@ -339,7 +346,7 @@ TEST_CASE("Seeded mirror registration and WithGuestValuesStable stay monotonic u
             REQUIRE(observed > seeded_value);
             REQUIRE(observed >= stable_value);
         }
-        manager->UnregisterGuestMirror(handle);
+        REQUIRE(monotonic.load(std::memory_order_acquire));
     }
 
     incrementer.join();

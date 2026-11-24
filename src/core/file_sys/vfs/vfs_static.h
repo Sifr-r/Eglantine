@@ -46,6 +46,9 @@ public:
     }
 
     std::size_t Read(u8* data, std::size_t length, std::size_t offset) const override {
+        if (length == 0 || offset >= size) {
+            return 0;
+        }
         const auto read = (std::min)(length, size - offset);
         std::fill(data, data + read, value);
         return read;
@@ -64,6 +67,9 @@ public:
     }
 
     std::vector<u8> ReadBytes(std::size_t length, std::size_t offset) const override {
+        if (length == 0 || offset >= size) {
+            return {};
+        }
         const auto read = (std::min)(length, size - offset);
         return std::vector<u8>(read, value);
     }

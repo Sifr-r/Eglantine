@@ -1035,7 +1035,7 @@ abstract class SettingsItem(
             // GPU Logging settings
             put(
                 SingleChoiceSetting(
-                    ByteSetting.GPU_LOG_LEVEL,
+                    IntSetting.GPU_LOG_LEVEL,
                     titleId = R.string.gpu_log_level,
                     descriptionId = R.string.gpu_log_level_description,
                     choicesId = R.array.gpuLogLevelEntries,

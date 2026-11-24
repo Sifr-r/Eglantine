@@ -311,8 +311,10 @@ private:
 // Every ioctl succeeds with a zeroed reply and is logged, so the driver's use of it shows up.
 class nx2_stub_device final : public nvdevice {
 public:
+    static constexpr DeviceKind Kind = DeviceKind::Nx2Stub;
+
     explicit nx2_stub_device(Core::System& system_, std::string name_)
-        : nvdevice{system_}, name{std::move(name_)} {}
+        : nvdevice{system_, Kind}, name{std::move(name_)} {}
 
     NvResult Ioctl1(DeviceFD fd, Ioctl command, std::span<const u8> input,
                     std::span<u8> output) override {

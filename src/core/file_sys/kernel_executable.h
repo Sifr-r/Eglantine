@@ -58,6 +58,7 @@ public:
     explicit KIP(const VirtualFile& file);
 
     Loader::ResultStatus GetStatus() const;
+    u64 GetSize() const;
 
     std::string GetName() const;
     u64 GetTitleID() const;
@@ -90,6 +91,7 @@ private:
 
     KIPHeader header{};
     std::array<std::vector<u8>, 6> decompressed_sections;
+    u64 size = 0;
 };
 
 class INI {

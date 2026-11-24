@@ -17,6 +17,9 @@
 #pragma warning(pop)
 #endif
 
+#include <algorithm>
+#include <stdexcept>
+
 #include <fmt/ranges.h>
 
 #include "common/fs/file.h"
@@ -320,6 +323,11 @@ Result NfcDevice::ReadMifare(std::span<const MifareReadBlockParameter> parameter
 
     Common::Input::MifareRequest request{};
     Common::Input::MifareRequest out_data{};
+    if (parameters.empty() || parameters.size() > request.data.size() ||
+        read_block_data.size() > out_data.data.size()) {
+        return ResultInvalidArgument;
+    }
+
     const auto unknown = parameters[0].sector_key.unknown;
     for (std::size_t i = 0; i < parameters.size(); i++) {
         if (unknown != parameters[i].sector_key.unknown) {
@@ -373,6 +381,11 @@ Result NfcDevice::WriteMifare(std::span<const MifareWriteBlockParameter> paramet
         return ResultInvalidArgument;
     }
 
+    Common::Input::MifareRequest request{};
+    if (parameters.empty() || parameters.size() > request.data.size()) {
+        return ResultInvalidArgument;
+    }
+
     const auto unknown = parameters[0].sector_key.unknown;
     for (std::size_t i = 0; i < parameters.size(); i++) {
         if (unknown != parameters[i].sector_key.unknown) {
@@ -380,7 +393,6 @@ Result NfcDevice::WriteMifare(std::span<const MifareWriteBlockParameter> paramet
         }
     }
 
-    Common::Input::MifareRequest request{};
     for (std::size_t i = 0; i < parameters.size(); i++) {
         if (parameters[i].sector_key.command == MifareCmd::None) {
             continue;
@@ -389,7 +401,7 @@ Result NfcDevice::WriteMifare(std::span<const MifareWriteBlockParameter> paramet
         request.data[i].sector = parameters[i].sector_number;
         memcpy(request.data[i].key.data(), parameters[i].sector_key.sector_key.data(),
                sizeof(KeyData));
-        memcpy(request.data[i].data.data(), parameters[i].data.data(), sizeof(KeyData));
+        memcpy(request.data[i].data.data(), parameters[i].data.data(), sizeof(DataBlock));
     }
 
     if (!npad_device->WriteMifareData(request)) {
@@ -1262,7 +1274,10 @@ Result NfcDevice::BreakTag(NFP::BreakType break_type) {
 }
 
 Result NfcDevice::HasBackup(const UniqueSerialNumber& uid, std::size_t uuid_size) const {
-    ASSERT_MSG(uuid_size < sizeof(UniqueSerialNumber), "Invalid UUID size");
+    ASSERT_MSG(uuid_size <= sizeof(UniqueSerialNumber), "Invalid UUID size");
+    if (uuid_size > sizeof(UniqueSerialNumber)) {
+        return ResultInvalidArgument;
+    }
     constexpr auto backup_dir = "backup";
     const auto yuzu_amiibo_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::AmiiboDir);
     const auto file_name =
@@ -1283,7 +1298,10 @@ Result NfcDevice::HasBackup(const NFP::TagUuid& tag_uid) const {
 
 Result NfcDevice::ReadBackupData(const UniqueSerialNumber& uid, std::size_t uuid_size,
                                  std::span<u8> data) const {
-    ASSERT_MSG(uuid_size < sizeof(UniqueSerialNumber), "Invalid UUID size");
+    ASSERT_MSG(uuid_size <= sizeof(UniqueSerialNumber), "Invalid UUID size");
+    if (uuid_size > sizeof(UniqueSerialNumber)) {
+        return ResultInvalidArgument;
+    }
     constexpr auto backup_dir = "backup";
     const auto yuzu_amiibo_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::AmiiboDir);
     const auto file_name =
@@ -1314,7 +1332,10 @@ Result NfcDevice::ReadBackupData(const NFP::TagUuid& tag_uid, std::span<u8> data
 
 Result NfcDevice::WriteBackupData(const UniqueSerialNumber& uid, std::size_t uuid_size,
                                   std::span<const u8> data) {
-    ASSERT_MSG(uuid_size < sizeof(UniqueSerialNumber), "Invalid UUID size");
+    ASSERT_MSG(uuid_size <= sizeof(UniqueSerialNumber), "Invalid UUID size");
+    if (uuid_size > sizeof(UniqueSerialNumber)) {
+        return ResultInvalidArgument;
+    }
     constexpr auto backup_dir = "backup";
     const auto yuzu_amiibo_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::AmiiboDir);
     const auto file_name =
@@ -1382,8 +1403,20 @@ NFP::AmiiboName NfcDevice::GetAmiiboName(const NFP::AmiiboSettings& settings) co
     }
 
     // Convert from utf16 to utf8
-    const auto amiibo_name_utf8 = Common::UTF16ToUTF8(settings_amiibo_name.data());
-    memcpy(amiibo_name.data(), amiibo_name_utf8.data(), amiibo_name_utf8.size());
+    const auto amiibo_name_view = Common::UTF16StringFromFixedZeroTerminatedBuffer(
+        std::u16string_view{settings_amiibo_name.data(), settings_amiibo_name.size()},
+        settings_amiibo_name.size());
+    std::string amiibo_name_utf8{};
+    try {
+        amiibo_name_utf8 = Common::UTF16ToUTF8(amiibo_name_view);
+    } catch (const std::range_error&) {
+        LOG_ERROR(Service_NFC, "Failed to convert Amiibo UTF-16 name to UTF-8");
+    }
+    const std::size_t copy_len = (std::min)(amiibo_name_utf8.size(), amiibo_name.size() - 1);
+    if (copy_len > 0) {
+        std::memcpy(amiibo_name.data(), amiibo_name_utf8.data(), copy_len);
+    }
+    amiibo_name[copy_len] = '\0';
 
     return amiibo_name;
 }
@@ -1393,9 +1426,20 @@ void NfcDevice::SetAmiiboName(NFP::AmiiboSettings& settings,
     std::array<char16_t, NFP::amiibo_name_length> settings_amiibo_name{};
 
     // Convert from utf8 to utf16
-    const auto amiibo_name_utf16 = Common::UTF8ToUTF16(amiibo_name.data());
-    memcpy(settings_amiibo_name.data(), amiibo_name_utf16.data(),
-           amiibo_name_utf16.size() * sizeof(char16_t));
+    const auto amiibo_name_str = Common::StringFromFixedZeroTerminatedBuffer(
+        std::string_view{amiibo_name.data(), amiibo_name.size()}, amiibo_name.size());
+    std::u16string amiibo_name_utf16{};
+    try {
+        amiibo_name_utf16 = Common::UTF8ToUTF16(amiibo_name_str);
+    } catch (const std::range_error&) {
+        LOG_ERROR(Service_NFC, "Failed to convert Amiibo UTF-8 name to UTF-16");
+    }
+    const std::size_t copy_len =
+        (std::min)(amiibo_name_utf16.size(), settings_amiibo_name.size());
+    if (copy_len > 0) {
+        std::memcpy(settings_amiibo_name.data(), amiibo_name_utf16.data(),
+                    copy_len * sizeof(char16_t));
+    }
 
     // Convert from little endian to big endian
     for (std::size_t i = 0; i < NFP::amiibo_name_length; i++) {

@@ -81,7 +81,7 @@ struct ThreadQueueList {
     T pop_first_better(Priority priority) {
         Queue* cur = first;
         Queue* stop = &queues[priority];
-        while (cur < stop) {
+        while (cur != nullptr && cur < stop) {
             if (!cur->data.empty()) {
                 auto tmp = std::move(cur->data.front());
                 cur->data.pop_front();

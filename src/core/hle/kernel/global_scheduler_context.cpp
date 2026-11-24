@@ -34,7 +34,9 @@ void GlobalSchedulerContext::AddThread(KThread* thread) noexcept {
 /// @brief Removes a thread from the scheduler
 void GlobalSchedulerContext::RemoveThread(KThread* thread) noexcept {
     std::scoped_lock lock{m_global_list_guard};
-    m_thread_list.erase(std::ranges::find(m_thread_list, thread));
+    if (const auto it = std::ranges::find(m_thread_list, thread); it != m_thread_list.end()) {
+        m_thread_list.erase(it);
+    }
 }
 
 /// @brief Rotates the scheduling queues of threads at a preemption priority

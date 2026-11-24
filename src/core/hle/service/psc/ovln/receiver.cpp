@@ -31,7 +31,7 @@ IReceiver::~IReceiver() {
 }
 
 Result IReceiver::AddSource(SourceName source_name) {
-    const std::string name = source_name.GetString();
+    const std::string name{source_name.GetString()};
     LOG_INFO(Service_PSC, "called: source_name={}", name);
 
     // Add source if it doesn't already exist
@@ -43,7 +43,7 @@ Result IReceiver::AddSource(SourceName source_name) {
 }
 
 Result IReceiver::RemoveSource(SourceName source_name) {
-    const std::string name = source_name.GetString();
+    const std::string name{source_name.GetString()};
     LOG_INFO(Service_PSC, "called: source_name={}", name);
 
     // Remove source if it exists

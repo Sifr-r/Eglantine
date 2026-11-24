@@ -70,16 +70,22 @@ Hidbus::~Hidbus() {
 
 void Hidbus::UpdateHidbus(std::chrono::nanoseconds ns_late) {
     if (is_hidbus_enabled) {
+        u8* shared_memory = system.Kernel().GetHidBusSharedMem().GetPointer();
         for (std::size_t i = 0; i < devices.size(); ++i) {
-            if (devices[i].is_device_initialized) {
+            if (devices[i].is_device_initialized && devices[i].device != nullptr) {
+                const auto entry_index =
+                    static_cast<std::size_t>(devices[i].handle.internal_index.Value());
+                if (entry_index >= hidbus_status.entries.size()) {
+                    continue;
+                }
                 auto& device = devices[i].device;
                 device->OnUpdate();
-                auto& cur_entry = hidbus_status.entries[devices[i].handle.internal_index];
+                auto& cur_entry = hidbus_status.entries[entry_index];
                 cur_entry.is_polling_mode = device->IsPollingMode();
                 cur_entry.polling_mode = device->GetPollingMode();
                 cur_entry.is_enabled = device->IsEnabled();
-                u8* shared_memory = system.Kernel().GetHidBusSharedMem().GetPointer();
-                std::memcpy(shared_memory + (i * sizeof(HidbusStatusManagerEntry)), &hidbus_status, sizeof(HidbusStatusManagerEntry));
+                std::memcpy(shared_memory + (entry_index * sizeof(HidbusStatusManagerEntry)),
+                            &cur_entry, sizeof(HidbusStatusManagerEntry));
             }
         }
     }
@@ -136,6 +142,9 @@ Result Hidbus::IsExternalDeviceConnected(Out<bool> out_is_connected, BusHandle b
     const auto device_index = GetDeviceIndexFromHandle(bus_handle);
 
     R_UNLESS(device_index.has_value(), ResultUnknown);
+    R_UNLESS(devices[device_index.value()].is_device_initialized &&
+                 devices[device_index.value()].device != nullptr,
+             ResultUnknown);
 
     *out_is_connected = devices[device_index.value()].device->IsDeviceActivated();
     R_SUCCEED();
@@ -191,6 +200,9 @@ Result Hidbus::Finalize(BusHandle bus_handle, AppletResourceUserId aruid) {
     const auto device_index = GetDeviceIndexFromHandle(bus_handle);
 
     R_UNLESS(device_index.has_value(), ResultUnknown);
+    R_UNLESS(devices[device_index.value()].is_device_initialized &&
+                 devices[device_index.value()].device != nullptr,
+             ResultUnknown);
 
     const auto entry_index = devices[device_index.value()].handle.internal_index;
     auto& cur_entry = hidbus_status.entries[entry_index];
@@ -220,6 +232,9 @@ Result Hidbus::EnableExternalDevice(bool is_enabled, BusHandle bus_handle, u64 i
     const auto device_index = GetDeviceIndexFromHandle(bus_handle);
 
     R_UNLESS(device_index.has_value(), ResultUnknown);
+    R_UNLESS(devices[device_index.value()].is_device_initialized &&
+                 devices[device_index.value()].device != nullptr,
+             ResultUnknown);
     devices[device_index.value()].device->Enable(is_enabled);
     R_SUCCEED();
 }
@@ -234,6 +249,9 @@ Result Hidbus::GetExternalDeviceId(Out<u32> out_device_id, BusHandle bus_handle)
     const auto device_index = GetDeviceIndexFromHandle(bus_handle);
 
     R_UNLESS(device_index.has_value(), ResultUnknown);
+    R_UNLESS(devices[device_index.value()].is_device_initialized &&
+                 devices[device_index.value()].device != nullptr,
+             ResultUnknown);
 
     *out_device_id = devices[device_index.value()].device->GetDeviceId();
     R_SUCCEED();
@@ -250,6 +268,9 @@ Result Hidbus::SendCommandAsync(BusHandle bus_handle,
     const auto device_index = GetDeviceIndexFromHandle(bus_handle);
 
     R_UNLESS(device_index.has_value(), ResultUnknown);
+    R_UNLESS(devices[device_index.value()].is_device_initialized &&
+                 devices[device_index.value()].device != nullptr,
+             ResultUnknown);
 
     devices[device_index.value()].device->SetCommand(buffer_data);
     R_SUCCEED();
@@ -266,6 +287,9 @@ Result Hidbus::GetSendCommandAsynceResult(Out<u64> out_data_size, BusHandle bus_
     const auto device_index = GetDeviceIndexFromHandle(bus_handle);
 
     R_UNLESS(device_index.has_value(), ResultUnknown);
+    R_UNLESS(devices[device_index.value()].is_device_initialized &&
+                 devices[device_index.value()].device != nullptr,
+             ResultUnknown);
 
     *out_data_size = devices[device_index.value()].device->GetReply(out_buffer_data);
     R_SUCCEED();
@@ -282,6 +306,9 @@ Result Hidbus::SetEventForSendCommandAsycResult(OutCopyHandle<Kernel::KReadableE
     const auto device_index = GetDeviceIndexFromHandle(bus_handle);
 
     R_UNLESS(device_index.has_value(), ResultUnknown);
+    R_UNLESS(devices[device_index.value()].is_device_initialized &&
+                 devices[device_index.value()].device != nullptr,
+             ResultUnknown);
 
     *out_event = &devices[device_index.value()].device->GetSendCommandAsycEvent();
     R_SUCCEED();
@@ -297,6 +324,7 @@ Result Hidbus::GetSharedMemoryHandle(OutCopyHandle<Kernel::KSharedMemory> out_sh
 Result Hidbus::EnableJoyPollingReceiveMode(u32 t_mem_size, JoyPollingMode polling_mode,
                                            BusHandle bus_handle,
                                            InCopyHandle<Kernel::KTransferMemory> t_mem) {
+    R_UNLESS(t_mem, ResultUnknown);
     ASSERT_MSG(t_mem_size == 0x1000, "t_mem_size is not 0x1000 bytes");
     ASSERT_MSG(t_mem->GetSize() == t_mem_size, "t_mem has incorrect size");
 
@@ -309,6 +337,9 @@ Result Hidbus::EnableJoyPollingReceiveMode(u32 t_mem_size, JoyPollingMode pollin
     const auto device_index = GetDeviceIndexFromHandle(bus_handle);
 
     R_UNLESS(device_index.has_value(), ResultUnknown);
+    R_UNLESS(devices[device_index.value()].is_device_initialized &&
+                 devices[device_index.value()].device != nullptr,
+             ResultUnknown);
 
     auto& device = devices[device_index.value()].device;
     device->SetPollingMode(polling_mode);
@@ -326,6 +357,9 @@ Result Hidbus::DisableJoyPollingReceiveMode(BusHandle bus_handle) {
     const auto device_index = GetDeviceIndexFromHandle(bus_handle);
 
     R_UNLESS(device_index.has_value(), ResultUnknown);
+    R_UNLESS(devices[device_index.value()].is_device_initialized &&
+                 devices[device_index.value()].device != nullptr,
+             ResultUnknown);
 
     auto& device = devices[device_index.value()].device;
     device->DisablePollingMode();

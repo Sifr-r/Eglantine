@@ -64,7 +64,8 @@ ChannelState::ChannelState(s32 bind_id_)
 {}
 
 void ChannelState::Init(Core::System& system, u64 program_id_,
-                        std::shared_ptr<NativeMacroContext> native_macro_context) {
+                        std::shared_ptr<NativeMacroContext> native_macro_context,
+                        std::shared_ptr<NativeQmdStateTable> native_qmd_table) {
     ASSERT(memory_manager);
     program_id = program_id_;
     payload.emplace(system, *memory_manager, *this);
@@ -75,8 +76,12 @@ void ChannelState::Init(Core::System& system, u64 program_id_,
     if (use_ampere) {
         // Switch 2 command streams use Ampere classes with Turing+ (MME64) macros, and its
         // block-linear surfaces the console's GOB swizzle.
+        const bool had_explicit_macro_ctx = native_macro_context != nullptr;
         if (!native_macro_context) {
             native_macro_context = system.GPU().GetOrCreateNativeMacroContext();
+        }
+        if (!native_qmd_table && !had_explicit_macro_ctx) {
+            native_qmd_table = system.GPU().GetOrCreateNativeQmdTable();
         }
         memory_manager->EnableNativeTiling();
         payload->maxwell_3d.SetNativeMacroContext(native_macro_context);
@@ -85,6 +90,9 @@ void ChannelState::Init(Core::System& system, u64 program_id_,
                                                    native_macro_context->positions,
                                                    native_macro_context.get());
         payload->kepler_compute.SetNativeDataRam(&payload->maxwell_3d.GetNativeDataRam());
+        if (native_qmd_table) {
+            payload->kepler_compute.SetNativeQmdTable(std::move(native_qmd_table));
+        }
     }
     initialized = true;
 }

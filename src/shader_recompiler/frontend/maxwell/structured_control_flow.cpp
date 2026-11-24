@@ -8,6 +8,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <iterator>
 #include <memory>
 #include <string>
 #include "common/container/unordered_map.h"
@@ -910,6 +911,7 @@ private:
         std::vector<IR::U1> demote_conds;
         u32 num_epilogues{};
         u32 branch_depth{};
+        u32 loop_depth{};
         for (const IR::AbstractSyntaxNode& node : syntax_list) {
             if (node.type == Type::If) {
                 ++branch_depth;
@@ -917,14 +919,20 @@ private:
             if (node.type == Type::EndIf) {
                 --branch_depth;
             }
+            if (node.type == Type::Loop) {
+                ++loop_depth;
+            }
+            if (node.type == Type::Repeat) {
+                --loop_depth;
+            }
             if (node.type != Type::Block) {
                 continue;
             }
             for (const IR::Inst& inst : node.data.block->Instructions()) {
                 const IR::Opcode op{inst.GetOpcode()};
                 if (op == IR::Opcode::DemoteToHelperInvocation) {
-                    // Skip reordering nested demote branches.
-                    if (branch_depth <= 1) {
+                    // Skip reordering nested or loop-enclosed demote branches.
+                    if (loop_depth == 0 && branch_depth <= 1) {
                         demote_blocks.push_back(node.data.block);
                     }
                     break;
@@ -940,20 +948,49 @@ private:
         if (demote_blocks.size() == 0) {
             return;
         }
-        if (num_epilogues > 1) {
-            LOG_DEBUG(Shader, "Combining demotes with more than one return is not implemented.");
+        if (num_epilogues != 1) {
+            LOG_DEBUG(Shader, "Combining demotes with {} returns is not implemented.",
+                      num_epilogues);
             return;
         }
-        s64 last_iterator_offset{};
         auto& asl{syntax_list};
+        s64 check_offset{};
+        for (const IR::Block* demote_block : demote_blocks) {
+            const auto start_it{asl.begin() + check_offset};
+            auto check_it{std::find_if(start_it, asl.end(), [&](const IR::AbstractSyntaxNode& asn) {
+                return asn.type == Type::If && asn.data.if_node.body == demote_block;
+            })};
+            if (check_it == asl.end()) {
+                // Demote without a conditional branch.
+                // No need to proceed since all fragment instances will be demoted regardless.
+                return;
+            }
+            const IR::Block* const end_if = check_it->data.if_node.merge;
+            check_offset = std::distance(asl.begin(), check_it) + 1;
+            check_it = std::find_if(check_it + 1, asl.end(),
+                                    [&](const IR::AbstractSyntaxNode& asn) {
+                                        return asn.type == Type::Block &&
+                                               asn.data.block == demote_block;
+                                    });
+            if (check_it == asl.end()) {
+                return;
+            }
+            check_it = std::find_if(check_it + 1, asl.end(),
+                                    [&](const IR::AbstractSyntaxNode& asn) {
+                                        return asn.type == Type::EndIf &&
+                                               asn.data.end_if.merge == end_if;
+                                    });
+            if (check_it == asl.end()) {
+                return;
+            }
+        }
+        s64 last_iterator_offset{};
         for (const IR::Block* demote_block : demote_blocks) {
             const auto start_it{asl.begin() + last_iterator_offset};
             auto asl_it{std::find_if(start_it, asl.end(), [&](const IR::AbstractSyntaxNode& asn) {
                 return asn.type == Type::If && asn.data.if_node.body == demote_block;
             })};
             if (asl_it == asl.end()) {
-                // Demote without a conditional branch.
-                // No need to proceed since all fragment instances will be demoted regardless.
                 return;
             }
             const IR::Block* const end_if = asl_it->data.if_node.merge;
@@ -964,11 +1001,17 @@ private:
             asl_it = std::find_if(asl_it, asl.end(), [&](const IR::AbstractSyntaxNode& asn) {
                 return asn.type == Type::Block && asn.data.block == demote_block;
             });
+            if (asl_it == asl.end()) {
+                return;
+            }
 
             asl_it = asl.erase(asl_it);
             asl_it = std::find_if(asl_it, asl.end(), [&](const IR::AbstractSyntaxNode& asn) {
                 return asn.type == Type::EndIf && asn.data.end_if.merge == end_if;
             });
+            if (asl_it == asl.end()) {
+                return;
+            }
             asl_it = asl.erase(asl_it);
         }
         const auto epilogue_func{[](const IR::AbstractSyntaxNode& asn) {
@@ -983,9 +1026,28 @@ private:
             return false;
         }};
         const auto reverse_it{std::find_if(asl.rbegin(), asl.rend(), epilogue_func)};
-        const auto return_block_it{(reverse_it + 1).base()};
+        if (reverse_it == asl.rend()) {
+            return;
+        }
+        auto return_block_it{(reverse_it + 1).base()};
+        if (return_block_it == asl.begin() || std::prev(return_block_it)->type != Type::Block) {
+            IR::Block* const combine_block{return_block_it->data.block};
+            for (IR::Inst& inst : combine_block->Instructions()) {
+                if (inst.GetOpcode() == IR::Opcode::Epilogue) {
+                    inst.Invalidate();
+                }
+            }
+            IR::Block* const new_return_block{block_pool.Create(inst_pool)};
+            IR::IREmitter{*new_return_block}.Epilogue();
+            combine_block->AddBranch(new_return_block);
 
-        IR::IREmitter ir{*(return_block_it - 1)->data.block};
+            IR::AbstractSyntaxNode new_return_node{};
+            new_return_node.type = Type::Block;
+            new_return_node.data.block = new_return_block;
+            return_block_it = asl.insert(std::next(return_block_it), new_return_node);
+        }
+
+        IR::IREmitter ir{*std::prev(return_block_it)->data.block};
         IR::U1 cond(IR::Value(false));
         for (const auto& demote_cond : demote_conds) {
             cond = ir.LogicalOr(cond, demote_cond);

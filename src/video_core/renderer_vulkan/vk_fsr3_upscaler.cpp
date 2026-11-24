@@ -399,10 +399,10 @@ void Fsr3Upscaler::CreateResources(VkExtent2D render_size, VkExtent2D upscale_si
     farthest_depth = CreateTexture(VK_FORMAT_R16_SFLOAT, rw, rh);
     shading_change = CreateTexture(VK_FORMAT_R8_UNORM, rw / 2, rh / 2);
     new_locks = CreateTexture(VK_FORMAT_R8_UNORM, uw, uh);
+    const u32 spd_max_dim = (std::max)(1U, (std::max)(rw / 2, rh / 2));
     const u32 spd_levels =
-        static_cast<u32>(std::floor(std::log2(static_cast<f32>((std::max)(rw / 2, rh / 2))))) + 1;
-    spd_mips = CreateTexture(VK_FORMAT_R16G16_SFLOAT, rw / 2, rh / 2,
-                             (std::max)(spd_levels, SPD_STORED_MIPS));
+        static_cast<u32>(std::floor(std::log2(static_cast<f32>(spd_max_dim)))) + 1;
+    spd_mips = CreateTexture(VK_FORMAT_R16G16_SFLOAT, rw / 2, rh / 2, spd_levels);
     farthest_depth_mip1 = CreateTexture(VK_FORMAT_R16_SFLOAT, rw / 2, rh / 2);
     dilated_motion_vectors = CreateTexture(VK_FORMAT_R16G16_SFLOAT, rw, rh);
     dilated_depth = CreateTexture(VK_FORMAT_R32_SFLOAT, rw, rh);
@@ -633,8 +633,11 @@ bool Fsr3Upscaler::Upscale(const Inputs& in) {
 
     const auto tex = [](const Texture& texture) { return Resource{.view = *texture.view}; };
     const auto mip = [&](u32 level) {
-        return Resource{.view = *spd_mips.levels[(std::min)(level, static_cast<u32>(
-                                                                       spd_mips.levels.size() - 1))]};
+        if (spd_mips.levels.empty()) {
+            return Resource{.view = *spd_mips.view};
+        }
+        return Resource{.view = *spd_mips.levels[(std::min)(
+                            level, static_cast<u32>(spd_mips.levels.size() - 1))]};
     };
     const Resource color{.view = in.color.view};
     const Resource depth{.view = in.depth.view};
