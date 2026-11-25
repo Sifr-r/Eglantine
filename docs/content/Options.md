@@ -8,7 +8,7 @@ Notes:
 
 - Defaults are marked per-platform.
 - "Non-UNIX" just means Windows/MSVC and Android (yes, macOS is UNIX
-- Android generally doesn't need to change anything; if you do, go to `src/android/app/build.gradle.kts`
+- Android generally doesn't need to change anything; if you do, go to `src/android/app/build.gradle`
 - To set a boolean variable to on, use `ON` for the value; to turn it off, use `OFF`
 - If a variable is mentioned as being e.g. "ON" for a specific platform(s), that means it is defaulted to OFF on others
 - TYPE is always boolean unless otherwise specified

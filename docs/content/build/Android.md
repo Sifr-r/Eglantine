@@ -3,7 +3,7 @@
 ## Dependencies
 
 * [Android Studio](https://developer.android.com/studio)
-* Android SDK platform 36, NDK `28.2.13676358`, and CMake `3.31.5`, as pinned in [the app build configuration](../../../src/android/app/build.gradle.kts).
+* Android SDK platform 36, NDK `28.2.13676358`, and CMake `3.31.5`, as pinned in [the app build configuration](../../../src/android/app/build.gradle).
 * JDK 17 for the Gradle build.
 * [Git](https://git-scm.com/download)
 
@@ -34,10 +34,9 @@ point `ANDROID_HOME` at the installed Android SDK. From `src/android`, run:
 ```
 
 Use `gradlew.bat` on Windows. The Android Gradle plugin writes the APK under
-`src/android/app/build/outputs/apk/`. To pass extra CMake options, use
-`-PYUZU_ANDROID_ARGS="-DOPTION=VALUE"`.
+`src/android/app/build/outputs/apk/`.
 
-See the [language and domain ownership ledger](../../../ARCHITECTURE.md#first-party-language-and-domain-ownership)
+See the [language and domain ownership ledger](../../knowledge/rust_ffi.md#first-party-language-and-domain-ownership)
 for the current ARM64 Android build and verification status.
 
 ### Additional Resources

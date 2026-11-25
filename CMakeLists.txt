@@ -285,7 +285,6 @@ cmake_dependent_option(YUZU_ROOM "Enable dedicated room functionality" ON "NOT A
 cmake_dependent_option(YUZU_ROOM_STANDALONE "Enable standalone room executable" ON "YUZU_ROOM" OFF)
 
 cmake_dependent_option(YUZU_CMD "Compile the eden-cli executable" ON "NOT ANDROID" OFF)
-cmake_dependent_option(EGLANTINE_ANDROID_NATIVE_PROTOTYPE "Build the SDL-hosted Android prototype" OFF "ANDROID" OFF)
 cmake_dependent_option(ENABLE_GPUI "Build the Eglantine GPUI desktop frontend" ON "NOT ANDROID AND YUZU_CMD" OFF)
 
 cmake_dependent_option(YUZU_CRASH_DUMPS "Compile crash dump (Minidump) support" OFF "WIN32 OR LINUX" OFF)

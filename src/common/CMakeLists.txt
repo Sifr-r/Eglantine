@@ -209,16 +209,8 @@ if(ANDROID)
         common
         PUBLIC fs/fs_android.cpp
         fs/fs_android.h
-        android/android_common.cpp
-        android/android_common.h
-        android/id_cache.cpp
-        android/id_cache.h
-        android/multiplayer/multiplayer.cpp
-        android/multiplayer/multiplayer.h
-        android/applets/software_keyboard.cpp
-        android/applets/software_keyboard.h
-        android/applets/web_browser.cpp
-        android/applets/web_browser.h)
+        android/android_settings.cpp
+        android/android_settings.h)
 endif()
 
 if(ARCHITECTURE_x86_64)

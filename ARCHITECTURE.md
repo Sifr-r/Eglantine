@@ -14,7 +14,7 @@ Eglantine is a Switch / Switch 2 emulator forked from Eden (Yuzu lineage). Nativ
 | --- | --- | --- | --- |
 | Boot, platform, HLE, saves, NUP, audio, network | [core](docs/knowledge/core.md) | [`Core::System`](src/core/core.cpp), [`PlatformProfile`](src/core/platform_profile.h), [`Nx2SessionState`](src/core/nx2_session_state.h) | `[platform-profile]`, `[platform-sizing]`, `[shutdown-ordering]`, `[nx2-session]` |
 | Device behaviour the guest can observe (operation mode, applets, catalogue, saves, profiles) | [device_behaviour](docs/knowledge/device_behaviour.md) | [`AppletManager`](src/core/hle/service/am/applet_manager.cpp), [`ISystemSettingsServer`](src/core/hle/service/set/system_settings_server.cpp), [`Settings::values.use_docked_mode`](src/common/settings.h) | `[save-data]`, `[set]`, `[ldn]`, `[sockets]`, `[key_code_map]` |
-| File recognition, library scans, frontends | [frontends](docs/knowledge/frontends.md) | [Loader](src/core/loader/loader.cpp), [Shared discovery](src/frontend_common/game_list_discovery.h), [Android JNI](src/android/app/src/main/jni/game_metadata.cpp), [GPUI shell](rust/apps/eglantine_gpui/src/main.rs) | `[loader-formats]`, `[config_persistence]`, `gpui_session.py`, `cargo test` |
+| File recognition, library scans, frontends | [frontends](docs/knowledge/frontends.md) | [Loader](src/core/loader/loader.cpp), [Shared discovery](src/frontend_common/game_list_discovery.h), [Android host](src/android/app/native/main.cpp), [GPUI shell](rust/apps/eglantine_gpui/src/main.rs) | `[loader-formats]`, `[config_persistence]`, `gpui_session.py`, `cargo test` |
 | Host memory, GPU readbacks, textures, Vulkan | [video_core](docs/knowledge/video_core.md) | [Host memory](src/common/host_memory.cpp), [Buffer cache](src/video_core/buffer_cache/buffer_cache.h), [Texture code](src/video_core/textures) | `[host_memory]`, `[buffer-download-policy]`, `[textures]`, `[draw_skip_policy]` |
 | Native shaders (SM86 lowering & direct SPIR-V) | [shader_recompiler](docs/knowledge/shader_recompiler.md) | [Ampere lowering](src/shader_recompiler/frontend/ampere/lower_to_maxwell.h), [Pipeline cache](src/video_core/renderer_vulkan/vk_pipeline_cache.cpp), [Shader triage](.claude/skills/nx2-shader-triage/SKILL.md) | `[ampere]`, `[ampere-lazy-lowering]`, controlled frame comparison |
 | Rust FFI crates, language ownership, ISPC | [rust_ffi](docs/knowledge/rust_ffi.md) | [Workspace](rust/Cargo.toml), [FFI crate](rust/crates/eglantine_ffi/src/lib.rs), [AddRustCrate](CMakeModules/AddRustCrate.cmake) | `cargo test --manifest-path rust/Cargo.toml --locked --offline` |
@@ -49,14 +49,14 @@ cargo test --locked --manifest-path rust/apps/eglantine_gpui/Cargo.toml   # GPUI
 | `yuzu_cmd` | `src/yuzu_cmd` | SDL host (`eden-cli`), GPUI backend, NX2 lab runner |
 | `eglantine_gpui` | `rust/apps/eglantine_gpui` | GPUI desktop shell (`eglantine`, separate Cargo workspace) |
 | `updater` / `web_service` | `src/updater`, `src/web_service` | Self-update helper and web/telemetry services |
-| `android` | `src/android` | Android Kotlin/Gradle UI + JNI over `core` |
+| `android` | `src/android` | Android SDL3 + Rust/C++ frontend (Groovy Gradle) |
 | `simd_kernels` | `src/simd_kernels` | Multi-ISA ISPC texture kernels (`AddIspcKernel.cmake`) |
 | `eglantine_rs` | `rust/` | `std`-only Cargo FFI bundle (`eglantine_ffi` -> `eglantine_rs`) |
 | `tests` | `src/tests` | Catch2 unit tests mirroring `src/` |
 
 C++ owns emulator state, `eden-cli`, desktop game discovery, Ampere-to-Maxwell lowering, NUP
-archives, and the Switch 2 controller protocol. GPUI owns the desktop shell, Kotlin/JNI owns the
-shipping Android frontend, and Rust owns direct SM86 compute SPIR-V. See the
+archives, and the Switch 2 controller protocol. GPUI owns the desktop shell, SDL3 + Rust (`eglantine_android`) + C++
+owns Android, and Rust owns direct SM86 compute SPIR-V. See the
 [language ownership table](docs/knowledge/rust_ffi.md#first-party-language-and-domain-ownership)
 for the crate dependencies and runtime switches.
 

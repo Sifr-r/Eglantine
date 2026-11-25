@@ -5,14 +5,52 @@
 
 use std::borrow::Cow;
 use std::ffi::{CStr, CString};
+use std::path::PathBuf;
+
+use crate::library::{GameEntry, LibraryStore, is_document_uri};
+use crate::overlay::OverlayState;
+use crate::settings::SettingsSnapshot;
 
 const MAX_STATUS_DETAIL: usize = 88;
+pub(super) const VISIBLE_GAME_ROWS: usize = 5;
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ViewMode {
+    #[default]
+    Library,
+    Settings,
+}
+
 pub(super) struct App {
     suspended: bool,
     document: Option<CString>,
     activity: Activity,
+    view: ViewMode,
+    library: LibraryStore,
+    overlay: OverlayState,
+    settings: SettingsSnapshot,
+    driver_name: CString,
+    storage_dir: Option<PathBuf>,
+    has_prod_keys: bool,
+    scroll_offset: usize,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            suspended: false,
+            document: None,
+            activity: Activity::default(),
+            view: ViewMode::Library,
+            library: LibraryStore::default(),
+            overlay: OverlayState::default(),
+            settings: SettingsSnapshot::default(),
+            driver_name: c"System default".to_owned(),
+            storage_dir: None,
+            has_prod_keys: false,
+            scroll_offset: 0,
+        }
+    }
 }
 
 impl App {
@@ -20,16 +58,101 @@ impl App {
         self.suspended = suspended;
     }
 
-    pub(super) fn begin_selection(&mut self) -> bool {
-        if !self.is_idle() {
-            return false;
+    pub(super) fn set_storage_dir(&mut self, dir: &str) {
+        if dir.is_empty() {
+            return;
         }
-        self.activity = Activity::Picking;
-        true
+        let path = PathBuf::from(dir);
+        self.library = LibraryStore::load_from_dir(&path);
+        self.overlay = OverlayState::load_from_dir(&path);
+        self.storage_dir = Some(path);
+        self.clamp_scroll();
+        if self.document.is_none()
+            && let Some(selected) = self.library.selected_game()
+        {
+            self.document = Some(selected.uri.clone());
+        }
+    }
+
+    pub(super) fn set_has_prod_keys(&mut self, present: bool) {
+        self.has_prod_keys = present;
+    }
+
+    pub(super) fn has_prod_keys(&self) -> bool {
+        self.has_prod_keys
+    }
+
+    pub(super) fn games(&self) -> &[GameEntry] {
+        self.library.games()
+    }
+
+    pub(super) fn selected_game_index(&self) -> Option<usize> {
+        self.library.selected_index()
+    }
+
+    pub(super) fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    pub(super) fn overlay_mut(&mut self) -> &mut OverlayState {
+        &mut self.overlay
+    }
+
+    pub(super) fn view(&self) -> ViewMode {
+        self.view
+    }
+
+    pub(super) fn toggle_view(&mut self) {
+        if !self.is_idle() {
+            return;
+        }
+        self.view = match self.view {
+            ViewMode::Library => ViewMode::Settings,
+            ViewMode::Settings => ViewMode::Library,
+        };
+    }
+
+    pub(super) fn settings(&self) -> SettingsSnapshot {
+        self.settings
+    }
+
+    pub(super) fn settings_mut(&mut self) -> &mut SettingsSnapshot {
+        &mut self.settings
+    }
+
+    pub(super) fn driver_name(&self) -> &CStr {
+        &self.driver_name
+    }
+
+    pub(super) fn set_settings(&mut self, snapshot: SettingsSnapshot, driver_name: Option<&str>) {
+        self.settings = snapshot.normalized();
+        if let Some(name) = driver_name.map(str::trim).filter(|s| !s.is_empty())
+            && let Ok(cstr) = CString::new(name)
+        {
+            self.driver_name = cstr;
+        } else {
+            self.driver_name = c"System default".to_owned();
+        }
+    }
+
+    pub(super) fn begin_selection(&mut self) -> bool {
+        self.begin_picker(PickerKind::GameFile)
+    }
+
+    pub(super) fn begin_folder_selection(&mut self) -> bool {
+        self.begin_picker(PickerKind::GameFolder)
+    }
+
+    pub(super) fn begin_keys_selection(&mut self) -> bool {
+        self.begin_picker(PickerKind::KeysFile)
+    }
+
+    pub(super) fn begin_driver_selection(&mut self) -> bool {
+        self.begin_picker(PickerKind::DriverFile)
     }
 
     pub(super) fn selection_result(&mut self, result: SelectionResult<'_>) {
-        if !matches!(self.activity, Activity::Picking) {
+        if !matches!(self.activity, Activity::Picking(PickerKind::GameFile)) {
             return;
         }
         let message = match result {
@@ -50,6 +173,109 @@ impl App {
                 }),
         };
         self.activity = Activity::Message(message);
+    }
+
+    pub(super) fn folder_scan_result(
+        &mut self,
+        tree_uri: Option<&str>,
+        games: Vec<(String, String, u64)>,
+        error: Option<&str>,
+    ) {
+        if !matches!(self.activity, Activity::Picking(PickerKind::GameFolder)) {
+            return;
+        }
+        let message = if let Some(err) = error.map(str::trim).filter(|err| !err.is_empty()) {
+            status_with_detail("Folder scan failed: ", err).into()
+        } else if let Some(tree_uri) = tree_uri.filter(|uri| is_document_uri(uri)) {
+            self.library.add_folder(tree_uri);
+            let scanned = self.library.upsert_games(games);
+            self.clamp_scroll();
+            if self.document.is_none()
+                && let Some(selected) = self.library.selected_game()
+            {
+                self.document = Some(selected.uri.clone());
+            }
+            self.save_library();
+            let detail = format!(
+                "{scanned} scanned ({} total in library).",
+                self.library.games().len()
+            );
+            status_with_detail("Folder added: ", &detail).into()
+        } else if tree_uri.is_some() {
+            Cow::Borrowed(c"The picker returned an invalid Android folder URI.")
+        } else {
+            Cow::Borrowed(c"Folder selection cancelled.")
+        };
+        self.activity = Activity::Message(message);
+    }
+
+    pub(super) fn keys_install_result(&mut self, error: Option<&str>, has_keys: bool) {
+        if !matches!(self.activity, Activity::Picking(PickerKind::KeysFile)) {
+            return;
+        }
+        self.has_prod_keys = has_keys;
+        let message = if let Some(err) = error.map(str::trim).filter(|err| !err.is_empty()) {
+            status_with_detail("Keys install: ", err).into()
+        } else if has_keys {
+            Cow::Borrowed(c"Keys installed (prod.keys ready).")
+        } else {
+            Cow::Borrowed(c"Keys file installed.")
+        };
+        self.activity = Activity::Message(message);
+    }
+
+    pub(super) fn driver_install_result(&mut self, error: Option<&str>, driver_name: Option<&str>) {
+        if !matches!(self.activity, Activity::Picking(PickerKind::DriverFile)) {
+            return;
+        }
+        let message = if let Some(err) = error.map(str::trim).filter(|err| !err.is_empty()) {
+            status_with_detail("Driver install: ", err).into()
+        } else {
+            if let Some(name) = driver_name.map(str::trim).filter(|s| !s.is_empty())
+                && let Ok(cstr) = CString::new(name)
+            {
+                self.driver_name = cstr;
+            }
+            Cow::Borrowed(c"Custom GPU driver installed.")
+        };
+        self.activity = Activity::Message(message);
+    }
+
+    pub(super) fn clear_driver(&mut self) {
+        if !self.is_idle() {
+            return;
+        }
+        self.driver_name = c"System default".to_owned();
+        self.activity = Activity::Message(Cow::Borrowed(c"Reset GPU driver to System default."));
+    }
+
+    pub(super) fn select_game_index(&mut self, index: usize) -> bool {
+        if !self.is_idle() {
+            return false;
+        }
+        let Some(uri) = self.library.select(index).map(CStr::to_owned) else {
+            return false;
+        };
+        self.document = Some(uri);
+        self.save_library();
+        if let Some(game) = self.library.selected_game() {
+            let title = game.title.to_string_lossy();
+            self.activity = Activity::Message(status_with_detail("Selected: ", &title).into());
+        }
+        true
+    }
+
+    pub(super) fn scroll_games(&mut self, delta: isize) {
+        if !self.is_idle() {
+            return;
+        }
+        let max_offset = self.library.games().len().saturating_sub(VISIBLE_GAME_ROWS);
+        let next = if delta < 0 {
+            self.scroll_offset.saturating_sub(delta.unsigned_abs())
+        } else {
+            self.scroll_offset.saturating_add(delta as usize)
+        };
+        self.scroll_offset = next.min(max_offset);
     }
 
     pub(super) fn can_launch(&self) -> bool {
@@ -83,24 +309,54 @@ impl App {
 
     pub(super) fn status(&self) -> &CStr {
         match &self.activity {
-            Activity::Ready => c"No document selected.",
-            Activity::Picking => c"Waiting for the Android document picker...",
+            Activity::Ready => c"Select a game file or add a library folder.",
+            Activity::Picking(PickerKind::GameFile) => c"Waiting for the Android document picker...",
+            Activity::Picking(PickerKind::GameFolder) => c"Waiting for the Android folder picker...",
+            Activity::Picking(PickerKind::KeysFile) => c"Waiting for the Android keys picker...",
+            Activity::Picking(PickerKind::DriverFile) => c"Waiting for the GPU driver picker...",
             Activity::Launching => c"Starting emulation...",
             Activity::Running => c"Emulation is running.",
             Activity::Message(message) => message,
         }
     }
 
+    fn begin_picker(&mut self, kind: PickerKind) -> bool {
+        if !self.is_idle() {
+            return false;
+        }
+        self.activity = Activity::Picking(kind);
+        true
+    }
+
     fn is_idle(&self) -> bool {
         !self.suspended && matches!(self.activity, Activity::Ready | Activity::Message(_))
     }
+
+    fn clamp_scroll(&mut self) {
+        let max_offset = self.library.games().len().saturating_sub(VISIBLE_GAME_ROWS);
+        self.scroll_offset = self.scroll_offset.min(max_offset);
+    }
+
+    fn save_library(&self) {
+        if let Some(dir) = &self.storage_dir {
+            let _ = self.library.save_to_dir(dir);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PickerKind {
+    GameFile,
+    GameFolder,
+    KeysFile,
+    DriverFile,
 }
 
 #[derive(Default)]
 enum Activity {
     #[default]
     Ready,
-    Picking,
+    Picking(PickerKind),
     Launching,
     Running,
     Message(Cow<'static, CStr>),
@@ -110,13 +366,6 @@ pub(super) enum SelectionResult<'a> {
     Cancelled,
     Selected(Option<&'a str>),
     Failed(Option<&'a str>),
-}
-
-fn is_document_uri(uri: &str) -> bool {
-    uri.strip_prefix("content://").is_some_and(|rest| {
-        let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        authority_end != 0 && !rest.chars().any(|c| c.is_control() || c.is_whitespace())
-    })
 }
 
 fn status_with_detail(prefix: &str, detail: &str) -> CString {
@@ -142,6 +391,8 @@ mod tests {
         let mut app = App::default();
         assert!(app.begin_selection());
         assert!(!app.begin_selection());
+        assert!(!app.begin_folder_selection());
+        assert!(!app.begin_keys_selection());
         app.selection_result(SelectionResult::Cancelled);
         assert_eq!(app.status(), c"Document selection cancelled.");
         assert!(app.begin_selection());
@@ -164,7 +415,7 @@ mod tests {
     fn callback_without_pending_request_cannot_replace_status() {
         let mut app = App::default();
         app.selection_result(SelectionResult::Selected(Some("content://provider/other")));
-        assert_eq!(app.status(), c"No document selected.");
+        assert_eq!(app.status(), c"Select a game file or add a library folder.");
     }
 
     #[test]
@@ -218,5 +469,53 @@ mod tests {
         app.session_ended(None);
         assert_eq!(app.status(), c"Emulation ended.");
         assert!(app.can_launch());
+    }
+
+    #[test]
+    fn folder_scan_populates_library_and_allows_selecting_game() {
+        let mut app = App::default();
+        assert!(app.begin_folder_selection());
+        app.folder_scan_result(
+            Some("content://provider/tree/games"),
+            vec![
+                ("content://provider/doc/b".to_owned(), "Zelda".to_owned(), 2),
+                ("content://provider/doc/a".to_owned(), "Mario".to_owned(), 1),
+            ],
+            None,
+        );
+        assert_eq!(app.games().len(), 2);
+        assert_eq!(app.selected_game_index(), Some(0));
+        assert!(app.can_launch());
+
+        assert!(app.select_game_index(1));
+        assert_eq!(app.status(), c"Selected: Zelda");
+        assert_eq!(app.begin_launch(), Some(c"content://provider/doc/b"));
+    }
+
+    #[test]
+    fn keys_install_updates_prod_keys_flag_and_status() {
+        let mut app = App::default();
+        assert!(!app.has_prod_keys());
+        assert!(app.begin_keys_selection());
+        app.keys_install_result(None, true);
+        assert!(app.has_prod_keys());
+        assert_eq!(app.status(), c"Keys installed (prod.keys ready).");
+    }
+
+    #[test]
+    fn view_toggle_and_driver_install_update_state() {
+        let mut app = App::default();
+        assert_eq!(app.view(), super::ViewMode::Library);
+        app.toggle_view();
+        assert_eq!(app.view(), super::ViewMode::Settings);
+
+        assert!(app.begin_driver_selection());
+        app.driver_install_result(None, Some("turnip_v25.so"));
+        assert_eq!(app.driver_name(), c"turnip_v25.so");
+        assert_eq!(app.status(), c"Custom GPU driver installed.");
+
+        app.clear_driver();
+        assert_eq!(app.driver_name(), c"System default");
+        assert_eq!(app.status(), c"Reset GPU driver to System default.");
     }
 }

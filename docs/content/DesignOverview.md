@@ -14,7 +14,7 @@ No formal fuzzing or formal verification has been done on the emulator as a whol
 
 ## src/android/
 
-Entire Android frontend, written mostly in Kotlin and generally having asinine hacks (thanks Android) due to the particularly horrific (and particular way) to do things.
+Android frontend powered by SDL3's upstream Activity, Rust ([rust/apps/eglantine_android](../../rust/apps/eglantine_android)), and C++ ([src/android/app/native](../../src/android/app/native)), packaged with Groovy Gradle.
 
 ## src/audio_core/
 

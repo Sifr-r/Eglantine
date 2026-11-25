@@ -242,8 +242,8 @@ target_sources(audio_core PRIVATE
     sink/sdl3_sink.cpp
     sink/sdl3_sink.h)
 
-if(EGLANTINE_ANDROID_NATIVE_PROTOTYPE)
-    target_link_libraries(audio_core PRIVATE eglantine-android-prototype-sdl)
+if(ANDROID)
+    target_link_libraries(audio_core PRIVATE eglantine-android-sdl)
 else()
     target_link_libraries(audio_core PRIVATE SDL3::SDL3)
 endif()

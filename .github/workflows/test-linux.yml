@@ -159,7 +159,8 @@ jobs:
             build/tests/rust-target
             rust/target
             rust/apps/eglantine_gpui/target
-          key: rust-v1-linux-x86_64-tests-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml', 'rust/apps/eglantine_gpui/Cargo.toml', 'rust/apps/eglantine_gpui/Cargo.lock', 'rust/apps/eglantine_gpui/src/**/*.rs') }}
+            rust/apps/eglantine_android/target
+          key: rust-v1-linux-x86_64-tests-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml', 'rust/apps/eglantine_gpui/Cargo.toml', 'rust/apps/eglantine_gpui/Cargo.lock', 'rust/apps/eglantine_gpui/src/**/*.rs', 'rust/apps/eglantine_android/Cargo.toml', 'rust/apps/eglantine_android/Cargo.lock', 'rust/apps/eglantine_android/src/**/*.rs') }}
           restore-keys: |
             rust-v1-linux-x86_64-tests-
 
@@ -171,7 +172,8 @@ jobs:
             build/tests/rust-target
             rust/target
             rust/apps/eglantine_gpui/target
-          key: rust-v1-linux-x86_64-tests-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml', 'rust/apps/eglantine_gpui/Cargo.toml', 'rust/apps/eglantine_gpui/Cargo.lock', 'rust/apps/eglantine_gpui/src/**/*.rs') }}
+            rust/apps/eglantine_android/target
+          key: rust-v1-linux-x86_64-tests-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml', 'rust/apps/eglantine_gpui/Cargo.toml', 'rust/apps/eglantine_gpui/Cargo.lock', 'rust/apps/eglantine_gpui/src/**/*.rs', 'rust/apps/eglantine_android/Cargo.toml', 'rust/apps/eglantine_android/Cargo.lock', 'rust/apps/eglantine_android/src/**/*.rs') }}
           restore-keys: |
             rust-v1-linux-x86_64-tests-
 
@@ -182,6 +184,10 @@ jobs:
       - name: Run GPUI library unit tests
         shell: bash
         run: cargo test --manifest-path rust/apps/eglantine_gpui/Cargo.toml --no-default-features --lib --locked
+
+      - name: Run Android Rust frontend unit tests
+        shell: bash
+        run: cargo test --manifest-path rust/apps/eglantine_android/Cargo.toml --locked --offline
 
       - name: Configure tests
         shell: bash

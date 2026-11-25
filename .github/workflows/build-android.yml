@@ -89,6 +89,10 @@ jobs:
         shell: bash
         run: cargo test --manifest-path rust/Cargo.toml --locked --offline
 
+      - name: Run Android Rust frontend unit tests
+        shell: bash
+        run: cargo test --manifest-path rust/apps/eglantine_android/Cargo.toml --locked --offline
+
       - name: Build Android Snapdragon APK (arm64-v8a)
         shell: bash
         env:

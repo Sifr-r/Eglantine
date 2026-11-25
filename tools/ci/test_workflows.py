@@ -119,6 +119,30 @@ class WorkflowConfigurationTests(unittest.TestCase):
         self.assertIn("rust/apps/eglantine_gpui/Cargo.toml", gpui_step["run"])
         self.assertIn("--no-default-features", gpui_step["run"])
 
+    def test_android_rust_frontend_and_prototype_ci_checks(self):
+        tl = self.workflows["test-linux.yml"]
+        catch2_steps = tl["jobs"]["catch2"]["steps"]
+        android_rust_step = next(
+            s for s in catch2_steps if s.get("name") == "Run Android Rust frontend unit tests"
+        )
+        self.assertIn("rust/apps/eglantine_android/Cargo.toml", android_rust_step["run"])
+        self.assertIn("--locked --offline", android_rust_step["run"])
+        cache_step = next(
+            s for s in catch2_steps if s.get("name") == "Cache Rust build artifacts (restore and save)"
+        )
+        self.assertIn("rust/apps/eglantine_android/target", cache_step["with"]["path"])
+
+        ba = self.workflows["build-android.yml"]
+        build_steps = ba["jobs"]["build"]["steps"]
+        ba_rust_step = next(
+            s for s in build_steps if s.get("name") == "Run Android Rust frontend unit tests"
+        )
+        self.assertIn("rust/apps/eglantine_android/Cargo.toml", ba_rust_step["run"])
+        apk_step = next(
+            s for s in build_steps if s.get("name") == "Build Android Snapdragon APK (arm64-v8a)"
+        )
+        self.assertIn(":app:assembleMainlineRelWithDebInfo", apk_step["run"])
+
     def test_windows_mingw_pgo_receives_display_pgo(self):
         bw = self.workflows["build-windows.yml"]
         setup_step = next(

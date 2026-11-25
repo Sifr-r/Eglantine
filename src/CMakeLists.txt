@@ -328,11 +328,8 @@ if(ENABLE_WEB_SERVICE)
     add_subdirectory(web_service)
 endif()
 
-if(EGLANTINE_ANDROID_NATIVE_PROTOTYPE)
-    add_subdirectory(android/native-prototype/native)
-elseif(ANDROID)
-    add_subdirectory(android/app/src/main/jni)
-    target_include_directories(yuzu-android PRIVATE android/app/src/main)
+if(ANDROID)
+    add_subdirectory(android/app/native)
 endif()
 
 include(GenerateDepHashes)

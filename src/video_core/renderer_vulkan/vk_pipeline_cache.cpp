@@ -71,7 +71,7 @@
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 #ifdef __ANDROID__
-#include "../../android/app/src/main/jni/android_settings.h"
+#include "common/android/android_settings.h"
 #endif
 
 #ifdef EGLANTINE_ENABLE_RUST_AMP_SPIRV

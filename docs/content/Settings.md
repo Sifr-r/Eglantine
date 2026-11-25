@@ -25,17 +25,13 @@ However, this process can be tedious for those unfamiliar; this document serves 
 - [Adding Boolean Settings Toggles](#adding-boolean-settings-toggles)
   - [Step 1 - Common Setting](#step-1---common-setting)
   - [Step 2 - Qt Toggle](#step-2---qt-toggle)
-  - [Step 3 - Kotlin (Android)](#step-3---kotlin-android)
-    - [Step 3.1 - BooleanSetting.kt](#step-31---booleansettingkt)
-    - [Step 3.2 - SettingsItem.kt](#step-32---settingsitemkt)
-    - [Step 3.3 - SettingsFragmentPresenter.kt](#step-33---settingsfragmentpresenterkt)
-    - [Step 3.4 - Localization](#step-34---localization)
+  - [Step 3 - Android (Rust + C++)](#step-3---android-rust--c)
   - [Step 4 - Use Your Toggle](#step-4---use-your-toggle)
   - [Best Practices](#best-practices-1)
 
 ## Adding Boolean Settings Toggles
 
-This guide will walk you through adding a new boolean toggle setting to Eden's configuration across both Qt's (PC) and Kotlin's (Android) UIs.
+This guide will walk you through adding a new boolean toggle setting to Eden's configuration across Qt (PC) and the Rust/C++ Android UI.
 
 ---
 
@@ -88,68 +84,11 @@ INSERT(Settings,
 
 ---
 
-### Step 3 - Kotlin (Android)
+### Step 3 - Android (Rust + C++)
 
-#### Step 3.1 - BooleanSetting.kt
-
-Add where it should be in the settings.
-
-Example: `src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/BooleanSetting.kt`
-
-```kts
-RENDERER_YOUR_SETTING_NAME("your_setting_name"),
-```
-
-#### Make sure to:
-
-* Ensure the prefix naming matches the intended category.
-
----
-
-#### Step 3.2 - SettingsItem.kt
-
-Add the toggle to the Kotlin (Android) UI
-
-Example: `src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/model/view/SettingsItem.kt`
-
-```kts
-put(
-    SwitchSetting(
-        BooleanSetting.RENDERER_YOUR_SETTING_NAME,
-        titleId = R.string.your_setting_name,
-        descriptionId = R.string.your_setting_name_description
-    )
-)
-```
-
----
-
-#### Step 3.3 - SettingsFragmentPresenter.kt
-
-Add your setting within the right category.
-
-Example: `src/android/app/src/main/java/org/yuzu/yuzu_emu/features/settings/ui/SettingsFragmentPresenter.kt`
-
-```kts
-add(BooleanSetting.RENDERER_YOUR_SETTING_NAME.key)
-```
-
-> **Warning**
->
-> Remember, placing matters! Settings appear in the order of where you add them.
-
----
-
-#### Step 3.4 - Localization
-
-Add your setting and description in the appropriate place.
-
-Example: `src/android/app/src/main/res/values/strings.xml`
-
-```xml
-<string name="your_setting_name">Your Setting Display Name</string>
-<string name="your_setting_name_description">Detailed description of what this setting does. Explain any caveats, requirements, or warnings here.</string>
-```
+1. Add the field to `SettingsSnapshot` in `rust/apps/eglantine_android/src/settings.rs` and expose a row in `rust/apps/eglantine_android/src/ui.rs`.
+2. Mirror the field in `EglAndroidSettings` (`rust/apps/eglantine_android/include/eglantine_android.h`) and `AndroidSettingsSnapshot` (`src/android/app/native/core_session.h`).
+3. Map it to `Settings::values` in `CoreSession::GetSettingsSnapshot()` / `ApplySettingsSnapshot()` (`src/android/app/native/core_session.cpp`), and ensure `NativeAndroidConfig` (`src/android/app/native/native_config.cpp`) persists its category in `config.ini`.
 
 ---
 
@@ -222,17 +161,6 @@ bool feature_enabled = Settings::GetDebugKnobAt(0);
 bool another_feature = Settings::GetDebugKnobAt(15);
 ```
 
-```kts
-//kotlin side
-import org.yuzu.yuzu_emu.features.settings.model.Settings
-
-//To use it as a general purpose uint var
-val debug_knobs: Int = UShortSetting.DEBUG_KNOBS.getInt()
-
-// Check if bit x is set
-bool feature_enabled = Settings.GetDebugKnobAt(x); //x as integer from 0 to 15
-```
-
 The function returns `true` if the specified bit (0-15) is set in the `debug_knobs` value, `false` otherwise.
 
 #### Setting Debug Knobs (user side)
@@ -242,8 +170,7 @@ Developers must inform which knobs are tied to each functionality to be tested.
 The debug knobs value can be set through:
 
 1. **Desktop UI**: In the Debug configuration tab, there's a spinbox for "Debug knobs" (0-65535)
-2. **Android UI**: Available as an integer setting in the Debug section
-3. **Configuration Files**: Set the `debug_knobs` value in the emulator's configuration
+2. **Configuration Files**: Set the `debug_knobs` value in `config.ini`
 
 #### Bit Manipulation Examples
 

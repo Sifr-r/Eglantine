@@ -48,10 +48,6 @@ else()
 endif()
 
 if (ANDROID)
-    target_sources(input_common PRIVATE
-        drivers/android.cpp
-        drivers/android.h)
-
     target_link_libraries(input_common PRIVATE android)
 else()
     target_sources(input_common PRIVATE

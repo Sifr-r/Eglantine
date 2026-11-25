@@ -13,52 +13,12 @@
 #include "core/crypto/key_manager.h"
 #include "frontend_common/content_manager.h"
 
-#ifdef __ANDROID__
-#include <jni.h>
-#include <common/android/id_cache.h>
-#include <common/android/android_common.h>
-#endif
-
 FirmwareManager::KeyInstallResult
 FirmwareManager::InstallKeys(const std::string& location, const std::string& extension) {
     LOG_INFO(Frontend, "Installing key files from {}", location);
 
     const auto keys_dir = Common::FS::GetEdenPath(Common::FS::EdenPath::KeysDir);
 
-#ifdef __ANDROID__
-    JNIEnv *env = Common::Android::GetEnvForThread();
-
-    jstring jsrc = Common::Android::ToJString(env, location);
-
-    jclass native = Common::Android::GetNativeLibraryClass();
-    jmethodID getExtension = Common::Android::GetFileExtension();
-
-    jstring jext = static_cast<jstring>(env->CallStaticObjectMethod(
-        native,
-        getExtension,
-        jsrc
-    ));
-
-    std::string ext = Common::Android::GetJString(env, jext);
-
-    if (ext != extension) {
-        return ErrorWrongFilename;
-    }
-
-    jmethodID copyToStorage = Common::Android::GetCopyToStorage();
-    jstring jdest = Common::Android::ToJString(env, keys_dir.string() + "/");
-
-    jboolean copyResult = env->CallStaticBooleanMethod(
-        native,
-        copyToStorage,
-        jsrc,
-        jdest
-    );
-
-    if (!copyResult) {
-        return ErrorFailedCopy;
-    }
-#else
     if (!location.ends_with(extension)) {
         return ErrorWrongFilename;
     }
@@ -103,7 +63,6 @@ FirmwareManager::InstallKeys(const std::string& location, const std::string& ext
             return ErrorFailedCopy;
         }
     }
-#endif
 
     // Reinitialize the key manager
     Core::Crypto::KeyManager::Instance().ReloadKeys();

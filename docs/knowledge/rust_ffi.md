@@ -9,7 +9,7 @@
 | NUP archives | `src/core/file_sys/nup_container.cpp`, `src/core/file_sys/nup_writer.cpp` | C++ owns archive parsing, reading, writing, extraction, metadata, and journal recovery. |
 | Switch 2 input | `src/input_common/helpers/switch2_protocol` | C++ owns packet codecs, USB/BLE transport, and controller lifecycle. |
 | Host shaders & SIMD | `src/video_core/host_shaders`, `dist/post_shaders`, `src/simd_kernels` | Keep GLSL build + post shaders (Slang & ISPC audio retired). Keep 3 ISPC texture kernels until x86-64 + ARM64 throughput/parity gates pass. |
-| Android frontend | `src/android`, `src/common/android`, `src/common/fs/fs_android.*` | Kotlin/Android APIs + JNI at C++ boundary; Gradle Kotlin DSL. |
+| Android frontend | `src/android/app`, `rust/apps/eglantine_android`, `src/common/android` | SDL3 + Rust (`eglantine_android`) + C++ host; Groovy Gradle packaging (zero Kotlin). |
 | Build, CI, tools | CMake, Gradle, Cargo, `.github/`, `tools/` | Keep declarative build configs, Python release/CI checks, Perl DTrace/filters, and C crash helper. |
 
 Retire a duplicate only after identical outputs, failure behavior, and acceptable performance (prefer C++ on a tie; verify desktop + ARM64 Android link before removing C++).
