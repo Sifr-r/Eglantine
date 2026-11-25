@@ -514,7 +514,7 @@ fn ffi_roundtrip_null_safety_and_idempotent_free() {
         assert_eq!(egl_nup_has_resumable_journal(ptr::null(), 0), 0);
         assert_eq!(egl_nup_container_parse(ptr::null(), ptr::null_mut()), -1);
 
-        let unaligned_ptr = 1usize as *mut EglNupParsedContainer;
+        let unaligned_ptr = std::ptr::without_provenance_mut::<EglNupParsedContainer>(1);
         egl_nup_container_free(unaligned_ptr);
         egl_nup_free_bytes(ptr::null_mut());
         egl_nup_free_string(ptr::null_mut());

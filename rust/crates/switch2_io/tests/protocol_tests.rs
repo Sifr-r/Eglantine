@@ -315,8 +315,10 @@ fn gyro_and_optical_mouse_processors() {
     let mut gyro = GyroMouseProcessor::default();
     let t0 = 10_000_000_000u64;
     gyro.start_calibration(t0);
-    let mut s = Switch2InputReport::default();
-    s.gyroscope = [10, -20, 30];
+    let mut s = Switch2InputReport {
+        gyroscope: [10, -20, 30],
+        ..Default::default()
+    };
     assert!(
         !gyro
             .process(
@@ -379,11 +381,13 @@ fn gyro_and_optical_mouse_processors() {
     assert!(approx_eq(gyro.gyro_bias[2], 60.0));
 
     let mut opt = OpticalMouseProcessor::default();
-    let mut r1 = Switch2InputReport::default();
-    r1.mouse_x = 65530;
-    r1.mouse_y = 10;
-    r1.mouse_distance = 300;
-    r1.mouse_roughness = 500;
+    let mut r1 = Switch2InputReport {
+        mouse_x: 65530,
+        mouse_y: 10,
+        mouse_distance: 300,
+        mouse_roughness: 500,
+        ..Default::default()
+    };
     let o1 = opt.process(&r1, ControllerType::Right, true);
     assert!(o1.active);
     assert_eq!(o1.delta_x, 0);
@@ -403,182 +407,184 @@ fn ffi_surface_and_null_safety() {
     assert_eq!(egl_sw2_reverse_lower_bits4(0x01), 0x08);
     assert_eq!(egl_sw2_signed_looping_difference16(0, 65535), -1);
 
-    let mut len = 0usize;
-    let name_ptr = egl_sw2_product_name(0x2069, &mut len);
-    assert!(!name_ptr.is_null());
-    assert_eq!(len, "Switch 2 Pro Controller".len());
-    let uuid_ptr = egl_sw2_ble_uuid(0, &mut len);
-    assert!(!uuid_ptr.is_null());
-    assert_eq!(len, ble_uuids::INPUT_REPORT.len());
+    unsafe {
+        let mut len = 0usize;
+        let name_ptr = egl_sw2_product_name(0x2069, &mut len);
+        assert!(!name_ptr.is_null());
+        assert_eq!(len, "Switch 2 Pro Controller".len());
+        let uuid_ptr = egl_sw2_ble_uuid(0, &mut len);
+        assert!(!uuid_ptr.is_null());
+        assert_eq!(len, ble_uuids::INPUT_REPORT.len());
 
-    // Null / invalid pointers fail gracefully without UB or panics
-    assert_eq!(
-        egl_sw2_parse_ble_manufacturer_data(ptr::null(), 16, ptr::null_mut()),
-        0
-    );
-    assert_eq!(
-        egl_sw2_strip_hid_report_id(ptr::null(), 0, ptr::null_mut(), ptr::null_mut()),
-        0
-    );
-    assert_eq!(
-        egl_sw2_parse_user_stick_calibration(ptr::null(), 0, ptr::null_mut()),
-        0
-    );
-    assert_eq!(
-        egl_sw2_parse_controller_info(ptr::null(), 0, ptr::null_mut()),
-        0
-    );
-    assert_eq!(
-        egl_sw2_parse_input_report(
-            ptr::null(),
-            0,
-            ptr::null(),
-            ptr::null(),
-            50,
-            ptr::null_mut()
-        ),
-        0
-    );
+        // Null / invalid pointers fail gracefully without UB or panics
+        assert_eq!(
+            egl_sw2_parse_ble_manufacturer_data(ptr::null(), 16, ptr::null_mut()),
+            0
+        );
+        assert_eq!(
+            egl_sw2_strip_hid_report_id(ptr::null(), 0, ptr::null_mut(), ptr::null_mut()),
+            0
+        );
+        assert_eq!(
+            egl_sw2_parse_user_stick_calibration(ptr::null(), 0, ptr::null_mut()),
+            0
+        );
+        assert_eq!(
+            egl_sw2_parse_controller_info(ptr::null(), 0, ptr::null_mut()),
+            0
+        );
+        assert_eq!(
+            egl_sw2_parse_input_report(
+                ptr::null(),
+                0,
+                ptr::null(),
+                ptr::null(),
+                50,
+                ptr::null_mut()
+            ),
+            0
+        );
 
-    // Valid FFI roundtrip + idempotent free
-    let mut ble_info = EglSw2BleAdvertisementInfo::default();
-    let mut adv = [0u8; 16];
-    write_u16_le(&mut adv, 3, NINTENDO_VENDOR_ID);
-    write_u16_le(&mut adv, 5, 0x2066);
-    assert_eq!(
-        egl_sw2_parse_ble_manufacturer_data(adv.as_ptr(), adv.len(), &mut ble_info),
-        1
-    );
-    assert_eq!(ble_info.product_id, 0x2066);
+        // Valid FFI roundtrip + idempotent free
+        let mut ble_info = EglSw2BleAdvertisementInfo::default();
+        let mut adv = [0u8; 16];
+        write_u16_le(&mut adv, 3, NINTENDO_VENDOR_ID);
+        write_u16_le(&mut adv, 5, 0x2066);
+        assert_eq!(
+            egl_sw2_parse_ble_manufacturer_data(adv.as_ptr(), adv.len(), &mut ble_info),
+            1
+        );
+        assert_eq!(ble_info.product_id, 0x2066);
 
-    let mut bytes = EglSw2Bytes::default();
-    let payload = [0xAAu8, 0xBB];
-    assert_eq!(
-        egl_sw2_build_command_packet(0x02, 0x04, payload.as_ptr(), payload.len(), 1, &mut bytes),
-        0
-    );
-    assert_eq!(bytes.len, 10);
-    egl_sw2_free_bytes(&mut bytes);
-    assert!(bytes.data.is_null());
-    assert_eq!(bytes.len, 0);
-    egl_sw2_free_bytes(&mut bytes);
-    egl_sw2_free_bytes(ptr::null_mut());
+        let mut bytes = EglSw2Bytes::default();
+        let payload = [0xAAu8, 0xBB];
+        assert_eq!(
+            egl_sw2_build_command_packet(0x02, 0x04, payload.as_ptr(), payload.len(), 1, &mut bytes),
+            0
+        );
+        assert_eq!(bytes.len, 10);
+        egl_sw2_free_bytes(&mut bytes);
+        assert!(bytes.data.is_null());
+        assert_eq!(bytes.len, 0);
+        egl_sw2_free_bytes(&mut bytes);
+        egl_sw2_free_bytes(ptr::null_mut());
 
-    // Smoke-check remaining FFI entrypoints compile & run cleanly
-    let mut x = 0u16;
-    let mut y = 0u16;
-    let stick_bytes = pack_stick_xy(100, 200);
-    egl_sw2_unpack_stick_xy(stick_bytes.as_ptr(), 3, &mut x, &mut y);
-    assert_eq!((x, y), (100, 200));
+        // Smoke-check remaining FFI entrypoints compile & run cleanly
+        let mut x = 0u16;
+        let mut y = 0u16;
+        let stick_bytes = pack_stick_xy(100, 200);
+        egl_sw2_unpack_stick_xy(stick_bytes.as_ptr(), 3, &mut x, &mut y);
+        assert_eq!((x, y), (100, 200));
 
-    let mut cal = EglSw2StickCalibration::default();
-    egl_sw2_parse_stick_calibration([0u8; 9].as_ptr(), 9, &mut cal);
-    assert_eq!(cal.center_x, 2048);
-    assert_eq!(
-        egl_sw2_apply_stick_calibration_axis(2048, 2048, 1500, 1500, 50),
-        0.0
-    );
+        let mut cal = EglSw2StickCalibration::default();
+        egl_sw2_parse_stick_calibration([0u8; 9].as_ptr(), 9, &mut cal);
+        assert_eq!(cal.center_x, 2048);
+        assert_eq!(
+            egl_sw2_apply_stick_calibration_axis(2048, 2048, 1500, 1500, 50),
+            0.0
+        );
 
-    let mut cinfo = EglSw2ControllerInfo::default();
-    let mut cbuf = [0u8; 37];
-    cbuf[2..5].copy_from_slice(b"ABC");
-    assert_eq!(
-        egl_sw2_parse_controller_info(cbuf.as_ptr(), cbuf.len(), &mut cinfo),
-        1
-    );
-    assert_eq!(cinfo.serial_len, 3);
+        let mut cinfo = EglSw2ControllerInfo::default();
+        let mut cbuf = [0u8; 37];
+        cbuf[2..5].copy_from_slice(b"ABC");
+        assert_eq!(
+            egl_sw2_parse_controller_info(cbuf.as_ptr(), cbuf.len(), &mut cinfo),
+            1
+        );
+        assert_eq!(cinfo.serial_len, 3);
 
-    let mut irep = EglSw2InputReport::default();
-    let raw_rep = [0u8; MINIMUM_INPUT_REPORT_SIZE];
-    assert_eq!(
-        egl_sw2_parse_input_report(raw_rep.as_ptr(), raw_rep.len(), &cal, &cal, 50, &mut irep),
-        1
-    );
-    let mut mot = EglSw2MotionOutput::default();
-    let bias = [0.0f32; 3];
-    egl_sw2_convert_imu_to_motion(&irep, bias.as_ptr(), 4000, &mut mot);
-    assert_eq!(mot.delta_timestamp, 4000);
+        let mut irep = EglSw2InputReport::default();
+        let raw_rep = [0u8; MINIMUM_INPUT_REPORT_SIZE];
+        assert_eq!(
+            egl_sw2_parse_input_report(raw_rep.as_ptr(), raw_rep.len(), &cal, &cal, 50, &mut irep),
+            1
+        );
+        let mut mot = EglSw2MotionOutput::default();
+        let bias = [0.0f32; 3];
+        egl_sw2_convert_imu_to_motion(&irep, bias.as_ptr(), 4000, &mut mot);
+        assert_eq!(mot.delta_timestamp, 4000);
 
-    let mut vpkt = EglSw2VibrationPacketData::default();
-    egl_sw2_vibration_from_status(0.5, 100.0, 0.25, 200.0, &mut vpkt);
-    let mut enc5 = [0u8; 5];
-    egl_sw2_vibration_encode_5bytes(&vpkt, enc5.as_mut_ptr());
+        let mut vpkt = EglSw2VibrationPacketData::default();
+        egl_sw2_vibration_from_status(0.5, 100.0, 0.25, 200.0, &mut vpkt);
+        let mut enc5 = [0u8; 5];
+        egl_sw2_vibration_encode_5bytes(&vpkt, enc5.as_mut_ptr());
 
-    let mut mread = [0u8; 8];
-    egl_sw2_build_memory_read_payload(0x40, 0x0001_3000, mread.as_mut_ptr());
-    assert_eq!(mread[0], 0x40);
+        let mut mread = [0u8; 8];
+        egl_sw2_build_memory_read_payload(0x40, 0x0001_3000, mread.as_mut_ptr());
+        assert_eq!(mread[0], 0x40);
 
-    let mut vib_rep = EglSw2Bytes::default();
-    assert_eq!(
-        egl_sw2_build_vibration_report(0, 1, &vpkt, &vpkt, &vpkt, &mut vib_rep),
-        0
-    );
-    assert_eq!(vib_rep.len, 33);
-    egl_sw2_free_bytes(&mut vib_rep);
+        let mut vib_rep = EglSw2Bytes::default();
+        assert_eq!(
+            egl_sw2_build_vibration_report(0, 1, &vpkt, &vpkt, &vpkt, &mut vib_rep),
+            0
+        );
+        assert_eq!(vib_rep.len, 33);
+        egl_sw2_free_bytes(&mut vib_rep);
 
-    assert_eq!(
-        egl_sw2_build_usb_vibration_report(0x2069, 2, &vpkt, &mut vib_rep),
-        0
-    );
-    assert_eq!(vib_rep.len, 64);
-    egl_sw2_free_bytes(&mut vib_rep);
+        assert_eq!(
+            egl_sw2_build_usb_vibration_report(0x2069, 2, &vpkt, &mut vib_rep),
+            0
+        );
+        assert_eq!(vib_rep.len, 64);
+        egl_sw2_free_bytes(&mut vib_rep);
 
-    let mut gstate = EglSw2GyroMouseState::default();
-    let mut gout = EglSw2GyroMouseOutput::default();
-    let mut action = 0u8;
-    assert_eq!(
-        egl_sw2_gyro_mouse_process(
-            &mut gstate,
-            ptr::null(),
-            0,
-            &irep,
-            ControllerType::Pro as u8,
-            0,
-            1,
-            1,
-            0,
-            1.0,
-            0,
-            &mut action,
-            &mut gout
-        ),
-        0
-    );
-    assert_eq!(gout.active, 1);
+        let mut gstate = EglSw2GyroMouseState::default();
+        let mut gout = EglSw2GyroMouseOutput::default();
+        let mut action = 0u8;
+        assert_eq!(
+            egl_sw2_gyro_mouse_process(
+                &mut gstate,
+                ptr::null(),
+                0,
+                &irep,
+                ControllerType::Pro as u8,
+                0,
+                1,
+                1,
+                0,
+                1.0,
+                0,
+                &mut action,
+                &mut gout
+            ),
+            0
+        );
+        assert_eq!(gout.active, 1);
 
-    let mut ostate = EglSw2OpticalMouseState::default();
-    let mut oout = EglSw2OpticalMouseOutput::default();
-    assert_eq!(
-        egl_sw2_optical_mouse_process(
-            &mut ostate,
-            &irep,
-            ControllerType::Left as u8,
-            1,
-            &mut oout
-        ),
-        0
-    );
-    assert_eq!(oout.active, 0);
+        let mut ostate = EglSw2OpticalMouseState::default();
+        let mut oout = EglSw2OpticalMouseOutput::default();
+        assert_eq!(
+            egl_sw2_optical_mouse_process(
+                &mut ostate,
+                &irep,
+                ControllerType::Left as u8,
+                1,
+                &mut oout
+            ),
+            0
+        );
+        assert_eq!(oout.active, 0);
 
-    // F0599: cal_sample_count * 3 overflow must be rejected instead of wrapping.
-    let sentinel_samples = [0i16; 3];
-    let overflow_samples = (usize::MAX / 3) + 1;
-    assert_eq!(
-        egl_sw2_gyro_mouse_process(
-            &mut gstate,
-            sentinel_samples.as_ptr(),
-            overflow_samples,
-            &irep,
-            ControllerType::Pro as u8,
-            0,
-            1,
-            1,
-            0,
-            1.0,
-            0,
-            &mut action,
-            &mut gout
-        ),
-        -1
-    );
+        // F0599: cal_sample_count * 3 overflow must be rejected instead of wrapping.
+        let sentinel_samples = [0i16; 3];
+        let overflow_samples = (usize::MAX / 3) + 1;
+        assert_eq!(
+            egl_sw2_gyro_mouse_process(
+                &mut gstate,
+                sentinel_samples.as_ptr(),
+                overflow_samples,
+                &irep,
+                ControllerType::Pro as u8,
+                0,
+                1,
+                1,
+                0,
+                1.0,
+                0,
+                &mut action,
+                &mut gout
+            ),
+            -1
+        );
+    }
 }

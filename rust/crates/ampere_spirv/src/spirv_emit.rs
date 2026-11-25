@@ -200,7 +200,7 @@ fn push_inst(buf: &mut Vec<u32>, opcode: u16, words: &[u32]) {
 fn encode_str_words(s: &str) -> Vec<u32> {
     let bytes = s.as_bytes();
     let total = bytes.len() + 1;
-    let word_len = (total + 3) / 4;
+    let word_len = total.div_ceil(4);
     let mut out = vec![0u32; word_len];
     for (i, &b) in bytes.iter().enumerate() {
         out[i / 4] |= u32::from(b) << ((i % 4) * 8);

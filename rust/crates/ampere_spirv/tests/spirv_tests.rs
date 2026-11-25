@@ -768,6 +768,7 @@ mod regression_tests {
     use eglantine_ampere_spirv::ssa_ir::SsaOp;
     use eglantine_ampere_spirv::{lower_to_ssa, LowerInput};
 
+    #[allow(clippy::too_many_arguments)]
     fn enc_shf_imm(dst: u32, a: u32, shift: u32, c: u32, ty: u32, wrap: bool, right: bool, hi: bool) -> Instruction {
         let w0 = 0x819 | (7 << 12) | (dst << 16) | (a << 24);
         let w2 = c
@@ -778,6 +779,7 @@ mod regression_tests {
         sm86(w0, shift, w2, 0)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn enc_shf_reg(dst: u32, a: u32, shift_reg: u32, c: u32, ty: u32, wrap: bool, right: bool, hi: bool) -> Instruction {
         let w0 = 0x219 | (7 << 12) | (dst << 16) | (a << 24);
         let w2 = c
@@ -969,7 +971,7 @@ mod regression_tests {
         // F0050: IMAD.WIDE / IMAD.HI / UIMAD.WIDE include c:c+1 & neg_c carry into hi word.
         let imad_wide = sm86(0x225 | (7 << 12) | (6 << 16) | (1 << 24), 2, 4 | (1 << 11), 0);
         let imad_hi = sm86(0x227 | (7 << 12) | (8 << 16) | (1 << 24), 2, 4, 0);
-        let uimad_wide = sm86(0x2a5 | (7 << 12) | (2 << 16) | (0 << 24), 1, 4, 0);
+        let uimad_wide = sm86(0x2a5 | (7 << 12) | (2 << 16), 1, 4, 0);
         let uldc_u64_pair0 = uldc_u64(0, 0, 0x140);
         let uldc_u64_pair4 = uldc_u64(4, 0, 0x148);
         let wide_code = [
@@ -1015,12 +1017,12 @@ mod regression_tests {
         // F0051: Single-armed If updates R2 ptr offset; merge_states must Phi byte_offset (valid SSA dominance).
         let ldc_r2_b64 = sm86(0xb82 | (7 << 12) | (2 << 16) | (255 << 24), 0x160 << 6, 5 << 9, 0);
         let pred_iadd_r2 = sm86(
-            0x210 | (0 << 12) | (2 << 16) | (2 << 24),
+            0x210 | (2 << 16) | (2 << 24),
             4,
             255 | (0x3f << 17) | (15 << 23),
             0,
         );
-        let pred_uisetp = sm86(0x88c | (0 << 12), 10, (1 << 12) | (2 << 17) | (7 << 23), 0);
+        let pred_uisetp = sm86(0x88c, 10, (1 << 12) | (2 << 17) | (7 << 23), 0);
         let if_code = [
             ldc_r2_b64,
             s2r(0, 33),
@@ -1115,7 +1117,7 @@ mod regression_tests {
             mov_imm(1, 99),
             enc_shfl_imm(2, 0, 1, 1, 0x0f0f, 1), // SHFL.UP P0, R2, R1, 1, 0x0f0f
             stg_ur(2, 255, 4, 0),
-            sm86(0x986 | (0 << 12), 1 | (4 << 8), 0x0810_a100 | 4 | (4 << 9), 0), // @P0 STG [UR4+4], R1
+            sm86(0x986, 1 | (4 << 8), 0x0810_a100 | 4 | (4 << 9), 0), // @P0 STG [UR4+4], R1
             exit_insn(7, false),
         ];
         let mut shfl_in = default_compute_input(&shfl_code);

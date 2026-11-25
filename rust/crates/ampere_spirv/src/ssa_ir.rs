@@ -404,6 +404,7 @@ impl<'a> SsaBuilder<'a> {
         f
     }
 
+    #[allow(clippy::wrong_self_convention)]
     fn to_u32_bits(&mut self, blk: usize, f: ValueId) -> ValueId {
         self.alloc_val(blk, ValType::U32, SsaOp::Bitcast { to: ValType::U32, val: f })
     }
@@ -2066,7 +2067,7 @@ impl<'a> SsaBuilder<'a> {
             DecodedOp::Hmma { dst, ra, rb, rc, depth } => {
                 if self.stage != Stage::Compute
                     || self.workgroup_size[0] == 0
-                    || (self.workgroup_size[0] % 32) != 0
+                    || !self.workgroup_size[0].is_multiple_of(32)
                     || self.info.requires_coherent_global_memory
                     || self.info.requires_coherent_image_memory
                 {
@@ -2083,12 +2084,12 @@ impl<'a> SsaBuilder<'a> {
                 let mut a_vals = [self.zero_u32; 4];
                 for (i, slot) in a_vals.iter_mut().take(a_len).enumerate() {
                     let r = ra.saturating_add(i as u8);
-                    *slot = if r >= 255 { self.zero_u32 } else { state.r[r as usize] };
+                    *slot = if r == 255 { self.zero_u32 } else { state.r[r as usize] };
                 }
                 let mut b_vals = [self.zero_u32; 2];
                 for (i, slot) in b_vals.iter_mut().take(b_len).enumerate() {
                     let r = rb.saturating_add(i as u8);
-                    *slot = if r >= 255 { self.zero_u32 } else { state.r[r as usize] };
+                    *slot = if r == 255 { self.zero_u32 } else { state.r[r as usize] };
                 }
                 let c_vals = if rc == 255 {
                     [self.zero_u32; 2]
@@ -2162,6 +2163,7 @@ impl<'a> SsaBuilder<'a> {
         Ok(self.alloc_val(blk, ValType::U32, SsaOp::ReadBuiltin(special)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_imad_64(
         &mut self,
         blk: usize,
@@ -2252,6 +2254,7 @@ impl<'a> SsaBuilder<'a> {
         Ok((lo_sum, hi_val))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_ldc(
         &mut self,
         blk: usize,
@@ -2350,6 +2353,7 @@ impl<'a> SsaBuilder<'a> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn propagate_add_ptr(
         &mut self,
         blk: usize,
@@ -2380,6 +2384,7 @@ impl<'a> SsaBuilder<'a> {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve_global_ptr(
         &mut self,
         blk: usize,
@@ -2615,6 +2620,7 @@ impl<'a> SsaBuilder<'a> {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_shf(
         &mut self,
         blk: usize,

@@ -333,8 +333,13 @@ pub extern "C" fn egl_sw2_product_id_to_controller_type(pid: u16) -> u8 {
     product_id_to_controller_type(parsed) as u8
 }
 
+/// Returns the NUL-terminated product name for `pid`, optionally writing its byte length.
+///
+/// # Safety
+///
+/// `out_len` must be null or point to a valid, aligned, writable `usize`.
 #[no_mangle]
-pub extern "C" fn egl_sw2_product_name(pid: u16, out_len: *mut usize) -> *const c_char {
+pub unsafe extern "C" fn egl_sw2_product_name(pid: u16, out_len: *mut usize) -> *const c_char {
     let parsed = ProductId::from_raw(pid).unwrap_or(ProductId::None);
     static_c_str(product_name_c_str(parsed).to_bytes_with_nul(), out_len)
 }
@@ -345,8 +350,13 @@ pub extern "C" fn egl_sw2_feature_mask_for_product(pid: u16) -> u8 {
     feature_mask_for_product(parsed)
 }
 
+/// Returns the NUL-terminated Switch 2 BLE GATT UUID string for `kind`.
+///
+/// # Safety
+///
+/// `out_len` must be null or point to a valid, aligned, writable `usize`.
 #[no_mangle]
-pub extern "C" fn egl_sw2_ble_uuid(kind: u32, out_len: *mut usize) -> *const c_char {
+pub unsafe extern "C" fn egl_sw2_ble_uuid(kind: u32, out_len: *mut usize) -> *const c_char {
     let _ = (
         ble_uuids::INPUT_REPORT,
         ble_uuids::VIBRATION_JOYCON_R,
@@ -366,8 +376,14 @@ pub extern "C" fn egl_sw2_ble_uuid(kind: u32, out_len: *mut usize) -> *const c_c
     }
 }
 
+/// Strips the USB HID report ID byte from `usb_report[..len]`, writing `out_offset` and `out_len`.
+///
+/// # Safety
+///
+/// If `len > 0`, `usb_report` must point to `len` readable bytes; `out_offset` and `out_len` must
+/// be null or point to valid, aligned, writable `usize` values.
 #[no_mangle]
-pub extern "C" fn egl_sw2_strip_hid_report_id(
+pub unsafe extern "C" fn egl_sw2_strip_hid_report_id(
     usb_report: *const u8,
     len: usize,
     out_offset: *mut usize,
@@ -393,8 +409,14 @@ pub extern "C" fn egl_sw2_strip_hid_report_id(
     result.unwrap_or(0)
 }
 
+/// Parses a BLE manufacturer advertisement payload into `out_info`.
+///
+/// # Safety
+///
+/// If `len > 0`, `data` must point to `len` readable bytes; `out_info` must be null or point to
+/// a valid, aligned, writable [`EglSw2BleAdvertisementInfo`].
 #[no_mangle]
-pub extern "C" fn egl_sw2_parse_ble_manufacturer_data(
+pub unsafe extern "C" fn egl_sw2_parse_ble_manufacturer_data(
     data: *const u8,
     len: usize,
     out_info: *mut EglSw2BleAdvertisementInfo,
@@ -427,8 +449,14 @@ pub extern "C" fn egl_sw2_parse_ble_manufacturer_data(
     result.unwrap_or(0)
 }
 
+/// Unpacks 12-bit X/Y stick axes from `three_bytes[..len]` into `out_x` and `out_y`.
+///
+/// # Safety
+///
+/// If `len > 0`, `three_bytes` must point to `len` readable bytes; `out_x` and `out_y` must be
+/// null or point to valid, aligned, writable `u16` values.
 #[no_mangle]
-pub extern "C" fn egl_sw2_unpack_stick_xy(
+pub unsafe extern "C" fn egl_sw2_unpack_stick_xy(
     three_bytes: *const u8,
     len: usize,
     out_x: *mut u16,
@@ -447,8 +475,14 @@ pub extern "C" fn egl_sw2_unpack_stick_xy(
     }));
 }
 
+/// Parses factory stick calibration bytes into `out_cal`.
+///
+/// # Safety
+///
+/// If `len > 0`, `data` must point to `len` readable bytes; `out_cal` must be null or point to a
+/// valid, aligned, writable [`EglSw2StickCalibration`].
 #[no_mangle]
-pub extern "C" fn egl_sw2_parse_stick_calibration(
+pub unsafe extern "C" fn egl_sw2_parse_stick_calibration(
     data: *const u8,
     len: usize,
     out_cal: *mut EglSw2StickCalibration,
@@ -465,8 +499,14 @@ pub extern "C" fn egl_sw2_parse_stick_calibration(
     }));
 }
 
+/// Parses a user stick calibration block into `out_cal`.
+///
+/// # Safety
+///
+/// If `len > 0`, `block` must point to `len` readable bytes; `out_cal` must be null or point to
+/// a valid, aligned, writable [`EglSw2StickCalibration`].
 #[no_mangle]
-pub extern "C" fn egl_sw2_parse_user_stick_calibration(
+pub unsafe extern "C" fn egl_sw2_parse_user_stick_calibration(
     block: *const u8,
     len: usize,
     out_cal: *mut EglSw2StickCalibration,
@@ -500,8 +540,14 @@ pub extern "C" fn egl_sw2_apply_stick_calibration_axis(
     apply_stick_calibration_axis(raw_value, center, max_offset, min_offset, deadzone)
 }
 
+/// Parses a controller info block from `data[..len]` into `out_info`.
+///
+/// # Safety
+///
+/// If `len > 0`, `data` must point to `len` readable bytes; `out_info` must be null or point to
+/// a valid, aligned, writable [`EglSw2ControllerInfo`].
 #[no_mangle]
-pub extern "C" fn egl_sw2_parse_controller_info(
+pub unsafe extern "C" fn egl_sw2_parse_controller_info(
     data: *const u8,
     len: usize,
     out_info: *mut EglSw2ControllerInfo,
@@ -537,8 +583,14 @@ pub extern "C" fn egl_sw2_parse_controller_info(
     result.unwrap_or(0)
 }
 
+/// Parses a Switch 2 input report `data[..len]` using `left_cal` and `right_cal` into `out_report`.
+///
+/// # Safety
+///
+/// If `len > 0`, `data` must point to `len` readable bytes; `left_cal`, `right_cal`, and
+/// `out_report` must be null or point to valid, aligned structs (`out_report` writable).
 #[no_mangle]
-pub extern "C" fn egl_sw2_parse_input_report(
+pub unsafe extern "C" fn egl_sw2_parse_input_report(
     data: *const u8,
     len: usize,
     left_cal: *const EglSw2StickCalibration,
@@ -572,8 +624,14 @@ pub extern "C" fn egl_sw2_parse_input_report(
     result.unwrap_or(0)
 }
 
+/// Converts raw IMU samples in `report` and `gyro_bias[..3]` into `out_motion`.
+///
+/// # Safety
+///
+/// Non-null `report`, `gyro_bias` (3 readable `f32` elements), and `out_motion` (writable) must be
+/// valid and properly aligned.
 #[no_mangle]
-pub extern "C" fn egl_sw2_convert_imu_to_motion(
+pub unsafe extern "C" fn egl_sw2_convert_imu_to_motion(
     report: *const EglSw2InputReport,
     gyro_bias: *const f32,
     delta_timestamp_us: u64,
@@ -610,8 +668,13 @@ pub extern "C" fn egl_sw2_convert_imu_to_motion(
     }));
 }
 
+/// Encodes `pkt` into a 5-byte HD rumble payload written to `out_bytes[..5]`.
+///
+/// # Safety
+///
+/// Non-null `pkt` must be valid and aligned, and `out_bytes` must point to 5 writable bytes.
 #[no_mangle]
-pub extern "C" fn egl_sw2_vibration_encode_5bytes(
+pub unsafe extern "C" fn egl_sw2_vibration_encode_5bytes(
     pkt: *const EglSw2VibrationPacketData,
     out_bytes: *mut u8,
 ) {
@@ -627,8 +690,13 @@ pub extern "C" fn egl_sw2_vibration_encode_5bytes(
     }));
 }
 
+/// Builds a vibration packet from amplitude/frequency parameters into `out_pkt`.
+///
+/// # Safety
+///
+/// `out_pkt` must be null or point to a valid, aligned, writable [`EglSw2VibrationPacketData`].
 #[no_mangle]
-pub extern "C" fn egl_sw2_vibration_from_status(
+pub unsafe extern "C" fn egl_sw2_vibration_from_status(
     low_amplitude: f32,
     low_frequency: f32,
     high_amplitude: f32,
@@ -651,8 +719,14 @@ pub extern "C" fn egl_sw2_vibration_from_status(
     }));
 }
 
+/// Builds a Switch 2 command packet from `payload[..payload_len]` into `out_bytes`.
+///
+/// # Safety
+///
+/// If `payload_len > 0`, `payload` must point to `payload_len` readable bytes; `out_bytes` must
+/// be null or point to a valid, aligned, writable [`EglSw2Bytes`].
 #[no_mangle]
-pub extern "C" fn egl_sw2_build_command_packet(
+pub unsafe extern "C" fn egl_sw2_build_command_packet(
     command_id: u8,
     subcommand_id: u8,
     payload: *const u8,
@@ -676,8 +750,13 @@ pub extern "C" fn egl_sw2_build_command_packet(
     result.unwrap_or(-1)
 }
 
+/// Writes an 8-byte SPI/memory read command payload to `out_payload[..8]`.
+///
+/// # Safety
+///
+/// Non-null `out_payload` must point to 8 writable bytes.
 #[no_mangle]
-pub extern "C" fn egl_sw2_build_memory_read_payload(
+pub unsafe extern "C" fn egl_sw2_build_memory_read_payload(
     length: u8,
     address: u32,
     out_payload: *mut u8,
@@ -693,8 +772,14 @@ pub extern "C" fn egl_sw2_build_memory_read_payload(
     }));
 }
 
+/// Builds a BLE vibration report from three motor packets into `out_bytes`.
+///
+/// # Safety
+///
+/// Non-null `motor1`, `motor2`, `motor3`, and `out_bytes` must be valid and properly aligned
+/// (`out_bytes` writable).
 #[no_mangle]
-pub extern "C" fn egl_sw2_build_vibration_report(
+pub unsafe extern "C" fn egl_sw2_build_vibration_report(
     packet_id: u8,
     is_pro_controller: u8,
     motor1: *const EglSw2VibrationPacketData,
@@ -726,8 +811,13 @@ pub extern "C" fn egl_sw2_build_vibration_report(
     result.unwrap_or(-1)
 }
 
+/// Builds a USB vibration report from `motor` into `out_bytes`.
+///
+/// # Safety
+///
+/// Non-null `motor` and `out_bytes` must be valid and properly aligned (`out_bytes` writable).
 #[no_mangle]
-pub extern "C" fn egl_sw2_build_usb_vibration_report(
+pub unsafe extern "C" fn egl_sw2_build_usb_vibration_report(
     pid: u16,
     sequence: u8,
     motor: *const EglSw2VibrationPacketData,
@@ -762,8 +852,15 @@ pub extern "C" fn egl_sw2_signed_looping_difference16(previous: u16, current: u1
     signed_looping_difference16(previous, current)
 }
 
+/// Processes one input report through the gyro-mouse state machine.
+///
+/// # Safety
+///
+/// Non-null `state`, `report`, `out_sample_action`, and `out_output` must be valid and properly
+/// aligned (`state`, `out_sample_action`, and `out_output` writable); if `cal_sample_count > 0`,
+/// `cal_samples_xyz` must point to `cal_sample_count * 3` readable `i16` values.
 #[no_mangle]
-pub extern "C" fn egl_sw2_gyro_mouse_process(
+pub unsafe extern "C" fn egl_sw2_gyro_mouse_process(
     state: *mut EglSw2GyroMouseState,
     cal_samples_xyz: *const i16,
     cal_sample_count: usize,
@@ -828,7 +925,7 @@ pub extern "C" fn egl_sw2_gyro_mouse_process(
                     let mut sx = 0.0f64;
                     let mut sy = 0.0f64;
                     let mut sz = 0.0f64;
-                    for chunk in samples_flat.chunks_exact(3) {
+                    for chunk in samples_flat.as_chunks::<3>().0 {
                         sx += chunk[0] as f64;
                         sy += chunk[1] as f64;
                         sz += chunk[2] as f64;
@@ -886,8 +983,14 @@ pub extern "C" fn egl_sw2_gyro_mouse_process(
     result.unwrap_or(-1)
 }
 
+/// Processes one input report through the optical-mouse state machine.
+///
+/// # Safety
+///
+/// Non-null `state`, `report`, and `out_output` must be valid and properly aligned (`state` and
+/// `out_output` writable).
 #[no_mangle]
-pub extern "C" fn egl_sw2_optical_mouse_process(
+pub unsafe extern "C" fn egl_sw2_optical_mouse_process(
     state: *mut EglSw2OpticalMouseState,
     report: *const EglSw2InputReport,
     controller_type: u8,
@@ -937,8 +1040,14 @@ pub extern "C" fn egl_sw2_optical_mouse_process(
     result.unwrap_or(-1)
 }
 
+/// Frees a byte buffer owned by [`EglSw2Bytes`] and zeroes its fields.
+///
+/// # Safety
+///
+/// `bytes` must be null or point to a valid, aligned [`EglSw2Bytes`] allocated by this crate (or
+/// already zeroed).
 #[no_mangle]
-pub extern "C" fn egl_sw2_free_bytes(bytes: *mut EglSw2Bytes) {
+pub unsafe extern "C" fn egl_sw2_free_bytes(bytes: *mut EglSw2Bytes) {
     if bytes.is_null() || !bytes.is_aligned() {
         return;
     }

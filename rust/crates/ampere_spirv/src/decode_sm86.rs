@@ -867,7 +867,7 @@ fn unsup(raw_opcode: u32, reason: &'static str) -> DecodedOp {
 
 fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
     let dst = insn.bits(16, 8) as u8;
-    let unif_dst = (dst & 63) as u8;
+    let unif_dst = dst & 63;
     let form = insn.bits(9, 3);
 
     match raw_opcode {

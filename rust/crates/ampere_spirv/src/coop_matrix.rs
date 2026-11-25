@@ -217,6 +217,7 @@ pub fn emit_native_coop_hmma<B: CoopSpirvBuilder>(
     let matrix_b_ty = b.type_coop_matrix(f16_ty, tile_k, tile_n, COOP_USE_MATRIX_B);
     let matrix_c_ty = b.type_coop_matrix(accum_elem_ty, tile_m, tile_n, COOP_USE_MATRIX_ACCUMULATOR);
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_f16_word<B: CoopSpirvBuilder>(
         b: &mut B,
         f16_ty: u32,

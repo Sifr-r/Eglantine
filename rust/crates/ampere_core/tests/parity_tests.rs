@@ -72,7 +72,7 @@ fn capture_state_sequences() {
     );
     let oob_jcal = Instruction::new([
         0x0000_7945,
-        (ProgramCaptureState::MAXIMUM_INSTRUCTIONS * 16) as u32,
+        ProgramCaptureState::MAXIMUM_INSTRUCTIONS * 16,
         0,
         0,
     ]);

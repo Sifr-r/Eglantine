@@ -463,7 +463,7 @@ unsafe fn checked_slice<'a, T>(ptr_val: *const T, count: usize) -> Option<&'a [T
     if count == 0 {
         return Some(&[]);
     }
-    if ptr_val.is_null() || (ptr_val as usize) % std::mem::align_of::<T>() != 0 {
+    if ptr_val.is_null() || !(ptr_val as usize).is_multiple_of(std::mem::align_of::<T>()) {
         return None;
     }
     let bytes = std::mem::size_of::<T>().checked_mul(count)?;
@@ -478,7 +478,7 @@ fn is_valid_mut_ptr<T>(ptr_val: *mut T, count: usize) -> bool {
     if count == 0 {
         return true;
     }
-    if ptr_val.is_null() || (ptr_val as usize) % std::mem::align_of::<T>() != 0 {
+    if ptr_val.is_null() || !(ptr_val as usize).is_multiple_of(std::mem::align_of::<T>()) {
         return false;
     }
     std::mem::size_of::<T>()
@@ -488,7 +488,7 @@ fn is_valid_mut_ptr<T>(ptr_val: *mut T, count: usize) -> bool {
 
 #[inline]
 unsafe fn read_aligned<T: Copy>(ptr_val: *const T) -> Option<T> {
-    if ptr_val.is_null() || (ptr_val as usize) % std::mem::align_of::<T>() != 0 {
+    if ptr_val.is_null() || !(ptr_val as usize).is_multiple_of(std::mem::align_of::<T>()) {
         return None;
     }
     Some(unsafe { ptr::read(ptr_val) })
@@ -634,7 +634,10 @@ fn make_error_output(msg: &str) -> EglSpirvCompileOutput {
 }
 
 unsafe fn free_raw_slice<T>(ptr_val: *mut T, len: usize) {
-    if !ptr_val.is_null() && len > 0 && (ptr_val as usize) % std::mem::align_of::<T>() == 0 {
+    if !ptr_val.is_null()
+        && len > 0
+        && (ptr_val as usize).is_multiple_of(std::mem::align_of::<T>())
+    {
         let slice_ptr = ptr::slice_from_raw_parts_mut(ptr_val, len);
         drop(unsafe { Box::from_raw(slice_ptr) });
     }
@@ -674,73 +677,74 @@ fn write_outcome_to_c(outcome: CompileOutcome, out: &mut EglSpirvCompileOutput) 
 }
 
 fn info_to_c(info: &ShaderInfo) -> EglShaderInfoSummary {
-    let mut out = EglShaderInfoSummary::default();
-    out.constant_buffer_mask = info.constant_buffer_mask;
-    out.constant_buffer_used_sizes = info.constant_buffer_used_sizes;
-    out.used_constant_buffer_types = info.used_constant_buffer_types;
-    out.used_storage_buffer_types = info.used_storage_buffer_types;
-    out.used_indirect_cbuf_types = info.used_indirect_cbuf_types;
-    out.nvn_buffer_base = info.nvn_buffer_base;
-    out.nvn_buffer_used_mask = info.nvn_buffer_used_mask;
-    out.used_clip_distances = info.used_clip_distances;
-    out.stores_frag_color_mask = info.stores_frag_color_mask;
-    out.frag_color_components = info.frag_color_components;
-
-    out.uses_workgroup_id = u8::from(info.uses_workgroup_id);
-    out.uses_local_invocation_id = u8::from(info.uses_local_invocation_id);
-    out.uses_invocation_id = u8::from(info.uses_invocation_id);
-    out.uses_invocation_info = u8::from(info.uses_invocation_info);
-    out.uses_sample_id = u8::from(info.uses_sample_id);
-    out.uses_is_helper_invocation = u8::from(info.uses_is_helper_invocation);
-    out.uses_subgroup_invocation_id = u8::from(info.uses_subgroup_invocation_id);
-    out.uses_subgroup_shuffles = u8::from(info.uses_subgroup_shuffles);
-    out.uses_quad_shuffles = u8::from(info.uses_quad_shuffles);
-    out.uses_subgroup_vote = u8::from(info.uses_subgroup_vote);
-    out.uses_subgroup_mask = u8::from(info.uses_subgroup_mask);
-    out.uses_fswzadd = u8::from(info.uses_fswzadd);
-    out.uses_fp16 = u8::from(info.uses_fp16);
-    out.uses_fp64 = u8::from(info.uses_fp64);
-    out.uses_fp16_denorms_flush = u8::from(info.uses_fp16_denorms_flush);
-    out.uses_fp16_denorms_preserve = u8::from(info.uses_fp16_denorms_preserve);
-    out.uses_fp32_denorms_flush = u8::from(info.uses_fp32_denorms_flush);
-    out.uses_fp32_denorms_preserve = u8::from(info.uses_fp32_denorms_preserve);
-    out.uses_int8 = u8::from(info.uses_int8);
-    out.uses_int16 = u8::from(info.uses_int16);
-    out.uses_int64 = u8::from(info.uses_int64);
-    out.uses_local_memory = u8::from(info.uses_local_memory);
-    out.uses_global_memory = u8::from(info.uses_global_memory);
-    out.stores_global_memory = u8::from(info.stores_global_memory);
-    out.requires_coherent_global_memory = u8::from(info.requires_coherent_global_memory);
-    out.requires_coherent_image_memory = u8::from(info.requires_coherent_image_memory);
-    out.uses_cooperative_matrix = u8::from(info.uses_cooperative_matrix);
-    out.requires_full_subgroups = u8::from(info.requires_full_subgroups);
-    out.native_global_bounds = u8::from(info.native_global_bounds);
-    out.uses_cbuf_indirect = u8::from(info.uses_cbuf_indirect);
-    out.uses_rescaling_uniform = u8::from(info.uses_rescaling_uniform);
-    out.uses_render_area = u8::from(info.uses_render_area);
-    out.stores_frag_depth = u8::from(info.stores_frag_depth);
-    out.stores_sample_mask = u8::from(info.stores_sample_mask);
-    out.uses_demote_to_helper_invocation = u8::from(info.uses_demote_to_helper_invocation);
-    out.uses_derivatives = u8::from(info.uses_derivatives);
-    out.uses_typeless_image_reads = u8::from(info.uses_typeless_image_reads);
-    out.uses_typeless_image_writes = u8::from(info.uses_typeless_image_writes);
-    out.uses_shared_increment = u8::from(info.uses_shared_increment);
-    out.uses_shared_decrement = u8::from(info.uses_shared_decrement);
-    out.uses_global_increment = u8::from(info.uses_global_increment);
-    out.uses_global_decrement = u8::from(info.uses_global_decrement);
-    out.uses_atomic_f32_add = u8::from(info.uses_atomic_f32_add);
-    out.uses_atomic_s32_min = u8::from(info.uses_atomic_s32_min);
-    out.uses_atomic_s32_max = u8::from(info.uses_atomic_s32_max);
-    out.uses_int64_bit_atomics = u8::from(info.uses_int64_bit_atomics);
-    out.is_task = u8::from(info.is_task);
-    out.is_mesh = u8::from(info.is_mesh);
-    out.uses_push_constants = u8::from(info.uses_push_constants);
-    out.uses_image_1d = u8::from(info.uses_image_1d);
-    out.uses_sampled_1d = u8::from(info.uses_sampled_1d);
-    out.uses_image_buffers = u8::from(info.uses_image_buffers);
-    out.uses_atomic_image_u32 = u8::from(info.uses_atomic_image_u32);
-    out.removed_conditional_barrier = u8::from(info.removed_conditional_barrier);
-    out.uses_shadow_lod = u8::from(info.uses_shadow_lod);
+    let mut out = EglShaderInfoSummary {
+        constant_buffer_mask: info.constant_buffer_mask,
+        constant_buffer_used_sizes: info.constant_buffer_used_sizes,
+        used_constant_buffer_types: info.used_constant_buffer_types,
+        used_storage_buffer_types: info.used_storage_buffer_types,
+        used_indirect_cbuf_types: info.used_indirect_cbuf_types,
+        nvn_buffer_base: info.nvn_buffer_base,
+        nvn_buffer_used_mask: info.nvn_buffer_used_mask,
+        used_clip_distances: info.used_clip_distances,
+        stores_frag_color_mask: info.stores_frag_color_mask,
+        frag_color_components: info.frag_color_components,
+        uses_workgroup_id: u8::from(info.uses_workgroup_id),
+        uses_local_invocation_id: u8::from(info.uses_local_invocation_id),
+        uses_invocation_id: u8::from(info.uses_invocation_id),
+        uses_invocation_info: u8::from(info.uses_invocation_info),
+        uses_sample_id: u8::from(info.uses_sample_id),
+        uses_is_helper_invocation: u8::from(info.uses_is_helper_invocation),
+        uses_subgroup_invocation_id: u8::from(info.uses_subgroup_invocation_id),
+        uses_subgroup_shuffles: u8::from(info.uses_subgroup_shuffles),
+        uses_quad_shuffles: u8::from(info.uses_quad_shuffles),
+        uses_subgroup_vote: u8::from(info.uses_subgroup_vote),
+        uses_subgroup_mask: u8::from(info.uses_subgroup_mask),
+        uses_fswzadd: u8::from(info.uses_fswzadd),
+        uses_fp16: u8::from(info.uses_fp16),
+        uses_fp64: u8::from(info.uses_fp64),
+        uses_fp16_denorms_flush: u8::from(info.uses_fp16_denorms_flush),
+        uses_fp16_denorms_preserve: u8::from(info.uses_fp16_denorms_preserve),
+        uses_fp32_denorms_flush: u8::from(info.uses_fp32_denorms_flush),
+        uses_fp32_denorms_preserve: u8::from(info.uses_fp32_denorms_preserve),
+        uses_int8: u8::from(info.uses_int8),
+        uses_int16: u8::from(info.uses_int16),
+        uses_int64: u8::from(info.uses_int64),
+        uses_local_memory: u8::from(info.uses_local_memory),
+        uses_global_memory: u8::from(info.uses_global_memory),
+        stores_global_memory: u8::from(info.stores_global_memory),
+        requires_coherent_global_memory: u8::from(info.requires_coherent_global_memory),
+        requires_coherent_image_memory: u8::from(info.requires_coherent_image_memory),
+        uses_cooperative_matrix: u8::from(info.uses_cooperative_matrix),
+        requires_full_subgroups: u8::from(info.requires_full_subgroups),
+        native_global_bounds: u8::from(info.native_global_bounds),
+        uses_cbuf_indirect: u8::from(info.uses_cbuf_indirect),
+        uses_rescaling_uniform: u8::from(info.uses_rescaling_uniform),
+        uses_render_area: u8::from(info.uses_render_area),
+        stores_frag_depth: u8::from(info.stores_frag_depth),
+        stores_sample_mask: u8::from(info.stores_sample_mask),
+        uses_demote_to_helper_invocation: u8::from(info.uses_demote_to_helper_invocation),
+        uses_derivatives: u8::from(info.uses_derivatives),
+        uses_typeless_image_reads: u8::from(info.uses_typeless_image_reads),
+        uses_typeless_image_writes: u8::from(info.uses_typeless_image_writes),
+        uses_shared_increment: u8::from(info.uses_shared_increment),
+        uses_shared_decrement: u8::from(info.uses_shared_decrement),
+        uses_global_increment: u8::from(info.uses_global_increment),
+        uses_global_decrement: u8::from(info.uses_global_decrement),
+        uses_atomic_f32_add: u8::from(info.uses_atomic_f32_add),
+        uses_atomic_s32_min: u8::from(info.uses_atomic_s32_min),
+        uses_atomic_s32_max: u8::from(info.uses_atomic_s32_max),
+        uses_int64_bit_atomics: u8::from(info.uses_int64_bit_atomics),
+        is_task: u8::from(info.is_task),
+        is_mesh: u8::from(info.is_mesh),
+        uses_push_constants: u8::from(info.uses_push_constants),
+        uses_image_1d: u8::from(info.uses_image_1d),
+        uses_sampled_1d: u8::from(info.uses_sampled_1d),
+        uses_image_buffers: u8::from(info.uses_image_buffers),
+        uses_atomic_image_u32: u8::from(info.uses_atomic_image_u32),
+        removed_conditional_barrier: u8::from(info.removed_conditional_barrier),
+        uses_shadow_lod: u8::from(info.uses_shadow_lod),
+        ..Default::default()
+    };
 
     let cbuf_n = info.constant_buffer_descriptors.len().min(MAX_CBUFS);
     for (i, d) in info.constant_buffer_descriptors.iter().take(cbuf_n).enumerate() {
@@ -876,6 +880,13 @@ fn convert_img_desc(d: &ImageDescriptor) -> EglSpirvImageDescriptor {
     }
 }
 
+/// Compiles a single SM86 shader described by `input` into SPIR-V 1.6 words in `out_output`.
+///
+/// # Safety
+///
+/// `input` must be null or point to a valid [`EglSpirvCompileInput`] whose inner slices cover
+/// their declared counts; `out_output` must be null or point to a valid, aligned, writable
+/// [`EglSpirvCompileOutput`].
 #[no_mangle]
 pub unsafe extern "C" fn egl_ampere_spirv_compile(
     input: *const EglSpirvCompileInput,
@@ -922,6 +933,12 @@ pub unsafe extern "C" fn egl_ampere_spirv_compile(
     }
 }
 
+/// Compiles a batch of `count` SM86 shaders from `inputs` into `outputs`.
+///
+/// # Safety
+///
+/// When `count > 0`, `inputs` and `outputs` must point to `count` valid, aligned elements
+/// (`outputs` writable), and each input's inner pointers must cover its declared counts.
 #[no_mangle]
 pub unsafe extern "C" fn egl_ampere_spirv_compile_batch(
     inputs: *const EglSpirvCompileInput,
@@ -985,10 +1002,17 @@ pub unsafe extern "C" fn egl_ampere_spirv_compile_batch(
     }
 }
 
+/// Frees heap buffers owned by `output` and resets its fields to default.
+///
+/// # Safety
+///
+/// `output` must be null or point to a valid, aligned [`EglSpirvCompileOutput`] produced by
+/// [`egl_ampere_spirv_compile`] or [`egl_ampere_spirv_compile_batch`] (or already zeroed).
 #[no_mangle]
 pub unsafe extern "C" fn egl_ampere_spirv_free(output: *mut EglSpirvCompileOutput) {
     let _ = catch_unwind(AssertUnwindSafe(|| unsafe {
-        if output.is_null() || (output as usize) % std::mem::align_of::<EglSpirvCompileOutput>() != 0
+        if output.is_null()
+            || !(output as usize).is_multiple_of(std::mem::align_of::<EglSpirvCompileOutput>())
         {
             return;
         }

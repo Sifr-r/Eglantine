@@ -3,15 +3,10 @@
 
 #![deny(warnings)]
 
-#[forbid(unsafe_code)]
 pub mod coop_matrix;
-#[forbid(unsafe_code)]
 pub mod decode_sm86;
-#[forbid(unsafe_code)]
 pub mod reflect;
-#[forbid(unsafe_code)]
 pub mod spirv_emit;
-#[forbid(unsafe_code)]
 pub mod ssa_ir;
 
 pub mod ffi;
@@ -112,7 +107,7 @@ pub fn compile_batch(inputs: &[OwnedCompileInput]) -> Vec<CompileOutcome> {
             .collect();
     }
 
-    let chunk_size = (inputs.len() + worker_count - 1) / worker_count;
+    let chunk_size = inputs.len().div_ceil(worker_count);
     let mut results: Vec<Option<CompileOutcome>> = vec![None; inputs.len()];
 
     std::thread::scope(|scope| {

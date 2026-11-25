@@ -346,6 +346,7 @@ impl GyroMouseProcessor {
         self.prev_trigger = false;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn process(
         &mut self,
         report: &Switch2InputReport,
@@ -389,6 +390,7 @@ impl GyroMouseProcessor {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn process_post_calibration(
         &mut self,
         report: &Switch2InputReport,
