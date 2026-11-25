@@ -119,6 +119,46 @@ std::string Lowercase(std::string s) {
     return s;
 }
 
+/// One timeline event as JSON; log events also carry their level name.
+nlohmann::json StreamEventJson(const Event& e) {
+    nlohmann::json j{{"seq", e.seq},       {"frame", e.frame},     {"kind", EventKindName(e.kind)},
+                     {"source", e.source}, {"msg", e.message}};
+    if (e.kind == EventKind::Log) {
+        static constexpr const char* levels[] = {"trace", "debug", "info",
+                                                 "warning", "error", "critical"};
+        j["level"] = e.level < 6 ? levels[e.level] : "?";
+    }
+    return j;
+}
+
+std::string FormatMcpNotification(const Event& e) {
+    const char* level = e.kind == EventKind::Crash ? "critical"
+                        : e.kind == EventKind::Unimplemented ? "warning"
+                        : e.level >= 5 ? "critical"
+                        : e.level == 4 ? "error"
+                                       : "warning";
+    return nlohmann::json{{"jsonrpc", "2.0"},
+                          {"method", "notifications/message"},
+                          {"params", {{"level", level},
+                                      {"logger", e.source},
+                                      {"data", StreamEventJson(e)}}}}
+        .dump();
+}
+
+nlohmann::json RunToolStructured(const ToolRegistry& registry, ToolContext& ctx, const char* name,
+                                 const nlohmann::json& args) {
+    const Tool* t = registry.Find(name);
+    if (!t) {
+        return nullptr;
+    }
+    try {
+        const auto r = t->handler(ctx, args);
+        return r.structured ? *r.structured : nlohmann::json(nullptr);
+    } catch (const std::exception&) {
+        return nullptr;
+    }
+}
+
 } // namespace
 
 Timeline* Server::ActiveTimeline() {
@@ -333,6 +373,266 @@ std::string Server::Url() const {
     return fmt::format("http://{}:{}/mcp", config.bind_address, config.port);
 }
 
+bool Server::IsAuthorized(const httplib::Request& req, httplib::Response& res) const {
+    if (!Protocol::IsAllowedHost(req.get_header_value("Host"))) {
+        res.status = 403;
+        return false;
+    }
+    if (const auto origin = req.get_header_value("Origin");
+        !origin.empty() && !Protocol::IsAllowedOrigin(origin)) {
+        res.status = 403;
+        return false;
+    }
+    if (!config.bearer_token.empty() &&
+        req.get_header_value("Authorization") != "Bearer " + config.bearer_token &&
+        req.get_param_value("token") != config.bearer_token) {
+        res.status = 401;
+        return false;
+    }
+    return true;
+}
+
+Timeline::Query Server::ParseTimelineQuery(const httplib::Request& req) const {
+    Timeline::Query q;
+    q.since_seq = timeline.LastSeq();
+    if (req.has_param("since_seq")) {
+        q.since_seq = std::strtoull(req.get_param_value("since_seq").c_str(), nullptr, 10);
+    }
+    const std::string kinds = req.get_param_value("kinds");
+    for (size_t start = 0; start < kinds.size();) {
+        const size_t comma = std::min(kinds.find(',', start), kinds.size());
+        if (const auto kind = EventKindFromName(kinds.substr(start, comma - start))) {
+            q.kinds.push_back(*kind);
+        }
+        start = comma + 1;
+    }
+    q.contains = req.get_param_value("contains");
+    q.source_prefix = req.get_param_value("source_prefix");
+    if (req.has_param("min_level")) {
+        static constexpr std::string_view levels[] = {"trace", "debug", "info",
+                                                      "warning", "error", "critical"};
+        for (int i = 0; i < 6; ++i) {
+            if (levels[i] == req.get_param_value("min_level")) {
+                q.min_level = i;
+            }
+        }
+    }
+    return q;
+}
+
+void Server::StreamEvents(httplib::Response& res, Timeline::Query query,
+                          std::function<std::string(const Event&)> format) const {
+    res.set_header("Cache-Control", "no-cache");
+    res.set_chunked_content_provider(
+        "text/event-stream",
+        [this, q = std::move(query), format = std::move(format)](size_t,
+                                                                 httplib::DataSink& sink) mutable {
+            if (!running) {
+                return false;
+            }
+            if (!timeline.WaitFor(q, std::chrono::seconds{15})) {
+                return sink.write(": ping\n\n", 8);
+            }
+            q.limit = 500;
+            const auto r = timeline.Read(q);
+            for (const auto& e : r.events) {
+                const std::string text = "data: " + format(e) + "\n\n";
+                if (!sink.write(text.data(), text.size())) {
+                    return false;
+                }
+            }
+            q.since_seq = r.next_seq;
+            return true;
+        });
+}
+
+void Server::HandleMcpRequest(const httplib::Request& req, httplib::Response& res) {
+    HttpRequest request;
+    request.method = req.method;
+    request.path = req.path;
+    request.body = req.body;
+    for (const auto& [key, value] : req.headers) {
+        request.headers.emplace(Lowercase(key), value);
+    }
+    const HttpResponse response = protocol->Handle(request);
+    res.status = response.status;
+    for (const auto& [key, value] : response.headers) {
+        res.set_header(key, value);
+    }
+    if (!response.body.empty()) {
+        res.set_content(response.body, response.content_type.c_str());
+    }
+}
+
+void Server::HandleMcpStream(const httplib::Request& req, httplib::Response& res) {
+    if (!IsAuthorized(req, res)) {
+        return;
+    }
+    const std::string session = req.get_header_value("Mcp-Session-Id");
+    if (req.get_header_value("Accept").find("text/event-stream") == std::string::npos ||
+        session.empty() || !protocol->HasSession(session)) {
+        HandleMcpRequest(req, res); // protocol rules: 405 without a stream, 400/404 for sessions
+        return;
+    }
+    Timeline::Query q;
+    q.since_seq = timeline.LastSeq();
+    q.kinds = {EventKind::Log, EventKind::Crash, EventKind::Unimplemented};
+    q.min_level = 3;
+    StreamEvents(res, std::move(q), FormatMcpNotification);
+}
+
+void Server::HandleStatusJson(const httplib::Request& req, httplib::Response& res) {
+    if (!IsAuthorized(req, res)) {
+        return;
+    }
+    ToolContext ctx = MakeContext();
+    nlohmann::json out = nlohmann::json::object();
+    if (const Tool* status = registry.Find("status")) {
+        if (auto r = status->handler(ctx, nlohmann::json::object()); r.structured) {
+            out = *r.structured;
+        }
+    }
+    // The screen label costs a frame capture: only when asked (?screen=1).
+    if (ctx.GameRunning() && req.get_param_value("screen") == "1") {
+        std::string error;
+        if (const auto state = GameScreenState(ctx, error); !state.is_null()) {
+            out["screen"] = state["screen"];
+        }
+    }
+    if (const auto holder = control.Current()) {
+        out["control"] = holder->label.empty() ? holder->session_id.substr(0, 8) : holder->label;
+    }
+    const auto a = Activity::Get().Snapshot();
+    if (a.tool_calls > 0) {
+        out["last_tool"] = fmt::format(
+            "{} ({} s ago)", a.last_tool,
+            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
+                                                             a.last_tool_time)
+                .count());
+    }
+    if (a.recording) {
+        out["recording"] = fmt::format("{}: {} frames, {} presses", a.record_name,
+                                       a.record_frames, a.record_checkpoints);
+    }
+    if (!a.route_state.empty() &&
+        (a.route_state == "running" ||
+         std::chrono::steady_clock::now() - a.route_changed < std::chrono::seconds{30})) {
+        out["route"] = fmt::format("{} {}/{} {} {}", a.route, a.route_step, a.route_total,
+                                   a.route_state, a.route_detail);
+    }
+    // Debugger, A/B test and recent reports for the dashboard's lower panels (?extras=1,
+    // polled less often: the report listing reads directories).
+    if (req.get_param_value("extras") == "1") {
+        out["extras"] = {
+            {"debugger", RunToolStructured(registry, ctx, "debugger_status", nlohmann::json::object())},
+            {"ab_test", RunToolStructured(registry, ctx, "ab_test_status", nlohmann::json::object())},
+            {"reports", RunToolStructured(registry, ctx, "report_list", {{"limit", 5}})}};
+    }
+    res.set_content(out.dump(), "application/json");
+}
+
+void Server::HandleScreenPng(const httplib::Request& req, httplib::Response& res) {
+    if (!IsAuthorized(req, res)) {
+        return;
+    }
+    const u32 width = std::clamp<u32>(
+        req.has_param("w") ? static_cast<u32>(std::atoi(req.get_param_value("w").c_str())) : 640,
+        160, 1920);
+    std::string error;
+    if (const auto png = host.CaptureScreenshotPng(width, std::chrono::milliseconds{1000}, error)) {
+        res.set_content(std::string{png->begin(), png->end()}, "image/png");
+    } else {
+        res.status = 503;
+        res.set_content(error, "text/plain");
+    }
+}
+
+void Server::HandleEventsWait(const httplib::Request& req, httplib::Response& res) {
+    if (!IsAuthorized(req, res)) {
+        return;
+    }
+    Timeline::Query q = ParseTimelineQuery(req);
+    const long timeout_s = std::clamp(
+        req.has_param("timeout_s") ? std::atol(req.get_param_value("timeout_s").c_str()) : 600L,
+        1L, 86400L);
+    // Wait in slices so a server stop isn't held up for long.
+    std::optional<Event> found;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{timeout_s};
+    while (running && !found && std::chrono::steady_clock::now() < deadline) {
+        found = timeline.WaitFor(q, std::chrono::seconds{1});
+    }
+    nlohmann::json out;
+    if (found) {
+        out = {{"matched", true},
+               {"seq", found->seq},
+               {"frame", found->frame},
+               {"kind", EventKindName(found->kind)},
+               {"source", found->source},
+               {"msg", found->message}};
+    } else {
+        out = {{"matched", false}, {"next_seq", timeline.LastSeq()}};
+    }
+    res.set_content(out.dump(1), "application/json");
+}
+
+void Server::RegisterRoutes() {
+    // GET /stream/timeline?<filter>: the timeline as SSE (dashboard, external recorders).
+    http->Get("/stream/timeline", [this](const httplib::Request& req, httplib::Response& res) {
+        if (IsAuthorized(req, res)) {
+            StreamEvents(res, ParseTimelineQuery(req),
+                         [](const Event& e) { return StreamEventJson(e).dump(); });
+        }
+    });
+
+    // GET /mcp with Accept: text/event-stream and a session: the MCP server-to-client stream.
+    // Pushes notifications/message for crashes, new unimplemented commands and warning+ logs.
+    http->Get("/mcp", [this](const httplib::Request& req, httplib::Response& res) {
+        HandleMcpStream(req, res);
+    });
+
+    // Dashboard and its data (read-only).
+    http->Get("/", [this](const httplib::Request& req, httplib::Response& res) {
+        if (IsAuthorized(req, res)) {
+            res.set_content(kDashboardHtml, "text/html; charset=utf-8");
+        }
+    });
+    http->Get("/status.json", [this](const httplib::Request& req, httplib::Response& res) {
+        HandleStatusJson(req, res);
+    });
+    http->Get("/screen.png", [this](const httplib::Request& req, httplib::Response& res) {
+        HandleScreenPng(req, res);
+    });
+
+    // GET /events/wait?kinds=crash,unimpl&contains=..&source_prefix=..&min_level=..&timeout_s=..
+    // Blocks until a matching timeline event happens after the request (or the timeout) and
+    // returns it as JSON. Made for a background `curl` an agent starts and gets woken by when it
+    // exits, without holding an MCP call open.
+    http->Get("/events/wait", [this](const httplib::Request& req, httplib::Response& res) {
+        HandleEventsWait(req, res);
+    });
+    const auto mcp_handler = [this](const httplib::Request& req, httplib::Response& res) {
+        HandleMcpRequest(req, res);
+    };
+    http->Post(".*", mcp_handler);
+    http->Get(".*", mcp_handler);
+    http->Delete(".*", mcp_handler);
+}
+
+void Server::WriteDiscoveryFile() const {
+    const nlohmann::json discovery{{"url", Url()},
+                                   {"port", config.port},
+                                   {"pid", CurrentProcessId()},
+                                   {"frontend", host.FrontendName()},
+                                   {"token_required", !config.bearer_token.empty()},
+                                   {"writes_enabled", writes_allowed.load()}};
+    const std::string text = discovery.dump(1);
+    if (Common::FS::WriteStringToFile(DiscoveryPath(), Common::FS::FileType::TextFile, text) !=
+        text.size()) {
+        LOG_WARNING(Debug_MCP, "Could not write the discovery file {}",
+                    Common::FS::PathToUTF8String(DiscoveryPath()));
+    }
+}
+
 /// Sets up the HTTP routes, binds the port and starts listening; returns an error or empty.
 std::string Server::Start() {
     if (running) {
@@ -360,265 +660,7 @@ std::string Server::Start() {
     http->set_read_timeout(60, 0);
     http->set_write_timeout(60, 0);
 
-    // Converts an httplib request (headers lowercased) to HttpRequest, runs it through Protocol
-    // and copies the result back. Runs on an httplib worker thread.
-    const auto handler = [this](const httplib::Request& req, httplib::Response& res) {
-        HttpRequest request;
-        request.method = req.method;
-        request.path = req.path;
-        request.body = req.body;
-        for (const auto& [key, value] : req.headers) {
-            request.headers.emplace(Lowercase(key), value);
-        }
-        const HttpResponse response = protocol->Handle(request);
-        res.status = response.status;
-        for (const auto& [key, value] : response.headers) {
-            res.set_header(key, value);
-        }
-        if (!response.body.empty()) {
-            res.set_content(response.body, response.content_type.c_str());
-        }
-    };
-    // GET /events/wait?kinds=crash,unimpl&contains=..&source_prefix=..&min_level=..&timeout_s=..
-    // Blocks until a matching timeline event happens after the request (or the timeout) and
-    // returns it as JSON. Made for a background `curl` an agent starts and gets woken by when it
-    // exits, without holding an MCP call open.
-    // Same checks as /mcp for the other routes (the token may also come as ?token= for browsers).
-    const auto authorized = [this](const httplib::Request& req, httplib::Response& res) {
-        if (!Protocol::IsAllowedHost(req.get_header_value("Host"))) {
-            res.status = 403;
-            return false;
-        }
-        if (const auto origin = req.get_header_value("Origin");
-            !origin.empty() && !Protocol::IsAllowedOrigin(origin)) {
-            res.status = 403;
-            return false;
-        }
-        if (!config.bearer_token.empty() &&
-            req.get_header_value("Authorization") != "Bearer " + config.bearer_token &&
-            req.get_param_value("token") != config.bearer_token) {
-            res.status = 401;
-            return false;
-        }
-        return true;
-    };
-    // Timeline filter from ?since_seq&kinds=a,b&contains&source_prefix&min_level.
-    const auto parse_query = [this](const httplib::Request& req) {
-        Timeline::Query q;
-        q.since_seq = timeline.LastSeq();
-        if (req.has_param("since_seq")) {
-            q.since_seq = std::strtoull(req.get_param_value("since_seq").c_str(), nullptr, 10);
-        }
-        const std::string kinds = req.get_param_value("kinds");
-        for (size_t start = 0; start < kinds.size();) {
-            const size_t comma = std::min(kinds.find(',', start), kinds.size());
-            if (const auto kind = EventKindFromName(kinds.substr(start, comma - start))) {
-                q.kinds.push_back(*kind);
-            }
-            start = comma + 1;
-        }
-        q.contains = req.get_param_value("contains");
-        q.source_prefix = req.get_param_value("source_prefix");
-        if (req.has_param("min_level")) {
-            static constexpr std::string_view levels[] = {"trace", "debug", "info",
-                                                          "warning", "error", "critical"};
-            for (int i = 0; i < 6; ++i) {
-                if (levels[i] == req.get_param_value("min_level")) {
-                    q.min_level = i;
-                }
-            }
-        }
-        return q;
-    };
-    // Server-sent events: calls next(q) for batches of matching events, pinging every 15 s.
-    const auto stream_events = [this](httplib::Response& res, Timeline::Query q,
-                                      std::function<std::string(const Event&)> format) {
-        res.set_header("Cache-Control", "no-cache");
-        res.set_chunked_content_provider(
-            "text/event-stream",
-            [this, q, format](size_t, httplib::DataSink& sink) mutable {
-                if (!running) {
-                    return false;
-                }
-                if (!timeline.WaitFor(q, std::chrono::seconds{15})) {
-                    return sink.write(": ping\n\n", 8);
-                }
-                q.limit = 500;
-                const auto r = timeline.Read(q);
-                for (const auto& e : r.events) {
-                    const std::string text = "data: " + format(e) + "\n\n";
-                    if (!sink.write(text.data(), text.size())) {
-                        return false;
-                    }
-                }
-                q.since_seq = r.next_seq;
-                return true;
-            });
-    };
-    // One timeline event as JSON; log events also carry their level name.
-    const auto event_json = [](const Event& e) {
-        nlohmann::json j{{"seq", e.seq},       {"frame", e.frame},     {"kind", EventKindName(e.kind)},
-                         {"source", e.source}, {"msg", e.message}};
-        if (e.kind == EventKind::Log) {
-            static constexpr const char* levels[] = {"trace", "debug", "info",
-                                                     "warning", "error", "critical"};
-            j["level"] = e.level < 6 ? levels[e.level] : "?";
-        }
-        return j;
-    };
-
-    // GET /stream/timeline?<filter>: the timeline as SSE (dashboard, external recorders).
-    http->Get("/stream/timeline",
-              [=](const httplib::Request& req, httplib::Response& res) {
-                  if (authorized(req, res)) {
-                      stream_events(res, parse_query(req),
-                                    [=](const Event& e) { return event_json(e).dump(); });
-                  }
-              });
-
-    // GET /mcp with Accept: text/event-stream and a session: the MCP server-to-client stream.
-    // Pushes notifications/message for crashes, new unimplemented commands and warning+ logs.
-    http->Get("/mcp", [=, this](const httplib::Request& req, httplib::Response& res) {
-        if (!authorized(req, res)) {
-            return;
-        }
-        const std::string session = req.get_header_value("Mcp-Session-Id");
-        if (req.get_header_value("Accept").find("text/event-stream") == std::string::npos ||
-            session.empty() || !protocol->HasSession(session)) {
-            handler(req, res); // protocol rules: 405 without a stream, 400/404 for sessions
-            return;
-        }
-        Timeline::Query q;
-        q.since_seq = timeline.LastSeq();
-        q.kinds = {EventKind::Log, EventKind::Crash, EventKind::Unimplemented};
-        q.min_level = 3;
-        stream_events(res, q, [=](const Event& e) {
-            const char* level = e.kind == EventKind::Crash ? "critical"
-                                : e.kind == EventKind::Unimplemented ? "warning"
-                                : e.level >= 5 ? "critical"
-                                : e.level == 4 ? "error"
-                                               : "warning";
-            return nlohmann::json{{"jsonrpc", "2.0"},
-                                  {"method", "notifications/message"},
-                                  {"params", {{"level", level},
-                                              {"logger", e.source},
-                                              {"data", event_json(e)}}}}
-                .dump();
-        });
-    });
-
-    // Dashboard and its data (read-only).
-    http->Get("/", [=](const httplib::Request& req, httplib::Response& res) {
-        if (authorized(req, res)) {
-            res.set_content(kDashboardHtml, "text/html; charset=utf-8");
-        }
-    });
-    http->Get("/status.json", [=, this](const httplib::Request& req, httplib::Response& res) {
-        if (!authorized(req, res)) {
-            return;
-        }
-        ToolContext ctx = MakeContext();
-        nlohmann::json out = nlohmann::json::object();
-        if (const Tool* status = registry.Find("status")) {
-            if (auto r = status->handler(ctx, nlohmann::json::object()); r.structured) {
-                out = *r.structured;
-            }
-        }
-        // The screen label costs a frame capture: only when asked (?screen=1).
-        if (ctx.GameRunning() && req.get_param_value("screen") == "1") {
-            std::string error;
-            if (const auto state = GameScreenState(ctx, error); !state.is_null()) {
-                out["screen"] = state["screen"];
-            }
-        }
-        if (const auto holder = control.Current()) {
-            out["control"] = holder->label.empty() ? holder->session_id.substr(0, 8) : holder->label;
-        }
-        const auto a = Activity::Get().Snapshot();
-        if (a.tool_calls > 0) {
-            out["last_tool"] = fmt::format(
-                "{} ({} s ago)", a.last_tool,
-                std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() -
-                                                                 a.last_tool_time)
-                    .count());
-        }
-        if (a.recording) {
-            out["recording"] = fmt::format("{}: {} frames, {} presses", a.record_name,
-                                           a.record_frames, a.record_checkpoints);
-        }
-        if (!a.route_state.empty() &&
-            (a.route_state == "running" ||
-             std::chrono::steady_clock::now() - a.route_changed < std::chrono::seconds{30})) {
-            out["route"] = fmt::format("{} {}/{} {} {}", a.route, a.route_step, a.route_total,
-                                       a.route_state, a.route_detail);
-        }
-        // Debugger, A/B test and recent reports for the dashboard's lower panels (?extras=1,
-        // polled less often: the report listing reads directories).
-        if (req.get_param_value("extras") == "1") {
-            const auto run = [&](const char* tool, const nlohmann::json& args) -> nlohmann::json {
-                const Tool* t = registry.Find(tool);
-                if (!t) {
-                    return nullptr;
-                }
-                try {
-                    const auto r = t->handler(ctx, args);
-                    return r.structured ? *r.structured : nlohmann::json(nullptr);
-                } catch (const std::exception&) {
-                    return nullptr;
-                }
-            };
-            out["extras"] = {{"debugger", run("debugger_status", nlohmann::json::object())},
-                             {"ab_test", run("ab_test_status", nlohmann::json::object())},
-                             {"reports", run("report_list", {{"limit", 5}})}};
-        }
-        res.set_content(out.dump(), "application/json");
-    });
-    http->Get("/screen.png", [=, this](const httplib::Request& req, httplib::Response& res) {
-        if (!authorized(req, res)) {
-            return;
-        }
-        const u32 width = std::clamp<u32>(
-            req.has_param("w") ? static_cast<u32>(std::atoi(req.get_param_value("w").c_str())) : 640,
-            160, 1920);
-        std::string error;
-        if (const auto png = host.CaptureScreenshotPng(width, std::chrono::milliseconds{1000}, error)) {
-            res.set_content(std::string{png->begin(), png->end()}, "image/png");
-        } else {
-            res.status = 503;
-            res.set_content(error, "text/plain");
-        }
-    });
-
-    http->Get("/events/wait", [=, this](const httplib::Request& req, httplib::Response& res) {
-        if (!authorized(req, res)) {
-            return;
-        }
-        Timeline::Query q = parse_query(req);
-        const long timeout_s = std::clamp(
-            req.has_param("timeout_s") ? std::atol(req.get_param_value("timeout_s").c_str()) : 600L,
-            1L, 86400L);
-        // Wait in slices so a server stop isn't held up for long.
-        std::optional<Event> found;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{timeout_s};
-        while (running && !found && std::chrono::steady_clock::now() < deadline) {
-            found = timeline.WaitFor(q, std::chrono::seconds{1});
-        }
-        nlohmann::json out;
-        if (found) {
-            out = {{"matched", true},
-                   {"seq", found->seq},
-                   {"frame", found->frame},
-                   {"kind", EventKindName(found->kind)},
-                   {"source", found->source},
-                   {"msg", found->message}};
-        } else {
-            out = {{"matched", false}, {"next_seq", timeline.LastSeq()}};
-        }
-        res.set_content(out.dump(1), "application/json");
-    });
-    http->Post(".*", handler);
-    http->Get(".*", handler);
-    http->Delete(".*", handler);
+    RegisterRoutes();
 
     if (!http->bind_to_port(config.bind_address, config.port)) {
         http.reset();
@@ -635,20 +677,7 @@ std::string Server::Start() {
     InstallTraceHooks();
     http_thread = std::thread([this] { http->listen_after_bind(); });
     // Discovery file so scripts find a running instance (never contains the token).
-    {
-        const nlohmann::json discovery{{"url", Url()},
-                                       {"port", config.port},
-                                       {"pid", CurrentProcessId()},
-                                       {"frontend", host.FrontendName()},
-                                       {"token_required", !config.bearer_token.empty()},
-                                       {"writes_enabled", writes_allowed.load()}};
-        const std::string text = discovery.dump(1);
-        if (Common::FS::WriteStringToFile(DiscoveryPath(), Common::FS::FileType::TextFile, text) !=
-            text.size()) {
-            LOG_WARNING(Debug_MCP, "Could not write the discovery file {}",
-                        Common::FS::PathToUTF8String(DiscoveryPath()));
-        }
-    }
+    WriteDiscoveryFile();
     timeline.Push(EventKind::State, 0, "mcp", "MCP server listening on " + Url());
     LOG_INFO(Debug_MCP, "MCP server listening on {}", Url());
     return {};

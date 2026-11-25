@@ -23,3 +23,6 @@ eglantine_ampere_core = { path = "../ampere_core", optional = true }
 eglantine_ampere_spirv = { path = "../ampere_spirv", optional = true }
 eglantine_nup_fs = { path = "../nup_fs", optional = true }
 eglantine_switch2_io = { path = "../switch2_io", optional = true }
+
+[package.metadata.cargo-machete]
+ignored = ["eglantine_ampere_core"]

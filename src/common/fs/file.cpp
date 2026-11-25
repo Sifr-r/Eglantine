@@ -241,10 +241,6 @@ fs::path IOFile::GetPath() const {
     return file_path;
 }
 
-FileAccessMode IOFile::GetAccessMode() const {
-    return file_access_mode;
-}
-
 FileType IOFile::GetType() const {
     return file_type;
 }

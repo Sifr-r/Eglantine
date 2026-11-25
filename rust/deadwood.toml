@@ -1,0 +1,23 @@
+# Switch 2 HID/BLE protocol and calibration constants kept as documented protocol definitions.
+[public-api]
+items = [
+    "eglantine_switch2_io::types::command_id::USB_INIT",
+    "eglantine_switch2_io::types::command_id::LEDS",
+    "eglantine_switch2_io::types::command_id::VIBRATION",
+    "eglantine_switch2_io::types::command_id::FEATURE",
+    "eglantine_switch2_io::types::command_id::PAIR",
+    "eglantine_switch2_io::types::sub_command_id::LEDS_SET_PLAYER",
+    "eglantine_switch2_io::types::sub_command_id::VIBRATION_PLAY_PRESET",
+    "eglantine_switch2_io::types::sub_command_id::PAIR_SET_MAC",
+    "eglantine_switch2_io::types::sub_command_id::PAIR_LTK2",
+    "eglantine_switch2_io::types::sub_command_id::PAIR_FINISH",
+    "eglantine_switch2_io::types::sub_command_id::PAIR_LTK1",
+    "eglantine_switch2_io::types::sub_command_id::FEATURE_INIT",
+    "eglantine_switch2_io::types::sub_command_id::FEATURE_ENABLE",
+    "eglantine_switch2_io::types::sub_command_id::SELECT_INPUT_REPORT",
+    "eglantine_switch2_io::types::feature_flags::STARTUP",
+    "eglantine_switch2_io::types::memory_address::FACTORY_JOYSTICK1",
+    "eglantine_switch2_io::types::memory_address::FACTORY_JOYSTICK2",
+    "eglantine_switch2_io::types::memory_address::USER_JOYSTICK1",
+    "eglantine_switch2_io::types::memory_address::USER_JOYSTICK2",
+]

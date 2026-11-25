@@ -69,7 +69,6 @@
 #include "core/memory/cheat_engine.h"
 #include "core/perf_stats.h"
 #include "core/reporter.h"
-#include "core/tools/freezer.h"
 #include "core/tools/renderdoc.h"
 #include "hid_core/hid_core.h"
 #include "network/network.h"
@@ -667,7 +666,6 @@ struct System::Impl {
     std::optional<Core::DeviceMemory> device_memory;
     std::optional<AudioCore::AudioCore> audio_core;
     std::optional<Memory::CheatEngine> cheat_engine;
-    std::optional<Tools::Freezer> memory_freezer;
     std::optional<Tools::RenderdocAPI> renderdoc_api;
     std::optional<Tegra::GPU> gpu_core;
 
@@ -1100,14 +1098,6 @@ void System::SetExitLocked(bool locked) {
     impl->exit_locked = locked;
 }
 
-bool System::GetExitLocked() const {
-    return impl->exit_locked;
-}
-
-void System::SetExitRequested(bool requested) {
-    impl->exit_requested = requested;
-}
-
 bool System::GetExitRequested() const {
     return impl->exit_requested;
 }
@@ -1213,10 +1203,6 @@ Core::Debugger& System::GetDebugger() {
 
 const Core::Debugger& System::GetDebugger() const {
     return *impl->debugger;
-}
-
-Tools::RenderdocAPI& System::GetRenderdocAPI() {
-    return *impl->renderdoc_api;
 }
 
 void System::RunServer(std::unique_ptr<Service::ServerManager>&& server_manager) {

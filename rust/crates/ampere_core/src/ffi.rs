@@ -158,8 +158,13 @@ unsafe fn write_bytes(out_bytes: *mut EglAmpereBytes, bytes: Vec<u8>) {
     ptr::write(out_bytes, EglAmpereBytes { data, len });
 }
 
+/// Initializes an [`EglAmpereCaptureState`] buffer in place.
+///
+/// # Safety
+///
+/// `state` must be null or point to a valid, properly aligned, writable [`EglAmpereCaptureState`].
 #[no_mangle]
-pub extern "C" fn egl_ampere_capture_init(state: *mut EglAmpereCaptureState) {
+pub unsafe extern "C" fn egl_ampere_capture_init(state: *mut EglAmpereCaptureState) {
     if state.is_null() || !state.is_aligned() {
         return;
     }
@@ -168,8 +173,14 @@ pub extern "C" fn egl_ampere_capture_init(state: *mut EglAmpereCaptureState) {
     }
 }
 
+/// Feeds one instruction at `index` into the program capture state machine.
+///
+/// # Safety
+///
+/// `state` and `insn` must each be null or point to valid, properly aligned values (`state` must
+/// be writable for the duration of the call).
 #[no_mangle]
-pub extern "C" fn egl_ampere_capture_observe(
+pub unsafe extern "C" fn egl_ampere_capture_observe(
     state: *mut EglAmpereCaptureState,
     insn: *const EglAmpereInstruction,
     index: u32,
@@ -205,8 +216,13 @@ pub extern "C" fn egl_ampere_capture_observe(
     result.unwrap_or(EglAmpereCaptureResult::InvalidTarget)
 }
 
+/// Computes the deterministic 64-bit native program key for `source[..count]`.
+///
+/// # Safety
+///
+/// If `count > 0`, `source` must point to `count` valid, aligned [`EglAmpereInstruction`] items.
 #[no_mangle]
-pub extern "C" fn egl_ampere_native_program_key(
+pub unsafe extern "C" fn egl_ampere_native_program_key(
     source: *const EglAmpereInstruction,
     count: usize,
 ) -> u64 {
@@ -219,8 +235,13 @@ pub extern "C" fn egl_ampere_native_program_key(
     result.unwrap_or(0)
 }
 
+/// Returns `1` if `code[..count]` ends with a valid native address map footer, else `0`.
+///
+/// # Safety
+///
+/// If `count > 0`, `code` must point to `count` valid, aligned `u64` words.
 #[no_mangle]
-pub extern "C" fn egl_ampere_has_native_address_map(code: *const u64, count: usize) -> u8 {
+pub unsafe extern "C" fn egl_ampere_has_native_address_map(code: *const u64, count: usize) -> u8 {
     let result = catch_unwind(AssertUnwindSafe(|| {
         let Some(slice) = (unsafe { slice_from_raw(code, count) }) else {
             return 0;
@@ -230,8 +251,14 @@ pub extern "C" fn egl_ampere_has_native_address_map(code: *const u64, count: usi
     result.unwrap_or(0)
 }
 
+/// Resolves a guest shader `address` against the native address map in `code[..count]`.
+///
+/// # Safety
+///
+/// If `count > 0`, `code` must point to `count` valid, aligned `u64` words; `out_target` must be
+/// null or point to a valid, aligned, writable `u32`.
 #[no_mangle]
-pub extern "C" fn egl_ampere_native_program_address(
+pub unsafe extern "C" fn egl_ampere_native_program_address(
     code: *const u64,
     count: usize,
     address: u32,
@@ -257,8 +284,13 @@ pub extern "C" fn egl_ampere_native_program_address(
     result.unwrap_or(0)
 }
 
+/// Returns the expected guest source byte size encoded in an override blob, or `0` if invalid.
+///
+/// # Safety
+///
+/// If `len > 0`, `bytes` must point to `len` readable bytes.
 #[no_mangle]
-pub extern "C" fn egl_ampere_override_source_size(bytes: *const u8, len: usize) -> u32 {
+pub unsafe extern "C" fn egl_ampere_override_source_size(bytes: *const u8, len: usize) -> u32 {
     let result = catch_unwind(AssertUnwindSafe(|| {
         let Some(slice) = (unsafe { slice_from_raw(bytes, len) }) else {
             return 0;
@@ -268,8 +300,14 @@ pub extern "C" fn egl_ampere_override_source_size(bytes: *const u8, len: usize) 
     result.unwrap_or(0)
 }
 
+/// Encodes a lowered program override blob into `out_bytes`.
+///
+/// # Safety
+///
+/// Non-null pointers must be valid and properly aligned; `source` must cover `source_count` items,
+/// `program` must reference valid instruction/offset/error slices, and `out_bytes` must be writable.
 #[no_mangle]
-pub extern "C" fn egl_ampere_encode_override(
+pub unsafe extern "C" fn egl_ampere_encode_override(
     source: *const EglAmpereInstruction,
     source_count: usize,
     program: *const EglAmpereLoweredProgram,
@@ -324,8 +362,14 @@ pub extern "C" fn egl_ampere_encode_override(
     result.unwrap_or(-1)
 }
 
+/// Decodes a serialized native override blob against `source[..source_count]` into `out_program`.
+///
+/// # Safety
+///
+/// Non-null pointers must be valid and properly aligned for `len` bytes, `source_count`
+/// instructions, and writable `out_program`.
 #[no_mangle]
-pub extern "C" fn egl_ampere_decode_override(
+pub unsafe extern "C" fn egl_ampere_decode_override(
     bytes: *const u8,
     len: usize,
     source: *const EglAmpereInstruction,
@@ -351,8 +395,15 @@ pub extern "C" fn egl_ampere_decode_override(
     result.unwrap_or(-1)
 }
 
+/// Lowers SM86 instructions `code[..count]` to Maxwell words in `out_program`.
+///
+/// # Safety
+///
+/// If `count > 0`, `code` must point to `count` valid, aligned [`EglAmpereInstruction`] items;
+/// `options` must be null or point to a valid [`EglAmpereLoweringOptions`]; `out_program` must
+/// be null or point to a writable [`EglAmpereLoweredProgram`].
 #[no_mangle]
-pub extern "C" fn egl_ampere_lower_to_maxwell(
+pub unsafe extern "C" fn egl_ampere_lower_to_maxwell(
     code: *const EglAmpereInstruction,
     count: usize,
     options: *const EglAmpereLoweringOptions,
@@ -397,8 +448,14 @@ pub extern "C" fn egl_ampere_lower_to_maxwell(
     result.unwrap_or(-1)
 }
 
+/// Frees buffers owned by an [`EglAmpereLoweredProgram`] and zeroes its fields.
+///
+/// # Safety
+///
+/// `program` must be null or point to a valid, aligned [`EglAmpereLoweredProgram`] whose owned
+/// pointers were allocated by this crate (or already zeroed).
 #[no_mangle]
-pub extern "C" fn egl_ampere_free_lowered(program: *mut EglAmpereLoweredProgram) {
+pub unsafe extern "C" fn egl_ampere_free_lowered(program: *mut EglAmpereLoweredProgram) {
     if program.is_null() || !program.is_aligned() {
         return;
     }
@@ -414,8 +471,14 @@ pub extern "C" fn egl_ampere_free_lowered(program: *mut EglAmpereLoweredProgram)
     }
 }
 
+/// Frees a byte buffer owned by [`EglAmpereBytes`] and zeroes its fields.
+///
+/// # Safety
+///
+/// `bytes` must be null or point to a valid, aligned [`EglAmpereBytes`] allocated by this crate
+/// (or already zeroed).
 #[no_mangle]
-pub extern "C" fn egl_ampere_free_bytes(bytes: *mut EglAmpereBytes) {
+pub unsafe extern "C" fn egl_ampere_free_bytes(bytes: *mut EglAmpereBytes) {
     if bytes.is_null() || !bytes.is_aligned() {
         return;
     }
@@ -444,7 +507,9 @@ mod tests {
         assert_eq!(offset_of!(EglAmpereCaptureState, _pad), 94);
 
         let mut state = EglAmpereCaptureState::default();
-        egl_ampere_capture_init(&mut state);
+        unsafe {
+            egl_ampere_capture_init(&mut state);
+        }
         let insns = [
             Instruction::new([0x0000_734e, 0, 0, 0x000f_e400]),
             Instruction::new([0x0003_7802, 0x70, 0x0000_0f00, 0x000f_c800]),
@@ -464,7 +529,7 @@ mod tests {
                 EglAmpereCaptureResult::Continue
             };
             assert_eq!(
-                egl_ampere_capture_observe(&mut state, insn, index as u32),
+                unsafe { egl_ampere_capture_observe(&mut state, insn, index as u32) },
                 expected
             );
         }

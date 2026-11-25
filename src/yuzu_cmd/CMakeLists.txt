@@ -65,6 +65,11 @@ target_include_directories(yuzu-cmd PRIVATE ${RESOURCES_DIR})
 
 target_link_libraries(yuzu-cmd PRIVATE SDL3::SDL3)
 
+add_custom_command(TARGET yuzu-cmd POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${PROJECT_SOURCE_DIR}/dist/nx2_switches.txt" "$<TARGET_FILE_DIR:yuzu-cmd>/nx2_switches.txt"
+    VERBATIM)
+
 if(UNIX AND NOT APPLE)
     install(TARGETS yuzu-cmd)
 endif()

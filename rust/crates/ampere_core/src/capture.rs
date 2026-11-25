@@ -69,7 +69,7 @@ impl ProgramCaptureState {
             if index + 1 == setup_len && self.is_geometry_exit_setup() {
                 let target = self.exit_setup[1].words[1];
                 if target < setup_len * 16
-                    || (target % 16) != 0
+                    || !target.is_multiple_of(16)
                     || target >= Self::MAXIMUM_INSTRUCTIONS * 16
                 {
                     return CaptureResult::InvalidTarget;

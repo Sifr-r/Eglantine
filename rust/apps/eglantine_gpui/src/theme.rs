@@ -313,10 +313,10 @@ impl Theme {
                 return Err(invalid(format!("Missing or invalid theme image {image:?}")));
             }
         }
-        if let Some(font) = &self.style.font_asset {
-            if !self.assets.get(font).is_some_and(|kind| !kind.is_image()) {
-                return Err(invalid(format!("Missing or invalid theme font {font:?}")));
-            }
+        if let Some(font) = &self.style.font_asset
+            && !self.assets.get(font).is_some_and(|kind| !kind.is_image())
+        {
+            return Err(invalid(format!("Missing or invalid theme font {font:?}")));
         }
         Ok(())
     }

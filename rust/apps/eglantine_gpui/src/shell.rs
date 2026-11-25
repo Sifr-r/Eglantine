@@ -149,12 +149,25 @@ pub struct Shell {
     _polling: Task<()>,
 }
 
+pub struct ShellConfig {
+    pub dir: PathBuf,
+    pub preferences: Preferences,
+    pub message: Option<String>,
+    pub safe_theme: bool,
+    pub initial_game: Option<PathBuf>,
+    pub user_profile_override: Option<u8>,
+}
+
 impl Shell {
-    pub fn new(
-        window: &mut Window, cx: &mut Context<Self>, dir: PathBuf, preferences: Preferences,
-        mut message: Option<String>, safe_theme: bool, initial_game: Option<PathBuf>,
-        user_profile_override: Option<u8>,
-    ) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>, config: ShellConfig) -> Self {
+        let ShellConfig {
+            dir,
+            preferences,
+            mut message,
+            safe_theme,
+            initial_game,
+            user_profile_override,
+        } = config;
         let library = Library::open(dir.clone()).map_err(|error| message = Some(error)).ok();
         let settings = EmulatorConfig::load(&dir).map_err(|error| message = Some(error)).ok();
         let package = ThemePackage::load_active(&dir, safe_theme)
@@ -352,8 +365,11 @@ impl Shell {
             match key {
                 "enter" | "escape" => self.searching = false,
                 "backspace" => { self.search.pop(); }
-                _ => if let Some(character) = &event.keystroke.key_char {
-                    if self.search.len() < 4096 && !character.chars().any(char::is_control) {
+                _ => {
+                    if let Some(character) = &event.keystroke.key_char
+                        && self.search.len() < 4096
+                        && !character.chars().any(char::is_control)
+                    {
                         self.search.push_str(character);
                     }
                 }

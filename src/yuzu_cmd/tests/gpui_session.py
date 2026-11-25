@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Windows smoke test for GPUI's private JSONL subprocess modes."""
+"""Cross-platform smoke and protocol tests for GPUI's private JSONL subprocess modes."""
 
 import json
 import os
@@ -27,6 +27,19 @@ def write_homebrew(path):
     path.write_bytes(image)
 
 
+def build_cli_env(cli_source):
+    env = dict(os.environ)
+    parent = str(cli_source.parent)
+    if sys.platform == "win32":
+        env["PATH"] = parent + os.pathsep + env.get("PATH", "")
+    else:
+        env["LD_LIBRARY_PATH"] = parent + os.pathsep + env.get("LD_LIBRARY_PATH", "")
+        if sys.platform == "darwin":
+            env["DYLD_LIBRARY_PATH"] = parent + os.pathsep + env.get("DYLD_LIBRARY_PATH", "")
+    env["EDEN_NX2_HIDE_WINDOW"] = "1"
+    return env
+
+
 class SessionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -34,24 +47,54 @@ class SessionTests(unittest.TestCase):
         cls.addClassCleanup(cls.temp.cleanup)
         cls.root = Path(cls.temp.name)
         cls.cli = cls.root / CLI.name
-        shutil.copyfile(CLI, cls.cli)
+        shutil.copy2(CLI, cls.cli)
         (cls.root / "user").mkdir()
         cls.library = cls.root / "Biblïothèque"
         cls.library.mkdir()
         cls.rom = cls.library / "Églantine.nro"
         write_homebrew(cls.rom)
-        cls.env = dict(os.environ)
-        cls.env["PATH"] = str(CLI.parent) + os.pathsep + cls.env.get("PATH", "")
-        cls.env["EDEN_NX2_HIDE_WINDOW"] = "1"
+        cls.env = build_cli_env(CLI)
 
-    def run_cli(self, *args, env=None):
+    def run_cli(self, *args, env=None, cwd=None):
         result = subprocess.run(
             [self.cli, *args], input="", capture_output=True, encoding="utf-8",
-            env=self.env if env is None else env, cwd=self.root, timeout=30, check=False,
+            env=self.env if env is None else env, cwd=self.root if cwd is None else cwd,
+            timeout=30, check=False,
         )
         rows = [json.loads(line) for line in result.stdout.splitlines()]
         self.assertTrue(all(row["version"] == 1 for row in rows))
         return result, rows
+
+    def start_session(self):
+        diagnostics = self.root / "session.stderr"
+        stderr = diagnostics.open("wb")
+        self.addCleanup(stderr.close)
+        process = subprocess.Popen(
+            [self.cli, "--gpui-session", "-g", self.rom, "--null-render"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
+            encoding="utf-8", env=self.env, cwd=self.root,
+        )
+        self.addCleanup(self.reap, process)
+        messages = queue.Queue()
+
+        def read_messages():
+            for line in process.stdout:
+                messages.put(json.loads(line))
+            messages.put(None)
+
+        threading.Thread(target=read_messages, daemon=True).start()
+
+        def receive(event):
+            try:
+                row = messages.get(timeout=30)
+            except queue.Empty:
+                self.fail(f"Timed out waiting for {event}: {diagnostics.read_text(errors='replace')[-4000:]}")
+            self.assertIsNotNone(row, "the gameplay host exited early")
+            self.assertEqual(row["version"], 1)
+            self.assertEqual(row["event"], event, row)
+            return row
+
+        return process, receive
 
     def test_missing_game_reports_error(self):
         result, rows = self.run_cli("--gpui-session")
@@ -84,33 +127,7 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(missing.exists())
 
     def test_pause_resume_stop_and_framing(self):
-        diagnostics = self.root / "session.stderr"
-        stderr = diagnostics.open("wb")
-        self.addCleanup(stderr.close)
-        process = subprocess.Popen(
-            [self.cli, "--gpui-session", "-g", self.rom, "--null-render"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr,
-            encoding="utf-8", env=self.env, cwd=self.root,
-        )
-        self.addCleanup(self.reap, process)
-        messages = queue.Queue()
-
-        def read_messages():
-            for line in process.stdout:
-                messages.put(json.loads(line))
-            messages.put(None)
-
-        threading.Thread(target=read_messages, daemon=True).start()
-
-        def receive(event):
-            try:
-                row = messages.get(timeout=30)
-            except queue.Empty:
-                self.fail(f"Timed out waiting for {event}: {diagnostics.read_text(errors='replace')[-4000:]}")
-            self.assertIsNotNone(row, "the gameplay host exited early")
-            self.assertEqual(row["version"], 1)
-            self.assertEqual(row["event"], event, row)
-            return row
+        process, receive = self.start_session()
 
         def send(command, request_id, version=1):
             value = json.dumps({"version": version, "id": request_id, "command": command})
@@ -137,17 +154,133 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(receive("state")["state"], "stopped")
         self.assertEqual(process.wait(timeout=30), 0)
 
+    def test_unknown_command_and_malformed_json_keep_session_running(self):
+        process, receive = self.start_session()
+        receive("ready")
+        self.assertEqual(receive("state")["state"], "running")
+
+        process.stdin.write("{not json\n")
+        process.stdin.flush()
+        self.assertIn("Invalid", receive("error")["message"])
+
+        process.stdin.write('{"version":1,"command":"pause"}\n')
+        process.stdin.flush()
+        self.assertIn("Invalid", receive("error")["message"])
+
+        process.stdin.write(json.dumps({"version": 1, "id": 10, "command": "bogus"}) + "\n")
+        process.stdin.flush()
+        reply = receive("reply")
+        self.assertEqual(reply["id"], 10)
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["state"], "running")
+
+        process.stdin.write(json.dumps({"version": 1, "id": 11, "command": "stop"}) + "\n")
+        process.stdin.flush()
+        self.assertEqual(receive("state")["state"], "stopping")
+        stop_reply = receive("reply")
+        self.assertTrue(stop_reply["ok"])
+        self.assertEqual(stop_reply["id"], 11)
+        self.assertEqual(receive("state")["state"], "stopped")
+        self.assertEqual(process.wait(timeout=30), 0)
+
+    def test_oversized_request_emits_error_and_exits(self):
+        process, receive = self.start_session()
+        receive("ready")
+        self.assertEqual(receive("state")["state"], "running")
+
+        process.stdin.write("x" * 4100 + "\n")
+        process.stdin.flush()
+        self.assertIn("size limit", receive("error")["message"])
+        self.assertEqual(receive("state")["state"], "stopping")
+        self.assertEqual(receive("state")["state"], "stopped")
+        self.assertEqual(process.wait(timeout=30), 0)
+
+    def test_closing_stdin_triggers_orderly_shutdown(self):
+        process, receive = self.start_session()
+        receive("ready")
+        self.assertEqual(receive("state")["state"], "running")
+
+        process.stdin.close()
+        self.assertEqual(receive("state")["state"], "stopping")
+        self.assertEqual(receive("state")["state"], "stopped")
+        self.assertEqual(process.wait(timeout=30), 0)
+
+    def test_gpui_content_validation_and_empty_verify(self):
+        with tempfile.TemporaryDirectory(prefix="eglantine-gpui-content-") as tmp:
+            work = Path(tmp)
+
+            result, rows = self.run_cli("--gpui-content")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual([row["event"] for row in rows], ["ready", "error"])
+
+            result, rows = self.run_cli("--gpui-content", "unknown_op")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual([row["event"] for row in rows], ["ready", "error"])
+
+            result, rows = self.run_cli("--gpui-content", "verify_content", str(work))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual([row["event"] for row in rows], ["ready", "error"])
+
+            result, rows = self.run_cli("--gpui-content", "verify_content")
+            self.assertEqual(result.returncode, 0, (rows, result.stderr))
+            self.assertEqual([row["event"] for row in rows], ["ready", "content_done"])
+
+            txt_file = work / "notes.txt"
+            txt_file.write_text("not content", encoding="utf-8")
+            nca_file = work / "0123456789abcdef0123456789abcdef.nca"
+            nca_file.write_bytes(b"\x00" * 16)
+            nsp_file = work / "update.nsp"
+            nsp_file.write_bytes(b"\x00" * 16)
+
+            for args in (
+                ("--gpui-content", "install_content", str(work / "missing.nsp")),
+                ("--gpui-content", "install_content", str(txt_file)),
+                ("--gpui-content", "install_content", str(nca_file)),
+                ("--gpui-content", "install_nca_update", str(nsp_file)),
+            ):
+                result, rows = self.run_cli(*args)
+                self.assertNotEqual(result.returncode, 0, args)
+                self.assertEqual([row["event"] for row in rows], ["ready", "error"], args)
+
+            empty_fw = work / "empty_fw"
+            empty_fw.mkdir()
+            result, rows = self.run_cli("--gpui-content", "install_firmware", str(empty_fw))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual([row["event"] for row in rows], ["ready", "error"])
+
+            bad_fw = work / "bad_fw"
+            bad_fw.mkdir()
+            (bad_fw / "bad_name.nca").write_bytes(b"\x00" * 16)
+            result, rows = self.run_cli("--gpui-content", "install_firmware", str(bad_fw))
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual([row["event"] for row in rows], ["ready", "error"])
+            self.assertIn("invalid NCA", rows[-1]["message"])
+
+            registered = self.root / "user" / "nand" / "system" / "Contents" / "registered"
+            registered.mkdir(parents=True, exist_ok=True)
+            marker = registered / "existing.nca"
+            marker.write_bytes(b"\x00" * 16)
+            try:
+                result, rows = self.run_cli("--gpui-content", "install_firmware", str(empty_fw))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual([row["event"] for row in rows], ["ready", "error"])
+                self.assertIn("empty system NAND", rows[-1]["message"])
+            finally:
+                marker.unlink(missing_ok=True)
+
     @staticmethod
     def reap(process):
         if process.poll() is None:
             process.kill()
             process.wait(timeout=15)
-        process.stdin.close()
-        process.stdout.close()
+        if process.stdin and not process.stdin.closed:
+            process.stdin.close()
+        if process.stdout and not process.stdout.closed:
+            process.stdout.close()
 
 
 if __name__ == "__main__":
-    if sys.platform != "win32" or len(sys.argv) != 2:
-        sys.exit("Usage on Windows: python -I gpui_session.py path/to/eden-cli.exe")
+    if len(sys.argv) != 2:
+        sys.exit("Usage: python -I gpui_session.py path/to/eden-cli")
     CLI = Path(sys.argv[1]).resolve(strict=True)
     unittest.main(argv=sys.argv[:1])

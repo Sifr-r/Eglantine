@@ -312,7 +312,7 @@ public:
                 return;
             }
             Interrupt(lock);
-            for (auto& bp : breakpoints) {
+            for (const auto& bp : breakpoints) {
                 if (bp.enabled) {
                     Command(RemovePacket(bp));
                 }
@@ -422,7 +422,7 @@ public:
             return nullptr;
         }
         // Stepping off an exec breakpoint needs it removed for that one instruction.
-        Breakpoint* bp = StoppedAtExecBreakpoint();
+        const Breakpoint* bp = StoppedAtExecBreakpoint();
         if (bp) {
             Command(RemovePacket(*bp));
         }
@@ -609,10 +609,10 @@ private:
     /// Before resuming from a breakpoint or watchpoint stop, executes the stopped instruction
     /// with that breakpoint removed, so the game does not stop on it again at once.
     void StepOverStoppedBreakpoint() {
-        Breakpoint* bp = nullptr;
+        const Breakpoint* bp = nullptr;
         if (paused_info.is_object() && paused_info.contains("breakpoint")) {
             const u32 id = paused_info["breakpoint"].get<u32>();
-            for (auto& b : breakpoints) {
+            for (const auto& b : breakpoints) {
                 if (b.id == id && b.enabled) {
                     bp = &b;
                 }
@@ -934,10 +934,6 @@ json EmptySchema() {
 }
 
 } // namespace
-
-json DebuggerStatusJson() {
-    return DebugClient::Get().Status();
-}
 
 void StopDebuggerWork() {
     DebugClient::Get().Detach();

@@ -1257,11 +1257,6 @@ public:
         return stopped_active;
     }
 
-    [[nodiscard]] bool Recording() {
-        std::scoped_lock lock{mutex};
-        return active;
-    }
-
     /// Stops and joins the recording thread if it is still running.
     ~Recorder() {
         StopWorker();

@@ -1,0 +1,27 @@
+# `video_core` — GPU, Memory, Caches, and Vulkan
+
+Entry points: `src/video_core/gpu.cpp`, `src/video_core/memory_manager.h`, `src/video_core/renderer_vulkan/vk_pipeline_cache.cpp`.
+
+## Engines, Channels, and Thread Split
+
+- **Native selection & MME:** `VideoCommon::Maxwell3D` (`GetNativeMacroEngine().native_turing`) selects the Switch 2 path. `Tegra::GPU::Impl` (`gpu.cpp`) owns per-session `NativeMacroContext` (declared before `gpu_thread`, `renderer`, `scheduler`, `channels`) so channels share macro RAM without cross-session leaks (`src/tests/video_core/nx2_macro_context.cpp`).
+- **Channel bridge:** `Tegra::Control::ChannelStateBridge` (`control/channel_state_bridge.h`) is a trivially copyable non-owning bridge covering engines, memory manager, DMA pusher, dirty tables, and Ampere `GraphicsProgramAddress` (`reserved[0..1]`). `ChannelSetupCaches<P>` (`control/channel_state_cache.{h,inc,cpp}`) uses `std::deque<std::optional<P>>` and `CreateChannelFromBridge`; `Vulkan::StateTracker` / `OpenGL::StateTracker` keep `DirtyFlags*` pointing to `default_flags` when unbound (`[channel_bridge]`).
+- **GPU split (`src/video_core/gpu_split.{h,cpp}`):** Separates front-thread ring bookkeeping and back-thread engine pointer on 128-byte boundaries. `GpuSplit::active` is atomic (acquire/release). `MemoryManager::RunRasterizerWork` batches `{DAddr, u64}` regions by value onto the split back thread (`DeferFunction`/`Drain` on `OnGpuThread()`, `GPU::RunInOrderSync` elsewhere).
+
+## Memory Manager, Syncpoints, and Lifetime
+
+- **Page-table lock order:** `cache mutexes -> page_table_mutex -> runs_guard -> guard`. Never hold `MemoryManager` locks across rasterizer, cache, or callback calls; collect segments under lock, merge host-contiguous ranges, and invoke `rasterizer->ModifyGPUMemory` after unlock. `Unmap` and `FlushCaching` use local scratch vectors (thread-safe).
+- **Address-space lifetime:** `Tegra::MemoryManager` inherits `enable_shared_from_this`. `ChannelSetupCaches<P>::AddressSpaceRef::owner` holds `weak_ptr<MemoryManager>`, and `ImageBase::address_space` guards `TextureCache::UnregisterImage` / `WriteBackMemory` / `WriteBackImage` across channel close while `ForEachSparseSegment` skips unmapped segments (`[lifetime]`). `g_nx2_sparse_backing_mutex` and `QueryCacheLegacy::mutex` are non-recursive `std::mutex`.
+- **Syncpoints (`src/video_core/host1x/syncpoint_manager.{h,cpp}`):** Validates `IsValidSyncpoint(id)`, provides seeded multi-listener `RegisterGuestMirror(..., seed_initial)` with per-mirror moved tracking (`TakeMovedGuestForMirror`) and `WithGuestValuesStable` (`[syncpoint]`).
+
+## Buffer Cache, Texture Cache, and Readbacks
+
+- **Download policy (`buffer_cache/buffer_cache_base.h`, `buffer_cache.h`):** `DeviceMemoryManager::CanTrapCpuReads()` and `PlatformProfile::prefer_async_buffer_downloads` (`true` Switch 1, `false` Switch 2) gate `EvaluateAsyncBufferDownloads()` / `EvaluateFlushesOnCpuRead()` / `BufferCache::FlushesOnCpuRead()`, honoring `EDEN_NX2_BUFFER_DOWNLOADS=0|1`. Enforces `size == 0` guards, sorted fence interval union, `MaxDeviceArea()` clamping, and `buffer_cache.mutex`-guarded `GetFlushArea` in Vulkan/OpenGL (`[buffer-download-policy]`).
+- **Textures & pinned DMA readbacks:** `ImageBase` tracks `first_written_frame`, `last_written_frame`, `cleared_frame` (`RedrawnEveryFrame`, `HasRecentPriorFrameOutput`). `TextureCache::ClearCovers()` checks `surface_clip` and flipped lower-left `WindowOrigin` scissors (`[clear_covers]`). `HandleScratchAllocationFailure()` rolls back failed uploads and keeps GC-evicted images registered. Inline I2M (`engine_upload.cpp`) passes `UsesNativeTiling()` to `SwizzleSubrect` (`src/tests/video_core/texture_swizzle.cpp`). `PendingDownload` pins DMA destinations via `HostRuns`; `FenceManager` tracks `buffer_downloads` / `ordered_fences_in_flight` (`[pending_download]`).
+- **ETC2/EAC (`src/video_core/textures/etc2.cpp`):** Khronos-spec software decoder called by `ConvertImage` when optimal hardware ETC2 is unavailable; distinct RGBA alpha vs 11-bit EAC reconstruction (`src/tests/video_core/etc2.cpp`).
+
+## Pipeline Cache, Vulkan, Upscaling, and Switches
+
+- **Cache versions & draw skip:** Vulkan `CACHE_VERSION = 36` (`MIN_COMPATIBLE_CACHE_VERSION = 20` Switch 1, `MIN_COMPATIBLE_NX2_CACHE_VERSION = 36` Switch 2; OpenGL `CACHE_VERSION = 30`). `EvaluateDrawSkip` (`renderer_vulkan/draw_skip_policy.h`) governs `BuiltPipeline`, `CanSkipDraw`, `DeferRuntimeBuild`, and `CanSkipForDiskReplay` (`in_flight_disk_replays`); excludes non-indexed draws without vertex stream 0 and preserves depth-only occlusion/memory-write draws (`[draw_skip_policy]`).
+- **Vulkan safety & upscalers:** `BlitScaleHelper()` uses distinct `normal_view`/`scale_view` and `dst_undefined` barriers. `MakeNvidiaDriverVersion()` drives broken-dynamic-state checks; `WriteStaticPipelineCache()` writes atomically via temp file + rename (`~Device()` catches exceptions); `Enumerate<VkPhysicalDevice>` retries `VK_INCOMPLETE` (`vulkan_device_version.cpp`, `vulkan_static_cache.cpp`). Temporal upscaling shares `Vulkan::ITemporalUpscaler` (`vk_temporal_upscaler.h`): `DLSS -> XeSS -> FSR 3.1 -> temporal stand-in` (`vk_xess_upscaler.{h,cpp}`).
+- **`Nx2Perf` (`src/video_core/nx2_perf.h`):** Performance switches are **on by default**. `EDEN_NX2_PERF_OPT=0` disables all; `EDEN_NX2_PERF_SAFE=1` disables `DefaultOffMask`; `EDEN_NX2_PERF_ON=`/`OFF=` toggle individuals; `EDEN_NX2_PERF_VERIFY=1` cross-checks against baseline paths.

@@ -95,7 +95,16 @@ fn main() {
             },
             |window, app| app.new(|cx| {
                 shell::Shell::new(
-                    window, cx, dir, preferences, initial_message, safe_theme, initial_game, user_profile,
+                    window,
+                    cx,
+                    shell::ShellConfig {
+                        dir,
+                        preferences,
+                        message: initial_message,
+                        safe_theme,
+                        initial_game,
+                        user_profile_override: user_profile,
+                    },
                 )
             }),
         );

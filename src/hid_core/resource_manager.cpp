@@ -113,6 +113,9 @@ void ResourceManager::Initialize() {
     InitializeConsoleSixAxisSampler();
     InitializeAHidSampler();
 
+    // The motion callback reads both the common and console six-axis samplers.
+    system.CoreTiming().ScheduleLoopingEvent(motion_update_ns, motion_update_ns,
+                                            motion_update_event);
     is_initialized = true;
 }
 
@@ -260,8 +263,6 @@ void ResourceManager::InitializeHidCommonSampler() {
                                              default_update_event);
     system.CoreTiming().ScheduleLoopingEvent(mouse_keyboard_update_ns, mouse_keyboard_update_ns,
                                              mouse_keyboard_update_event);
-    system.CoreTiming().ScheduleLoopingEvent(motion_update_ns, motion_update_ns,
-                                             motion_update_event);
 }
 
 void ResourceManager::InitializeTouchScreenSampler() {

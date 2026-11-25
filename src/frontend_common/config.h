@@ -199,7 +199,7 @@ protected:
     void WriteSettingGeneric(const Settings::BasicSetting* setting);
 
     template <typename T>
-    [[nodiscard]] std::string ToString(const T& value_) {
+    [[nodiscard]] static std::string ToString(const T& value_) {
         if constexpr (std::is_same_v<T, std::string>) {
             return value_;
         } else if constexpr (std::is_same_v<T, std::optional<u32>>) {

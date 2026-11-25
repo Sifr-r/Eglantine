@@ -84,7 +84,16 @@ pub struct SessionClient {
 
 impl SessionClient {
     pub fn launch(&mut self, game: &Path, fullscreen: bool, config: Option<&Path>) -> Result<(), String> {
-        self.launch_with_config(game, fullscreen, config.map(Path::to_path_buf), "F10", "guide", None, None)
+        self.launch_with_config(Launch {
+            game: game.into(),
+            fullscreen,
+            config: config.map(Path::to_path_buf),
+            home_key: "F10".into(),
+            home_button: "guide".into(),
+            user_profile: None,
+            handoff: false,
+            _override_file: None,
+        })
     }
 
     pub fn launch_game(&mut self, game: &Path, config: &EmulatorConfig) -> Result<(), String> {
@@ -100,38 +109,26 @@ impl SessionClient {
             let profile = config.user_profile();
             (profile != 0).then_some(profile)
         });
-        self.launch_with_config(
-            game,
-            fullscreen,
-            Some(path),
-            config.home_key(),
-            config.home_button(),
-            user_profile,
-            override_file,
-        )
-    }
-
-    fn launch_with_config(
-        &mut self, game: &Path, fullscreen: bool, config: Option<PathBuf>,
-        home_key: &str, home_button: &str, user_profile: Option<u8>,
-        override_file: Option<tempfile::TempPath>,
-    ) -> Result<(), String> {
-        if self.host.is_some() {
-            return Err("A game session is already active".into());
-        }
-        if !game.is_file() && !game.is_dir() {
-            return Err(format!("Game was not found at {}", game.display()));
-        }
-        self.start(Launch {
+        self.launch_with_config(Launch {
             game: game.into(),
             fullscreen,
-            config,
-            home_key: home_key.to_owned(),
-            home_button: home_button.to_owned(),
+            config: Some(path),
+            home_key: config.home_key().to_owned(),
+            home_button: config.home_button().to_owned(),
             user_profile,
             handoff: false,
             _override_file: override_file,
         })
+    }
+
+    fn launch_with_config(&mut self, launch: Launch) -> Result<(), String> {
+        if self.host.is_some() {
+            return Err("A game session is already active".into());
+        }
+        if !launch.game.is_file() && !launch.game.is_dir() {
+            return Err(format!("Game was not found at {}", launch.game.display()));
+        }
+        self.start(launch)
     }
 
     fn start(&mut self, launch: Launch) -> Result<(), String> {

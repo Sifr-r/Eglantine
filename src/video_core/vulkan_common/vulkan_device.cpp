@@ -1700,7 +1700,9 @@ void Device::RemoveUnsuitableExtensions() {
     // 32-lane warp. The matrices hold 16-bit floats, so the device needs shaderFloat16. Shaders
     // with them use the Vulkan memory model and run with full subgroups.
     {
-        const auto raw_shapes = physical.GetCooperativeMatrixPropertiesKHR();
+        const auto raw_shapes = extensions.cooperative_matrix
+                                    ? physical.GetCooperativeMatrixPropertiesKHR()
+                                    : std::vector<VkCooperativeMatrixPropertiesKHR>{};
         coop_matrix_capabilities = {};
         coop_matrix_capabilities.extension_supported = extensions.cooperative_matrix;
         coop_matrix_capabilities.feature_enabled =

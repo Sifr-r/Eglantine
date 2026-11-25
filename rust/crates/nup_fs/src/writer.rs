@@ -1184,6 +1184,8 @@ enum PackStart {
     Fresh(Plan, Layout),
 }
 
+type PackWritePhaseOutput<'cb> = (Plan, PackProgress, Option<&'cb mut dyn FnMut(&PackProgress)>);
+
 #[allow(clippy::too_many_arguments)]
 fn pack_dump_write_phase<'cb>(
     dump_root: &Path,
@@ -1196,10 +1198,7 @@ fn pack_dump_write_phase<'cb>(
     cancel_poll: Option<&dyn Fn() -> bool>,
     mut progress_cb: Option<&'cb mut dyn FnMut(&PackProgress)>,
     start: PackStart,
-) -> Result<
-    (Plan, PackProgress, Option<&'cb mut dyn FnMut(&PackProgress)>),
-    (PackResult, String),
-> {
+) -> Result<PackWritePhaseOutput<'cb>, (PackResult, String)> {
     let (plan, layout, mut part_file, mut journal_writer, mut completed, mut dedup_map, mut cursor) =
         match start {
             PackStart::Resumed(saved_plan, saved_extents) => {

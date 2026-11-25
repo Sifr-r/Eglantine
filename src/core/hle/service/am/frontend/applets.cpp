@@ -121,16 +121,8 @@ FrontendAppletHolder::FrontendAppletHolder(Core::System& system_) : system{syste
 
 FrontendAppletHolder::~FrontendAppletHolder() = default;
 
-const FrontendAppletSet& FrontendAppletHolder::GetFrontendAppletSet() const {
-    return frontend;
-}
-
 NFP::CabinetMode FrontendAppletHolder::GetCabinetMode() const {
     return cabinet_mode;
-}
-
-AppletId FrontendAppletHolder::GetCurrentAppletId() const {
-    return current_applet_id;
 }
 
 void FrontendAppletHolder::SetFrontendAppletSet(FrontendAppletSet set) {
@@ -226,10 +218,6 @@ void FrontendAppletHolder::SetDefaultAppletsIfMissing() {
     if (frontend.net_connect == nullptr) {
         frontend.net_connect = std::make_unique<Core::Frontend::DefaultNetConnectApplet>();
     }
-}
-
-void FrontendAppletHolder::ClearAll() {
-    frontend = {};
 }
 
 std::shared_ptr<FrontendApplet> FrontendAppletHolder::GetApplet(std::shared_ptr<Applet> applet,

@@ -14,7 +14,7 @@ use crate::protocol::{
 use crate::rumble::{build_usb_vibration_report, build_vibration_report, VibrationPacketData};
 use crate::types::{
     ble_uuids, feature_mask_for_product, is_supported_product_id, product_id_to_controller_type,
-    product_name, reverse_lower_bits4, signed_looping_difference16, ControllerType,
+    product_name_c_str, reverse_lower_bits4, signed_looping_difference16, ControllerType,
     GyroActivationMode, GyroMouseMode, ProductId, StickCalibration, Switch2InputReport,
 };
 
@@ -336,14 +336,7 @@ pub extern "C" fn egl_sw2_product_id_to_controller_type(pid: u16) -> u8 {
 #[no_mangle]
 pub extern "C" fn egl_sw2_product_name(pid: u16, out_len: *mut usize) -> *const c_char {
     let parsed = ProductId::from_raw(pid).unwrap_or(ProductId::None);
-    let _ = product_name(parsed);
-    match parsed {
-        ProductId::JoyCon2Right => static_c_str(b"Switch 2 Joy-Con (Right)\0", out_len),
-        ProductId::JoyCon2Left => static_c_str(b"Switch 2 Joy-Con (Left)\0", out_len),
-        ProductId::ProController2 => static_c_str(b"Switch 2 Pro Controller\0", out_len),
-        ProductId::NsoGameCube => static_c_str(b"NSO GameCube Controller\0", out_len),
-        ProductId::None => static_c_str(b"Unknown Switch 2 Controller\0", out_len),
-    }
+    static_c_str(product_name_c_str(parsed).to_bytes_with_nul(), out_len)
 }
 
 #[no_mangle]

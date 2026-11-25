@@ -54,11 +54,10 @@ if (YUZU_STATIC_ROOM)
     set(YUZU_ROOM_STANDALONE ON)
 
     # disable e v e r y t h i n g
-    set(ENABLE_QT OFF)
+    set(ENABLE_GPUI OFF)
     set(YUZU_CMD OFF)
     set(ENABLE_CUBEB OFF)
     set(ENABLE_UPDATE_CHECKER OFF)
-    set(USE_DISCORD_PRESENCE OFF)
     set(BUILD_TESTING OFF)
     set(ENABLE_WEB_SERVICE OFF)
     set(ENABLE_LIBUSB OFF)
@@ -73,16 +72,10 @@ if (YUZU_STATIC_ROOM)
     set(fmt_FORCE_BUNDLED ON)
 endif()
 
-# qt stuff
-option(ENABLE_QT "Enable the Qt frontend" ON)
-option(ENABLE_QT_TRANSLATION "Enable translations for the Qt frontend" ON)
-option(ENABLE_UPDATE_CHECKER "Enable update checker (for Qt and Android)" OFF)
-cmake_dependent_option(YUZU_USE_QT_MULTIMEDIA "Use QtMultimedia for Camera"  OFF "NOT YUZU_USE_BUNDLED_QT" OFF)
-cmake_dependent_option(YUZU_USE_QT_WEB_ENGINE "Use QtWebEngine for web applet implementation" OFF "NOT YUZU_USE_BUNDLED_QT" OFF)
-set(YUZU_QT_MIRROR "" CACHE STRING "What mirror to use for downloading the bundled Qt libraries")
-cmake_dependent_option(YUZU_USE_BUNDLED_QT "Download bundled Qt binaries" "${MSVC}" "ENABLE_QT" OFF)
+option(ENABLE_UPDATE_CHECKER "Enable update checker (for desktop and Android)" OFF)
 
 option(ENABLE_DEBUG_TOOLS "Enable debugging tools (maxwell disassembler, SPIRV translator, etc)" OFF)
+option(ENABLE_DEAD_CODE_REPORT "Enable linker dead-code elimination reporting (MSVC /VERBOSE:REF or ELF --print-gc-sections)" OFF)
 option(ENABLE_WERROR "Enable -Werror diagnostics" ON)
 option(ENABLE_RUST_AMPERE "Enable Rust Ampere shader lowering parity backend" ON)
 option(ENABLE_RUST_AMP_SPIRV "Enable Rust direct SM86-to-SPIR-V shader compiler" ON)
@@ -115,11 +108,6 @@ endif()
 option(ENABLE_LSFG "Enable frame generation (LSFG and FSR 3 Fluid Motion)" ON)
 
 option(ENABLE_RESHADE "Enable ReShade FX post-processing effects" ON)
-
-# non-linux bundled qt are static
-if (YUZU_USE_BUNDLED_QT AND (APPLE OR NOT UNIX))
-    set(YUZU_STATIC_BUILD ON)
-endif()
 
 # TODO: does mingw need any of this anymore
 # static stuff
@@ -223,13 +211,8 @@ endif()
 
 # Set runtime library to MD/MDd for all configurations
 if(MSVC)
-    if (YUZU_USE_BUNDLED_QT AND ARCHITECTURE_arm64)
-        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-        set(libflag MT)
-    else()
-        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
-        set(libflag MD)
-    endif()
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+    set(libflag MD)
 
     # Force all projects (including external dependencies) to use the same runtime
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /${libflag}")
@@ -277,8 +260,6 @@ option(ENABLE_WEB_SERVICE "Enable web services (telemetry, etc.)" ON)
 option(ENABLE_MCP_SERVER "Build the built-in MCP server for AI agents (off at runtime by default)" ON)
 option(ENABLE_WIFI_SCAN "Enable WiFi scanning" OFF)
 
-cmake_dependent_option(USE_DISCORD_PRESENCE "Enables Discord Rich Presence" OFF "ENABLE_QT" OFF)
-
 option(YUZU_TESTS "Compile tests" "${BUILD_TESTING}")
 
 # Install udev rules on Linux (mainly for gyros)
@@ -307,15 +288,16 @@ cmake_dependent_option(YUZU_ROOM "Enable dedicated room functionality" ON "NOT A
 cmake_dependent_option(YUZU_ROOM_STANDALONE "Enable standalone room executable" ON "YUZU_ROOM" OFF)
 
 cmake_dependent_option(YUZU_CMD "Compile the eden-cli executable" ON "NOT ANDROID" OFF)
-option(ENABLE_GPUI "Build the experimental Eglantine GPUI desktop shell" OFF)
+cmake_dependent_option(EGLANTINE_ANDROID_NATIVE_PROTOTYPE "Build the SDL-hosted Android prototype" OFF "ANDROID" OFF)
+cmake_dependent_option(ENABLE_GPUI "Build the Eglantine GPUI desktop frontend" ON "NOT ANDROID AND YUZU_CMD" OFF)
 
 cmake_dependent_option(YUZU_CRASH_DUMPS "Compile crash dump (Minidump) support" OFF "WIN32 OR LINUX" OFF)
 option(ENABLE_SENTRY "Enable Sentry crash reporting in the desktop frontends" OFF)
 
 if (ENABLE_SENTRY)
-    if (ANDROID OR YUZU_STATIC_ROOM OR NOT (ENABLE_QT OR YUZU_CMD) OR
+    if (ANDROID OR YUZU_STATIC_ROOM OR NOT YUZU_CMD OR
         NOT (WIN32 OR LINUX OR CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
-        message(FATAL_ERROR "ENABLE_SENTRY requires a Qt or SDL frontend on Windows, Linux, or macOS.")
+        message(FATAL_ERROR "ENABLE_SENTRY requires an SDL desktop build on Windows, Linux, or macOS.")
     endif()
 
     find_package(sentry 0.17.5 CONFIG QUIET)
@@ -637,10 +619,6 @@ if (NOT YUZU_STATIC_ROOM)
         find_package(SDL3)
     endif()
 
-    if (USE_DISCORD_PRESENCE)
-        find_package(DiscordRPC)
-    endif()
-
     if (ENABLE_CUBEB)
         find_package(cubeb)
     endif()
@@ -648,77 +626,6 @@ if (NOT YUZU_STATIC_ROOM)
     if (YUZU_TESTS OR DYNARMIC_TESTS)
         find_package(Catch2)
     endif()
-endif()
-
-# Qt stuff
-if (ENABLE_QT)
-    if (YUZU_USE_BUNDLED_QT)
-        AddQt(Eden-CI/Qt 6.11.1)
-    else()
-        message(STATUS "Using system Qt")
-        if (NOT Qt6_DIR)
-            set(Qt6_DIR "" CACHE PATH "Additional path to search for Qt6 libraries like C:/Qt/6.8.3/msvc2022_64/lib/cmake/Qt6")
-        endif()
-        list(APPEND CMAKE_PREFIX_PATH "${Qt6_DIR}")
-    endif()
-
-    find_package(Qt6 REQUIRED COMPONENTS Core)
-
-    if (NOT DEFINED QT_TARGET_PATH)
-        get_target_property(qtcore_path Qt6::Core LOCATION_Release)
-        string(FIND "${qtcore_path}" "/bin/" qtcore_path_bin_pos REVERSE)
-        string(FIND "${qtcore_path}" "/lib/" qtcore_path_lib_pos REVERSE)
-        if (qtcore_path_bin_pos GREATER qtcore_path_lib_pos)
-            string(SUBSTRING "${qtcore_path}" 0 ${qtcore_path_bin_pos} QT_TARGET_PATH)
-        else()
-            string(SUBSTRING "${qtcore_path}" 0 ${qtcore_path_lib_pos} QT_TARGET_PATH)
-        endif()
-    endif()
-
-    if (NOT DEFINED QT_HOST_PATH)
-        set(QT_HOST_PATH "${QT_TARGET_PATH}")
-    endif()
-
-    message(STATUS "Using target Qt at ${QT_TARGET_PATH}")
-    message(STATUS "Using host Qt at ${QT_HOST_PATH}")
-
-    ## Components ##
-
-    # Best practice is to ask for all components at once, so they are from the same version
-    set(YUZU_QT_COMPONENTS Core Widgets Charts Concurrent Gui)
-    if (LINUX OR FREEBSD)
-        list(APPEND YUZU_QT_COMPONENTS DBus)
-        # yes Qt, we get it
-        set(QT_NO_PRIVATE_MODULE_WARNING ON)
-        list(APPEND YUZU_QT_OPTIONAL GuiPrivate)
-    endif()
-
-    if (YUZU_USE_QT_MULTIMEDIA)
-        list(APPEND YUZU_QT_COMPONENTS Multimedia)
-    endif()
-
-    if (YUZU_USE_QT_WEB_ENGINE)
-        list(APPEND YUZU_QT_COMPONENTS WebEngineCore WebEngineWidgets)
-    endif()
-
-    if (ENABLE_QT_TRANSLATION)
-        list(APPEND YUZU_QT_OPTIONAL LinguistTools)
-    endif()
-
-    find_package(Qt6 REQUIRED COMPONENTS ${YUZU_QT_COMPONENTS} OPTIONAL_COMPONENTS ${YUZU_QT_OPTIONAL})
-
-    if (ENABLE_QT_TRANSLATION AND NOT Qt6LinguistTools_FOUND)
-        message(STATUS "Qt6 LinguistTools not found; disabling Qt translations")
-        set(ENABLE_QT_TRANSLATION OFF)
-    endif()
-    set(QT_MAJOR_VERSION 6)
-    # Qt6 sets cxx_std_17 and we need to undo that
-    set_target_properties(Qt6::Platform PROPERTIES INTERFACE_COMPILE_FEATURES "")
-
-    ## Qt Externals ##
-
-    # QuaZip
-    AddJsonPackage(quazip)
 endif()
 
 if (NOT YUZU_STATIC_ROOM AND NOT (YUZU_USE_BUNDLED_FFMPEG OR YUZU_USE_EXTERNAL_FFMPEG))
@@ -805,22 +712,23 @@ endif()
 add_subdirectory(src)
 
 if (ENABLE_GPUI)
-    if (NOT WIN32 OR NOT TARGET yuzu-cmd)
-        message(FATAL_ERROR "The GPUI preview requires Windows and YUZU_CMD=ON")
+    if (NOT TARGET yuzu-cmd)
+        message(FATAL_ERROR "The GPUI frontend requires YUZU_CMD=ON")
     endif()
     find_program(CARGO_EXECUTABLE cargo REQUIRED)
     set(gpui_manifest "${PROJECT_SOURCE_DIR}/rust/apps/eglantine_gpui/Cargo.toml")
     set(gpui_target_dir "${PROJECT_BINARY_DIR}/gpui-cargo")
     set(gpui_profile "$<IF:$<CONFIG:Debug>,debug,release>")
     set(gpui_binary "${gpui_target_dir}/${gpui_profile}/eglantine-gpui${CMAKE_EXECUTABLE_SUFFIX}")
-    add_custom_target(eglantine-gpui ALL
+    add_custom_target(eglantine ALL
         COMMAND "${CARGO_EXECUTABLE}" build --locked --manifest-path "${gpui_manifest}"
             --target-dir "${gpui_target_dir}" $<$<NOT:$<CONFIG:Debug>>:--release>
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-            "${gpui_binary}" "$<TARGET_FILE_DIR:yuzu-cmd>/eglantine-gpui${CMAKE_EXECUTABLE_SUFFIX}"
+            "${gpui_binary}" "$<TARGET_FILE_DIR:yuzu-cmd>/eglantine${CMAKE_EXECUTABLE_SUFFIX}"
         DEPENDS yuzu-cmd
         VERBATIM
     )
+    add_custom_target(eglantine-gpui DEPENDS eglantine)
 endif()
 
 if (ENABLE_DEBUG_TOOLS)
@@ -829,10 +737,7 @@ if (ENABLE_DEBUG_TOOLS)
     add_subdirectory(tools/maxwell-ir)
 endif()
 
-# Set yuzu project or yuzu-cmd project as default StartUp Project in Visual Studio depending on whether QT is enabled or not
-if(ENABLE_QT)
-    set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT yuzu)
-else()
+if(TARGET yuzu-cmd)
     set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT yuzu-cmd)
 endif()
 
@@ -846,7 +751,7 @@ endif()
 # https://www.freedesktop.org/software/appstream/docs/
 
 # TODO: Icon/install handling n such should be put into dist/CMakeLists.txt
-if(ENABLE_QT AND UNIX AND NOT APPLE)
+if(ENABLE_GPUI AND UNIX AND NOT APPLE)
     install(FILES "dist/dev.eglantine.eglantine.desktop"
         DESTINATION "share/applications")
     install(FILES "dist/dev.eden_emu.eden.svg"

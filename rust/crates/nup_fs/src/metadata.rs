@@ -525,7 +525,7 @@ pub fn parse_nacp_bytes(bytes: &[u8], nacp_language_index: i32) -> ParsedNacp {
         let compressed_size = read_u16_le(&raw, 0) as usize;
         let end = (2 + compressed_size).min(0x3000);
         if let Ok(decompressed) = inflate_raw(&raw[2..end], 0x300 * 32) {
-            for chunk in decompressed.chunks_exact(0x300) {
+            for chunk in decompressed.as_chunks::<0x300>().0 {
                 entries.push((
                     c_str_from_fixed(&chunk[0..0x200]),
                     c_str_from_fixed(&chunk[0x200..0x300]),
@@ -533,7 +533,7 @@ pub fn parse_nacp_bytes(bytes: &[u8], nacp_language_index: i32) -> ParsedNacp {
             }
         }
     } else {
-        for chunk in raw[0..0x3000].chunks_exact(0x300) {
+        for chunk in raw[0..0x3000].as_chunks::<0x300>().0 {
             entries.push((
                 c_str_from_fixed(&chunk[0..0x200]),
                 c_str_from_fixed(&chunk[0x200..0x300]),
@@ -831,7 +831,7 @@ pub fn newest_update_index(packages: &[PackageInfo]) -> Option<usize> {
         if pkg.kind != PackageKind::Update {
             continue;
         }
-        if best.map_or(true, |b| pkg.version > packages[b].version) {
+        if best.is_none_or(|b| pkg.version > packages[b].version) {
             best = Some(i);
         }
     }
@@ -1004,7 +1004,7 @@ pub(crate) fn edit_nup_metadata_with_cancel_poll(
 
     if toc_offset != SUPERBLOCK_SIZE as u64
         || toc_size == 0
-        || blob_offset % EXTENT_ALIGNMENT != 0
+        || !blob_offset.is_multiple_of(EXTENT_ALIGNMENT)
         || super_file_size != file_size
         || package_count != package_total
         || file_size > i64::MAX as u64

@@ -37,6 +37,9 @@ pub trait ZstdCodec: Sync {
 
 pub trait ReadAt {
     fn len(&self) -> u64;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
     fn read_at(&self, offset: u64, dst: &mut [u8]) -> io::Result<usize>;
 
     fn read_exact_vec(&self, offset: u64, size: usize) -> io::Result<Vec<u8>> {
@@ -67,7 +70,7 @@ pub const fn align_up(value: u64, alignment: u64) -> u64 {
     if alignment == 0 {
         return value;
     }
-    ((value + alignment - 1) / alignment) * alignment
+    value.div_ceil(alignment) * alignment
 }
 
 #[inline]
@@ -161,9 +164,8 @@ impl Sha256 {
 
     fn compress(state: &mut [u32; 8], block: &[u8]) {
         let mut w = [0u32; 64];
-        for i in 0..16 {
-            let j = i * 4;
-            w[i] = u32::from_be_bytes([block[j], block[j + 1], block[j + 2], block[j + 3]]);
+        for (dst, chunk) in w[..16].iter_mut().zip(block.as_chunks::<4>().0) {
+            *dst = u32::from_be_bytes(*chunk);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -265,11 +267,11 @@ pub fn to_hex(bytes: &[u8]) -> String {
 
 pub fn from_hex(hex: &str) -> Result<Vec<u8>, String> {
     let bytes = hex.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err("malformed hex".to_string());
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let hi = hex_nibble(pair[0])?;
         let lo = hex_nibble(pair[1])?;
         out.push((hi << 4) | lo);

@@ -29,6 +29,19 @@ jobs:
         shell: bash
         run: git ls-tree -r --name-only -z HEAD | python3 -I tools/ci/check_release_paths.py --stdin0
 
+  docs-layout:
+    name: Check documentation layout
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check the documentation tree is kept in this repository
+        shell: bash
+        run: python3 -I tools/ci/check_docs_layout.py --ref HEAD
+
   license-headers:
     name: Check SPDX license headers
     if: github.event_name == 'pull_request'

@@ -654,6 +654,11 @@ fn free_owned_metadata_inner(meta: &mut EglNupOwnedMetadata) {
     free_owned_string_inner(&mut meta.version_source);
 }
 
+/// Returns `1` if `bytes[..len]` starts with valid NUP magic and `total_size` meets minimum size.
+///
+/// # Safety
+///
+/// If `len > 0`, `bytes` must point to `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_is_nup_magic(
     bytes: *const u8,
@@ -669,6 +674,12 @@ pub unsafe extern "C" fn egl_nup_is_nup_magic(
     .unwrap_or(0)
 }
 
+/// Parses a NUP container TOC and package metadata through the `vfs` callbacks into `out_container`.
+///
+/// # Safety
+///
+/// `vfs` must point to a valid [`EglNupVfsOps`] table and `out_container` must be a valid, aligned,
+/// writable [`EglNupParsedContainer`].
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_container_parse(
     vfs: *const EglNupVfsOps,
@@ -791,6 +802,12 @@ pub unsafe extern "C" fn egl_nup_container_parse(
     }
 }
 
+/// Frees all heap allocations owned by `container` and resets it to zero.
+///
+/// # Safety
+///
+/// `container` must be null or point to a valid, aligned [`EglNupParsedContainer`] produced by
+/// [`egl_nup_container_parse`] (or already zeroed).
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_container_free(container: *mut EglNupParsedContainer) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -852,6 +869,12 @@ pub unsafe extern "C" fn egl_nup_container_free(container: *mut EglNupParsedCont
     }));
 }
 
+/// Reads and optionally decompresses one NUP file extent into `out_bytes`.
+///
+/// # Safety
+///
+/// `vfs` and `zstd` must point to valid callback tables, and `out_bytes` must be a valid,
+/// aligned, writable [`EglNupOwnedBytes`].
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_read_extent(
     vfs: *const EglNupVfsOps,
@@ -893,6 +916,12 @@ pub unsafe extern "C" fn egl_nup_read_extent(
     .unwrap_or(-1)
 }
 
+/// Verifies SHA-256 integrity of every file extent in the NUP container.
+///
+/// # Safety
+///
+/// `vfs` and `zstd` must point to valid callback tables; if `progress_cb` is `Some`,
+/// `progress_ctx` must be valid for the callback during this call.
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_verify_integrity(
     vfs: *const EglNupVfsOps,
@@ -925,6 +954,11 @@ pub unsafe extern "C" fn egl_nup_verify_integrity(
     .unwrap_or(-1)
 }
 
+/// Returns `1` if `dir_utf8[..dir_len]` points to a loose Switch game dump directory.
+///
+/// # Safety
+///
+/// If `dir_len > 0`, `dir_utf8` must point to `dir_len` readable UTF-8 bytes.
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_is_loose_dump(dir_utf8: *const c_char, dir_len: usize) -> u8 {
     catch_unwind(AssertUnwindSafe(|| {
@@ -936,6 +970,12 @@ pub unsafe extern "C" fn egl_nup_is_loose_dump(dir_utf8: *const c_char, dir_len:
     .unwrap_or(0)
 }
 
+/// Resolves the dump root directory from a `main` executable path into `out_root`.
+///
+/// # Safety
+///
+/// If `main_len > 0`, `main_utf8` must point to `main_len` readable UTF-8 bytes; `out_root` must be
+/// null or point to a valid, aligned, writable [`EglNupOwnedString`].
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_dump_root_from_main(
     main_utf8: *const c_char,
@@ -964,6 +1004,12 @@ pub unsafe extern "C" fn egl_nup_dump_root_from_main(
     .unwrap_or(0)
 }
 
+/// Probes metadata from a loose dump directory into `out_meta`.
+///
+/// # Safety
+///
+/// If `dump_root_len > 0`, `dump_root_utf8` must point to `dump_root_len` readable UTF-8 bytes;
+/// `out_meta` must be null or point to a valid, aligned, writable [`EglNupOwnedMetadata`].
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_probe_metadata(
     dump_root_utf8: *const c_char,
@@ -988,6 +1034,12 @@ pub unsafe extern "C" fn egl_nup_probe_metadata(
     .unwrap_or(-1)
 }
 
+/// Probes metadata from a `.nup` archive file on disk into `out_meta`.
+///
+/// # Safety
+///
+/// If `archive_len > 0`, `archive_utf8` must point to `archive_len` readable UTF-8 bytes;
+/// `out_meta` must be null or point to a valid, aligned, writable [`EglNupOwnedMetadata`].
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_probe_nup_metadata(
     archive_utf8: *const c_char,
@@ -1011,6 +1063,12 @@ pub unsafe extern "C" fn egl_nup_probe_nup_metadata(
     .unwrap_or(-1)
 }
 
+/// Computes the default `.nup` output archive path for a loose dump into `out_path`.
+///
+/// # Safety
+///
+/// If `dump_root_len > 0`, `dump_root_utf8` must point to `dump_root_len` readable UTF-8 bytes;
+/// `out_path` must be null or point to a valid, aligned, writable [`EglNupOwnedString`].
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_default_archive_path(
     dump_root_utf8: *const c_char,
@@ -1037,6 +1095,12 @@ pub unsafe extern "C" fn egl_nup_default_archive_path(
     .unwrap_or(-1)
 }
 
+/// Computes the default extraction directory path for a `.nup` archive into `out_path`.
+///
+/// # Safety
+///
+/// If `archive_len > 0`, `archive_utf8` must point to `archive_len` readable UTF-8 bytes;
+/// `out_path` must be null or point to a valid, aligned, writable [`EglNupOwnedString`].
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_default_extract_path(
     archive_utf8: *const c_char,
@@ -1063,6 +1127,11 @@ pub unsafe extern "C" fn egl_nup_default_extract_path(
     .unwrap_or(-1)
 }
 
+/// Returns `1` if both `<archive>.part` and `<archive>.journal` exist for resumption.
+///
+/// # Safety
+///
+/// If `archive_len > 0`, `archive_utf8` must point to `archive_len` readable UTF-8 bytes.
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_has_resumable_journal(
     archive_utf8: *const c_char,
@@ -1120,6 +1189,13 @@ unsafe fn with_progress_and_cancel<R>(
     f(&cancel_flag, poll_opt, cb_opt)
 }
 
+/// Packs a loose Switch dump directory into a `.nup` archive file.
+///
+/// # Safety
+///
+/// String pointers must cover their byte lengths, `options` (if non-null) and `zstd` must point to
+/// valid structs/callback tables, `out_error` must be null or writable, and callback contexts must
+/// remain valid for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_pack_dump(
     dump_root_utf8: *const c_char,
@@ -1207,6 +1283,12 @@ pub unsafe extern "C" fn egl_nup_pack_dump(
     })
 }
 
+/// Extracts a `.nup` archive file to `out_dir_utf8[..out_dir_len]`.
+///
+/// # Safety
+///
+/// String pointers must cover their byte lengths, `zstd` must point to a valid callback table,
+/// `out_error` must be null or writable, and callback contexts must remain valid during the call.
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_extract(
     archive_utf8: *const c_char,
@@ -1271,6 +1353,13 @@ pub unsafe extern "C" fn egl_nup_extract(
     })
 }
 
+/// Edits metadata fields inside an existing `.nup` archive.
+///
+/// # Safety
+///
+/// `archive_utf8[..archive_len]` must be readable UTF-8, `edit` must point to a valid
+/// [`EglNupMetadataEdit`], `out_error` must be null or writable, and callback contexts must remain
+/// valid for the duration of the call.
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_edit_metadata(
     archive_utf8: *const c_char,
@@ -1347,6 +1436,12 @@ pub unsafe extern "C" fn egl_nup_edit_metadata(
     })
 }
 
+/// Frees an owned byte buffer and zeroes its fields.
+///
+/// # Safety
+///
+/// `bytes` must be null or point to a valid, aligned [`EglNupOwnedBytes`] allocated by this crate
+/// (or already zeroed).
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_free_bytes(bytes: *mut EglNupOwnedBytes) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -1357,6 +1452,12 @@ pub unsafe extern "C" fn egl_nup_free_bytes(bytes: *mut EglNupOwnedBytes) {
     }));
 }
 
+/// Frees an owned UTF-8 string buffer and zeroes its fields.
+///
+/// # Safety
+///
+/// `str_val` must be null or point to a valid, aligned [`EglNupOwnedString`] allocated by this
+/// crate (or already zeroed).
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_free_string(str_val: *mut EglNupOwnedString) {
     let _ = catch_unwind(AssertUnwindSafe(|| {
@@ -1367,6 +1468,12 @@ pub unsafe extern "C" fn egl_nup_free_string(str_val: *mut EglNupOwnedString) {
     }));
 }
 
+/// Frees all owned fields of an [`EglNupOwnedMetadata`] struct and zeroes it.
+///
+/// # Safety
+///
+/// `meta` must be null or point to a valid, aligned [`EglNupOwnedMetadata`] allocated by this crate
+/// (or already zeroed).
 #[no_mangle]
 pub unsafe extern "C" fn egl_nup_free_metadata(meta: *mut EglNupOwnedMetadata) {
     let _ = catch_unwind(AssertUnwindSafe(|| {

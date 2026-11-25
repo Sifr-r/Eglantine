@@ -186,7 +186,7 @@ impl<'a> LowerCtx<'a> {
 
     #[inline]
     pub(super) const fn valid_cbuf(&self) -> bool {
-        self.insn.bits(91, 1) == 0 && self.bank() < 18 && (self.insn.bits(38, 16) % 4) == 0
+        self.insn.bits(91, 1) == 0 && self.bank() < 18 && self.insn.bits(38, 16).is_multiple_of(4)
     }
 
     pub(super) fn uniform_register(&mut self, reg: u32) -> u32 {

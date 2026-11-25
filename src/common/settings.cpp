@@ -442,14 +442,8 @@ void RestoreGlobalState(bool is_powered_on) {
     values.use_squashed_iterated_blend = false;
 }
 
-static bool configuring_global = true;
-
 bool IsConfiguringGlobal() {
-    return configuring_global;
-}
-
-void SetConfiguringGlobal(bool is_global) {
-    configuring_global = is_global;
+    return true;
 }
 
 u16 SpeedLimit() {
@@ -478,37 +472,6 @@ void SetSpeedMode(const SpeedMode& mode) {
     case SpeedMode::Standard:
     default:
         break;
-    }
-}
-
-void ToggleStandardMode() {
-    values.use_speed_limit.SetValue(!values.use_speed_limit.GetValue());
-    SetSpeedMode(SpeedMode::Standard);
-}
-
-void ToggleTurboMode() {
-    if (values.current_speed_mode.GetValue() != SpeedMode::Turbo)
-        SetSpeedMode(SpeedMode::Turbo);
-    else
-        SetSpeedMode(SpeedMode::Standard);
-}
-
-void ToggleSlowMode() {
-    if (values.current_speed_mode.GetValue() != SpeedMode::Slow)
-        SetSpeedMode(SpeedMode::Slow);
-    else
-        SetSpeedMode(SpeedMode::Standard);
-}
-
-bool IsOpenGL() {
-    const auto backend = Settings::values.renderer_backend.GetValue();
-    switch (backend) {
-    case RendererBackend::OpenGL_GLSL:
-    case RendererBackend::OpenGL_GLASM:
-    case RendererBackend::OpenGL_SPIRV:
-        return true;
-    default:
-        return false;
     }
 }
 

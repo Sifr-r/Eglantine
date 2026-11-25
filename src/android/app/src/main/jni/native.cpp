@@ -43,13 +43,10 @@
 #include <frontend_common/content_manager.h>
 #include <jni.h>
 
-extern "C" {
-#include <libavcodec/jni.h>
-}
-
 #include "common/android/multiplayer/multiplayer.h"
 #include "common/android/android_common.h"
 #include "common/android/id_cache.h"
+#include "common/device_power_state.h"
 #include "common/dynamic_library.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
@@ -117,11 +114,6 @@ static EmulationSession s_instance;
 //Abdroid Multiplayer which can be initialized with parameters
 std::unique_ptr<AndroidMultiplayer> multiplayer{nullptr};
 std::shared_ptr<Core::AnnounceMultiplayerSession> announce_multiplayer_session;
-
-//Power Status default values
-std::atomic<int> g_battery_percentage = {100};
-std::atomic<bool> g_is_charging = {false};
-std::atomic<bool> g_has_battery = {true};
 
 // playtime
 std::unique_ptr<PlayTime::PlayTimeManager> play_time_manager;
@@ -935,13 +927,6 @@ std::optional<AdrenotoolsDriverInfo> QueryAdrenotoolsDriverInfo(JNIEnv* env, job
 #endif
 
 } // namespace
-
-extern "C" {
-jint InitFFmpegOnLoad(JavaVM* vm) {
-    av_jni_set_java_vm(vm, nullptr);
-    return 0;
-}
-}
 
 extern "C" {
 
@@ -2067,9 +2052,7 @@ JNIEXPORT void JNICALL Java_org_yuzu_yuzu_1emu_NativeLibrary_updatePowerState(
         jboolean isCharging,
         jboolean hasBattery) {
 
-    g_battery_percentage.store(percentage, std::memory_order_relaxed);
-    g_is_charging.store(isCharging, std::memory_order_relaxed);
-    g_has_battery.store(hasBattery, std::memory_order_relaxed);
+    Common::SetAndroidPowerStatus({percentage, isCharging != JNI_FALSE, hasBattery != JNI_FALSE});
 }
 
 JNIEXPORT jboolean JNICALL Java_org_yuzu_yuzu_1emu_NativeLibrary_isUpdateCheckerEnabled(

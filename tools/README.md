@@ -56,6 +56,7 @@ python3 -m unittest discover -s tools/ci -p test_check_release_paths.py
 - `clang-format.sh`: Runs `clang-format` on the entire codebase.
     * Requires: clang
 - `cpp-lint.sh`: Homemade dumb C++ linter.
+- `dead_code.py`: Parses MSVC (`/VERBOSE:REF` via `-DENABLE_DEAD_CODE_REPORT=ON`) or GNU `ld`/`lld` (`--print-gc-sections`) linker GC output, filters third-party/ABI noise, and optionally runs `cppcheck`/`clang-tidy` unused checks.
 - `fuzzsettings.cpp`: Fuzz settings files.
 
 ## Android

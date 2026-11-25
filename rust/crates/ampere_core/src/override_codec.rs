@@ -104,7 +104,7 @@ pub fn program_override_source_size(bytes: &[u8]) -> u32 {
             header[5] != 0
         })
         || header[2] == 0
-        || (header[2] % 16) != 0
+        || !header[2].is_multiple_of(16)
         || header[2] > 1_048_576
         || header[3] == 0
         || header[3] > 1_048_576
@@ -144,9 +144,9 @@ pub fn decode_program_override(bytes: &[u8], source: &[Instruction]) -> LoweredP
         return fail(result, "native override source length mismatch");
     }
     let src_payload = &bytes[24..24 + source_bytes];
-    for (chunk, insn) in src_payload.chunks_exact(16).zip(source.iter()) {
-        for (word_bytes, &word) in chunk.chunks_exact(4).zip(insn.words.iter()) {
-            if word_bytes != word.to_le_bytes() {
+    for (chunk, insn) in src_payload.as_chunks::<16>().0.iter().zip(source.iter()) {
+        for (word_bytes, &word) in chunk.as_chunks::<4>().0.iter().zip(insn.words.iter()) {
+            if *word_bytes != word.to_le_bytes() {
                 return fail(result, "native override source mismatch");
             }
         }
@@ -155,14 +155,14 @@ pub fn decode_program_override(bytes: &[u8], source: &[Instruction]) -> LoweredP
     let insns_len = header[3] as usize;
     let insns_end = insns_start + insns_len * 8;
     result.instructions.reserve_exact(insns_len);
-    for chunk in bytes[insns_start..insns_end].chunks_exact(8) {
+    for chunk in bytes[insns_start..insns_end].as_chunks::<8>().0 {
         result.instructions.push(read_u64_le(chunk, 0));
     }
     if header[5] != 0 {
         let offsets_len = header[5] as usize;
         let offsets_end = insns_end + offsets_len * 4;
         result.source_instruction_offsets.reserve_exact(offsets_len);
-        for chunk in bytes[insns_end..offsets_end].chunks_exact(4) {
+        for chunk in bytes[insns_end..offsets_end].as_chunks::<4>().0 {
             result.source_instruction_offsets.push(read_u32_le(chunk, 0));
         }
         let mut previous = 0u32;

@@ -96,13 +96,28 @@ class WorkflowConfigurationTests(unittest.TestCase):
         self.assertEqual(lh["if"], "github.event_name == 'pull_request'")
         self.assertIn("tools/ci/license-header.sh", lh["steps"][1]["run"])
 
+    def test_source_checks_verifies_the_documentation_layout(self):
+        sc = self.workflows["source-checks.yml"]
+        job = sc["jobs"]["docs-layout"]
+        run = next(step["run"] for step in job["steps"] if "run" in step)
+        self.assertIn("tools/ci/check_docs_layout.py", run)
+        self.assertIn("--ref HEAD", run)
+
     def test_test_linux_runs_license_header_tests_and_shellcheck(self):
         tl = self.workflows["test-linux.yml"]
         steps = tl["jobs"]["scripts"]["steps"]
         py_step = next(s for s in steps if s.get("name") == "Run Python unit tests")
         sc_step = next(s for s in steps if s.get("name") == "Run ShellCheck on CI and NX2 scripts")
         self.assertIn("tools/ci/test_license_header.py", py_step["run"])
+        self.assertIn("tools/ci/test_check_docs_layout.py", py_step["run"])
+        self.assertIn("tools/test_dead_code.py", py_step["run"])
+        self.assertIn("tools/nx2/test_catalog.py", py_step["run"])
         self.assertIn("tools/ci/license-header.sh", sc_step["run"])
+
+        catch2_steps = tl["jobs"]["catch2"]["steps"]
+        gpui_step = next(s for s in catch2_steps if s.get("name") == "Run GPUI library unit tests")
+        self.assertIn("rust/apps/eglantine_gpui/Cargo.toml", gpui_step["run"])
+        self.assertIn("--no-default-features", gpui_step["run"])
 
     def test_windows_mingw_pgo_receives_display_pgo(self):
         bw = self.workflows["build-windows.yml"]

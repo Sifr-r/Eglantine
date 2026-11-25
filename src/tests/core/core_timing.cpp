@@ -10,6 +10,7 @@
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
+#include <future>
 #include <memory>
 #include <optional>
 #include <string>
@@ -145,6 +146,36 @@ TEST_CASE("CoreTiming[BasicOrderNoPausing]", "[core]") {
     printf("HostTimer No Pausing Scheduling Time: %.3f %.6f\n", micro, mili);
     printf("HostTimer No Pausing Timer Time: %.3f %.6f\n", timer_time / 1000.f,
            timer_time / 1000000.f);
+}
+
+TEST_CASE("CoreTiming leaves overdue callbacks queued when paused", "[core][core_timing]") {
+    using namespace std::chrono_literals;
+    std::promise<void> pause_requested;
+    std::promise<void> follow_up_ran;
+    auto pause_result = pause_requested.get_future();
+    auto follow_up_result = follow_up_ran.get_future();
+    Core::Timing::CoreTiming timing;
+    timing.SetMulticore(true);
+    timing.Initialize([] {});
+    auto pause_event = Core::Timing::CreateEvent("pause", [&](s64, std::chrono::nanoseconds) {
+        timing.Pause(true);
+        pause_requested.set_value();
+        return std::nullopt;
+    });
+    auto follow_up_event =
+        Core::Timing::CreateEvent("follow-up", [&](s64, std::chrono::nanoseconds) {
+            follow_up_ran.set_value();
+            return std::nullopt;
+        });
+    timing.ScheduleEvent(0ns, pause_event, true);
+    timing.ScheduleEvent(0ns, follow_up_event, true);
+    timing.Pause(false);
+    REQUIRE(pause_result.wait_for(2s) == std::future_status::ready);
+    timing.SyncPause(true);
+    REQUIRE(follow_up_result.wait_for(0s) == std::future_status::timeout);
+
+    timing.Pause(false);
+    REQUIRE(follow_up_result.wait_for(2s) == std::future_status::ready);
 }
 
 TEST_CASE("CoreTiming keeps the Switch 2 guest counter independent of CPU clock",

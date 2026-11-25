@@ -121,7 +121,7 @@ impl ReadAt for FileReader {
         let mut f = self
             .file
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "lock poisoned"))?;
+            .map_err(|_| io::Error::other("lock poisoned"))?;
         f.seek(SeekFrom::Start(offset))?;
         io::Read::read(&mut *f, dst)
     }
@@ -176,7 +176,7 @@ impl NupContainer {
             || blob_offset > file_size
             || toc_offset > blob_offset
             || toc_size > blob_offset - toc_offset
-            || blob_offset % 0x10 != 0
+            || !blob_offset.is_multiple_of(0x10)
         {
             return Err("superblock bounds check failed".to_string());
         }
@@ -218,7 +218,7 @@ impl NupContainer {
             || pool_offset < needed
             || pool_offset > toc_len_u64
             || pool_size > toc_len_u64 - pool_offset
-            || (pool_offset - needed) % 4 != 0
+            || !(pool_offset - needed).is_multiple_of(4)
         {
             return Err("TOC pool/children bounds check failed".to_string());
         }
@@ -328,7 +328,7 @@ impl NupContainer {
                 || (size != 0
                     && (extent_size == 0
                         || extent_offset < blob_offset
-                        || extent_offset % 0x10 != 0
+                        || !extent_offset.is_multiple_of(0x10)
                         || extent_offset > file_size
                         || extent_size > file_size - extent_offset
                         || (codec == CODEC_RAW && extent_size != size)))
@@ -352,8 +352,8 @@ impl NupContainer {
         let child_count = children_bytes / 4;
         let mut children = Vec::with_capacity(child_count);
         let total_nodes = dir_count + file_count;
-        for chunk in toc[children_offset..children_offset + children_bytes].chunks_exact(4) {
-            let child = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for chunk in toc[children_offset..children_offset + children_bytes].as_chunks::<4>().0 {
+            let child = u32::from_le_bytes(*chunk);
             if (child as u64) >= total_nodes {
                 return Err("child index out of range".to_string());
             }
@@ -454,7 +454,7 @@ impl NupContainer {
 
     pub fn find_package(&self, kind: PackageKind, title_id: Option<u64>) -> Option<usize> {
         self.packages.iter().position(|p| {
-            p.kind == kind && title_id.map_or(true, |tid| p.title_id == tid)
+            p.kind == kind && title_id.is_none_or(|tid| p.title_id == tid)
         })
     }
 
@@ -468,7 +468,7 @@ impl NupContainer {
             if pkg.kind != PackageKind::Update {
                 continue;
             }
-            if best.map_or(true, |b| pkg.version > self.packages[b].version) {
+            if best.is_none_or(|b| pkg.version > self.packages[b].version) {
                 best = Some(i);
             }
         }
@@ -606,6 +606,7 @@ fn count_dir(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_dir(
     container: &NupContainer,
     reader: &dyn ReadAt,

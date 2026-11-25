@@ -112,9 +112,11 @@ fn duplicate_produces_valid_distinct_theme() {
     assert_ne!(copy.name, original.name);
     assert!(copy.name.ends_with("Copy"));
 
-    let mut long = Theme::default();
-    long.id = "a".repeat(48);
-    long.name = "Long Theme Name ".repeat(5);
+    let long = Theme {
+        id: "a".repeat(48),
+        name: "Long Theme Name ".repeat(5),
+        ..Default::default()
+    };
     let long_copy = long.duplicate();
     long_copy.validate().unwrap();
 }

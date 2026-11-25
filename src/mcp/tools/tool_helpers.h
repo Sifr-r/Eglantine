@@ -139,8 +139,6 @@ void StopSessionAbTest(const std::string& session);
 void StopSessionRoutes(const std::string& session);
 
 // debugger_tools.cpp
-/// Debugger state (attached, running/paused, breakpoints, recent hits) for status and dashboard.
-json DebuggerStatusJson();
 /// Removes breakpoints and detaches from the GDB stub (server shutdown).
 void StopDebuggerWork();
 /// After a boot with the GDB stub on: waits (up to 30 s) for the stub to listen and attaches,

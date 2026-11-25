@@ -104,6 +104,9 @@ static constexpr jint JNI_VERSION = JNI_VERSION_1_6;
 
 namespace Common::Android {
     JNIEnv *GetEnvForThread() {
+        if (s_java_vm == nullptr) {
+            return nullptr;
+        }
         thread_local static struct OwnedEnv {
             OwnedEnv() {
                 status = s_java_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6);

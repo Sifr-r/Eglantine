@@ -56,14 +56,14 @@ See the [User Handbook](docs/content/user/README.md) for setup, settings and tro
 | A code or documentation change | [Repository instructions](AGENTS.md) and [contribution guide](CONTRIBUTING.md) |
 | A subsystem or test | [Architecture task map](ARCHITECTURE.md#task-map) |
 | A Switch 2 runtime or shader investigation | [Debugging and lab tools](tools/README.md#switch-2-and-emulator-debugging) |
-| The reasoning behind an earlier design | [Historical migration guide](POLYGLOT_IMPLEMENTATION_PLAN.md) and [Switch 2 development notes](NX2_NOTES.md) |
+| The reasoning behind an earlier design | [Historical archive](docs/archive/README.md) ([polyglot guide](docs/archive/POLYGLOT_IMPLEMENTATION_PLAN.md), [Switch 2 notes](docs/archive/NX2_NOTES.md)) |
 | Release history or asset attribution | [Changelog](CHANGELOG.md) and [asset provenance](ASSET_PROVENANCE.md) |
 
 ## Building
 
 See the [General Build Guide](docs/content/Build.md).
 
-From a configured desktop build directory, the main CMake targets are `yuzu` (Qt), `yuzu-cmd` (SDL), and `tests` (Catch2). See the [architecture task map](ARCHITECTURE.md#task-map) for targeted checks. The Android frontend lives in `src/android`. Check its [Gradle configuration](src/android/app/build.gradle.kts) for the SDK, NDK, and CMake pins.
+From a configured desktop build directory, the main CMake targets are `eglantine` (GPUI), `yuzu-cmd` (SDL), and `tests` (Catch2). See the [architecture task map](ARCHITECTURE.md#task-map) for targeted checks. The Android frontend lives in `src/android`. Check its [Gradle configuration](src/android/app/build.gradle.kts) for the SDK, NDK, and CMake pins.
 
 ## Download
 

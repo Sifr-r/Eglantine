@@ -90,7 +90,6 @@ public:
     u64 GetTotalSpaceSize(FileSys::StorageId id) const;
 
     void SetGameCard(FileSys::VirtualFile file);
-    FileSys::XCI* GetGameCard() const;
 
     FileSys::RegisteredCache* GetSystemNANDContents() const;
     FileSys::RegisteredCache* GetUserNANDContents() const;
@@ -120,8 +119,6 @@ public:
     FileSys::VirtualDir GetModificationDumpRoot(u64 title_id) const;
 
     FileSys::VirtualDir GetBCATDirectory(u64 title_id) const;
-
-    FileSys::ExternalContentProvider* GetExternalContentProvider() const;
 
     // Creates the SaveData, SDMC, and BIS Factories. Should be called once and before any function
     // above is called.

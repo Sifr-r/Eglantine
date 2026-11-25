@@ -165,13 +165,6 @@ public:
     [[nodiscard]] std::filesystem::path GetPath() const;
 
     /**
-     * Gets the access mode of the file.
-     *
-     * @returns The access mode of the file.
-     */
-    [[nodiscard]] FileAccessMode GetAccessMode() const;
-
-    /**
      * Gets the type of the file.
      *
      * @returns The type of the file.

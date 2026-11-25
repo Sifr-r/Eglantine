@@ -1080,8 +1080,6 @@ bool CurrentProgramIsSwitch2();
 AstcRecompression GetAstcRecompression();
 void SetAstcRecompressionOverride(std::optional<AstcRecompression> recompression);
 
-bool IsOpenGL();
-
 bool IsDockedMode();
 
 float Volume();
@@ -1089,9 +1087,6 @@ float Volume();
 // speed limit ops
 u16 SpeedLimit();
 void SetSpeedMode(const SpeedMode &mode);
-void ToggleStandardMode();
-void ToggleTurboMode();
-void ToggleSlowMode();
 
 std::string GetTimeZoneString(TimeZone time_zone);
 
@@ -1104,6 +1099,5 @@ void UpdateRescalingInfo();
 void RestoreGlobalState(bool is_powered_on);
 
 bool IsConfiguringGlobal();
-void SetConfiguringGlobal(bool is_global);
 
 } // namespace Settings

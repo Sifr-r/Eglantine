@@ -148,13 +148,6 @@ pub fn extent_to_json(extent: &JournalExtent) -> String {
     out
 }
 
-/// Serializes a `JournalLine`.
-pub fn journal_line_to_json(line: &JournalLine) -> String {
-    match line {
-        JournalLine::Extent(extent) => extent_to_json(extent),
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 enum JsonValue {
     Null,
@@ -385,7 +378,7 @@ impl<'a> JsonParser<'a> {
     }
 }
 
-fn get_obj<'a>(val: &'a JsonValue) -> Result<&'a BTreeMap<String, JsonValue>, String> {
+fn get_obj(val: &JsonValue) -> Result<&BTreeMap<String, JsonValue>, String> {
     match val {
         JsonValue::Object(map) => Ok(map),
         _ => Err("expected JSON object".to_string()),

@@ -11,4 +11,7 @@ struct PowerStatus {
 };
 
 PowerStatus GetPowerStatus();
+#ifdef __ANDROID__
+void SetAndroidPowerStatus(PowerStatus status);
+#endif
 } // namespace Common

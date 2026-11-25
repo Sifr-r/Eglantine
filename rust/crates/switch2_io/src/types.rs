@@ -3,6 +3,8 @@
 
 #![forbid(unsafe_code)]
 
+use std::ffi::CStr;
+
 pub const NINTENDO_VENDOR_ID: u16 = 0x057E;
 pub const NINTENDO_BLE_MANUFACTURER_ID: u16 = 0x0553;
 
@@ -388,12 +390,19 @@ pub const fn product_id_to_controller_type(pid: ProductId) -> ControllerType {
 
 #[inline]
 pub const fn product_name(pid: ProductId) -> &'static str {
+    match std::str::from_utf8(product_name_c_str(pid).to_bytes()) {
+        Ok(name) => name,
+        Err(_) => panic!("controller product names must be UTF-8"),
+    }
+}
+
+pub(crate) const fn product_name_c_str(pid: ProductId) -> &'static CStr {
     match pid {
-        ProductId::JoyCon2Right => "Switch 2 Joy-Con (Right)",
-        ProductId::JoyCon2Left => "Switch 2 Joy-Con (Left)",
-        ProductId::ProController2 => "Switch 2 Pro Controller",
-        ProductId::NsoGameCube => "NSO GameCube Controller",
-        ProductId::None => "Unknown Switch 2 Controller",
+        ProductId::JoyCon2Right => c"Switch 2 Joy-Con (Right)",
+        ProductId::JoyCon2Left => c"Switch 2 Joy-Con (Left)",
+        ProductId::ProController2 => c"Switch 2 Pro Controller",
+        ProductId::NsoGameCube => c"NSO GameCube Controller",
+        ProductId::None => c"Unknown Switch 2 Controller",
     }
 }
 

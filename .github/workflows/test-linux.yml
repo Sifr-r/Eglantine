@@ -41,8 +41,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 -I tools/ci/test_check_release_paths.py
+          python3 -I tools/ci/test_check_docs_layout.py
           python3 -I tools/ci/test_license_header.py
           python3 -I tools/ci/test_workflows.py
+          python3 -I tools/test_dead_code.py
+          python3 -I tools/nx2/test_catalog.py
           python3 -I tools/nx2/test_debug_mcp.py
           python3 -I tools/nx2/test_thread_worker_wake.py
 
@@ -155,7 +158,8 @@ jobs:
           path: |
             build/tests/rust-target
             rust/target
-          key: rust-v1-linux-x86_64-tests-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+            rust/apps/eglantine_gpui/target
+          key: rust-v1-linux-x86_64-tests-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml', 'rust/apps/eglantine_gpui/Cargo.toml', 'rust/apps/eglantine_gpui/Cargo.lock', 'rust/apps/eglantine_gpui/src/**/*.rs') }}
           restore-keys: |
             rust-v1-linux-x86_64-tests-
 
@@ -166,13 +170,18 @@ jobs:
           path: |
             build/tests/rust-target
             rust/target
-          key: rust-v1-linux-x86_64-tests-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml') }}
+            rust/apps/eglantine_gpui/target
+          key: rust-v1-linux-x86_64-tests-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock', 'rust/crates/**/*.rs', 'rust/crates/**/Cargo.toml', 'rust/apps/eglantine_gpui/Cargo.toml', 'rust/apps/eglantine_gpui/Cargo.lock', 'rust/apps/eglantine_gpui/src/**/*.rs') }}
           restore-keys: |
             rust-v1-linux-x86_64-tests-
 
       - name: Run Rust workspace tests
         shell: bash
         run: cargo test --manifest-path rust/Cargo.toml --locked --offline
+
+      - name: Run GPUI library unit tests
+        shell: bash
+        run: cargo test --manifest-path rust/apps/eglantine_gpui/Cargo.toml --no-default-features --lib --locked
 
       - name: Configure tests
         shell: bash
@@ -183,7 +192,7 @@ jobs:
             -DBUILD_TESTING=ON \
             -DYUZU_TESTS=ON \
             -DDYNARMIC_TESTS=OFF \
-            -DENABLE_QT=OFF \
+            -DENABLE_GPUI=OFF \
             -DENABLE_UPDATE_CHECKER=ON \
             -DYUZU_CMD=OFF \
             -DYUZU_ROOM=OFF \

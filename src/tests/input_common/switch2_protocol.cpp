@@ -10,6 +10,7 @@
 #include <map>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <catch2/catch_approx.hpp>
@@ -76,6 +77,30 @@ Switch2InputReport MakeValidMouseReport(u16 mouse_x, u16 mouse_y, u16 distance, 
 }
 
 } // namespace
+
+TEST_CASE("Switch 2 product IDs resolve to controller types and names", "[switch2]") {
+    struct ProductExpectation {
+        u16 id;
+        bool supported;
+        ControllerType type;
+        std::string_view name;
+    };
+    constexpr std::array<ProductExpectation, 6> products{{
+        {0x2066, true, ControllerType::Right, "Switch 2 Joy-Con (Right)"},
+        {0x2067, true, ControllerType::Left, "Switch 2 Joy-Con (Left)"},
+        {0x2069, true, ControllerType::Pro, "Switch 2 Pro Controller"},
+        {0x2073, true, ControllerType::GameCube, "NSO GameCube Controller"},
+        {0x0000, false, ControllerType::None, "Unknown Switch 2 Controller"},
+        {0x2009, false, ControllerType::None, "Unknown Switch 2 Controller"},
+    }};
+    for (const auto& [id, supported, type, name] : products) {
+        CAPTURE(id);
+        const auto product = static_cast<ProductId>(id);
+        REQUIRE(IsSupportedProductId(id) == supported);
+        REQUIRE(ProductIdToControllerType(product) == type);
+        REQUIRE(ProductName(product) == name);
+    }
+}
 
 TEST_CASE("ParseBleManufacturerData parses pairing, paired MAC, and rejects invalid frames",
           "[switch2]") {
@@ -1580,17 +1605,6 @@ TEST_CASE("Switch2Controllers Dual Joy-Con Roll steering handles disconnect, Mer
 
 TEST_CASE("Switch2 protocol codecs match Rust FFI parity", "[switch2]") {
     const auto exercise_codecs = [] {
-        REQUIRE(IsSupportedProductId(static_cast<u16>(ProductId::JoyCon2Right)));
-        REQUIRE(IsSupportedProductId(static_cast<u16>(ProductId::JoyCon2Left)));
-        REQUIRE(IsSupportedProductId(static_cast<u16>(ProductId::ProController2)));
-        REQUIRE(IsSupportedProductId(static_cast<u16>(ProductId::NsoGameCube)));
-        REQUIRE_FALSE(IsSupportedProductId(0x2009U));
-
-        REQUIRE(ProductIdToControllerType(ProductId::JoyCon2Left) == ControllerType::Left);
-        REQUIRE(ProductIdToControllerType(ProductId::JoyCon2Right) == ControllerType::Right);
-        REQUIRE(ProductIdToControllerType(ProductId::ProController2) == ControllerType::Pro);
-        REQUIRE(ProductIdToControllerType(ProductId::NsoGameCube) == ControllerType::GameCube);
-        REQUIRE(ProductName(ProductId::ProController2) == "Switch 2 Pro Controller");
         REQUIRE(FeatureMaskForProduct(ProductId::JoyCon2Left) == FeatureFlags::JoyCon);
         REQUIRE(FeatureMaskForProduct(ProductId::ProController2) == FeatureFlags::Standard);
 
@@ -1727,7 +1741,7 @@ TEST_CASE("Switch2 protocol codecs match Rust FFI parity", "[switch2]") {
     set_env("EDEN_NX2_RUST_SWITCH2_IO", "1");
     exercise_codecs();
 
-    // Direct BLE UUID & static product string parity check against C ABI
+    // Check the BLE UUIDs exported by the C ABI.
     std::size_t uuid_len = 0;
     const char* uuid_ptr = egl_sw2_ble_uuid(EGL_SW2_UUID_INPUT_REPORT, &uuid_len);
     REQUIRE(std::string_view{uuid_ptr, uuid_len} == InputReportUuid);

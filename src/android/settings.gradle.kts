@@ -23,5 +23,9 @@ dependencyResolutionManagement {
 
 include(":app")
 
+if (providers.gradleProperty("nativeAndroidPrototype").isPresent) {
+    include(":native-prototype")
+}
+
 include("Eden")
 project(":Eden").projectDir = file("../..")

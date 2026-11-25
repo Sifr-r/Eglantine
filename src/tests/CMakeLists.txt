@@ -55,6 +55,7 @@ add_executable(tests
     core/ldn.cpp
     core/loader_file_formats.cpp
     core/memory_range.cpp
+    core/nso_loader.cpp
     core/internal_network/socket_proxy.cpp
     core/nup_writer.cpp
     core/nx2_debug_server.cpp
@@ -136,6 +137,7 @@ add_executable(tests
     video_core/texture_clear_covers.cpp
     video_core/vulkan_device_version.cpp
     video_core/vulkan_static_cache.cpp
+    audio_core/opus_decode.cpp
     audio_core/sink_stream_silent.cpp
     core/memory_span.cpp
     frontend_common/config_persistence.cpp
@@ -168,14 +170,17 @@ if (ENABLE_MCP_SERVER)
     target_sources(tests PRIVATE mcp/protocol.cpp)
     target_link_libraries(tests PRIVATE mcp)
 endif()
-if (ENABLE_QT)
-    target_sources(tests PRIVATE qt_common/qt_config_ban_list.cpp)
-    target_link_libraries(tests PRIVATE qt_common Qt6::Core SimpleIni::SimpleIni)
-    add_test(NAME qt_config_ban_list COMMAND tests "[qt_config]")
-endif()
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 add_test(NAME tests COMMAND tests)
+if (TARGET eglantine_rs)
+    add_test(NAME tests_ampere_rust_parity COMMAND tests "[ampere]")
+    set_tests_properties(tests_ampere_rust_parity PROPERTIES ENVIRONMENT "EDEN_NX2_RUST_AMPERE_VERIFY=1")
+endif()
+add_test(NAME tests_ampere_direct_sm86 COMMAND tests "[ampere-lazy-lowering]")
+set_tests_properties(tests_ampere_direct_sm86 PROPERTIES ENVIRONMENT "EDEN_NX2_DIRECT_SM86=1")
+add_test(NAME tests_nx2_perf_verify COMMAND tests "[nx2_perf]")
+set_tests_properties(tests_nx2_perf_verify PROPERTIES ENVIRONMENT "EDEN_NX2_PERF_VERIFY=1")
 
 # needed for vma
 if(NOT MSVC)

@@ -252,7 +252,9 @@ std::optional<s64> CoreTiming::Advance() {
     std::scoped_lock lock{advance_lock, basic_lock};
     global_timer = GetGlobalTimeNs().count();
 
-    while (!event_queue.empty() && event_queue.top().time <= global_timer) {
+    // The timing thread must acknowledge pause even if new work keeps the queue overdue.
+    while ((!is_multicore || !paused) && !event_queue.empty() &&
+           event_queue.top().time <= global_timer) {
         const Event& evt = event_queue.top();
 
         if (const auto event_type{evt.type.lock()}) {

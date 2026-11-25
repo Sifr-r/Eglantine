@@ -502,10 +502,6 @@ void FileSystemController::SetGameCard(FileSys::VirtualFile file) {
     gamecard_placeholder = std::make_unique<FileSys::PlaceholderCache>(dir);
 }
 
-FileSys::XCI* FileSystemController::GetGameCard() const {
-    return gamecard.get();
-}
-
 FileSys::RegisteredCache* FileSystemController::GetGameCardContents() const {
     return gamecard_registered.get();
 }
@@ -539,10 +535,6 @@ FileSys::RegisteredCache* FileSystemController::GetSDMCContents() const {
         return nullptr;
 
     return sdmc_factory->GetSDMCContents();
-}
-
-FileSys::ExternalContentProvider* FileSystemController::GetExternalContentProvider() const {
-    return external_provider.get();
 }
 
 FileSys::PlaceholderCache* FileSystemController::GetSystemNANDPlaceholder() const {

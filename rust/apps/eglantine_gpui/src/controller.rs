@@ -142,7 +142,7 @@ pub fn reduced_motion() -> bool {
         let mut enabled = 1;
         // The action accepts a pointer to a writable Win32 BOOL.
         let success = unsafe { SystemParametersInfoW(GET_CLIENT_AREA_ANIMATION, 0, &mut enabled, 0) };
-        return success != 0 && enabled == 0;
+        success != 0 && enabled == 0
     }
     #[cfg(not(windows))]
     false

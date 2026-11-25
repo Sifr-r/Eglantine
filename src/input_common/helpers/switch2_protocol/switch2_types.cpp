@@ -51,48 +51,6 @@ f32 ApplySoftDeadzone(f32 value, f32 deadzone) {
     return value > 0.0f ? (value - deadzone) : (value + deadzone);
 }
 
-bool IsSupportedProductIdCpp(u16 raw_pid) {
-    switch (static_cast<ProductId>(raw_pid)) {
-    case ProductId::JoyCon2Right:
-    case ProductId::JoyCon2Left:
-    case ProductId::ProController2:
-    case ProductId::NsoGameCube:
-        return true;
-    default:
-        return false;
-    }
-}
-
-ControllerType ProductIdToControllerTypeCpp(ProductId pid) {
-    switch (pid) {
-    case ProductId::JoyCon2Left:
-        return ControllerType::Left;
-    case ProductId::JoyCon2Right:
-        return ControllerType::Right;
-    case ProductId::ProController2:
-        return ControllerType::Pro;
-    case ProductId::NsoGameCube:
-        return ControllerType::GameCube;
-    default:
-        return ControllerType::None;
-    }
-}
-
-std::string_view ProductNameCpp(ProductId pid) {
-    switch (pid) {
-    case ProductId::JoyCon2Right:
-        return "Switch 2 Joy-Con (Right)";
-    case ProductId::JoyCon2Left:
-        return "Switch 2 Joy-Con (Left)";
-    case ProductId::ProController2:
-        return "Switch 2 Pro Controller";
-    case ProductId::NsoGameCube:
-        return "NSO GameCube Controller";
-    default:
-        return "Unknown Switch 2 Controller";
-    }
-}
-
 std::optional<std::span<const u8>> StripHidReportIdCpp(std::span<const u8> usb_report) {
     if (usb_report.size() < MinimumInputReportSize + 1) {
         return std::nullopt;
@@ -107,7 +65,7 @@ std::optional<BleAdvertisementInfo> ParseBleManufacturerDataCpp(std::span<const 
 
     const u16 vendor_id = DecodeU16LE(data, 3);
     const u16 raw_pid = DecodeU16LE(data, 5);
-    if (vendor_id != NintendoVendorId || !IsSupportedProductIdCpp(raw_pid)) {
+    if (vendor_id != NintendoVendorId || !IsSupportedProductId(raw_pid)) {
         return std::nullopt;
     }
 
@@ -597,60 +555,63 @@ u64 TimePointNs(std::chrono::steady_clock::time_point tp) {
 
 bool IsSupportedProductId(u16 raw_pid) {
 #ifdef EGLANTINE_ENABLE_RUST_SWITCH2_IO
-    const auto mode = GetSwitch2IoBackendMode();
-    if (mode == Switch2IoBackendMode::Rust) {
-        return egl_sw2_is_supported_product_id(raw_pid) != 0;
-    }
-    const bool cpp_res = IsSupportedProductIdCpp(raw_pid);
-    if (mode == Switch2IoBackendMode::Verify &&
-        (egl_sw2_is_supported_product_id(raw_pid) != 0) != cpp_res) {
-        FailSwitch2Parity("IsSupportedProductId");
-    }
-    return cpp_res;
+    return egl_sw2_is_supported_product_id(raw_pid) != 0;
 #else
-    return IsSupportedProductIdCpp(raw_pid);
+    switch (static_cast<ProductId>(raw_pid)) {
+    case ProductId::JoyCon2Right:
+    case ProductId::JoyCon2Left:
+    case ProductId::ProController2:
+    case ProductId::NsoGameCube:
+        return true;
+    default:
+        return false;
+    }
 #endif
 }
 
 ControllerType ProductIdToControllerType(ProductId pid) {
 #ifdef EGLANTINE_ENABLE_RUST_SWITCH2_IO
-    const auto mode = GetSwitch2IoBackendMode();
-    const u16 raw_pid = static_cast<u16>(pid);
-    if (mode == Switch2IoBackendMode::Rust) {
-        return static_cast<ControllerType>(egl_sw2_product_id_to_controller_type(raw_pid));
-    }
-    const ControllerType cpp_res = ProductIdToControllerTypeCpp(pid);
-    if (mode == Switch2IoBackendMode::Verify &&
-        static_cast<ControllerType>(egl_sw2_product_id_to_controller_type(raw_pid)) != cpp_res) {
-        FailSwitch2Parity("ProductIdToControllerType");
-    }
-    return cpp_res;
+    return static_cast<ControllerType>(egl_sw2_product_id_to_controller_type(static_cast<u16>(pid)));
 #else
-    return ProductIdToControllerTypeCpp(pid);
+    switch (pid) {
+    case ProductId::JoyCon2Left:
+        return ControllerType::Left;
+    case ProductId::JoyCon2Right:
+        return ControllerType::Right;
+    case ProductId::ProController2:
+        return ControllerType::Pro;
+    case ProductId::NsoGameCube:
+        return ControllerType::GameCube;
+    default:
+        return ControllerType::None;
+    }
 #endif
 }
 
 std::string_view ProductName(ProductId pid) {
 #ifdef EGLANTINE_ENABLE_RUST_SWITCH2_IO
-    const auto mode = GetSwitch2IoBackendMode();
-    const u16 raw_pid = static_cast<u16>(pid);
-    if (mode == Switch2IoBackendMode::Rust) {
-        std::size_t len = 0;
-        const char* ptr = egl_sw2_product_name(raw_pid, &len);
-        return std::string_view{ptr, len};
+    std::size_t len = 0;
+    const char* name = egl_sw2_product_name(static_cast<u16>(pid), &len);
+    if (name != nullptr) {
+        return {name, len};
     }
-    const std::string_view cpp_res = ProductNameCpp(pid);
-    if (mode == Switch2IoBackendMode::Verify) {
-        std::size_t len = 0;
-        const char* ptr = egl_sw2_product_name(raw_pid, &len);
-        if (std::string_view{ptr, len} != cpp_res) {
-            FailSwitch2Parity("ProductName");
-        }
-    }
-    return cpp_res;
+    LOG_ERROR(Input, "Rust Switch 2 product name lookup returned no name for PID {:04x}",
+              static_cast<u16>(pid));
 #else
-    return ProductNameCpp(pid);
+    switch (pid) {
+    case ProductId::JoyCon2Right:
+        return "Switch 2 Joy-Con (Right)";
+    case ProductId::JoyCon2Left:
+        return "Switch 2 Joy-Con (Left)";
+    case ProductId::ProController2:
+        return "Switch 2 Pro Controller";
+    case ProductId::NsoGameCube:
+        return "NSO GameCube Controller";
+    default:
+        break;
+    }
 #endif
+    return "Unknown Switch 2 Controller";
 }
 
 std::optional<std::span<const u8>> StripHidReportId(std::span<const u8> usb_report) {

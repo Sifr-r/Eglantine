@@ -27,7 +27,7 @@ pub fn append_native_address_map(code: &mut Vec<u64>, offsets: &[u32]) {
 
 #[inline]
 pub fn native_program_address(code: &[u64], address: u32) -> Option<u32> {
-    if !has_native_address_map(code) || (address % 16) != 0 {
+    if !has_native_address_map(code) || !address.is_multiple_of(16) {
         return None;
     }
     let count = code[code.len() - 2];
@@ -42,8 +42,8 @@ pub fn native_program_address(code: &[u64], address: u32) -> Option<u32> {
     let target = code[start + (address / 16) as usize];
     if target < 0x50
         || target >= (start as u64).saturating_mul(8)
-        || (target % 8) != 0
-        || (target % 32) == 0
+        || !target.is_multiple_of(8)
+        || target.is_multiple_of(32)
     {
         return None;
     }

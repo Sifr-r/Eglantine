@@ -8,9 +8,6 @@
 
 #elif defined(__ANDROID__)
 #include <atomic>
-extern std::atomic<int> g_battery_percentage;
-extern std::atomic<bool> g_is_charging;
-extern std::atomic<bool> g_has_battery;
 
 #elif defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -27,6 +24,16 @@ extern std::atomic<bool> g_has_battery;
 #endif
 
 namespace Common {
+
+#ifdef __ANDROID__
+namespace {
+std::atomic<PowerStatus> android_power_status{PowerStatus{100, false, true}};
+}
+
+void SetAndroidPowerStatus(PowerStatus status) {
+    android_power_status.store(status, std::memory_order_relaxed);
+}
+#endif
 
     PowerStatus GetPowerStatus()
     {
@@ -46,9 +53,7 @@ namespace Common {
         }
 
 #elif defined(__ANDROID__)
-        info.percentage = g_battery_percentage.load(std::memory_order_relaxed);
-        info.charging = g_is_charging.load(std::memory_order_relaxed);
-        info.has_battery = g_has_battery.load(std::memory_order_relaxed);
+        info = android_power_status.load(std::memory_order_relaxed);
 
 #elif defined(__APPLE__) && TARGET_OS_MAC
         info.has_battery = false;

@@ -391,12 +391,8 @@ public:
     [[nodiscard]] Core::Debugger& GetDebugger();
     [[nodiscard]] const Core::Debugger& GetDebugger() const;
 
-    [[nodiscard]] Tools::RenderdocAPI& GetRenderdocAPI();
-
     void SetExitLocked(bool locked);
-    bool GetExitLocked() const;
 
-    void SetExitRequested(bool requested);
     bool GetExitRequested() const;
 
     void SetApplicationProcessBuildID(const CurrentBuildProcessID& id);

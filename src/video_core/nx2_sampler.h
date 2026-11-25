@@ -6,7 +6,7 @@
 
 #pragma once
 
-#ifdef __linux__
+#if defined(__linux__) && (!defined(__ANDROID__) || __ANDROID_API__ >= 33)
 
 #include <dlfcn.h>
 #include <execinfo.h>

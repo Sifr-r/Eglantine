@@ -86,7 +86,7 @@ fn lower_uldc(ctx: &mut LowerCtx<'_>) -> StepAction {
             && ((uniform_dest & 1) != 0
                 || ctx.uniform_register(uniform_dest + 1) != target + 1))
         || ctx.bank() >= 18
-        || (insn.bits(38, 16) % alignment) != 0
+        || !insn.bits(38, 16).is_multiple_of(alignment)
         || insn.bits(62, 2) != 0
         || (insn.words[2] & !0xe00u32)
             != if opcode == 0xab9 {
@@ -984,7 +984,7 @@ fn lower_tld_b(ctx: &mut LowerCtx<'_>) -> StepAction {
     let dimension = insn.bits(61, 3);
     let coordinates = COORDINATE_COUNT[dimension as usize];
     let count = coordinates + 1;
-    let in_a = (count + 1) / 2;
+    let in_a = count.div_ceil(2);
     if coordinates == 0
         || insn.bits(59, 1) == 0
         || insn.bits(60, 1) == 0
@@ -1168,7 +1168,7 @@ fn lower_tmml(ctx: &mut LowerCtx<'_>) -> StepAction {
     let in_a = if source_b == 255 || opcode == 0x36a {
         coordinates
     } else {
-        (coordinates + 1) / 2
+        coordinates.div_ceil(2)
     };
     if coordinates == 0
         || insn.bits(76, 4) != 0
@@ -1249,7 +1249,7 @@ fn find_per_tap_offset_imm(ctx: &LowerCtx<'_>, reg: u32) -> Result<Option<u32>, 
             let packed = def.bits(79, 1) != 0;
             let first_count = if packed {
                 if high == 255 {
-                    (count + 1) / 2
+                    count.div_ceil(2)
                 } else {
                     1
                 }
@@ -1264,10 +1264,8 @@ fn find_per_tap_offset_imm(ctx: &LowerCtx<'_>, reg: u32) -> Result<Option<u32>, 
                 } else {
                     0
                 }
-            } else if count > 2 {
-                count - 2
             } else {
-                0
+                count.saturating_sub(2)
             };
             if (target != 255 && reg >= target && reg < target + first_count)
                 || (high != 255 && reg >= high && reg < high + second_count)
@@ -1280,7 +1278,7 @@ fn find_per_tap_offset_imm(ctx: &LowerCtx<'_>, reg: u32) -> Result<Option<u32>, 
             let channels = def.bits(72, 4).count_ones();
             let first_count = channels.clamp(1, 2);
             let second = def.bits(64, 8);
-            let second_count = if channels > 2 { channels - 2 } else { 0 };
+            let second_count = channels.saturating_sub(2);
             if (target != 255 && reg >= target && reg < target + first_count)
                 || (second != 255 && reg >= second && reg < second + second_count)
             {
@@ -1307,9 +1305,9 @@ fn find_per_tap_offset_imm(ctx: &LowerCtx<'_>, reg: u32) -> Result<Option<u32>, 
             continue;
         }
         let width = def.bits(73, 3);
-        let count = if matches!(op, 0x225 | 0x625 | 0x825 | 0x805 | 0x23c) {
-            2
-        } else if op == 0x305 && def.bits(75, 2) == 3 {
+        let count = if matches!(op, 0x225 | 0x625 | 0x825 | 0x805 | 0x23c)
+            || (op == 0x305 && def.bits(75, 2) == 3)
+        {
             2
         } else if matches!(op, 0x381 | 0x981 | 0x983 | 0x984) {
             if width == 6 {
@@ -1381,7 +1379,7 @@ fn lower_tld4(ctx: &mut LowerCtx<'_>) -> StepAction {
     let in_a = if meta != 0 {
         coordinates
     } else {
-        (coordinates + 1) / 2
+        coordinates.div_ceil(2)
     };
     let in_b = if meta != 0 { meta } else { coordinates - in_a };
     if (insn.bits(61, 3) != 1 && !array)
@@ -1678,7 +1676,7 @@ fn lower_general_tex(
     let in_a = if opcode == 0x361 && insn.bits(60, 1) == 0 {
         coordinates
     } else if count <= 4 {
-        (count + 1) / 2
+        count.div_ceil(2)
     } else if opcode == 0x361 {
         coordinates
     } else {
@@ -1843,7 +1841,7 @@ fn lower_attr(ctx: &mut LowerCtx<'_>) -> StepAction {
     }
     let address = insn.bits(40, 10);
     let components = insn.bits(74, 2) + 1;
-    if address % 4 != 0 || address + components * 4 > 0x400 || insn.bits(24, 8) != 255 {
+    if !address.is_multiple_of(4) || address + components * 4 > 0x400 || insn.bits(24, 8) != 255 {
         return fail(ctx, "native attribute address or indexing");
     }
     if opcode == 0x322 && address == 0x5c && components == 1 {

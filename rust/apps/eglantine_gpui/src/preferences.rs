@@ -70,11 +70,12 @@ mod tests {
     #[test]
     fn stores_window_bounds_and_selected_title() {
         let dir = tempfile::tempdir().unwrap();
-        let mut preferences = Preferences::default();
-        preferences.width = 1440;
-        preferences.height = 810;
-        preferences.fullscreen = true;
-        preferences.selected = Some(PathBuf::from("Library/Métro.nsp"));
+        let preferences = Preferences {
+            width: 1440,
+            height: 810,
+            fullscreen: true,
+            selected: Some(PathBuf::from("Library/Métro.nsp")),
+        };
         preferences.save(dir.path()).unwrap();
         let saved = Preferences::load(dir.path()).unwrap();
         assert_eq!(saved, preferences);

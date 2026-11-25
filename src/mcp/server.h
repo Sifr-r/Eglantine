@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <thread>
@@ -23,6 +24,8 @@ class System;
 }
 
 namespace httplib {
+struct Request;
+struct Response;
 class Server;
 }
 
@@ -105,6 +108,18 @@ public:
 private:
     /// Builds a ToolContext with the current writes flag and no session id.
     ToolContext MakeContext();
+    void RegisterRoutes();
+    void WriteDiscoveryFile() const;
+
+    bool IsAuthorized(const httplib::Request& req, httplib::Response& res) const;
+    Timeline::Query ParseTimelineQuery(const httplib::Request& req) const;
+    void StreamEvents(httplib::Response& res, Timeline::Query query,
+                      std::function<std::string(const Event&)> format) const;
+    void HandleMcpRequest(const httplib::Request& req, httplib::Response& res);
+    void HandleMcpStream(const httplib::Request& req, httplib::Response& res);
+    void HandleStatusJson(const httplib::Request& req, httplib::Response& res);
+    void HandleScreenPng(const httplib::Request& req, httplib::Response& res);
+    void HandleEventsWait(const httplib::Request& req, httplib::Response& res);
 
     Core::System& system;
     Host& host;

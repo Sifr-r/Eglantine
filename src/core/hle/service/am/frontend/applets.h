@@ -127,15 +127,12 @@ public:
     explicit FrontendAppletHolder(Core::System& system_);
     ~FrontendAppletHolder();
 
-    const FrontendAppletSet& GetFrontendAppletSet() const;
     NFP::CabinetMode GetCabinetMode() const;
-    AppletId GetCurrentAppletId() const;
 
     void SetFrontendAppletSet(FrontendAppletSet set);
     void SetCabinetMode(NFP::CabinetMode mode);
     void SetCurrentAppletId(AppletId applet_id);
     void SetDefaultAppletsIfMissing();
-    void ClearAll();
 
     std::shared_ptr<FrontendApplet> GetApplet(std::shared_ptr<Applet> applet, AppletId id,
                                               LibraryAppletMode mode) const;
