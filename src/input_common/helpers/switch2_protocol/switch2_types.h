@@ -303,6 +303,11 @@ struct Switch2DeviceInfo {
 [[nodiscard]] std::optional<BleAdvertisementInfo> ParseBleManufacturerData(
     std::span<const u8> data);
 
+[[nodiscard]] constexpr bool ShouldAcceptBleAdvertisement(const BleAdvertisementInfo& info,
+                                                          u64 host_mac) {
+    return info.is_pairing_mode || info.reconnect_mac == host_mac;
+}
+
 [[nodiscard]] std::pair<u16, u16> UnpackStickXY(std::span<const u8> three_bytes);
 [[nodiscard]] StickCalibration ParseStickCalibration(std::span<const u8> data);
 /// Parses a user stick calibration block: the 0xa1b2 magic followed by the 9-byte calibration
@@ -322,7 +327,15 @@ struct Switch2DeviceInfo {
 
 [[nodiscard]] std::vector<u8> BuildCommandPacket(u8 command_id, u8 subcommand_id,
                                                  std::span<const u8> payload, bool is_ble);
+[[nodiscard]] std::optional<std::span<const u8>> ParseCommandResponse(
+    std::span<const u8> response, u8 command_id, bool is_ble);
+[[nodiscard]] constexpr bool IsValidMemoryReadLength(u8 length) {
+    return length != 0 && length <= 0x4F;
+}
 [[nodiscard]] std::array<u8, 8> BuildMemoryReadPayload(u8 length, u32 address);
+[[nodiscard]] std::optional<std::span<const u8>> ParseMemoryReadResponse(
+    std::span<const u8> payload, u8 length, u32 address);
+[[nodiscard]] std::array<u8, 14> BuildPairSetMacPayload(u64 host_mac);
 /// Builds the BLE vibration report: 0x00, 0x50 | sequence and the rumble frame repeated
 /// three times (PROTOCOL.md section 44.2).
 [[nodiscard]] std::vector<u8> BuildVibrationReport(

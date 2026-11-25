@@ -77,10 +77,7 @@ option(ENABLE_UPDATE_CHECKER "Enable update checker (for desktop and Android)" O
 option(ENABLE_DEBUG_TOOLS "Enable debugging tools (maxwell disassembler, SPIRV translator, etc)" OFF)
 option(ENABLE_DEAD_CODE_REPORT "Enable linker dead-code elimination reporting (MSVC /VERBOSE:REF or ELF --print-gc-sections)" OFF)
 option(ENABLE_WERROR "Enable -Werror diagnostics" ON)
-option(ENABLE_RUST_AMPERE "Enable Rust Ampere shader lowering parity backend" ON)
 option(ENABLE_RUST_AMP_SPIRV "Enable Rust direct SM86-to-SPIR-V shader compiler" ON)
-option(ENABLE_RUST_NUP "Enable Rust NUP archive container and writer backend" ON)
-option(ENABLE_RUST_SWITCH2_IO "Enable Rust Switch 2 IO protocol codec" ON)
 cmake_dependent_option(ENABLE_ISPC_KERNELS "Enable ISPC multi-ISA SIMD kernels when ispc is available" ON "NOT ANDROID" OFF)
 cmake_dependent_option(ENABLE_INTEL_XESS "Enable Intel XeSS dynamic runtime upscaler" ON "NOT ANDROID AND ARCHITECTURE_x86_64" OFF)
 
@@ -683,21 +680,8 @@ if (MSVC AND CXX_CLANG)
     link_libraries(llvm-mingw-runtime)
 endif()
 
-if (NOT YUZU_STATIC_ROOM AND (ENABLE_RUST_AMPERE OR ENABLE_RUST_AMP_SPIRV OR ENABLE_RUST_NUP OR ENABLE_RUST_SWITCH2_IO))
+if (NOT YUZU_STATIC_ROOM AND ENABLE_RUST_AMP_SPIRV)
     include(AddRustCrate)
-    set(_eglantine_rust_features)
-    if (ENABLE_RUST_AMPERE)
-        list(APPEND _eglantine_rust_features ampere)
-    endif()
-    if (ENABLE_RUST_AMP_SPIRV)
-        list(APPEND _eglantine_rust_features ampere-spirv)
-    endif()
-    if (ENABLE_RUST_NUP)
-        list(APPEND _eglantine_rust_features nup)
-    endif()
-    if (ENABLE_RUST_SWITCH2_IO)
-        list(APPEND _eglantine_rust_features switch2-io)
-    endif()
     add_rust_static_library(
         TARGET eglantine_rs
         MANIFEST "${CMAKE_SOURCE_DIR}/rust/Cargo.toml"
@@ -705,7 +689,7 @@ if (NOT YUZU_STATIC_ROOM AND (ENABLE_RUST_AMPERE OR ENABLE_RUST_AMP_SPIRV OR ENA
         LIB_NAME eglantine_rs
         INCLUDE_DIR "${CMAKE_SOURCE_DIR}/rust/include"
         NO_DEFAULT_FEATURES
-        FEATURES ${_eglantine_rust_features}
+        FEATURES ampere-spirv
     )
 endif()
 

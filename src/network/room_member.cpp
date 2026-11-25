@@ -70,7 +70,8 @@ public:
 
     std::atomic<State> state{State::Idle}; ///< Current state of the RoomMember.
 
-    std::string nickname; ///< The nickname of this member.
+    std::string nickname;              ///< The nickname of this member.
+    mutable std::mutex nickname_mutex; ///< Mutex for locking nickname.
 
     std::string username;              ///< The username of this member.
     mutable std::mutex username_mutex; ///< Mutex for locking username.
@@ -414,6 +415,12 @@ void RoomMember::RoomMemberImpl::HandleRoomInformationPacket(const ENetEvent* ev
     MemberList new_members;
     new_members.resize(num_members);
 
+    std::string current_nickname;
+    {
+        std::lock_guard lock(nickname_mutex);
+        current_nickname = nickname;
+    }
+
     std::string own_username;
     bool found_own_member = false;
     for (auto& member : new_members) {
@@ -426,7 +433,7 @@ void RoomMember::RoomMemberImpl::HandleRoomInformationPacket(const ENetEvent* ev
         packet.Read(member.display_name);
         packet.Read(member.avatar_url);
 
-        if (member.nickname == nickname) {
+        if (member.nickname == current_nickname) {
             own_username = member.username;
             found_own_member = true;
         }
@@ -728,7 +735,8 @@ RoomMember::MemberList RoomMember::GetMemberInformation() const {
     return room_member_impl->member_information;
 }
 
-const std::string& RoomMember::GetNickname() const {
+std::string RoomMember::GetNickname() const {
+    std::lock_guard lock(room_member_impl->nickname_mutex);
     return room_member_impl->nickname;
 }
 
@@ -817,7 +825,10 @@ void RoomMember::Join(const std::string& nick, const char* server_addr, u16 serv
                 const bool aborted =
                     room_member_impl->join_abort_requested.load(std::memory_order_acquire);
                 if (!aborted && net > 0 && event.type == ENET_EVENT_TYPE_CONNECT) {
-                    room_member_impl->nickname = nick;
+                    {
+                        std::lock_guard nick_lock(room_member_impl->nickname_mutex);
+                        room_member_impl->nickname = nick;
+                    }
                     room_member_impl->StartLoop();
                     room_member_impl->SendJoinRequest(nick, preferred_fake_ip, password, token);
                     {

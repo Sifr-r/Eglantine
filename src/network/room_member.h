@@ -134,8 +134,10 @@ public:
 
     /**
      * Returns the nickname of the RoomMember.
+     *
+     * The nickname is returned by value, because it may be updated concurrently with this call.
      */
-    const std::string& GetNickname() const;
+    std::string GetNickname() const;
 
     /**
      * Returns the username of the RoomMember.

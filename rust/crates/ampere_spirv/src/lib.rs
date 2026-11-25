@@ -12,6 +12,7 @@ pub mod ssa_ir;
 pub mod ffi;
 
 pub use coop_matrix::CoopConfig;
+pub use decode_sm86::Instruction;
 pub use reflect::{
     Bindings, CbufDescriptor, FallbackReason, ImageBufferDescriptor, ImageDescriptor, Profile,
     ShaderInfo, SnapshotEnv, SsboDescriptor, Stage, TextureBufferDescriptor, TextureDescriptor,
@@ -19,8 +20,6 @@ pub use reflect::{
 };
 pub use spirv_emit::{emit_spirv_1_6, SPIRV_MAGIC};
 pub use ssa_ir::{lower_to_ssa, LowerInput, SsaProgram};
-
-use eglantine_ampere_rs::Instruction;
 
 /// Safe Rust output produced by [`compile_shader`] and [`compile_batch`].
 #[derive(Clone, Debug)]

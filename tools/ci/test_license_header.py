@@ -47,7 +47,7 @@ POLYGLOT_SPDX_GLOBS = [
     "src/video_core/renderer_vulkan/vk_temporal_upscaler.h",
     "src/video_core/renderer_vulkan/vk_xess_upscaler.h",
     "src/video_core/renderer_vulkan/vk_xess_upscaler.cpp",
-    "src/tests/video_core/ampere_rust_parity.cpp",
+    "src/tests/video_core/ampere_program.cpp",
     "src/tests/video_core/ampere_direct_spirv.cpp",
 ]
 

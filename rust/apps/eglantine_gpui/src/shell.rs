@@ -142,6 +142,7 @@ pub struct Shell {
     pub(crate) grid_columns: usize,
     pub(crate) content_busy: bool,
     metadata_request: u64,
+    pending_library_selection: Option<PathBuf>,
     user_profile_override: Option<u8>,
     pub(crate) shelf_scroll: gpui::ScrollHandle,
     pub(crate) view_scroll: gpui::ScrollHandle,
@@ -200,21 +201,13 @@ impl Shell {
         });
         let controller = Controller::new();
         let controller_name = controller.name();
-        let entries = library.as_ref().map_or(&[][..], Library::entries);
-        let selected = preferences.selected.and_then(|path| entries.iter().position(|entry| entry.path == path))
-            .unwrap_or_default();
-        let target = if !entries.is_empty() {
-            Target::Game(selected)
-        } else {
-            Target::AddFolder
-        };
         let mut shell = Self {
             dir,
             focus,
             controller,
-            target,
-            return_target: target,
-            selected,
+            target: Target::AddFolder,
+            return_target: Target::AddFolder,
+            selected: 0,
             screen: Screen::Home,
             overlay: Overlay::None,
             category: Category::Graphics,
@@ -232,13 +225,13 @@ impl Shell {
             grid_columns: 4,
             content_busy: false,
             metadata_request: 0,
+            pending_library_selection: preferences.selected,
             user_profile_override,
             shelf_scroll: Default::default(),
             view_scroll: Default::default(),
             client: SessionClient::default(),
             _polling: polling,
         };
-        shell.scroll_to_game(selected);
         shell.refresh_metadata(window, cx);
         if let Some(game) = initial_game {
             shell.launch(game);
@@ -252,6 +245,16 @@ impl Shell {
 
     pub(crate) fn entries(&self) -> &[library::LibraryEntry] {
         self.library.as_ref().map_or(&[], Library::entries)
+    }
+
+    fn library_selection_path(&self) -> Option<PathBuf> {
+        self.pending_library_selection.clone()
+            .or_else(|| self.entries().get(self.selected).map(|entry| entry.path.clone()))
+    }
+
+    fn set_library_selection(&mut self, index: usize) {
+        self.selected = index;
+        self.pending_library_selection = None;
     }
 
     pub(crate) fn visible_entries(&self) -> Vec<usize> {
@@ -427,7 +430,7 @@ impl Shell {
                 } else if let Some(next) = move_focus(&self.focus_rows(), self.target, direction) {
                     self.target = next;
                     if let Target::Game(index) = next {
-                        self.selected = index;
+                        self.set_library_selection(index);
                         self.scroll_to_game(index);
                     }
                 }
@@ -506,7 +509,7 @@ impl Shell {
         if self.session != Session::Idle || self.overlay != Overlay::None {
             return;
         }
-        self.selected = index;
+        self.set_library_selection(index);
         self.target = Target::Game(index);
         if options {
             self.open_game_options();
@@ -532,9 +535,9 @@ impl Shell {
         match target {
             Target::Fullscreen => window.toggle_fullscreen(),
             Target::Game(index) => {
-                self.selected = index;
-                if let Some(entry) = self.entries().get(index) {
-                    self.launch(entry.path.clone());
+                if let Some(path) = self.entries().get(index).map(|entry| entry.path.clone()) {
+                    self.set_library_selection(index);
+                    self.launch(path);
                 }
             }
             Target::Shortcut(ComponentId::Exit) => {
@@ -560,16 +563,12 @@ impl Shell {
             Target::OpenGame => self.pick(Picker::Game, window, cx),
             Target::GameOptions => self.open_game_options(),
             Target::PlaySelected => {
-                if let Some(entry) = self.entries().get(self.selected) {
-                    self.launch(entry.path.clone());
+                if let Some(path) = self.entries().get(self.selected).map(|entry| entry.path.clone()) {
+                    self.set_library_selection(self.selected);
+                    self.launch(path);
                 }
             }
-            Target::Refresh => {
-                if let Some(library) = &mut self.library && let Err(error) = library.refresh() {
-                    self.message = Some(error);
-                }
-                self.refresh_metadata(window, cx);
-            }
+            Target::Refresh => self.refresh_metadata(window, cx),
             Target::Search => self.searching = true,
             Target::Category(category) => self.select_category(category),
             Target::Setting(setting) => self.cycle_setting(setting, 1),
@@ -622,7 +621,7 @@ impl Shell {
             width: f32::from(size.width).round() as u16,
             height: f32::from(size.height).round() as u16,
             fullscreen: window.is_fullscreen(),
-            selected: self.entries().get(self.selected).map(|entry| entry.path.clone()),
+            selected: self.library_selection_path(),
         };
         preferences.clamp_window();
         if let Err(error) = preferences.save(&self.dir) {

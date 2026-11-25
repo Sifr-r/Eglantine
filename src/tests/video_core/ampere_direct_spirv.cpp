@@ -411,4 +411,123 @@ TEST_CASE("Direct SM86 batch compilation and fallback to Maxwell", "[video_core]
         egl_ampere_spirv_free(&outputs[i]);
     }
 }
+
+TEST_CASE("Direct SM86 FFI error paths, atomics/shfl/vote/f2i, and register bounds",
+          "[video_core][ampere]") {
+    // 1. Null/invalid FFI inputs populate descriptive error strings and free cleanly
+    EglSpirvCompileOutput err_out{};
+    CHECK(egl_ampere_spirv_compile(nullptr, &err_out) == -1);
+    CHECK(err_out.error != nullptr);
+    CHECK(err_out.error_len > 0U);
+    egl_ampere_spirv_free(&err_out);
+    CHECK(err_out.error == nullptr);
+    CHECK(err_out.error_len == 0U);
+
+    EglSpirvCompileInput bad_slice{};
+    bad_slice.stage = EGL_SPIRV_STAGE_COMPUTE;
+    bad_slice.code = nullptr;
+    bad_slice.code_count = 1U;
+    CHECK(egl_ampere_spirv_compile(&bad_slice, &err_out) == -1);
+    CHECK(err_out.error != nullptr);
+    egl_ampere_spirv_free(&err_out);
+
+    EglSpirvCompileInput bad_stage{};
+    bad_stage.stage = 99U;
+    CHECK(egl_ampere_spirv_compile(&bad_stage, &err_out) == -1);
+    CHECK(err_out.error != nullptr);
+    egl_ampere_spirv_free(&err_out);
+
+    CHECK(egl_ampere_spirv_compile_batch(nullptr, 0U, nullptr) == 0);
+    std::array<EglSpirvCompileOutput, 2> batch_err{};
+    CHECK(egl_ampere_spirv_compile_batch(nullptr, batch_err.size(), batch_err.data()) == -1);
+    CHECK(batch_err[0].error != nullptr);
+    for (auto& slot : batch_err) {
+        egl_ampere_spirv_free(&slot);
+    }
+
+    // 2. Non-compute stages cleanly fall back to Maxwell with zero error
+    const std::array<EglAmpereInstruction, 1> exit_only{{
+        {{0x0000794dU, 0U, 0x03800000U, 0U}},
+    }};
+    EglSpirvCompileInput non_compute{};
+    non_compute.stage = EGL_SPIRV_STAGE_VERTEX_B;
+    non_compute.code = exit_only.data();
+    non_compute.code_count = exit_only.size();
+    non_compute.profile = MakeSpirv16Profile(false);
+    REQUIRE(egl_ampere_spirv_compile(&non_compute, &err_out) == 0);
+    CHECK(err_out.fallback_to_maxwell == 1U);
+    CHECK(err_out.error == nullptr);
+    egl_ampere_spirv_free(&err_out);
+
+    // 3. ATOMG, SHFL (without shuffle_relative), VOTE, F2I, R2UR RZ, STG.64 R254, shared_memory_size=UINT32_MAX
+    const auto make_c = [](Shader::Ampere::Instruction i) {
+        return EglAmpereInstruction{{i.words[0], i.words[1], i.words[2], i.words[3]}};
+    };
+    const std::vector<EglAmpereInstruction> rich_code{
+        make_c(Sm86UldcU64(4U, 0U, 0x160U)),
+        make_c(Sm86MovImm(1U, 0x3fc00000U)), // 1.5f
+        // F2I.ROUND.S32 R2, R1
+        EglAmpereInstruction{{0x305U | (7U << 12) | (2U << 16), 1U, 0x00000100U | (2U << 11), 0U}},
+        // ATOMG.E.EXCH.U32 R3, [UR4], R2
+        EglAmpereInstruction{{0x9a8U | (7U << 12) | (3U << 16) | (255U << 24), 2U,
+                              0x081ee140U | 4U | (8U << 23), 0U}},
+        // SHFL.UP P0, R6, R3, 1, 0x1f
+        EglAmpereInstruction{{0xf89U | (7U << 12) | (6U << 16) | (3U << 24),
+                              (1U << 26) | (1U << 21) | (0x1fU << 8), 0U, 0U}},
+        // VOTE.ALL P1, R7, P0 (ballot -> R7, all-true -> P1)
+        EglAmpereInstruction{{0x806U | (7U << 12) | (7U << 16), 0U, (1U << 17), 0U}},
+        // R2UR UR2, RZ (255)
+        EglAmpereInstruction{{0x3c2U | (7U << 12) | (2U << 16) | (255U << 24), 0U, 0U, 0U}},
+        // STG.E.64 [UR4], R254 (reads R254 + RZ without OOB panic)
+        EglAmpereInstruction{{0x986U | (7U << 12) | (255U << 24), 254U,
+                              0x0810a100U | 4U | (5U << 9), 0U}},
+        // @P1 STG.E [UR4+12], R6 (keeps both SHFL R6 and VOTE P1 live)
+        EglAmpereInstruction{{0x986U | (1U << 12) | (255U << 24), 6U | (12U << 8),
+                              0x0810a100U | 4U | (4U << 9), 0U}},
+        make_c(Sm86StgUr(7U, 255U, 4U, 8U)),
+        make_c(Sm86Exit()),
+    };
+
+    EglSpirvCompileInput rich_in{};
+    rich_in.stage = EGL_SPIRV_STAGE_COMPUTE;
+    rich_in.texture_bound = ~0U;
+    rich_in.program_key = 0xface0002ULL;
+    rich_in.code = rich_code.data();
+    rich_in.code_count = rich_code.size();
+    rich_in.workgroup_size[0] = 32U;
+    rich_in.workgroup_size[1] = 1U;
+    rich_in.workgroup_size[2] = 1U;
+    rich_in.shared_memory_size = UINT32_MAX;
+    rich_in.profile = MakeSpirv16Profile(false);
+    rich_in.profile.support_shuffle_relative = 0U;
+
+    EglSpirvCompileOutput rich_out{};
+    REQUIRE(egl_ampere_spirv_compile(&rich_in, &rich_out) == 0);
+    CHECK(rich_out.fallback_to_maxwell == 0U);
+    CHECK(rich_out.info.uses_subgroup_shuffles == 1U);
+    CHECK(rich_out.info.uses_subgroup_vote == 1U);
+    CHECK(rich_out.info.stores_global_memory == 1U);
+    const auto rich_ops = ParseAndVerifySpirv16(rich_out.spirv_words, rich_out.word_count, 32U);
+    CHECK(std::any_of(rich_ops.begin(), rich_ops.end(),
+                      [](const ParsedSpirvOp& op) { return op.opcode == 229U; })); // OpAtomicExchange
+    CHECK(std::any_of(rich_ops.begin(), rich_ops.end(),
+                      [](const ParsedSpirvOp& op) { return op.opcode == 345U; })); // OpGroupNonUniformShuffle
+    CHECK(std::any_of(rich_ops.begin(), rich_ops.end(),
+                      [](const ParsedSpirvOp& op) { return op.opcode == 334U; })); // OpGroupNonUniformAll
+    egl_ampere_spirv_free(&rich_out);
+
+    // 4. Invalid uniform register ID >= 64 cleanly falls back to Maxwell
+    const std::array<EglAmpereInstruction, 2> bad_ur_code{{
+        {{0x890U | (7U << 12) | (2U << 16) | (64U << 24), 1U, 63U, 0U}},
+        {{0x0000794dU, 0U, 0x03800000U, 0U}},
+    }};
+    EglSpirvCompileInput bad_ur_in = rich_in;
+    bad_ur_in.shared_memory_size = 0U;
+    bad_ur_in.code = bad_ur_code.data();
+    bad_ur_in.code_count = bad_ur_code.size();
+    REQUIRE(egl_ampere_spirv_compile(&bad_ur_in, &rich_out) == 0);
+    CHECK(rich_out.fallback_to_maxwell == 1U);
+    CHECK(rich_out.error == nullptr);
+    egl_ampere_spirv_free(&rich_out);
+}
 #endif

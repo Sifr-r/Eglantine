@@ -26,10 +26,46 @@ struct PacketElementMinSize<std::string> {
     static constexpr std::size_t value = sizeof(u32);
 };
 
+/// Maximum number of elements allowed when reading a vector of strings from a packet.
+constexpr std::size_t MaxPacketStringVectorElements = 4096;
+
+/// The maximum number of elements that a peer-controlled vector read may allocate for type T.
+template <typename T>
+struct PacketElementMaxCount {
+    static constexpr std::size_t value = (std::numeric_limits<u32>::max)();
+};
+
+template <>
+struct PacketElementMaxCount<std::string> {
+    static constexpr std::size_t value = MaxPacketStringVectorElements;
+};
+
 /// The offset of the source ip address inside a relayed proxy or LDN packet. Both wire formats
 /// start with the message type, followed by the family or the packet type, followed by the four
 /// bytes of the source ip address of the sender.
 constexpr std::size_t RelaySourceIpOffset = 2;
+
+/// Maximum size of a payload that a member may relay to the other members of a room. This is
+/// sized for the largest UDP datagram that can be sent over IPv4.
+constexpr std::size_t MaxRelayedPayloadSize = 65507;
+
+/// Exact fixed wire header size preceding the payload bytes in an IdProxyPacket message:
+/// message type (u8) + local family (u8) + local IP (4) + local port (u16) +
+/// remote family (u8) + remote IP (4) + remote port (u16) + protocol (u8) +
+/// broadcast (u8) + payload size (u32).
+constexpr std::size_t ProxyPacketHeaderSize = 21;
+
+/// Exact fixed wire header size preceding the payload bytes in an IdLdnPacket message:
+/// message type (u8) + packet type (u8) + local IP (4) + remote IP (4) +
+/// broadcast (u8) + payload size (u32).
+constexpr std::size_t LdnPacketHeaderSize = 15;
+
+/// Returns true when a relayed packet's total byte length stays within `header_size +
+/// MaxRelayedPayloadSize`, checked without overflowing.
+[[nodiscard]] constexpr bool IsRelayedPacketSizeWithinCap(std::size_t packet_size,
+                                                          std::size_t header_size) noexcept {
+    return packet_size >= header_size && packet_size - header_size <= MaxRelayedPayloadSize;
+}
 
 /// A class that serializes data for network transfer. It also handles endianness
 class Packet {
@@ -172,6 +208,12 @@ Packet& Packet::Read(std::vector<T>& out_data) {
     u32 size = 0;
     Read(size);
     if (!is_valid) {
+        out_data.clear();
+        return *this;
+    }
+
+    if (static_cast<std::size_t>(size) > PacketElementMaxCount<T>::value) {
+        Invalidate();
         out_data.clear();
         return *this;
     }

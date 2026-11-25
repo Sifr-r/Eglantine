@@ -5,12 +5,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use eglantine_ampere_rs::Instruction;
-
 use crate::coop_matrix::CoopConfig;
 use crate::decode_sm86::{
     decode_program, AtomicOp, BoolComb, CbufRef, DecodedInsn, DecodedOp, FloatCmp, FloatSrc,
-    HalfSrc, IntCmp, MemBarrierScope, MemWidth, MufuOp, PredGuard, S2rSpecial, ShflMode,
+    HalfSrc, Instruction, IntCmp, MemBarrierScope, MemWidth, MufuOp, PredGuard, S2rSpecial, ShflMode,
     SrcOperand, VoteMode,
 };
 use crate::reflect::{
@@ -342,6 +340,24 @@ impl<'a> SsaBuilder<'a> {
         *sum = next_sum;
     }
 
+    #[inline]
+    fn read_reg(&self, state: &RegState, r: u8) -> ValueId {
+        if (r as usize) < 255 {
+            state.r[r as usize]
+        } else {
+            self.zero_u32
+        }
+    }
+
+    #[inline]
+    fn read_ureg(&self, state: &RegState, ur: u8) -> ValueId {
+        if (ur as usize) < 63 {
+            state.ur[ur as usize]
+        } else {
+            self.zero_u32
+        }
+    }
+
     fn write_reg(&self, state: &mut RegState, dst: u8, val: ValueId, ptr: Option<PtrOrigin>) {
         if (dst as usize) < 255 {
             state.r[dst as usize] = val;
@@ -361,8 +377,8 @@ impl<'a> SsaBuilder<'a> {
     fn eval_src(&mut self, blk: usize, state: &RegState, src: SrcOperand) -> ValueId {
         match src {
             SrcOperand::Zero => self.zero_u32,
-            SrcOperand::Reg(r) => state.r[r as usize],
-            SrcOperand::UReg(ur) => state.ur[ur as usize],
+            SrcOperand::Reg(r) => self.read_reg(state, r),
+            SrcOperand::UReg(ur) => self.read_ureg(state, ur),
             SrcOperand::Imm32(v) => self.const_u32(blk, v),
             SrcOperand::Cbuf(cbuf) => {
                 let bank = u32::from(cbuf.bank);
@@ -386,8 +402,8 @@ impl<'a> SsaBuilder<'a> {
 
     fn src_ptr(&self, state: &RegState, src: SrcOperand) -> Option<PtrOrigin> {
         match src {
-            SrcOperand::Reg(r) => state.r_ptr[r as usize],
-            SrcOperand::UReg(ur) => state.ur_ptr[ur as usize],
+            SrcOperand::Reg(r) if (r as usize) < 255 => state.r_ptr[r as usize],
+            SrcOperand::UReg(ur) if (ur as usize) < 63 => state.ur_ptr[ur as usize],
             _ => None,
         }
     }
@@ -1100,8 +1116,13 @@ impl<'a> SsaBuilder<'a> {
                 self.write_ureg(state, dst_ur, v, None);
             }
             DecodedOp::R2ur { dst_ur, src } => {
-                let v = state.r[src as usize];
-                self.write_ureg(state, dst_ur, v, state.r_ptr[src as usize]);
+                let v = self.read_reg(state, src);
+                let ptr = if (src as usize) < 255 {
+                    state.r_ptr[src as usize]
+                } else {
+                    None
+                };
+                self.write_ureg(state, dst_ur, v, ptr);
             }
             DecodedOp::Iadd3 {
                 dst,
@@ -1799,11 +1820,7 @@ impl<'a> SsaBuilder<'a> {
                         let cw = self.const_u32(blk, w);
                         self.alloc_val(blk, ValType::U32, SsaOp::IAdd(word_base, cw))
                     };
-                    let val = if src_reg == 255 {
-                        self.zero_u32
-                    } else {
-                        state.r[src_reg.saturating_add(w as u8) as usize]
-                    };
+                    let val = self.read_reg(state, src_reg.saturating_add(w as u8));
                     self.emit_void(blk, SsaOp::StoreSsboWord { ssbo_idx, word_idx: w_idx, val });
                 }
             }
@@ -1849,11 +1866,7 @@ impl<'a> SsaBuilder<'a> {
                         let cw = self.const_u32(blk, w);
                         self.alloc_val(blk, ValType::U32, SsaOp::IAdd(word_base, cw))
                     };
-                    let val = if src_reg == 255 {
-                        self.zero_u32
-                    } else {
-                        state.r[src_reg.saturating_add(w as u8) as usize]
-                    };
+                    let val = self.read_reg(state, src_reg.saturating_add(w as u8));
                     self.emit_void(blk, SsaOp::StoreSharedWord { word_idx: w_idx, val });
                 }
             }
@@ -1903,11 +1916,7 @@ impl<'a> SsaBuilder<'a> {
                         let cw = self.const_u32(blk, w);
                         self.alloc_val(blk, ValType::U32, SsaOp::IAdd(word_base, cw))
                     };
-                    let val = if src_reg == 255 {
-                        self.zero_u32
-                    } else {
-                        state.r[src_reg.saturating_add(w as u8) as usize]
-                    };
+                    let val = self.read_reg(state, src_reg.saturating_add(w as u8));
                     self.emit_void(blk, SsaOp::StoreLocalWord { word_idx: w_idx, val });
                 }
             }
@@ -2094,7 +2103,10 @@ impl<'a> SsaBuilder<'a> {
                 let c_vals = if rc == 255 {
                     [self.zero_u32; 2]
                 } else {
-                    [state.r[rc as usize], state.r[rc.saturating_add(1) as usize]]
+                    [
+                        self.read_reg(state, rc),
+                        self.read_reg(state, rc.saturating_add(1)),
+                    ]
                 };
                 let hmma = self.alloc_val(
                     blk,
@@ -2274,9 +2286,9 @@ impl<'a> SsaBuilder<'a> {
             self.info.uses_cbuf_indirect = true;
             self.info.record_cbuf_read(bank_u, 0, 0x10_000);
             let idx_val = if is_uniform {
-                state.ur[idx_reg as usize]
+                self.read_ureg(state, idx_reg)
             } else {
-                state.r[idx_reg as usize]
+                self.read_reg(state, idx_reg)
             };
             let base_v = self.const_u32(blk, base_off);
             let byte_idx = self.alloc_val(blk, ValType::U32, SsaOp::IAdd(idx_val, base_v));
@@ -3242,8 +3254,8 @@ pub fn lower_to_ssa(input: &LowerInput<'_>) -> Result<SsaProgram, FallbackReason
     let mut program = SsaProgram {
         stage: input.stage,
         workgroup_size: builder.workgroup_size,
-        shared_memory_bytes: (builder.shared_bytes_needed + 3) & !3,
-        local_memory_bytes: (builder.local_bytes_needed + 3) & !3,
+        shared_memory_bytes: builder.shared_bytes_needed.saturating_add(3) & !3,
+        local_memory_bytes: builder.local_bytes_needed.saturating_add(3) & !3,
         coop_config: builder.coop_config,
         profile: builder.profile,
         initial_bindings: input.bindings,

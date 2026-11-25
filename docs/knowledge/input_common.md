@@ -11,8 +11,7 @@ Entry points: `src/input_common/main.{h,cpp}`, `src/input_common/drivers/switch2
 ## Native Switch 2 Controllers
 
 - **Protocol & framing (`src/input_common/helpers/switch2_protocol/`):**
-  - `switch2_types.{h,cpp}`: BLE `0x0553` adv parser, 12-bit stick unpacking/calibration, 60+ byte report parser, 40-bit LRA vibration encoder, command/memory builders, IMU converter, `GyroMouseProcessor`, `OpticalMouseProcessor`.
-  - With `ENABLE_RUST_SWITCH2_IO` enabled, `rust/crates/switch2_io` handles product ID support, controller type, and display name lookups. Builds with the option off use the C++ lookups. The runtime Rust and parity flags still control the other migrated codecs.
+  - `switch2_types.{h,cpp}` owns the C++ protocol codecs and product lookups. It decodes BLE `0x0553` advertisements, 12-bit stick calibration, and 60+ byte input reports, handles command and memory framing, encodes 40-bit LRA vibration, and converts IMU and mouse input.
   - `switch2_transport.h`: `ISwitch2Transport` and `ISwitch2Scanner` + `CreateBleScanner()`/`CreateUsbScanner()`, implemented in `switch2_ble_win.cpp` (WinRT BLE GATT + non-Windows stub) and `switch2_usb.cpp` (`libusb`). Dependency direction: `Switch2Controllers` -> `Switch2Driver` -> `ISwitch2Transport` <- backends.
   - `switch2_driver.{h,cpp}`: protocol state machine, calibration/LED/rumble, mouse routing.
   - **Wire invariants:** Feature flags, common report, battery/IMU layouts, and rumble frames match `linux-switch2/PROTOCOL.md`. USB strips the report id before the parser; BLE announces the startup feature mask before the normal one (`Buttons | AnalogSticks | Motion | Rumble`, plus `Mouse` for Joy-Con).

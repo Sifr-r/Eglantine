@@ -37,7 +37,7 @@ impl Shell {
                         if let Err(error) = library.note_played(path) {
                             self.message = Some(error);
                         } else if let Some(index) = library.entries().iter().position(|entry| &entry.path == path) {
-                            self.selected = index;
+                            self.set_library_selection(index);
                             self.return_target = Target::Game(index);
                         }
                     }
@@ -125,10 +125,12 @@ impl Shell {
                         if let Some(path) = paths.into_iter().next() {
                             match picker {
                                 Picker::Folder => {
-                                    if let Some(library) = &mut shell.library && let Err(error) = library.add_folder(path) {
-                                        shell.message = Some(error);
+                                    if let Some(library) = &mut shell.library {
+                                        match library.add_folder(path) {
+                                            Ok(()) => shell.refresh_metadata(window, cx),
+                                            Err(error) => shell.message = Some(error),
+                                        }
                                     }
-                                    shell.refresh_metadata(window, cx);
                                 }
                                 Picker::Game => {
                                     shell.overlay = Overlay::None;
@@ -154,24 +156,29 @@ impl Shell {
         let scan = library.metadata_request();
         let task = cx.background_executor().spawn(async move { scan.read() });
         cx.spawn_in(window, async move |entity, cx| {
-            let (entries, error) = task.await;
+            let mut scan = task.await;
+            let complete = scan.is_complete();
+            let warning = scan.warning.take();
             let _ = cx.update(|_, cx| entity.update(cx, |shell, cx| {
                 if shell.metadata_request != generation {
                     return;
                 }
-                let selected = shell.entries().get(shell.selected).map(|entry| entry.path.clone());
+                let selected = shell.library_selection_path();
                 let focused = matches!(shell.target, Target::Game(_));
                 if let Some(library) = &mut shell.library {
-                    library.apply_metadata(entries);
+                    library.apply_metadata(scan);
                 }
                 let index = selected.and_then(|path| shell.entries().iter().position(|entry| entry.path == path));
+                if index.is_some() || complete {
+                    shell.pending_library_selection = None;
+                }
                 shell.selected = index.unwrap_or_default();
                 if focused || shell.target == Target::AddFolder && !shell.entries().is_empty() && shell.screen == Screen::Home {
                     shell.target = if shell.entries().is_empty() { Target::AddFolder } else { Target::Game(shell.selected) };
                     shell.scroll_to_game(shell.selected);
                 }
-                if let Some(error) = error {
-                    shell.message = Some(error);
+                if let Some(warning) = warning {
+                    shell.message = Some(warning);
                 }
                 cx.notify();
             }));

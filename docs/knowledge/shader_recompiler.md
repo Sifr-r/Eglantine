@@ -12,7 +12,7 @@ Entry points: `src/shader_recompiler/frontend/ampere/lower_to_maxwell.h`, `src/v
 ## Cross-Language & IR Invariants
 
 - **Direct SPIR-V FFI error contract:** `rust/crates/ampere_spirv/src/ffi.rs` populates `out.error` / `out.error_len` on hard errors (`rc == -1` or empty SPIR-V) while keeping `out.error == nullptr` / `out.error_len == 0` on graceful `FallbackToMaxwell`.
-- **Geometry exit-envelope parity:** `exit_setup`, `exit_handler_end`, `IsGeometryExitSetup` (omitting `FallbackEnd`) stay bit-exact across `src/shader_recompiler/frontend/ampere/program_capture.h`, `rust/include/eglantine_ampere.h`, and `rust/crates/ampere_core/src/{capture.rs,ffi.rs}`. Experimental geometry stage is opt-in via `EDEN_NX2_EXPERIMENTAL_GEOMETRY=1`.
+- **Geometry exit envelope:** `ProgramCaptureState` recognizes the geometry preamble and captures through the exit handler, including when the body uses a computed branch. Experimental geometry stage is opt-in via `EDEN_NX2_EXPERIMENTAL_GEOMETRY=1`.
 - **IR edge invariants:**
   - `ConstantPropagationPass` (`ir_opt/constant_propagation_pass.cpp`) handles zero-width and 32-bit `BitFieldUExtract` without shifting by 32.
   - `TexturePass::TryGetConstBuffer()` (`ir_opt/texture_pass.cpp`) tracks `CompositeExtractU32x2` word byte offsets.
@@ -21,6 +21,6 @@ Entry points: `src/shader_recompiler/frontend/ampere/lower_to_maxwell.h`, `src/v
 
 ## Verification
 
-- `./build/bin/tests "[ampere]"` (and `[ampere-lazy-lowering]`; run with `EDEN_NX2_RUST_AMPERE_VERIFY=1` or `EDEN_NX2_DIRECT_SM86=1` to cover alternate/differential paths).
-- Related test files: `src/tests/video_core/{ampere_lazy_lowering,ampere_direct_spirv,ampere_geometry,ampere_rust_parity,shader_precache,shader_precache_identity,shader_ir_edges}.cpp`.
+- `./build/bin/tests "[ampere]"` and `[ampere-lazy-lowering]`. Use `EDEN_NX2_DIRECT_SM86=1` to cover the Rust direct compute path.
+- Related test files: `src/tests/video_core/{ampere_lazy_lowering,ampere_direct_spirv,ampere_geometry,ampere_program,shader_precache,shader_precache_identity,shader_ir_edges}.cpp`.
 - Rust suite: `cargo test --manifest-path rust/Cargo.toml --locked --offline`.

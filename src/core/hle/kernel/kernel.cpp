@@ -231,12 +231,36 @@ struct KernelCore::Impl {
         CleanupObject(hidbus_shared_mem);
         CleanupObject(system_resource_limit);
 
+        // Close kernel-created core threads before resetting schedulers and physical cores:
+        // KThread::Finalize acquires KScopedSchedulerLock, whose unlock checks the active
+        // schedulers and may signal physical core interrupts.
         for (u32 core_id = 0; core_id < Core::Hardware::NUM_CPU_CORES; core_id++) {
             if (shutdown_threads[core_id]) {
+                if (std::exchange(shutdown_threads_started[core_id], false)) {
+                    {
+                        KScopedSchedulerLock sl{kernel};
+                        if (shutdown_threads[core_id]->GetRawState() == ThreadState::Runnable) {
+                            shutdown_threads[core_id]->SetState(kernel, ThreadState::Terminated);
+                        }
+                        KScheduler::ClearPreviousThread(kernel, shutdown_threads[core_id]);
+                    }
+                    // Run() opened a running reference that never exited via FinishTermination().
+                    shutdown_threads[core_id]->Close(kernel);
+                }
                 shutdown_threads[core_id]->Close(kernel);
                 shutdown_threads[core_id] = nullptr;
             }
+            if (main_threads[core_id]) {
+                main_threads[core_id]->Close(kernel);
+                main_threads[core_id] = nullptr;
+            }
+            if (idle_threads[core_id]) {
+                idle_threads[core_id]->Close(kernel);
+                idle_threads[core_id] = nullptr;
+            }
+        }
 
+        for (u32 core_id = 0; core_id < Core::Hardware::NUM_CPU_CORES; core_id++) {
             schedulers[core_id].reset();
             cores[core_id].reset();
         }
@@ -328,11 +352,13 @@ struct KernelCore::Impl {
             main_thread->SetCurrentCore(core);
             ASSERT(Kernel::KThread::InitializeMainThread(system, main_thread, core).IsSuccess());
             KThread::Register(system.Kernel(), main_thread);
+            main_threads[i] = main_thread;
 
             auto* idle_thread{Kernel::KThread::Create(system.Kernel())};
             idle_thread->SetCurrentCore(core);
             ASSERT(Kernel::KThread::InitializeIdleThread(system, idle_thread, core).IsSuccess());
             KThread::Register(system.Kernel(), idle_thread);
+            idle_threads[i] = idle_thread;
 
             schedulers[i]->Initialize(system.Kernel(), main_thread, idle_thread, core);
         }
@@ -447,6 +473,7 @@ struct KernelCore::Impl {
     void InitializeShutdownThreads() {
         for (u32 core_id = 0; core_id < active_core_count; core_id++) {
             shutdown_threads[core_id] = KThread::Create(system.Kernel());
+            shutdown_threads_started[core_id] = false;
             ASSERT(KThread::InitializeHighPriorityThread(system, shutdown_threads[core_id], {}, {}, core_id)
                 .IsSuccess());
             KThread::Register(system.Kernel(), shutdown_threads[core_id]);
@@ -948,7 +975,10 @@ struct KernelCore::Impl {
     // Memory layout
     std::optional<KMemoryLayout> memory_layout;
 
+    std::array<KThread*, Core::Hardware::NUM_CPU_CORES> main_threads{};
+    std::array<KThread*, Core::Hardware::NUM_CPU_CORES> idle_threads{};
     std::array<KThread*, Core::Hardware::NUM_CPU_CORES> shutdown_threads{};
+    std::array<bool, Core::Hardware::NUM_CPU_CORES> shutdown_threads_started{};
     std::array<std::optional<Kernel::KScheduler>, Core::Hardware::NUM_CPU_CORES> schedulers{};
 
     u32 active_core_count{4};
@@ -1276,6 +1306,9 @@ void KernelCore::RunOnGuestCoreProcess(std::string&& process_name, std::function
 
     // Initialize the thread.
     KThread* thread = KThread::Create(*this);
+    SCOPE_EXIT {
+        thread->Close(*this);
+    };
     ASSERT(R_SUCCEEDED(KThread::InitializeServiceThread(
         System(), thread, std::move(func), ServiceThreadPriority, ServiceThreadCore, process)));
 
@@ -1415,8 +1448,9 @@ void KernelCore::ShutdownCores() {
     impl->TerminateAllProcesses();
     KScopedSchedulerLock lk{*this};
     for (u32 core_id = 0; core_id < impl->active_core_count; ++core_id) {
-        if (impl->shutdown_threads[core_id] != nullptr) {
-            void(impl->shutdown_threads[core_id]->Run(*this));
+        if (impl->shutdown_threads[core_id] != nullptr &&
+            impl->shutdown_threads[core_id]->Run(*this).IsSuccess()) {
+            impl->shutdown_threads_started[core_id] = true;
         }
     }
 }

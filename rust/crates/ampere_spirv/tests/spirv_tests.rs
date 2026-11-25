@@ -4,20 +4,18 @@
 use std::collections::HashSet;
 use std::ptr;
 
-use eglantine_ampere_rs::ffi::EglAmpereInstruction;
-use eglantine_ampere_rs::Instruction;
 use eglantine_ampere_spirv::coop_matrix::{
     CAPABILITY_COOPERATIVE_MATRIX_KHR, OP_COOPERATIVE_MATRIX_MUL_ADD_KHR,
     OP_TYPE_COOPERATIVE_MATRIX_KHR,
 };
 use eglantine_ampere_spirv::ffi::{
     egl_ampere_spirv_compile, egl_ampere_spirv_compile_batch, egl_ampere_spirv_free,
-    EglSpirvBindings, EglSpirvCbufEntry, EglSpirvCompileInput, EglSpirvCompileOutput,
+    EglAmpereInstruction, EglSpirvBindings, EglSpirvCbufEntry, EglSpirvCompileInput, EglSpirvCompileOutput,
     EglSpirvCoopLayout, EglSpirvProfile,
 };
 use eglantine_ampere_spirv::{
-    compile_batch, compile_shader, Bindings, CoopConfig, LowerInput, OwnedCompileInput, Profile,
-    SnapshotEnv, Stage, SPIRV_1_6_VERSION, SPIRV_MAGIC,
+    compile_batch, compile_shader, Bindings, CoopConfig, Instruction, LowerInput, OwnedCompileInput,
+    Profile, SnapshotEnv, Stage, SPIRV_1_6_VERSION, SPIRV_MAGIC,
 };
 
 fn sm86(w0: u32, w1: u32, w2: u32, w3: u32) -> Instruction {
@@ -1406,5 +1404,87 @@ mod regression_tests {
             ops.iter().any(|o| o.opcode == 202),
             "expected OpBitFieldSExtract (202) for signed 8/16-bit F2I"
         );
+    }
+
+    #[test]
+    fn register_rz_urz_pair_bounds_and_shared_mem_alignment_edge_cases() {
+        // R2UR UR2, RZ (255), STG.64 [UR4], R254 (reads R254 + RZ), STS.64 [R0], R254,
+        // STL.64 [R0], R254, HMMA with rc=254, and shared/local_memory_size=u32::MAX must not panic.
+        let r2ur_rz = sm86(0x3c2 | (7 << 12) | (2 << 16) | (255 << 24), 0, 0, 0);
+        let stg_64_r254 = sm86(0x986 | (7 << 12) | (255 << 24), 254, 0x0810_a100 | 4 | (5 << 9), 0);
+        let sts_64_r254 = sm86(0x388 | (7 << 12) | (255 << 24), 254, 5 << 9, 0);
+        let stl_64_r254 = sm86(0x387 | (7 << 12) | (255 << 24), 254, 5 << 9, 0);
+        let hmma_rc254 = hmma_16816(16, 8, 12, 254);
+
+        let code = [
+            uldc_u64(4, 0, 0x160),
+            r2ur_rz,
+            mov_imm(8, 0),
+            mov_imm(9, 0),
+            mov_imm(10, 0),
+            mov_imm(11, 0),
+            mov_imm(12, 0),
+            mov_imm(13, 0),
+            mov_imm(254, 7),
+            hmma_rc254,
+            stg_64_r254,
+            sts_64_r254,
+            stl_64_r254,
+            exit_insn(7, false),
+        ];
+
+        let mut input = default_compute_input(&code);
+        input.shared_memory_size = u32::MAX;
+        input.local_memory_size = u32::MAX;
+        let out = compile_shader(&input);
+        assert!(out.fallback.is_none(), "unexpected fallback: {:?}", out.fallback);
+        let _ = assert_valid_spirv_1_6(&out.spirv_words, [32, 1, 1]);
+
+        // Uniform register IDs >= 64 (except 255 for unused/URZ) must decode as Unsupported
+        // and fall back cleanly instead of panicking on state.ur[ur].
+        let bad_ur_uiadd3 = sm86(0x890 | (7 << 12) | (2 << 16) | (64 << 24), 1, 63, 0);
+        assert!(matches!(
+            decode_insn(0, &bad_ur_uiadd3).op,
+            DecodedOp::Unsupported { .. }
+        ));
+        let fb = compile_shader(&default_compute_input(&[bad_ur_uiadd3, exit_insn(7, false)]));
+        assert!(fb.fallback.is_some());
+
+        // URZ=255 in UIADD3 c-slot decodes to SrcOperand::Zero cleanly.
+        let urz255_uiadd3 = sm86(0x890 | (7 << 12) | (2 << 16) | (63 << 24), 5, 255, 0);
+        assert!(matches!(
+            decode_insn(0, &urz255_uiadd3).op,
+            DecodedOp::Uiadd3 {
+                a: SrcOperand::Zero,
+                c: SrcOperand::Zero,
+                ..
+            }
+        ));
+        let ok_urz = compile_shader(&default_compute_input(&[urz255_uiadd3, exit_insn(7, false)]));
+        assert!(ok_urz.fallback.is_none());
+
+        // Rich compute program matching ampere_direct_spirv.cpp: ATOMG + SHFL (non-relative) + VOTE + @P1 STG.
+        let rich_code = [
+            uldc_u64(4, 0, 0x160),
+            mov_imm(1, 0x3fc0_0000),
+            sm86(0x305 | (7 << 12) | (2 << 16), 1, 0x0000_0100 | (2 << 11), 0),
+            sm86(0x9a8 | (7 << 12) | (3 << 16) | (255 << 24), 2, 0x081e_e140 | 4 | (8 << 23), 0),
+            enc_shfl_imm(6, 0, 3, 1, 0x1f, 1),
+            sm86(0x806 | (7 << 12) | (7 << 16), 0, 1 << 17, 0),
+            sm86(0x3c2 | (7 << 12) | (2 << 16) | (255 << 24), 0, 0, 0),
+            sm86(0x986 | (7 << 12) | (255 << 24), 254, 0x0810_a100 | 4 | (5 << 9), 0),
+            sm86(0x986 | (1 << 12) | (255 << 24), 6 | (12 << 8), 0x0810_a100 | 4 | (4 << 9), 0),
+            stg_ur(7, 255, 4, 8),
+            exit_insn(7, false),
+        ];
+        let mut rich_in = default_compute_input(&rich_code);
+        rich_in.profile.support_shuffle_relative = false;
+        rich_in.shared_memory_size = u32::MAX;
+        let rich_out = compile_shader(&rich_in);
+        assert!(rich_out.fallback.is_none(), "rich compile failed: {:?}", rich_out.fallback);
+        let rich_ops = assert_valid_spirv_1_6(&rich_out.spirv_words, [32, 1, 1]);
+        assert!(rich_ops.iter().any(|o| o.opcode == 229)); // OpAtomicExchange
+        assert!(rich_ops.iter().any(|o| o.opcode == 345)); // OpGroupNonUniformShuffle
+        assert!(rich_ops.iter().any(|o| o.opcode == 334)); // OpGroupNonUniformAll
     }
 }

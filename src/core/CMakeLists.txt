@@ -1254,11 +1254,6 @@ target_link_libraries(core PRIVATE
 
 target_link_libraries(core PUBLIC httplib::httplib zstd::zstd)
 
-if (ENABLE_RUST_NUP AND TARGET eglantine_rs)
-    target_link_libraries(core PUBLIC eglantine_rs zstd::zstd)
-    target_compile_definitions(core PUBLIC EGLANTINE_ENABLE_RUST_NUP=1)
-endif()
-
 if (ENABLE_WEB_SERVICE)
     target_compile_definitions(core PUBLIC ENABLE_WEB_SERVICE)
     target_link_libraries(core PUBLIC web_service)

@@ -3,7 +3,37 @@
 
 #![forbid(unsafe_code)]
 
-use eglantine_ampere_rs::Instruction;
+/// A 128-bit Ampere (SM86) SASS instruction.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Instruction {
+    pub words: [u32; 4],
+}
+
+impl Instruction {
+    #[inline]
+    pub const fn new(words: [u32; 4]) -> Self {
+        Self { words }
+    }
+
+    #[inline]
+    pub const fn bits(&self, offset: u32, count: u32) -> u32 {
+        if count == 0 {
+            return 0;
+        }
+        let idx = (offset / 32) as usize;
+        let mut bits = self.words[idx] as u64;
+        if idx + 1 < self.words.len() {
+            bits |= (self.words[idx + 1] as u64) << 32;
+        }
+        let mask = if count >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << count) - 1
+        };
+        ((bits >> (offset % 32)) & mask) as u32
+    }
+}
 
 /// Predicate register guard on every SM86 instruction (`bits(12, 4)`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,10 +88,21 @@ impl SrcOperand {
 
     #[inline]
     pub const fn ureg(id: u32) -> Self {
-        if id == 63 {
+        if id >= 63 {
             Self::Zero
         } else {
             Self::UReg(id as u8)
+        }
+    }
+
+    #[inline]
+    const fn decode_ureg(id: u32) -> Option<Self> {
+        if id == 63 || id == 255 {
+            Some(Self::Zero)
+        } else if id < 63 {
+            Some(Self::UReg(id as u8))
+        } else {
+            None
         }
     }
 }
@@ -695,7 +736,7 @@ fn decode_alu_operand(insn: &Instruction, which: u32) -> Option<(SrcOperand, boo
         match form {
             2 | 4 => Some((SrcOperand::Imm32(insn.words[1]), false, false)),
             3 | 5 => Some((SrcOperand::Cbuf(cbuf_from_insn(insn)?), abs, neg)),
-            6 | 7 => Some((SrcOperand::ureg(insn.bits(32, 8)), abs, neg)),
+            6 | 7 => Some((SrcOperand::decode_ureg(insn.bits(32, 8))?, abs, neg)),
             _ => None,
         }
     } else {
@@ -914,7 +955,12 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
                     };
                     SrcOperand::Cbuf(cbuf)
                 }
-                _ => SrcOperand::ureg(insn.bits(32, 8)),
+                _ => {
+                    let Some(ur) = SrcOperand::decode_ureg(insn.bits(32, 8)) else {
+                        return unsup(raw_opcode, "invalid UMOV uniform register");
+                    };
+                    ur
+                }
             };
             DecodedOp::Umov { dst_ur: unif_dst, src }
         }
@@ -979,13 +1025,20 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
             }
         }
         0x290 | 0x890 => {
-            let a = SrcOperand::ureg(insn.bits(24, 8));
+            let Some(a) = SrcOperand::decode_ureg(insn.bits(24, 8)) else {
+                return unsup(raw_opcode, "invalid UIADD3 a");
+            };
             let b = if raw_opcode == 0x890 {
                 SrcOperand::Imm32(insn.words[1])
             } else {
-                SrcOperand::ureg(insn.bits(32, 8))
+                let Some(ur) = SrcOperand::decode_ureg(insn.bits(32, 8)) else {
+                    return unsup(raw_opcode, "invalid UIADD3 b");
+                };
+                ur
             };
-            let c = SrcOperand::ureg(insn.bits(64, 8));
+            let Some(c) = SrcOperand::decode_ureg(insn.bits(64, 8)) else {
+                return unsup(raw_opcode, "invalid UIADD3 c");
+            };
             DecodedOp::Uiadd3 {
                 dst_ur: unif_dst,
                 a,
@@ -1024,19 +1077,27 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
             }
         }
         0x2a4 | 0x4a4 | 0x8a4 | 0x2a5 => {
-            let a = SrcOperand::ureg(insn.bits(24, 8));
+            let Some(a) = SrcOperand::decode_ureg(insn.bits(24, 8)) else {
+                return unsup(raw_opcode, "invalid UIMAD a");
+            };
             let wide = (raw_opcode & 0xff) == 0xa5;
             let imm_b = raw_opcode == 0x8a4 || form == 4;
             let imm_c = form == 2;
             let b = if imm_b {
                 SrcOperand::Imm32(insn.words[1])
             } else {
-                SrcOperand::ureg(insn.bits(if imm_c { 64 } else { 32 }, 8))
+                let Some(ur) = SrcOperand::decode_ureg(insn.bits(if imm_c { 64 } else { 32 }, 8)) else {
+                    return unsup(raw_opcode, "invalid UIMAD b");
+                };
+                ur
             };
             let c = if imm_c {
                 SrcOperand::Imm32(insn.words[1])
             } else {
-                SrcOperand::ureg(insn.bits(64, 8))
+                let Some(ur) = SrcOperand::decode_ureg(insn.bits(64, 8)) else {
+                    return unsup(raw_opcode, "invalid UIMAD c");
+                };
+                ur
             };
             DecodedOp::Uimad {
                 dst_ur: unif_dst,
@@ -1071,11 +1132,16 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
             }
         }
         0x291 | 0x891 => {
-            let a = SrcOperand::ureg(insn.bits(24, 8));
+            let Some(a) = SrcOperand::decode_ureg(insn.bits(24, 8)) else {
+                return unsup(raw_opcode, "invalid ULEA a");
+            };
             let b = if raw_opcode == 0x891 {
                 SrcOperand::Imm32(insn.words[1])
             } else {
-                SrcOperand::ureg(insn.bits(32, 8))
+                let Some(ur) = SrcOperand::decode_ureg(insn.bits(32, 8)) else {
+                    return unsup(raw_opcode, "invalid ULEA b");
+                };
+                ur
             };
             DecodedOp::Ulea {
                 dst_ur: unif_dst,
@@ -1106,13 +1172,20 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
             }
         }
         0x292 | 0x892 => {
-            let a = SrcOperand::ureg(insn.bits(24, 8));
+            let Some(a) = SrcOperand::decode_ureg(insn.bits(24, 8)) else {
+                return unsup(raw_opcode, "invalid ULOP3 a");
+            };
             let b = if raw_opcode == 0x892 {
                 SrcOperand::Imm32(insn.words[1])
             } else {
-                SrcOperand::ureg(insn.bits(32, 8))
+                let Some(ur) = SrcOperand::decode_ureg(insn.bits(32, 8)) else {
+                    return unsup(raw_opcode, "invalid ULOP3 b");
+                };
+                ur
             };
-            let c = SrcOperand::ureg(insn.bits(64, 8));
+            let Some(c) = SrcOperand::decode_ureg(insn.bits(64, 8)) else {
+                return unsup(raw_opcode, "invalid ULOP3 c");
+            };
             DecodedOp::Ulop3 {
                 dst_ur: unif_dst,
                 a,
@@ -1148,17 +1221,25 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
             }
         }
         0x299 | 0x499 | 0x899 => {
-            let a = SrcOperand::ureg(insn.bits(24, 8));
+            let Some(a) = SrcOperand::decode_ureg(insn.bits(24, 8)) else {
+                return unsup(raw_opcode, "invalid USHF a");
+            };
             let c_is_imm = raw_opcode == 0x499 || form == 2;
             let shift = if raw_opcode == 0x899 || form == 4 {
                 SrcOperand::Imm32(insn.words[1])
             } else {
-                SrcOperand::ureg(insn.bits(if c_is_imm { 64 } else { 32 }, 8))
+                let Some(ur) = SrcOperand::decode_ureg(insn.bits(if c_is_imm { 64 } else { 32 }, 8)) else {
+                    return unsup(raw_opcode, "invalid USHF shift");
+                };
+                ur
             };
             let c = if c_is_imm {
                 SrcOperand::Imm32(insn.words[1])
             } else {
-                SrcOperand::ureg(insn.bits(64, 8))
+                let Some(ur) = SrcOperand::decode_ureg(insn.bits(64, 8)) else {
+                    return unsup(raw_opcode, "invalid USHF c");
+                };
+                ur
             };
             let ty = insn.bits(73, 2);
             if ty < 2 {
@@ -1206,11 +1287,16 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
             if insn.bits(72, 1) != 0 {
                 return unsup(raw_opcode, "extended UISETP.EX");
             }
-            let a = SrcOperand::ureg(insn.bits(24, 8));
+            let Some(a) = SrcOperand::decode_ureg(insn.bits(24, 8)) else {
+                return unsup(raw_opcode, "invalid UISETP a");
+            };
             let b = if raw_opcode == 0x88c {
                 SrcOperand::Imm32(insn.words[1])
             } else {
-                SrcOperand::ureg(insn.bits(32, 8))
+                let Some(ur) = SrcOperand::decode_ureg(insn.bits(32, 8)) else {
+                    return unsup(raw_opcode, "invalid UISETP b");
+                };
+                ur
             };
             let Some(cmp) = decode_int_cmp(insn.bits(76, 3)) else {
                 return unsup(raw_opcode, "invalid UISETP cmp");
@@ -1251,7 +1337,10 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
         }
         0x309 | 0xd09 => {
             let src = if raw_opcode == 0xd09 {
-                SrcOperand::ureg(insn.bits(32, 8))
+                let Some(ur) = SrcOperand::decode_ureg(insn.bits(32, 8)) else {
+                    return unsup(raw_opcode, "invalid POPC uniform register");
+                };
+                ur
             } else {
                 let Some((s, _, _)) = decode_alu_operand(insn, 1) else {
                     return unsup(raw_opcode, "invalid POPC src");
@@ -1268,7 +1357,10 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
         }
         0x300 | 0xd00 => {
             let src = if raw_opcode == 0xd00 {
-                SrcOperand::ureg(insn.bits(32, 8))
+                let Some(ur) = SrcOperand::decode_ureg(insn.bits(32, 8)) else {
+                    return unsup(raw_opcode, "invalid FLO uniform register");
+                };
+                ur
             } else {
                 let Some((s, _, _)) = decode_alu_operand(insn, 1) else {
                     return unsup(raw_opcode, "invalid FLO src");
@@ -1283,11 +1375,16 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
                 shamt: insn.bits(74, 1) != 0,
             }
         }
-        0x2bd => DecodedOp::Uflo {
-            dst_ur: unif_dst,
-            src: SrcOperand::ureg(insn.bits(32, 8)),
-            shamt: insn.bits(74, 1) != 0,
-        },
+        0x2bd => {
+            let Some(src) = SrcOperand::decode_ureg(insn.bits(32, 8)) else {
+                return unsup(raw_opcode, "invalid UFLO uniform register");
+            };
+            DecodedOp::Uflo {
+                dst_ur: unif_dst,
+                src,
+                shamt: insn.bits(74, 1) != 0,
+            }
+        }
         0x81a => DecodedOp::Sgxt {
             dst,
             src: SrcOperand::reg(insn.bits(24, 8)),
@@ -1427,7 +1524,10 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
                 return unsup(raw_opcode, "half MUFU mode");
             }
             let (src, abs, neg) = if raw_opcode == 0xd08 {
-                (SrcOperand::ureg(insn.bits(32, 8)), false, false)
+                let Some(ur) = SrcOperand::decode_ureg(insn.bits(32, 8)) else {
+                    return unsup(raw_opcode, "invalid MUFU uniform register");
+                };
+                (ur, false, false)
             } else {
                 let Some(s) = decode_alu_operand(insn, 1) else {
                     return unsup(raw_opcode, "invalid MUFU src");
@@ -1457,7 +1557,12 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
             };
             let src = match raw_opcode {
                 0x906 => SrcOperand::Imm32(insn.words[1]),
-                0xd06 => SrcOperand::ureg(insn.bits(32, 8)),
+                0xd06 => {
+                    let Some(ur) = SrcOperand::decode_ureg(insn.bits(32, 8)) else {
+                        return unsup(raw_opcode, "invalid I2F uniform register");
+                    };
+                    ur
+                }
                 _ => SrcOperand::reg(insn.bits(32, 8)),
             };
             DecodedOp::I2f {
@@ -1476,7 +1581,12 @@ fn decode_op(index: usize, insn: &Instruction, raw_opcode: u32) -> DecodedOp {
                     Some(c) => c,
                     None => return unsup(raw_opcode, "invalid F2I cbuf"),
                 }),
-                0xd05 => SrcOperand::ureg(insn.bits(32, 8)),
+                0xd05 => {
+                    let Some(ur) = SrcOperand::decode_ureg(insn.bits(32, 8)) else {
+                        return unsup(raw_opcode, "invalid F2I uniform register");
+                    };
+                    ur
+                }
                 _ => SrcOperand::reg(insn.bits(32, 8)),
             };
             let dst_bits = match insn.bits(75, 2) {

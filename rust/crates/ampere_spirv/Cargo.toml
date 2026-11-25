@@ -10,9 +10,3 @@ license = "GPL-3.0-or-later"
 [lib]
 name = "eglantine_ampere_spirv"
 crate-type = ["rlib"]
-
-[dependencies]
-eglantine_ampere_core = { path = "../ampere_core" }
-
-[package.metadata.cargo-machete]
-ignored = ["eglantine_ampere_core"]

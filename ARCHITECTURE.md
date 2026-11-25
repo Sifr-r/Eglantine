@@ -54,9 +54,11 @@ cargo test --locked --manifest-path rust/apps/eglantine_gpui/Cargo.toml   # GPUI
 | `eglantine_rs` | `rust/` | `std`-only Cargo FFI bundle (`eglantine_ffi` -> `eglantine_rs`) |
 | `tests` | `src/tests` | Catch2 unit tests mirroring `src/` |
 
-C++ owns emulator state, `eden-cli`, and default Switch 2 lowering/NUP/input paths. GPUI owns the
-desktop shell; Kotlin/JNI owns Android; Rust owns opt-in parity crates and direct SM86 compute
-SPIR-V. Full table, crate DAG, and switches: [rust_ffi](docs/knowledge/rust_ffi.md#first-party-language-and-domain-ownership).
+C++ owns emulator state, `eden-cli`, desktop game discovery, Ampere-to-Maxwell lowering, NUP
+archives, and the Switch 2 controller protocol. GPUI owns the desktop shell, Kotlin/JNI owns the
+shipping Android frontend, and Rust owns direct SM86 compute SPIR-V. See the
+[language ownership table](docs/knowledge/rust_ffi.md#first-party-language-and-domain-ownership)
+for the crate dependencies and runtime switches.
 
 ## Knowledge cards
 
@@ -64,7 +66,7 @@ SPIR-V. Full table, crate DAG, and switches: [rust_ffi](docs/knowledge/rust_ffi.
 - [device_behaviour.md](docs/knowledge/device_behaviour.md) — what the console tells a running game: operation mode, applet/HOME lifecycle, catalogue and updates, save mounting, profiles, language and clock, amiibo, network; parity against the recomp.gg recompilation runtimes
 - [video_core.md](docs/knowledge/video_core.md) — `Maxwell3D`, `GpuSplit`, `MemoryManager` lock order, `BufferCache`, `TextureCache`, `PipelineCache`, `Nx2Perf`, upscalers
 - [shader_recompiler.md](docs/knowledge/shader_recompiler.md) — Lazy SM86 lowering, direct SM86 compute, warm precache, geometry parity, IR edges
-- [rust_ffi.md](docs/knowledge/rust_ffi.md) — Language ownership, 5 `std`-only Cargo crates, CMake/Cargo DAG, Android NDK, ISPC kernels, `EDEN_NX2_*` switches
+- [rust_ffi.md](docs/knowledge/rust_ffi.md) — Language ownership, direct SM86 Rust crates, CMake/Cargo dependencies, Android NDK, ISPC kernels, `EDEN_NX2_*` switches
 - [input_common.md](docs/knowledge/input_common.md) — `InputSubsystem`, SDL driver, Switch 2 BLE/USB protocol, `Switch2AutoPair`
 - [frontends.md](docs/knowledge/frontends.md) — GPUI shell, `eden-cli`, `frontend_common` persistence, Sentry crash reporting
 - [build_ci.md](docs/knowledge/build_ci.md) — `tools/nx2/` toolchain, MCP, `ignore/` boundary, CI/release checks

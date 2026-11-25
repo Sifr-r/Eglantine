@@ -109,8 +109,3 @@ endif()
 
 create_target_directory_groups(input_common)
 target_link_libraries(input_common PUBLIC hid_core PRIVATE common Boost::headers)
-
-if (ENABLE_RUST_SWITCH2_IO AND TARGET eglantine_rs)
-    target_link_libraries(input_common PUBLIC eglantine_rs)
-    target_compile_definitions(input_common PUBLIC EGLANTINE_ENABLE_RUST_SWITCH2_IO=1)
-endif()

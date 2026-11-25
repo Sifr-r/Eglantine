@@ -6,14 +6,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "eglantine_ampere.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #define EGL_SPIRV_MAX_CBUFS 18u
 #define EGL_SPIRV_MAX_SSBOS 64u
+
+typedef struct EglAmpereInstruction {
+    uint32_t words[4];
+} EglAmpereInstruction;
 
 typedef enum EglSpirvStage {
     EGL_SPIRV_STAGE_VERTEX_B = 0,

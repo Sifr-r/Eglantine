@@ -13,70 +13,7 @@ public:
     enum class Result { Continue, Complete, InvalidTarget };
     static constexpr u32 MaximumInstructions = 65536;
 
-#ifdef EGLANTINE_ENABLE_RUST_AMPERE
-    ProgramCaptureState()
-        : use_rust(detail::IsEnvFlagEnabled("EDEN_NX2_RUST_AMPERE")),
-          verify_rust(detail::IsEnvFlagEnabled("EDEN_NX2_RUST_AMPERE_VERIFY")) {
-        egl_ampere_capture_init(&rs_state);
-    }
-
     Result Observe(const Instruction& instruction, u32 index) {
-        if (verify_rust) {
-            const Result cpp_res = ObserveCpp(instruction, index);
-            const Result rust_res = ObserveRust(instruction, index);
-            bool exit_setup_match = true;
-            for (size_t i = 0; i < exit_setup.size(); ++i) {
-                if (!std::equal(exit_setup[i].words.begin(), exit_setup[i].words.end(),
-                                rs_state.exit_setup[i].words)) {
-                    exit_setup_match = false;
-                    break;
-                }
-            }
-            const bool state_match = exit_setup_match &&
-                                     exit_handler_end == rs_state.exit_handler_end &&
-                                     last_call_target == rs_state.last_call_target &&
-                                     last_forward_target == rs_state.last_forward_target &&
-                                     main_exited == (rs_state.main_exited != 0) &&
-                                     computed_branch == (rs_state.computed_branch != 0);
-            if (cpp_res != rust_res || !state_match) {
-                std::fprintf(
-                    stderr,
-                    "[EDEN_NX2_RUST_AMPERE_VERIFY] ProgramCaptureState mismatch at index %u "
-                    "(op=0x%03x): cpp=%d rust=%d state_match=%d\n",
-                    static_cast<unsigned>(index), static_cast<unsigned>(instruction.Bits(0, 12)),
-                    static_cast<int>(cpp_res), static_cast<int>(rust_res), state_match ? 1 : 0);
-                std::fflush(stderr);
-                std::abort();
-            }
-            return cpp_res;
-        }
-        if (use_rust) {
-            return ObserveRust(instruction, index);
-        }
-        return ObserveCpp(instruction, index);
-    }
-
-    Result ObserveRust(const Instruction& instruction, u32 index) {
-        static_assert(sizeof(Instruction) == sizeof(EglAmpereInstruction));
-        static_assert(alignof(Instruction) == alignof(EglAmpereInstruction));
-        const auto* c_insn = reinterpret_cast<const EglAmpereInstruction*>(&instruction);
-        switch (egl_ampere_capture_observe(&rs_state, c_insn, index)) {
-        case EGL_AMPERE_CAPTURE_CONTINUE:
-            return Result::Continue;
-        case EGL_AMPERE_CAPTURE_COMPLETE:
-            return Result::Complete;
-        case EGL_AMPERE_CAPTURE_INVALID_TARGET:
-            return Result::InvalidTarget;
-        }
-        return Result::InvalidTarget;
-    }
-#else
-    Result Observe(const Instruction& instruction, u32 index) {
-        return ObserveCpp(instruction, index);
-    }
-#endif
-
-    Result ObserveCpp(const Instruction& instruction, u32 index) {
         const u32 opcode = instruction.Bits(0, 12);
         if (index < exit_setup.size()) {
             exit_setup[index] = instruction;
@@ -148,10 +85,5 @@ private:
     u32 last_forward_target{};
     bool main_exited{};
     bool computed_branch{};
-#ifdef EGLANTINE_ENABLE_RUST_AMPERE
-    bool use_rust{};
-    bool verify_rust{};
-    EglAmpereCaptureState rs_state{};
-#endif
 };
 } // namespace Shader::Ampere

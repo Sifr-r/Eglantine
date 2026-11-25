@@ -7,16 +7,15 @@ use std::ffi::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr;
 
-use eglantine_ampere_rs::ffi::EglAmpereInstruction;
-use eglantine_ampere_rs::Instruction;
-
 use crate::coop_matrix::CoopConfig;
 use crate::reflect::{
     Bindings, CbufDescriptor, ImageBufferDescriptor, ImageDescriptor, Profile, ShaderInfo,
     SnapshotEnv, SsboDescriptor, Stage, TextureBufferDescriptor, TextureDescriptor, MAX_CBUFS,
     MAX_SSBOS,
 };
-use crate::{compile_batch, compile_shader, CompileOutcome, OwnedCompileInput};
+use crate::{compile_batch, compile_shader, CompileOutcome, Instruction, OwnedCompileInput};
+
+pub type EglAmpereInstruction = Instruction;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]

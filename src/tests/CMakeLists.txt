@@ -104,7 +104,7 @@ add_executable(tests
     video_core/ampere_lazy_lowering.cpp
     video_core/channel_bridge_parity.cpp
     video_core/ampere_lowering.cpp
-    video_core/ampere_rust_parity.cpp
+    video_core/ampere_program.cpp
     video_core/spirv_software_matrix.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_i2f.cpp
@@ -173,10 +173,6 @@ endif()
 target_link_libraries(tests PRIVATE ${PLATFORM_LIBRARIES} Catch2::Catch2WithMain Threads::Threads)
 
 add_test(NAME tests COMMAND tests)
-if (TARGET eglantine_rs)
-    add_test(NAME tests_ampere_rust_parity COMMAND tests "[ampere]")
-    set_tests_properties(tests_ampere_rust_parity PROPERTIES ENVIRONMENT "EDEN_NX2_RUST_AMPERE_VERIFY=1")
-endif()
 add_test(NAME tests_ampere_direct_sm86 COMMAND tests "[ampere-lazy-lowering]")
 set_tests_properties(tests_ampere_direct_sm86 PROPERTIES ENVIRONMENT "EDEN_NX2_DIRECT_SM86=1")
 add_test(NAME tests_nx2_perf_verify COMMAND tests "[nx2_perf]")

@@ -4,16 +4,27 @@
 #include <array>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "common/socket_types.h"
 #include "network/packet.h"
 #include "network/room.h"
+#include "network/room_member.h"
 
 namespace Network {
 namespace {
+
+static_assert(std::is_same_v<decltype(std::declval<const RoomMember&>().GetNickname()),
+                             std::string>,
+              "RoomMember::GetNickname must return the nickname by value");
+static_assert(PacketElementMaxCount<std::string>::value == MaxPacketStringVectorElements);
+static_assert(PacketElementMaxCount<u8>::value == (std::numeric_limits<u32>::max)());
 
 TEST_CASE("Packet", "[network]") {
     SECTION("A vector read of a truncated payload does not allocate") {
@@ -62,6 +73,37 @@ TEST_CASE("Packet", "[network]") {
 
         REQUIRE(static_cast<bool>(packet));
         REQUIRE((data == std::vector<std::string>{"a", "bb"}));
+    }
+
+    SECTION("A string vector exceeding the element cap does not allocate even with 4*N zero-length prefixes") {
+        constexpr u32 count = static_cast<u32>(MaxPacketStringVectorElements + 1);
+        Packet packet;
+        packet.Write(count);
+        for (u32 i = 0; i < count; ++i) {
+            packet.Write(static_cast<u32>(0));
+        }
+
+        std::vector<std::string> data;
+        packet.Read(data);
+
+        REQUIRE_FALSE(static_cast<bool>(packet));
+        REQUIRE(data.empty());
+        REQUIRE(data.capacity() == 0);
+    }
+
+    SECTION("A string vector at the element cap is read") {
+        constexpr u32 count = static_cast<u32>(MaxPacketStringVectorElements);
+        Packet packet;
+        packet.Write(count);
+        for (u32 i = 0; i < count; ++i) {
+            packet.Write(static_cast<u32>(0));
+        }
+
+        std::vector<std::string> data;
+        packet.Read(data);
+
+        REQUIRE(static_cast<bool>(packet));
+        REQUIRE(data.size() == MaxPacketStringVectorElements);
     }
 
     SECTION("IgnoreBytes past the end invalidates the packet") {
@@ -195,6 +237,54 @@ TEST_CASE("Packet", "[network]") {
 
         REQUIRE(packet.OverwriteBytes(RelaySourceIpOffset, assigned_ip.data(), assigned_ip.size()));
     }
+
+    SECTION("Proxy and LDN relay packet header+payload boundary checks") {
+        const IPv4Address addr{192, 168, 1, 2};
+        const std::vector<u8> max_payload(MaxRelayedPayloadSize, 0xAB);
+
+        Packet proxy_packet;
+        proxy_packet.Write(static_cast<u8>(IdProxyPacket));
+        proxy_packet.Write(static_cast<u8>(Domain::INET));
+        proxy_packet.Write(addr);
+        proxy_packet.Write(static_cast<u16>(1234));
+        proxy_packet.Write(static_cast<u8>(Domain::INET));
+        proxy_packet.Write(addr);
+        proxy_packet.Write(static_cast<u16>(5678));
+        proxy_packet.Write(static_cast<u8>(Protocol::UDP));
+        proxy_packet.Write(false);
+        proxy_packet.Write(max_payload);
+
+        REQUIRE(proxy_packet.GetDataSize() == ProxyPacketHeaderSize + MaxRelayedPayloadSize);
+        CHECK(IsRelayedPacketSizeWithinCap(proxy_packet.GetDataSize(), ProxyPacketHeaderSize));
+        CHECK_FALSE(
+            IsRelayedPacketSizeWithinCap(proxy_packet.GetDataSize() + 1, ProxyPacketHeaderSize));
+        CHECK_FALSE(IsRelayedPacketSizeWithinCap(ProxyPacketHeaderSize - 1, ProxyPacketHeaderSize));
+
+        Packet ldn_packet;
+        ldn_packet.Write(static_cast<u8>(IdLdnPacket));
+        ldn_packet.Write(static_cast<u8>(LDNPacketType::Scan));
+        ldn_packet.Write(addr);
+        ldn_packet.Write(addr);
+        ldn_packet.Write(true);
+        ldn_packet.Write(max_payload);
+
+        REQUIRE(ldn_packet.GetDataSize() == LdnPacketHeaderSize + MaxRelayedPayloadSize);
+        CHECK(IsRelayedPacketSizeWithinCap(ldn_packet.GetDataSize(), LdnPacketHeaderSize));
+        CHECK_FALSE(
+            IsRelayedPacketSizeWithinCap(ldn_packet.GetDataSize() + 1, LdnPacketHeaderSize));
+        CHECK_FALSE(IsRelayedPacketSizeWithinCap(LdnPacketHeaderSize - 1, LdnPacketHeaderSize));
+    }
+}
+
+TEST_CASE("RoomMember GetNickname returns by value safely", "[network]") {
+    RoomMember member;
+    REQUIRE(member.GetNickname().empty());
+
+    auto nickname = member.GetNickname();
+    nickname += "mutated";
+
+    // A later read must not observe the mutation, proving GetNickname returns by value.
+    REQUIRE(member.GetNickname().empty());
 }
 
 } // Anonymous namespace

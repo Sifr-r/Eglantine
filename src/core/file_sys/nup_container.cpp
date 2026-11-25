@@ -12,7 +12,6 @@
 #include <list>
 #include <map>
 #include <random>
-#include <cstdlib>
 #include <span>
 #include <string_view>
 #include <unordered_map>
@@ -26,118 +25,12 @@
 #include "common/swap.h"
 #include "core/file_sys/vfs/vfs_offset.h"
 
-#ifdef EGLANTINE_ENABLE_RUST_NUP
-#include "eglantine_nup_fs.h"
-#endif
-
 namespace FileSys {
 namespace {
 
 constexpr u32 NoDir = 0xFFFFFFFF;
 constexpr std::size_t SuperblockSize = 0x80;
 
-#ifdef EGLANTINE_ENABLE_RUST_NUP
-enum class RustNupBackendMode {
-    Cpp,
-    Rust,
-    Verify,
-};
-
-RustNupBackendMode GetRustNupBackendMode() {
-    const char* verify_env = std::getenv("EDEN_NX2_RUST_NUP_VERIFY");
-    if (verify_env != nullptr && verify_env[0] == '1') {
-        return RustNupBackendMode::Verify;
-    }
-    const char* mode_env = std::getenv("EDEN_NX2_RUST_NUP");
-    if (mode_env != nullptr) {
-        if (std::string_view{mode_env} == "verify") {
-            return RustNupBackendMode::Verify;
-        }
-        if (mode_env[0] == '1') {
-            return RustNupBackendMode::Rust;
-        }
-    }
-    return RustNupBackendMode::Cpp;
-}
-
-std::size_t VirtualFileReadAt(void* ctx, u64 offset, u8* dst, std::size_t len) {
-    if (ctx == nullptr || dst == nullptr || len == 0) {
-        return 0;
-    }
-    const auto* vf = static_cast<const VirtualFile*>(ctx);
-    if (*vf == nullptr) {
-        return 0;
-    }
-    const u64 file_size = (*vf)->GetSize();
-    if (offset >= file_size) {
-        return 0;
-    }
-    return (*vf)->Read(dst, len, static_cast<std::size_t>(offset));
-}
-
-EglNupVfsOps MakeNupVfsOps(const VirtualFile& vf) {
-    return EglNupVfsOps{
-        .ctx = const_cast<VirtualFile*>(&vf),
-        .size = vf ? vf->GetSize() : 0ULL,
-        .read_at = &VirtualFileReadAt,
-    };
-}
-
-EglNupZstdOps MakeContainerZstdOps() {
-    return EglNupZstdOps{
-        .compress = &ZSTD_compress,
-        .decompress = &ZSTD_decompress,
-        .compress_bound = &ZSTD_compressBound,
-        .is_error = &ZSTD_isError,
-    };
-}
-
-struct ScopedNupBytes {
-    EglNupOwnedBytes raw{};
-    ~ScopedNupBytes() {
-        egl_nup_free_bytes(&raw);
-    }
-    ScopedNupBytes(const ScopedNupBytes&) = delete;
-    ScopedNupBytes& operator=(const ScopedNupBytes&) = delete;
-    ScopedNupBytes() = default;
-};
-
-struct ScopedNupContainer {
-    EglNupParsedContainer raw{};
-    ~ScopedNupContainer() {
-        egl_nup_container_free(&raw);
-    }
-    ScopedNupContainer(const ScopedNupContainer&) = delete;
-    ScopedNupContainer& operator=(const ScopedNupContainer&) = delete;
-    ScopedNupContainer() = default;
-};
-
-std::string CopyRustStr(const EglNupOwnedString& s) {
-    if (s.data == nullptr || s.len == 0) {
-        return {};
-    }
-    return std::string(s.data, s.len);
-}
-
-std::vector<u8> CopyRustBytes(const EglNupOwnedBytes& b) {
-    if (b.data == nullptr || b.len == 0) {
-        return {};
-    }
-    return std::vector<u8>(b.data, b.data + b.len);
-}
-
-struct VerifyProgressBridgeCtx {
-    const std::function<bool(std::size_t, std::size_t)>* cb{};
-};
-
-uint8_t VerifyProgressBridge(void* ctx, std::size_t done, std::size_t total) {
-    const auto* state = static_cast<const VerifyProgressBridgeCtx*>(ctx);
-    if (state == nullptr || state->cb == nullptr || !(*state->cb)) {
-        return 1;
-    }
-    return (*state->cb)(done, total) ? 1 : 0;
-}
-#endif
 constexpr std::size_t PackageRecordSize = 0x40;
 constexpr std::size_t DirRecordSize = 0x18;
 constexpr std::size_t FileRecordSize = 0x50;
@@ -427,7 +320,7 @@ private:
         }
     }
 
-    std::vector<u8> DecompressCpp() const {
+    std::vector<u8> Decompress() const {
         if (extent_size > backing->GetSize() || extent_offset > backing->GetSize() - extent_size) {
             return {};
         }
@@ -444,41 +337,6 @@ private:
             return {};
         }
         return out;
-    }
-
-#ifdef EGLANTINE_ENABLE_RUST_NUP
-    std::vector<u8> DecompressRust() const {
-        const auto vfs = MakeNupVfsOps(backing);
-        const auto zstd = MakeContainerZstdOps();
-        ScopedNupBytes owned{};
-        if (egl_nup_read_extent(&vfs, &zstd, extent_offset, extent_size, uncompressed_size,
-                                1 /* CodecZstd */, &owned.raw) != 0) {
-            LOG_ERROR(Loader, "Rust NUP zstd decompression failed for {}", name);
-            return {};
-        }
-        return CopyRustBytes(owned.raw);
-    }
-#endif
-
-    std::vector<u8> Decompress() const {
-#ifdef EGLANTINE_ENABLE_RUST_NUP
-        const auto mode = GetRustNupBackendMode();
-        if (mode == RustNupBackendMode::Rust) {
-            return DecompressRust();
-        }
-        auto cpp = DecompressCpp();
-        if (mode == RustNupBackendMode::Verify) {
-            const auto rust = DecompressRust();
-            if (cpp != rust) {
-                LOG_CRITICAL(Loader, "NUP Decompress mismatch for {}: cpp={} rust={}", name,
-                             cpp.size(), rust.size());
-                return {};
-            }
-        }
-        return cpp;
-#else
-        return DecompressCpp();
-#endif
     }
 
     VirtualFile backing;
@@ -507,22 +365,7 @@ bool NupContainer::IsNupFile(const VirtualFile& file) {
     }
     std::array<u8, 4> magic{};
     file->ReadObject(&magic, 0);
-    const bool cpp_match = (magic == HeaderMagic);
-#ifdef EGLANTINE_ENABLE_RUST_NUP
-    const auto mode = GetRustNupBackendMode();
-    if (mode != RustNupBackendMode::Cpp) {
-        const bool rust_match =
-            egl_nup_is_nup_magic(magic.data(), magic.size(), file->GetSize()) != 0;
-        if (mode == RustNupBackendMode::Rust) {
-            return rust_match;
-        }
-        if (rust_match != cpp_match) {
-            LOG_CRITICAL(Loader, "NUP IsNupFile mismatch: cpp={} rust={}", cpp_match, rust_match);
-            return false;
-        }
-    }
-#endif
-    return cpp_match;
+    return magic == HeaderMagic;
 }
 
 NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,
@@ -545,171 +388,6 @@ NupContainer::NupContainer(VirtualFile file_, std::size_t memory_cache_cap,
 NupContainer::~NupContainer() = default;
 
 bool NupContainer::Parse() {
-#ifdef EGLANTINE_ENABLE_RUST_NUP
-    const auto mode = GetRustNupBackendMode();
-    if (mode == RustNupBackendMode::Rust) {
-        return ParseRust();
-    }
-    if (mode == RustNupBackendMode::Verify) {
-        const bool cpp_ok = ParseCpp();
-        const Loader::ResultStatus cpp_status = status;
-        const u64 cpp_toc_offset = toc_offset;
-        const u64 cpp_toc_size = toc_size;
-        const u64 cpp_blob_offset = blob_offset;
-        const u64 cpp_file_size = file_size;
-        auto cpp_packages = std::move(packages);
-        auto cpp_dirs = std::move(dirs);
-        auto cpp_files = std::move(files);
-        auto cpp_children = std::move(children);
-
-        toc_offset = 0;
-        toc_size = 0;
-        blob_offset = 0;
-        file_size = 0;
-        status = Loader::ResultStatus::ErrorNullFile;
-        packages.clear();
-        dirs.clear();
-        files.clear();
-        children.clear();
-
-        const bool rust_ok = ParseRust();
-        bool match = (cpp_ok == rust_ok);
-        if (match && cpp_ok) {
-            match = (cpp_toc_offset == toc_offset) && (cpp_toc_size == toc_size) &&
-                    (cpp_blob_offset == blob_offset) && (cpp_file_size == file_size) &&
-                    (cpp_children == children) && (cpp_dirs.size() == dirs.size()) &&
-                    (cpp_files.size() == files.size()) && (cpp_packages.size() == packages.size());
-            for (std::size_t i = 0; match && i < dirs.size(); ++i) {
-                match = (cpp_dirs[i].name == dirs[i].name) &&
-                        (cpp_dirs[i].first_child == dirs[i].first_child) &&
-                        (cpp_dirs[i].child_count == dirs[i].child_count);
-            }
-            for (std::size_t i = 0; match && i < files.size(); ++i) {
-                match = (cpp_files[i].name == files[i].name) &&
-                        (cpp_files[i].size == files[i].size) &&
-                        (cpp_files[i].sha256 == files[i].sha256) &&
-                        (cpp_files[i].extent_offset == files[i].extent_offset) &&
-                        (cpp_files[i].extent_size == files[i].extent_size) &&
-                        (cpp_files[i].codec == files[i].codec);
-            }
-            for (std::size_t i = 0; match && i < packages.size(); ++i) {
-                const auto& cp = cpp_packages[i];
-                const auto& rp = packages[i];
-                match = (cp.title_id == rp.title_id) && (cp.version == rp.version) &&
-                        (cp.kind == rp.kind) && (cp.standalone_update == rp.standalone_update) &&
-                        (cp.root_dir == rp.root_dir) && (cp.exefs_dir == rp.exefs_dir) &&
-                        (cp.romfs_dir == rp.romfs_dir) && (cp.meta_offset == rp.meta_offset) &&
-                        (cp.meta_size == rp.meta_size) && (cp.npdm == rp.npdm) &&
-                        (cp.title_name == rp.title_name) && (cp.publisher == rp.publisher) &&
-                        (cp.source_dump == rp.source_dump) &&
-                        (cp.localized_titles == rp.localized_titles) && (cp.icon == rp.icon) &&
-                        (cp.localized_icons == rp.localized_icons) &&
-                        (cp.display_version == rp.display_version);
-            }
-        }
-
-        toc_offset = cpp_toc_offset;
-        toc_size = cpp_toc_size;
-        blob_offset = cpp_blob_offset;
-        file_size = cpp_file_size;
-        status = cpp_status;
-        packages = std::move(cpp_packages);
-        dirs = std::move(cpp_dirs);
-        files = std::move(cpp_files);
-        children = std::move(cpp_children);
-
-        if (!match) {
-            LOG_CRITICAL(Loader, "NUP Parse() differential mismatch: cpp_ok={} rust_ok={}", cpp_ok,
-                         rust_ok);
-            status = Loader::ResultStatus::ErrorNUPBadFormat;
-            return false;
-        }
-        return cpp_ok;
-    }
-    return ParseCpp();
-}
-
-bool NupContainer::ParseRust() {
-    if (file == nullptr) {
-        status = Loader::ResultStatus::ErrorNullFile;
-        return false;
-    }
-    const auto vfs = MakeNupVfsOps(file);
-    ScopedNupContainer parsed{};
-    if (egl_nup_container_parse(&vfs, &parsed.raw) != 0) {
-        status = Loader::ResultStatus::ErrorNUPBadFormat;
-        return false;
-    }
-
-    toc_offset = parsed.raw.toc_offset;
-    toc_size = parsed.raw.toc_size;
-    blob_offset = parsed.raw.blob_offset;
-    file_size = parsed.raw.file_size;
-
-    packages.clear();
-    packages.reserve(parsed.raw.package_count);
-    for (std::size_t i = 0; i < parsed.raw.package_count; ++i) {
-        const auto& src = parsed.raw.packages[i];
-        PackageInfo dst{};
-        dst.title_id = src.title_id;
-        dst.version = src.version;
-        dst.kind = static_cast<PackageKind>(src.kind);
-        dst.standalone_update = src.standalone_update != 0;
-        dst.root_dir = src.root_dir;
-        dst.exefs_dir = src.exefs_dir;
-        dst.romfs_dir = src.romfs_dir;
-        dst.meta_offset = src.meta_offset;
-        dst.meta_size = src.meta_size;
-        dst.npdm = CopyRustBytes(src.npdm);
-        dst.title_name = CopyRustStr(src.title_name);
-        dst.publisher = CopyRustStr(src.publisher);
-        dst.source_dump = CopyRustStr(src.source_dump);
-        dst.localized_titles.reserve(src.localized_title_count);
-        for (std::size_t j = 0; j < src.localized_title_count; ++j) {
-            dst.localized_titles.emplace_back(CopyRustStr(src.localized_titles[j].lang),
-                                              CopyRustStr(src.localized_titles[j].value));
-        }
-        dst.icon = CopyRustBytes(src.icon);
-        dst.localized_icons.reserve(src.localized_icon_count);
-        for (std::size_t j = 0; j < src.localized_icon_count; ++j) {
-            dst.localized_icons.emplace_back(CopyRustStr(src.localized_icons[j].lang),
-                                             CopyRustBytes(src.localized_icons[j].data));
-        }
-        dst.display_version = CopyRustStr(src.display_version);
-        packages.push_back(std::move(dst));
-    }
-
-    dirs.clear();
-    dirs.reserve(parsed.raw.dir_count);
-    for (std::size_t i = 0; i < parsed.raw.dir_count; ++i) {
-        dirs.push_back(DirNode{
-            .name = CopyRustStr(parsed.raw.dirs[i].name),
-            .first_child = parsed.raw.dirs[i].first_child,
-            .child_count = parsed.raw.dirs[i].child_count,
-        });
-    }
-
-    files.clear();
-    files.reserve(parsed.raw.file_count);
-    for (std::size_t i = 0; i < parsed.raw.file_count; ++i) {
-        FileNode node{};
-        node.name = CopyRustStr(parsed.raw.files[i].name);
-        node.size = parsed.raw.files[i].size;
-        std::memcpy(node.sha256.data(), parsed.raw.files[i].sha256, 0x20);
-        node.extent_offset = parsed.raw.files[i].extent_offset;
-        node.extent_size = parsed.raw.files[i].extent_size;
-        node.codec = parsed.raw.files[i].codec;
-        files.push_back(std::move(node));
-    }
-
-    children.assign(parsed.raw.children, parsed.raw.children + parsed.raw.child_count);
-    exefs_dir_cache.resize(packages.size());
-    romfs_dir_cache.resize(packages.size());
-    return true;
-}
-
-bool NupContainer::ParseCpp() {
-#endif
     if (file->GetSize() < SuperblockSize) {
         status = Loader::ResultStatus::ErrorNUPBadFormat;
         return false;
@@ -831,6 +509,7 @@ bool NupContainer::ParseCpp() {
         std::memcpy(&record, base + pos, sizeof(record));
         pos += FileRecordSize;
         if (record.codec > CodecZstd || record.codec_flags != 0 ||
+            (record.codec == CodecRaw && record.extent_size != record.size) ||
             (record.size == 0 && (record.extent_offset != 0 || record.extent_size != 0)) ||
             (record.size != 0 &&
              (record.extent_size == 0 || record.extent_offset < blob_offset ||
@@ -880,6 +559,7 @@ bool NupContainer::ValidateDirTree() const {
         u32 next;
     };
     std::vector<u8> state(dirs.size(), Unvisited);
+    std::vector<bool> has_parent(dirs.size());
     std::vector<u32> height(dirs.size(), 0);
     std::vector<Frame> stack;
     for (u32 start = 0; start < dirs.size(); ++start) {
@@ -909,6 +589,11 @@ bool NupContainer::ValidateDirTree() const {
                 LOG_ERROR(Loader, "NUP directory tree contains a cycle");
                 return false;
             }
+            if (has_parent[child]) {
+                LOG_ERROR(Loader, "NUP directory tree contains a shared directory");
+                return false;
+            }
+            has_parent[child] = true;
             if (state[child] == Done) {
                 height[frame.dir] = std::max(height[frame.dir], height[child] + 1);
             } else {
@@ -1160,28 +845,11 @@ std::vector<u8> NupContainer::ReadExtentRaw(const FileNode& node) const {
 
 Loader::ResultStatus NupContainer::VerifyIntegrity(
     std::function<bool(std::size_t, std::size_t)> progress_callback) const {
-#ifdef EGLANTINE_ENABLE_RUST_NUP
-    const auto mode = GetRustNupBackendMode();
-    if (mode == RustNupBackendMode::Rust) {
-        const auto vfs = MakeNupVfsOps(file);
-        const auto zstd = MakeContainerZstdOps();
-        VerifyProgressBridgeCtx bridge_ctx{&progress_callback};
-        const int rc = egl_nup_verify_integrity(&vfs, &zstd,
-                                                progress_callback ? &VerifyProgressBridge : nullptr,
-                                                progress_callback ? &bridge_ctx : nullptr);
-        return rc == 0 ? Loader::ResultStatus::Success
-                       : Loader::ResultStatus::ErrorIntegrityVerificationFailed;
-    }
-#endif
     const std::size_t total = files.size();
-    Loader::ResultStatus cpp_result = Loader::ResultStatus::Success;
-    bool user_cancelled = false;
     for (std::size_t i = 0; i < total; ++i) {
         const FileNode& node = files[i];
         std::vector<u8> content;
-        if (node.size == 0) {
-            content = ReadExtentRaw(node);
-        } else if (node.codec == CodecRaw) {
+        if (node.size == 0 || node.codec == CodecRaw) {
             content = ReadExtentRaw(node);
         } else {
             NupVfsFile view(file, node.extent_offset, node.extent_size, node.size, node.name,
@@ -1190,36 +858,18 @@ Loader::ResultStatus NupContainer::VerifyIntegrity(
         }
         if (content.size() != node.size) {
             LOG_ERROR(Loader, "NUP integrity check failed for {}: short read", node.name);
-            cpp_result = Loader::ResultStatus::ErrorIntegrityVerificationFailed;
-            break;
+            return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
         }
         std::array<u8, 0x20> hash{};
         if (!Sha256(content.data(), content.size(), hash) || hash != node.sha256) {
             LOG_ERROR(Loader, "NUP integrity check failed for {}: SHA-256 mismatch", node.name);
-            cpp_result = Loader::ResultStatus::ErrorIntegrityVerificationFailed;
-            break;
+            return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
         }
         if (progress_callback && !progress_callback(i + 1, total)) {
-            user_cancelled = true;
-            cpp_result = Loader::ResultStatus::ErrorIntegrityVerificationFailed;
-            break;
-        }
-    }
-#ifdef EGLANTINE_ENABLE_RUST_NUP
-    if (mode == RustNupBackendMode::Verify && !user_cancelled) {
-        const auto vfs = MakeNupVfsOps(file);
-        const auto zstd = MakeContainerZstdOps();
-        const int rc = egl_nup_verify_integrity(&vfs, &zstd, nullptr, nullptr);
-        const auto rust_result = rc == 0 ? Loader::ResultStatus::Success
-                                         : Loader::ResultStatus::ErrorIntegrityVerificationFailed;
-        if (rust_result != cpp_result) {
-            LOG_CRITICAL(Loader, "NUP VerifyIntegrity mismatch: cpp={} rust={}",
-                         static_cast<int>(cpp_result), static_cast<int>(rust_result));
             return Loader::ResultStatus::ErrorIntegrityVerificationFailed;
         }
     }
-#endif
-    return cpp_result;
+    return Loader::ResultStatus::Success;
 }
 
 } // namespace FileSys

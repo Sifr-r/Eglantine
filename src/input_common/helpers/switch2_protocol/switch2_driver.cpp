@@ -329,20 +329,18 @@ bool Switch2Driver::WriteCommandChecked(u8 cmd_id, u8 subcmd_id, std::span<const
         return false;
     }
 
-    if (resp.size() < 8U || resp[0] != cmd_id) {
-        return false;
-    }
-    if (is_ble && resp[1] != 0x01U) {
+    const auto response_payload = ParseCommandResponse(resp, cmd_id, is_ble);
+    if (!response_payload) {
         return false;
     }
 
-    out_payload.assign(resp.begin() + 8, resp.end());
+    out_payload.assign(response_payload->begin(), response_payload->end());
     return true;
 }
 
 bool Switch2Driver::ReadMemory(u8 length, u32 address, std::vector<u8>& out_data) {
     out_data.clear();
-    if (length == 0U || length > 0x4FU) {
+    if (!IsValidMemoryReadLength(length)) {
         return false;
     }
 
@@ -352,21 +350,12 @@ bool Switch2Driver::ReadMemory(u8 length, u32 address, std::vector<u8>& out_data
         return false;
     }
 
-    const std::size_t expected_min_size = 8U + static_cast<std::size_t>(length);
-    if (payload.size() < expected_min_size || payload[0] != length) {
+    const auto data = ParseMemoryReadResponse(payload, length, address);
+    if (!data) {
         return false;
     }
 
-    const u32 resp_addr = static_cast<u32>(payload[4]) | (static_cast<u32>(payload[5]) << 8) |
-                          (static_cast<u32>(payload[6]) << 16) |
-                          (static_cast<u32>(payload[7]) << 24);
-    if (resp_addr != address) {
-        return false;
-    }
-
-    const auto begin_it = payload.begin() + 8;
-    const auto end_it = begin_it + static_cast<std::ptrdiff_t>(length);
-    out_data.assign(begin_it, end_it);
+    out_data.assign(data->begin(), data->end());
     return true;
 }
 

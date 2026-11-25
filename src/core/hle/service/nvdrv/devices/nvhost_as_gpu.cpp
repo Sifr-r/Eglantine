@@ -73,6 +73,17 @@ nvhost_as_gpu::~nvhost_as_gpu() {
 }
 
 void nvhost_as_gpu::DrainGpuCallbacks() {
+    // Tegra::GPU::RunInOrder always executes on the GPU thread (even in non-async GPU mode), and
+    // Tegra::GPU does not expose whether that thread is stopped or unstarted. Check the stop token
+    // and shutdown state before queueing, then bound the wait to 5 s with stop-token early wake.
+    const auto stop_token = system.GetEmulationStopToken();
+    const auto is_shutting_down = [&] {
+        return system.IsShuttingDown() && !system.IsPoweredOn();
+    };
+    if (stop_token.stop_requested() || is_shutting_down()) {
+        return;
+    }
+
     struct DrainState {
         std::mutex mutex;
         std::condition_variable cv;
@@ -88,7 +99,7 @@ void nvhost_as_gpu::DrainGpuCallbacks() {
         }
         state->cv.notify_all();
     });
-    std::stop_callback wake{system.GetEmulationStopToken(), [state] {
+    std::stop_callback wake{stop_token, [state] {
                                 {
                                     std::scoped_lock lk{state->mutex};
                                     state->stopped = true;
@@ -98,9 +109,7 @@ void nvhost_as_gpu::DrainGpuCallbacks() {
     // Wait for it, but not forever: a stuck GPU thread must not hang the emulator here.
     std::unique_lock lk{state->mutex};
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
-    const auto aborted = [&] {
-        return state->stopped || (system.IsShuttingDown() && !system.IsPoweredOn());
-    };
+    const auto aborted = [&] { return state->stopped || is_shutting_down(); };
     if (!state->cv.wait_until(lk, deadline, [&] { return state->done || aborted(); }) &&
         !aborted()) {
         LOG_ERROR(Service_NVDRV,

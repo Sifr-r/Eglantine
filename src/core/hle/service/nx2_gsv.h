@@ -426,6 +426,46 @@ private:
     std::shared_ptr<SharedState> m_shared = std::make_shared<SharedState>();
 };
 
+namespace Detail {
+
+template <typename EnqueueFn, typename ShutdownFn>
+[[nodiscard]] inline bool WaitForGpuCallbackDrain(std::stop_token stop_token,
+                                                  std::chrono::milliseconds timeout,
+                                                  EnqueueFn&& enqueue,
+                                                  ShutdownFn&& is_shutting_down) {
+    if (stop_token.stop_requested() || is_shutting_down()) {
+        return true;
+    }
+    struct DrainState {
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool done{};
+        bool stopped{};
+    };
+    auto state = std::make_shared<DrainState>();
+    enqueue([state] {
+        {
+            std::scoped_lock lk{state->mutex};
+            state->done = true;
+        }
+        state->cv.notify_all();
+    });
+    std::stop_callback wake{std::move(stop_token), [state] {
+                                {
+                                    std::scoped_lock lk{state->mutex};
+                                    state->stopped = true;
+                                }
+                                state->cv.notify_all();
+                            }};
+    std::unique_lock lk{state->mutex};
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto aborted = [&] { return state->stopped || is_shutting_down(); };
+    return state->cv.wait_until(lk, deadline, [&] { return state->done || aborted(); }) ||
+           aborted();
+}
+
+} // namespace Detail
+
 // Placeholder for the Switch 2 GPU session (nn::gpu::sdk), handed out by gsv 497.
 // - TIPC 11: [first, last] id range (first <= min(last, 64)); ids outside it are masked out.
 // - TIPC 12(id): event handle for that id (handle at word 3, result at word 4); the SDK attaches
@@ -516,37 +556,15 @@ public:
 
 private:
     // Lets the callbacks queued for the GPU thread run before the session is gone.
+    // Tegra::GPU::RunInOrder always executes on the GPU thread (even in non-async GPU mode), and
+    // Tegra::GPU does not expose whether that thread is stopped or unstarted. Check the stop token
+    // and shutdown state before queueing, then bound the wait to 5 s with stop-token early wake.
     void DrainGpuCallbacks() {
-        struct DrainState {
-            std::mutex mutex;
-            std::condition_variable cv;
-            bool done{};
-            bool stopped{};
-        };
-        auto state = std::make_shared<DrainState>();
-        // The GPU thread runs the queued callbacks in order, so this one is the last.
-        system.GPU().RunInOrder([state] {
-            {
-                std::scoped_lock lk{state->mutex};
-                state->done = true;
-            }
-            state->cv.notify_all();
-        });
-        std::stop_callback wake{system.GetEmulationStopToken(), [state] {
-                                    {
-                                        std::scoped_lock lk{state->mutex};
-                                        state->stopped = true;
-                                    }
-                                    state->cv.notify_all();
-                                }};
-        // Wait for it, but not forever: a stuck GPU thread must not hang the emulator here.
-        std::unique_lock lk{state->mutex};
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{5};
-        const auto aborted = [&] {
-            return state->stopped || (system.IsShuttingDown() && !system.IsPoweredOn());
-        };
-        if (!state->cv.wait_until(lk, deadline, [&] { return state->done || aborted(); }) &&
-            !aborted()) {
+        const bool finished_or_aborted = Detail::WaitForGpuCallbackDrain(
+            system.GetEmulationStopToken(), std::chrono::seconds{5},
+            [&](std::function<void()> cb) { system.GPU().RunInOrder(std::move(cb)); },
+            [&] { return system.IsShuttingDown() && !system.IsPoweredOn(); });
+        if (!finished_or_aborted) {
             LOG_ERROR(Service, "nx2:gpu callbacks did not finish in time");
         }
     }

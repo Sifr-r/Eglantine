@@ -10,13 +10,15 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -404,6 +406,70 @@ TEST_CASE("NUP rejects a directory that contains its own ancestor", "[nup]") {
             }) == Loader::ResultStatus::ErrorNUPBadFormat);
 }
 
+TEST_CASE("NUP validates directory ownership and raw extent sizes", "[nup]") {
+    const auto archive_status = [](std::initializer_list<std::pair<u32, u32>> dirs,
+                                   std::initializer_list<u32> children, size_t raw_size = 0,
+                                   size_t extent_size = 0) {
+        constexpr size_t toc = 0x80;
+        constexpr size_t first_dir = toc + 0x30 + 0x40;
+        const size_t first_file = first_dir + dirs.size() * 0x18;
+        const size_t first_child = first_file + (raw_size != 0 ? 0x50 : 0);
+        const size_t toc_end = first_child + children.size() * sizeof(u32);
+        const size_t blob_offset = (toc_end + 15) & ~size_t{15};
+        std::string nup(blob_offset + extent_size, '\0');
+
+        nup.replace(0, 4, "NUP\x01");
+        SetLe(nup, 0x04, toc, 2);
+        SetLe(nup, 0x06, 1, 2);
+        SetLe(nup, 0x08, toc, 8);
+        SetLe(nup, 0x10, toc_end - toc, 8);
+        SetLe(nup, 0x38, blob_offset, 8);
+        SetLe(nup, 0x40, nup.size(), 8);
+        SetLe(nup, 0x48, 1, 4);
+
+        nup.replace(toc, 4, "TOC\x01");
+        SetLe(nup, toc + 0x04, 1, 4);
+        SetLe(nup, toc + 0x08, dirs.size(), 8);
+        SetLe(nup, toc + 0x10, raw_size != 0, 8);
+        SetLe(nup, toc + 0x18, toc_end - toc, 8);
+        size_t pos = first_dir;
+        for (const auto& [start, count] : dirs) {
+            SetLe(nup, pos + 0x08, start, 4);
+            SetLe(nup, pos + 0x0C, count, 4);
+            pos += 0x18;
+        }
+        if (raw_size != 0) {
+            SetLe(nup, first_file + 0x08, raw_size, 8);
+            SetLe(nup, first_file + 0x10, blob_offset, 8);
+            SetLe(nup, first_file + 0x18, extent_size, 8);
+        }
+        pos = first_child;
+        for (const u32 child : children) {
+            SetLe(nup, pos, child, sizeof(child));
+            pos += sizeof(child);
+        }
+        return StatusAfterPatch(std::move(nup), [](std::string&, u64) {});
+    };
+
+    SECTION("an unreferenced directory tree can point to an earlier record") {
+        CHECK(archive_status({{0, 0}, {0, 0}, {0, 1}}, {1}) ==
+              Loader::ResultStatus::Success);
+    }
+    SECTION("a directory cannot appear under two parents") {
+        CHECK(archive_status({{0, 2}, {2, 1}, {3, 1}, {0, 0}}, {1, 2, 3, 3}) ==
+              Loader::ResultStatus::ErrorNUPBadFormat);
+    }
+    SECTION("directories outside the package tree cannot form a cycle") {
+        CHECK(archive_status({{0, 0}, {0, 1}, {1, 1}}, {2, 1}) ==
+              Loader::ResultStatus::ErrorNUPBadFormat);
+    }
+    SECTION("the size of a raw extent must match its file record") {
+        CHECK(archive_status({{0, 1}}, {1}, 32, 64) == Loader::ResultStatus::ErrorNUPBadFormat);
+        CHECK(archive_status({{0, 1}}, {1}, 64, 32) == Loader::ResultStatus::ErrorNUPBadFormat);
+        CHECK(archive_status({{0, 1}}, {1}, 32, 32) == Loader::ResultStatus::Success);
+    }
+}
+
 TEST_CASE("NUP marks updates standalone when the dump has no base", "[nup]") {
     TempDir t;
     const auto root = t.path / "Game";
@@ -546,6 +612,31 @@ TEST_CASE("NUP output is reproducible", "[nup]") {
     REQUIRE(hex == "718231e0974ca04c7be7bd6ed4334015b777c6e5f1ed51de23f899f81ee004ab");
 }
 
+TEST_CASE("NUP cancellation before publication leaves the dump intact", "[nup]") {
+    using namespace FileSys::Nup;
+    TempDir t;
+    const auto dump = t.path / "Game";
+    MakeDump(dump);
+    const auto sources = SourceTree(dump);
+    const auto archive = t.path / "Game.nup";
+    std::atomic_bool cancel{true};
+    CHECK(PackDump(dump, archive, {}, {}, &cancel) == PackResult::Cancelled);
+
+    cancel = false;
+    CHECK(PackDump(
+              dump, archive, {},
+              [&](const PackProgress& progress) {
+                  if (progress.files_done == progress.files_total) {
+                      cancel = true;
+                  }
+              },
+              &cancel) == PackResult::Cancelled);
+    CHECK_FALSE(fs::exists(archive));
+    CHECK_FALSE(fs::exists(archive.string() + ".part"));
+    CHECK_FALSE(fs::exists(archive.string() + ".journal"));
+    CHECK(SourceTree(dump) == sources);
+}
+
 TEST_CASE("NUP writes metadata overrides to the base and the newest update", "[nup]") {
     TempDir t;
     const auto root = t.path / "Game";
@@ -584,6 +675,7 @@ TEST_CASE("NUP probes the version from the game data list tag", "[nup]") {
     Put(root / "base/exefs/main", "main");
     Put(root / "base/exefs/main.npdm", Npdm(TitleId));
     Put(root / "base/romfs/GameData/GameDataList.Product.100.byml.zs", "x");
+    Put(root / "base/romfs/GameData/GameDataList.Product.99x.byml.zs", "x");
     Put(root / "base/romfs/System/Resource/ResourceSizeTable.Product.rsizetable.zs", "x");
     Put(root / "updates/458752/exefs/main", "main");
     Put(root / "updates/458752/exefs/main.npdm", Npdm(TitleId));
@@ -1210,182 +1302,63 @@ TEST_CASE("ParseLaunchParams preserves non-ASCII UTF-8 paths across options and 
 #endif
 }
 
-TEST_CASE("NUP roundtrip and Rust FFI differential parity", "[nup]") {
+TEST_CASE("NUP large archive roundtrip preserves bytes and metadata", "[nup]") {
     using namespace FileSys::Nup;
 
-    const auto roundtrip_check = [&](const std::string& expected_repro_sha,
-                                     bool check_scratch_preservation = false) {
-        TempDir t;
-        const auto root = t.path / "Game";
-        MakeDump(root);
-        Put(root / "Base/RomFS/large.bin", [] {
-            std::string data(20 * 1024 * 1024, '\0');
-            u32 x = 1;
-            for (auto& c : data) {
-                x = x * 1664525 + 1013904223;
-                c = static_cast<char>('a' + (x >> 28));
-            }
-            return data;
-        }());
-
-        REQUIRE(IsLooseDump(root));
-        const auto resolved_root = DumpRootFromMain(root / "Base/ExeFS/main");
-        REQUIRE(resolved_root.has_value());
-
-        const auto meta = ProbeMetadata(root);
-        REQUIRE(meta.display_version == "1.1.0");
-        REQUIRE(meta.version_source == "update 65536");
-
-        const auto archive = t.path / "Game.nup";
-        const auto legacy_archive = t.path / "Game.nup.rust_verify_tmp";
-        const auto legacy_part = t.path / "Game.nup.rust_verify_tmp.part";
-        const auto legacy_journal = t.path / "Game.nup.rust_verify_tmp.journal";
-        if (check_scratch_preservation) {
-            Put(legacy_archive, "existing archive");
-            Put(legacy_part, "existing partial archive");
-            Put(legacy_journal, "existing journal");
+    TempDir t;
+    const auto root = t.path / "Game";
+    MakeDump(root);
+    Put(root / "Base/RomFS/large.bin", [] {
+        std::string data(20 * 1024 * 1024, '\0');
+        u32 x = 1;
+        for (auto& c : data) {
+            x = x * 1664525 + 1013904223;
+            c = static_cast<char>('a' + (x >> 28));
         }
-        REQUIRE(PackDump(root, archive) == PackResult::Success);
-        if (check_scratch_preservation) {
-            CHECK(ReadAll(legacy_archive) == "existing archive");
-            CHECK(ReadAll(legacy_part) == "existing partial archive");
-            CHECK(ReadAll(legacy_journal) == "existing journal");
-            Put(legacy_archive, "existing archive before edit");
-            Put(legacy_part, "existing partial archive before edit");
-        }
+        return data;
+    }());
 
-        std::string hex;
-        for (const u8 b : Sha256(ReadAll(archive))) {
-            hex += fmt::format("{:02x}", b);
-        }
-        REQUIRE(hex == expected_repro_sha);
+    REQUIRE(IsLooseDump(root));
+    const auto resolved_root = DumpRootFromMain(root / "Base/ExeFS/main");
+    REQUIRE(resolved_root.has_value());
 
-        {
-            FileSys::RealVfsFilesystem vfs;
-            const auto vf =
-                vfs.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read);
-            REQUIRE(vf != nullptr);
-            REQUIRE(NupContainer::IsNupFile(vf));
-            NupContainer container{vf};
-            REQUIRE(container.GetStatus() == Loader::ResultStatus::Success);
-            REQUIRE(container.VerifyIntegrity({}) == Loader::ResultStatus::Success);
-        }
+    const auto meta = ProbeMetadata(root);
+    REQUIRE(meta.display_version == "1.1.0");
+    REQUIRE(meta.version_source == "update 65536");
 
-        MetadataEdit edit;
-        edit.title_name = "Rust Parity Title";
-        edit.display_version = "2.5.0";
-        REQUIRE(EditNupMetadata(archive, edit) == EditResult::Success);
-        if (check_scratch_preservation) {
-            CHECK(ReadAll(legacy_archive) == "existing archive before edit");
-            CHECK(ReadAll(legacy_part) == "existing partial archive before edit");
-        }
+    const auto archive = t.path / "Game.nup";
+    REQUIRE(PackDump(root, archive) == PackResult::Success);
 
-        const auto updated_meta = ProbeNupMetadata(archive);
-        REQUIRE(updated_meta.title_name == "Rust Parity Title");
-        REQUIRE(updated_meta.display_version == "2.5.0");
-
-        const auto extracted = t.path / "Extracted";
-        const auto legacy_extract_sentinel = t.path / "Extracted.rust_verify_tmp/nested/keep.txt";
-        if (check_scratch_preservation) {
-            Put(legacy_extract_sentinel, "existing extracted data");
-        }
-        REQUIRE(ExtractNup(archive, extracted) == ExtractResult::Success);
-        if (check_scratch_preservation) {
-            CHECK(ReadAll(legacy_extract_sentinel) == "existing extracted data");
-        }
-        REQUIRE(fs::is_regular_file(extracted / "base/exefs/main"));
-        REQUIRE(fs::is_regular_file(extracted / "base/romfs/large.bin"));
-
-        if (check_scratch_preservation) {
-            const auto output_entries = [&] {
-                std::vector<fs::path> names;
-                for (const auto& entry : fs::directory_iterator{t.path}) {
-                    names.push_back(entry.path().filename());
-                }
-                std::sort(names.begin(), names.end());
-                return names;
-            };
-            const auto trailing = t.path / "Trailing";
-            auto expected_entries = output_entries();
-            expected_entries.push_back(trailing.filename());
-            std::sort(expected_entries.begin(), expected_entries.end());
-
-            REQUIRE(ExtractNup(archive, trailing / "") == ExtractResult::Success);
-            CHECK(fs::is_regular_file(trailing / "base/exefs/main"));
-            CHECK(output_entries() == expected_entries);
-        }
-    };
-
-    constexpr auto kExpectedReproSha =
-        "718231e0974ca04c7be7bd6ed4334015b777c6e5f1ed51de23f899f81ee004ab";
-    roundtrip_check(kExpectedReproSha);
-
-#ifdef EGLANTINE_ENABLE_RUST_NUP
-    struct ScopedEnvVar {
-        const char* name;
-        std::optional<std::string> prev;
-        explicit ScopedEnvVar(const char* n, const char* value) : name{n} {
-            if (const char* old = std::getenv(n); old != nullptr) {
-                prev = std::string{old};
-            }
-            Set(value);
-        }
-        ~ScopedEnvVar() {
-            Set(prev ? prev->c_str() : nullptr);
-        }
-        void Set(const char* val) const {
-#ifdef _WIN32
-            _putenv_s(name, val != nullptr ? val : "");
-#else
-            if (val != nullptr) {
-                setenv(name, val, 1);
-            } else {
-                unsetenv(name);
-            }
-#endif
-        }
-    };
-
-    {
-        ScopedEnvVar rust_mode{"EDEN_NX2_RUST_NUP", nullptr};
-        ScopedEnvVar verify_mode{"EDEN_NX2_RUST_NUP_VERIFY", "1"};
-        roundtrip_check(kExpectedReproSha, true);
+    std::string hex;
+    for (const u8 b : Sha256(ReadAll(archive))) {
+        hex += fmt::format("{:02x}", b);
     }
+    REQUIRE(hex == "718231e0974ca04c7be7bd6ed4334015b777c6e5f1ed51de23f899f81ee004ab");
 
     {
-        ScopedEnvVar verify_mode{"EDEN_NX2_RUST_NUP_VERIFY", nullptr};
-        ScopedEnvVar rust_mode{"EDEN_NX2_RUST_NUP", "1"};
-        roundtrip_check(kExpectedReproSha);
-
-        // Also test cancel + journal resume with delete_sources under Rust backend.
-        TempDir rt;
-        const auto dump = rt.path / "ResumeGame";
-        MakeDump(dump);
-        const auto archive = rt.path / "ResumeGame.nup";
-        PackOptions opts;
-        opts.delete_sources = true;
-        opts.chunk_bytes = 1;
-        std::atomic_bool cancel{false};
-        const auto cancelled = PackDump(
-            dump, archive, opts,
-            [&](const PackProgress& p) {
-                if (p.files_done >= 3) {
-                    cancel.store(true, std::memory_order_relaxed);
-                }
-            },
-            &cancel);
-        REQUIRE(cancelled == PackResult::Cancelled);
-        REQUIRE(HasResumableJournal(archive));
-        REQUIRE(PackDump(dump, archive, opts) == PackResult::Success);
-        REQUIRE_FALSE(HasResumableJournal(archive));
         FileSys::RealVfsFilesystem vfs;
-        const auto vf = vfs.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read);
+        const auto vf =
+            vfs.OpenFile(Common::FS::PathToUTF8String(archive), FileSys::OpenMode::Read);
         REQUIRE(vf != nullptr);
-        NupContainer resumed{vf};
-        REQUIRE(resumed.GetStatus() == Loader::ResultStatus::Success);
-        REQUIRE(resumed.VerifyIntegrity({}) == Loader::ResultStatus::Success);
+        REQUIRE(NupContainer::IsNupFile(vf));
+        NupContainer container{vf};
+        REQUIRE(container.GetStatus() == Loader::ResultStatus::Success);
+        REQUIRE(container.VerifyIntegrity({}) == Loader::ResultStatus::Success);
     }
-#endif
+
+    MetadataEdit edit;
+    edit.title_name = "Edited Title";
+    edit.display_version = "2.5.0";
+    REQUIRE(EditNupMetadata(archive, edit) == EditResult::Success);
+
+    const auto updated_meta = ProbeNupMetadata(archive);
+    REQUIRE(updated_meta.title_name == "Edited Title");
+    REQUIRE(updated_meta.display_version == "2.5.0");
+
+    const auto extracted = t.path / "Extracted";
+    REQUIRE(ExtractNup(archive, extracted / "") == ExtractResult::Success);
+    REQUIRE(fs::is_regular_file(extracted / "base/exefs/main"));
+    REQUIRE(fs::is_regular_file(extracted / "base/romfs/large.bin"));
 }
 
 TEST_CASE("NUP boots the program that matches its base", "[nup][boot-inputs]") {
@@ -1435,4 +1408,427 @@ TEST_CASE("NUP boots the program that matches its base", "[nup][boot-inputs]") {
     u64 program_id{};
     REQUIRE(loader.ReadProgramId(program_id) == Loader::ResultStatus::Success);
     CHECK(program_id == edition_program);
+}
+
+TEST_CASE("NUP recovery from malformed journals, destructive pack, and legacy archives", "[nup]") {
+    using namespace FileSys::Nup;
+
+    const auto copy_dump = [](const fs::path& src, const fs::path& dst) {
+        fs::create_directories(dst);
+        fs::copy(src, dst, fs::copy_options::recursive);
+    };
+
+    const auto run_malformed_journal_suite = [&]() {
+        TempDir t;
+        const auto template_dump = t.path / "template" / "Game";
+        MakeDump(template_dump);
+        const auto ref_archive = t.path / "ref.nup";
+        REQUIRE(PackDump(template_dump, ref_archive) == PackResult::Success);
+        const auto ref_bytes = ReadAll(ref_archive);
+
+        const auto make_partial_run = [&](const fs::path& work_dir, const fs::path& archive,
+                                          std::string& out_plan_line,
+                                          std::vector<std::string>& out_ckpt_lines) {
+            copy_dump(template_dump, work_dir);
+            PackOptions opts{.delete_sources = true, .chunk_bytes = 1};
+            std::atomic_bool cancel{false};
+            REQUIRE(PackDump(
+                        work_dir, archive, opts,
+                        [&](const PackProgress& p) {
+                            if (p.files_done >= 3) {
+                                cancel.store(true, std::memory_order_relaxed);
+                            }
+                        },
+                        &cancel) == PackResult::Cancelled);
+            const auto journal_text = ReadAll(archive.string() + ".journal");
+            std::vector<std::string> lines;
+            size_t pos = 0;
+            while (pos < journal_text.size()) {
+                const auto nl = journal_text.find('\n', pos);
+                if (nl == std::string::npos) {
+                    break;
+                }
+                lines.push_back(journal_text.substr(pos, nl - pos));
+                pos = nl + 1;
+            }
+            REQUIRE(lines.size() >= 2);
+            out_plan_line = lines[0];
+            out_ckpt_lines.assign(lines.begin() + 1, lines.end());
+        };
+
+        // 1. Line 1 truncated (no '\n') and invalid JSON line 1 fall back to a fresh pack.
+        for (const std::string& bad_line1 : {std::string{"{\"format\":\"nup-journal\""},
+                                             std::string{"{not-json\n"}}) {
+            const auto case_name =
+                bad_line1.back() == '\n' ? std::string{"bad_j_json"} : std::string{"bad_j_trunc"};
+            const auto dump = t.path / case_name / "Game";
+            copy_dump(template_dump, dump);
+            const auto archive = t.path / (case_name + ".nup");
+            Put(archive.string() + ".part", "stale");
+            Put(archive.string() + ".journal", bad_line1);
+            PackOptions opts{.delete_sources = true, .chunk_bytes = 1};
+            REQUIRE(PackDump(dump, archive, opts) == PackResult::Success);
+            REQUIRE(ReadAll(archive) == ref_bytes);
+            REQUIRE_FALSE(fs::exists(archive.string() + ".part"));
+            REQUIRE_FALSE(fs::exists(archive.string() + ".journal"));
+        }
+
+        // 2. Corrupt line 1 valid JSON schema must fail with IoError (never silently reset).
+        {
+            const auto dump = t.path / "bad_plan_schema" / "Game";
+            copy_dump(template_dump, dump);
+            const auto archive = t.path / "bad_plan_schema.nup";
+            Put(archive.string() + ".part", "stale");
+            Put(archive.string() + ".journal", "{\"format\":\"wrong\",\"version\":1}\n");
+            PackOptions opts{.delete_sources = true, .chunk_bytes = 1};
+            REQUIRE(PackDump(dump, archive, opts) == PackResult::IoError);
+            REQUIRE_FALSE(fs::exists(archive));
+            REQUIRE(fs::exists(archive.string() + ".part"));
+            REQUIRE(fs::exists(archive.string() + ".journal"));
+            REQUIRE(fs::exists(dump / "Base/ExeFS/main"));
+        }
+
+        // Do not reset an unreadable journal or a valid JSON plan with invalid fields.
+        {
+            const auto dump = t.path / "bad_plan" / "Game";
+            copy_dump(template_dump, dump);
+            const auto archive = t.path / "bad_plan.nup";
+            const auto part = archive.string() + ".part";
+            const auto journal = archive.string() + ".journal";
+            Put(part, "keep partial data");
+            PackOptions opts{.delete_sources = true, .chunk_bytes = 1};
+
+            for (const std::string_view plan : {
+                     R"({"format":"nup-journal","version":1,"packages":[],"entries":[]})",
+                     R"({"format":"nup-journal","version":1.0,"entries":[],)"
+                     R"("packages":[{"kind":0,"flags":0,"title_id":1,"version":0,"meta":""}]})",
+                     R"({"format":"nup-journal","version":1,"packages":{},"entries":[]})",
+                 }) {
+                Put(journal, std::string{plan} + '\n');
+                REQUIRE(PackDump(dump, archive, opts) == PackResult::IoError);
+                REQUIRE(ReadAll(part) == "keep partial data");
+                REQUIRE_FALSE(fs::exists(archive));
+                REQUIRE(fs::exists(dump / "Base/ExeFS/main"));
+            }
+
+            REQUIRE(fs::remove(journal));
+            REQUIRE(fs::create_directory(journal));
+            REQUIRE(PackDump(dump, archive, opts) == PackResult::IoError);
+            REQUIRE(ReadAll(part) == "keep partial data");
+            REQUIRE_FALSE(fs::exists(archive));
+            REQUIRE(fs::exists(dump / "Base/ExeFS/main"));
+        }
+
+        // 3. Torn trailing checkpoint line + oversized .part tail recovers cleanly.
+        for (const std::string& torn_tail :
+             {std::string{"{\"file\":99"}, std::string{"{corrupt-json\n"}, std::string{"\n"}}) {
+            const auto case_name = "torn_" + std::to_string(torn_tail.size());
+            const auto dump = t.path / case_name / "Game";
+            const auto archive = t.path / (case_name + ".nup");
+            std::string plan_line;
+            std::vector<std::string> ckpts;
+            make_partial_run(dump, archive, plan_line, ckpts);
+
+            std::string rewritten = plan_line + "\n";
+            for (const auto& c : ckpts) {
+                rewritten += c + "\n";
+            }
+            rewritten += torn_tail;
+            Put(archive.string() + ".journal", rewritten);
+            {
+                std::ofstream app(archive.string() + ".part", std::ios::binary | std::ios::app);
+                app << std::string(128, '\xAB');
+            }
+            PackOptions opts{.delete_sources = true, .chunk_bytes = 1};
+            std::atomic_bool cancel{false};
+            REQUIRE(PackDump(
+                        dump, archive, opts,
+                        [&](const PackProgress& p) {
+                            if (p.files_done >= ckpts.size() + 2) {
+                                cancel = true;
+                            }
+                        },
+                        &cancel) == PackResult::Cancelled);
+            REQUIRE_FALSE(fs::exists(archive));
+            const auto resumed_journal = ReadAll(archive.string() + ".journal");
+            REQUIRE(static_cast<size_t>(
+                        std::count(resumed_journal.begin(), resumed_journal.end(), '\n')) >
+                    ckpts.size() + 1);
+            REQUIRE(resumed_journal.find(torn_tail, rewritten.size() - torn_tail.size()) !=
+                    rewritten.size() - torn_tail.size());
+            REQUIRE(PackDump(dump, archive, opts) == PackResult::Success);
+            REQUIRE(ReadAll(archive) == ref_bytes);
+        }
+
+        // 4. Valid JSON checkpoint errors must reject with IoError:
+        // missing fields, out-of-range file_index, bad sha256, invalid codec, short .part.
+        {
+            const auto dump = t.path / "bad_ckpt_base";
+            const auto archive = t.path / "bad_ckpt_base.nup";
+            std::string plan_line;
+            std::vector<std::string> ckpts;
+            make_partial_run(dump, archive, plan_line, ckpts);
+            const auto orig_part = ReadAll(archive.string() + ".part");
+            std::string good_first = plan_line + "\n";
+            for (const auto& c : ckpts) {
+                good_first += c + "\n";
+            }
+
+            const auto expect_io_error = [&](const std::string& jcontent, const std::string& pdata) {
+                Put(archive.string() + ".journal", jcontent);
+                Put(archive.string() + ".part", pdata);
+                PackOptions opts{.delete_sources = true, .chunk_bytes = 1};
+                REQUIRE(PackDump(dump, archive, opts) == PackResult::IoError);
+                REQUIRE_FALSE(fs::exists(archive));
+            };
+
+            expect_io_error(good_first + "{\"file\":0}\n", orig_part);
+            expect_io_error(
+                good_first +
+                    "{\"file\":9999,\"size\":1,\"sha256\":\"" + std::string(64, '0') +
+                    "\",\"offset\":1024,\"stored_size\":1,\"codec\":0}\n",
+                orig_part);
+            expect_io_error(
+                good_first +
+                    "{\"file\":0,\"size\":1,\"sha256\":\"deadbeef\",\"offset\":1024,"
+                    "\"stored_size\":1,\"codec\":0}\n",
+                orig_part);
+            expect_io_error(
+                good_first +
+                    "{\"file\":0,\"size\":1,\"sha256\":\"" + std::string(64, '0') +
+                    "\",\"offset\":1024,\"stored_size\":1,\"codec\":2}\n",
+                orig_part);
+            expect_io_error(
+                good_first +
+                    "{\"file\":0,\"size\":10,\"sha256\":\"" + std::string(64, '0') +
+                    "\",\"offset\":1024,\"stored_size\":5,\"codec\":0}\n",
+                orig_part);
+            expect_io_error(
+                good_first +
+                    "{\"file\":0,\"size\":0,\"sha256\":\"" + std::string(64, '0') +
+                    "\",\"offset\":0,\"stored_size\":0,\"codec\":0.5}\n",
+                orig_part);
+            // Offset + stored_size past .part EOF
+            expect_io_error(plan_line + "\n" + ckpts.back() + "\n", orig_part.substr(0, 64));
+
+            REQUIRE(fs::remove(dump / "dlc/0400ABCD00011001/0/romfs/addon.bin"));
+            Put(archive.string() + ".journal", good_first);
+            Put(archive.string() + ".part", orig_part);
+            PackOptions opts{.delete_sources = true, .chunk_bytes = 1};
+            REQUIRE(PackDump(dump, archive, opts) == PackResult::InvalidSource);
+            REQUIRE_FALSE(fs::exists(archive));
+            REQUIRE(HasResumableJournal(archive));
+        }
+    };
+
+    const auto run_destructive_pack_suite = [&]() {
+        TempDir t;
+        const auto template_dump = t.path / "template";
+        MakeDump(template_dump);
+        const auto ref_archive = t.path / "ref.nup";
+        REQUIRE(PackDump(template_dump, ref_archive) == PackResult::Success);
+        const auto ref_bytes = ReadAll(ref_archive);
+
+        // 1. Packing over existing archive fails without touching archive or sources.
+        for (bool del : {false, true}) {
+            const auto dump = t.path / (del ? "exist_del" : "exist_keep");
+            copy_dump(template_dump, dump);
+            const auto archive = t.path / (dump.filename().string() + ".nup");
+            const auto part = archive.string() + ".part";
+            Put(archive, "keep-me");
+            Put(part, "keep partial data");
+            PackOptions opts{.delete_sources = del, .chunk_bytes = 1};
+            REQUIRE(PackDump(dump, archive, opts) == PackResult::IoError);
+            REQUIRE(ReadAll(archive) == "keep-me");
+            REQUIRE(ReadAll(part) == "keep partial data");
+            REQUIRE(fs::exists(dump / "Base/ExeFS/main"));
+        }
+
+        // 2. Mid-chunk cancel leaves .journal clean, then resume produces exact archive & keeps root.
+        {
+            const auto dump = t.path / "clean_cancel";
+            Put(dump / "base/exefs/main", "main");
+            Put(dump / "base/exefs/main.npdm", Npdm(TitleId));
+            Put(dump / "base/romfs/a.bin", std::string(4096, 'a'));
+            Put(dump / "base/romfs/b.bin", std::string(4096, 'b'));
+            const auto single = t.path / "single.nup";
+            REQUIRE(PackDump(dump, single) == PackResult::Success);
+
+            const auto archive = t.path / "clean_cancel.nup";
+            PackOptions opts{.delete_sources = true, .chunk_bytes = 64ULL * 1024 * 1024};
+            std::atomic_bool cancel{false};
+            REQUIRE(PackDump(
+                        dump, archive, opts,
+                        [&](const PackProgress& p) {
+                            if (p.files_done >= 2) {
+                                cancel.store(true, std::memory_order_relaxed);
+                            }
+                        },
+                        &cancel) == PackResult::Cancelled);
+            REQUIRE(HasResumableJournal(archive));
+            REQUIRE(fs::exists(dump / "base/exefs/main"));
+            const auto jtext = ReadAll(archive.string() + ".journal");
+            REQUIRE(std::count(jtext.begin(), jtext.end(), '\n') == 1);
+
+            REQUIRE(PackDump(dump, archive, opts) == PackResult::Success);
+            REQUIRE_FALSE(HasResumableJournal(archive));
+            REQUIRE(ReadAll(archive) == ReadAll(single));
+            REQUIRE(fs::is_directory(dump));
+            REQUIRE_FALSE(fs::exists(dump / "base"));
+        }
+
+        // 3. Packing onto a directory fails with IoError and preserves destructive state.
+        {
+            const auto dump = t.path / "dir_target_dump";
+            copy_dump(template_dump, dump);
+            const auto archive = t.path / "dir_target.nup";
+            fs::create_directories(archive);
+            PackOptions opts{.delete_sources = true, .chunk_bytes = 1};
+            REQUIRE(PackDump(dump, archive, opts) == PackResult::IoError);
+            REQUIRE(fs::is_directory(archive));
+            REQUIRE(fs::exists(dump / "Base/ExeFS/main"));
+        }
+    };
+
+    const auto run_legacy_archive_suite = [&]() {
+        TempDir t;
+        const auto root = t.path / "LegacyDump";
+        Put(root / "updates/65536/exefs/main", "legacy-main");
+        Put(root / "updates/65536/exefs/main.npdm", Npdm(TitleId));
+        Put(root / "updates/65536/romfs/data.bin", std::string(1024, 'L'));
+        const auto archive = t.path / "Legacy.nup";
+        PackOptions opts;
+        opts.metadata.title_name = "Legacy Title";
+        opts.metadata.display_version = "1.2.3";
+        REQUIRE(PackDump(root, archive, opts) == PackResult::Success);
+
+        // Variant A: Legacy archive with non-zero reserved fields, LocalizedIcons (0x000A),
+        // unknown TLV (0x0077), trailing <8 byte TLV padding, and toc_offset=0x80 (editable).
+        {
+            auto bytes = ReadAll(archive);
+            const u64 toc_off = Le(bytes, 0x08, 8);
+            const u64 toc_sz = Le(bytes, 0x10, 8);
+            const u64 pkg_pos = toc_off + 0x30;
+            const u64 old_meta_off = Le(bytes, pkg_pos + 0x20, 8);
+            const u32 old_meta_sz = static_cast<u32>(Le(bytes, pkg_pos + 0x28, 4));
+            std::string meta = bytes.substr(old_meta_off, old_meta_sz);
+
+            // Append LocalizedIcons (0x000A) + unknown TLV (0x0077) + 3-byte trailing pad.
+            const std::string lang = "en-us";
+            const std::string icon_data = "ICONDATA";
+            std::string loc_payload;
+            loc_payload.push_back(static_cast<char>(lang.size()));
+            loc_payload += lang;
+            loc_payload.resize(loc_payload.size() + 4, '\0');
+            SetLe(loc_payload, loc_payload.size() - 4, icon_data.size(), 4);
+            loc_payload += icon_data;
+            auto append_tlv = [&](u16 type, const std::string& payload) {
+                const size_t at = meta.size();
+                meta.resize(at + 8 + payload.size(), '\0');
+                SetLe(meta, at, type, 2);
+                SetLe(meta, at + 2, 0xBEEF, 2); // non-zero TLV reserved
+                SetLe(meta, at + 4, payload.size(), 4);
+                meta.replace(at + 8, payload.size(), payload);
+            };
+            append_tlv(0x000A, loc_payload);
+            append_tlv(0x0077, "LEGACY_EXTRA");
+            meta.append(3, '\x55'); // trailing <8 byte alignment padding
+
+            bytes.resize(old_meta_off);
+            bytes += meta;
+            SetLe(bytes, pkg_pos + 0x28, meta.size(), 4);
+            // Non-zero reserved fields in superblock, TOC header, package, dir, and file records.
+            SetLe(bytes, 0x06, 0, 2); // older header_version = 0
+            bytes[0x60] = 0x42;
+            SetLe(bytes, toc_off + 0x28, 0x1122334455667788ULL, 8);
+            SetLe(bytes, pkg_pos + 0x1A, 0x1234, 2);
+            SetLe(bytes, pkg_pos + 0x1C, 0x56789ABC, 4);
+            SetLe(bytes, 0x40, bytes.size(), 8);
+            const auto toc_hash = Sha256(std::string_view{bytes}.substr(toc_off, toc_sz));
+            std::copy(toc_hash.begin(), toc_hash.end(), bytes.begin() + 0x18);
+
+            const auto legacy_path = t.path / "LegacyEditable.nup";
+            Put(legacy_path, bytes);
+
+            {
+                FileSys::RealVfsFilesystem real;
+                NupContainer c{real.OpenFile(Common::FS::PathToUTF8String(legacy_path),
+                                             FileSys::OpenMode::Read)};
+                REQUIRE(c.GetStatus() == Loader::ResultStatus::Success);
+                REQUIRE(c.VerifyIntegrity({}) == Loader::ResultStatus::Success);
+                REQUIRE(c.GetPackages().size() == 1);
+                REQUIRE(c.GetPackages()[0].standalone_update);
+                REQUIRE(c.GetPackages()[0].title_name == "Legacy Title");
+                REQUIRE(c.GetPackages()[0].localized_icons.size() == 1);
+                REQUIRE(c.GetPackages()[0].localized_icons[0].first == "en-us");
+            }
+
+            MetadataEdit edit;
+            edit.title_name = "Updated Legacy";
+            REQUIRE(EditNupMetadata(legacy_path, edit) == EditResult::Success);
+            REQUIRE(ProbeNupMetadata(legacy_path).title_name == "Updated Legacy");
+
+            const auto out_dir = t.path / ("Extract_" + std::to_string(bytes.size()));
+            if (fs::exists(out_dir)) {
+                fs::remove_all(out_dir);
+            }
+            REQUIRE(ExtractNup(legacy_path, out_dir) == ExtractResult::Success);
+            REQUIRE(ReadAll(out_dir / "updates/65536/romfs/data.bin") == std::string(1024, 'L'));
+        }
+
+        // Variant B: Extended superblock (header_size = 0x100, toc_offset = 0x100).
+        {
+            auto bytes = ReadAll(archive);
+            const u64 old_toc_off = Le(bytes, 0x08, 8);
+            const u64 toc_sz = Le(bytes, 0x10, 8);
+            const u64 old_blob = Le(bytes, 0x38, 8);
+            const u64 shift = 0x80;
+            const auto toc = bytes.substr(old_toc_off, toc_sz);
+            const auto tail = bytes.substr(old_blob);
+
+            std::string ext(0x100, '\0');
+            std::copy_n(bytes.begin(), 0x80, ext.begin());
+            SetLe(ext, 0x04, 0x100, 2); // extended header_size
+            SetLe(ext, 0x06, 2, 2);     // newer/legacy header_version
+            SetLe(ext, 0x08, old_toc_off + shift, 8);
+            SetLe(ext, 0x38, old_blob + shift, 8);
+
+            std::string new_toc = toc;
+            const u64 pkg_pos = 0x30;
+            const u64 file_count = Le(new_toc, 0x10, 8);
+            const u64 dir_count = Le(new_toc, 0x08, 8);
+            const u64 pkg_count = Le(new_toc, 0x04, 4);
+            for (u64 i = 0; i < pkg_count; ++i) {
+                const u64 off = pkg_pos + i * 0x40 + 0x20;
+                if (Le(new_toc, off, 8) != 0) {
+                    SetLe(new_toc, off, Le(new_toc, off, 8) + shift, 8);
+                }
+            }
+            const u64 files_pos = pkg_pos + pkg_count * 0x40 + dir_count * 0x18;
+            for (u64 i = 0; i < file_count; ++i) {
+                const u64 off = files_pos + i * 0x50 + 0x10;
+                if (Le(new_toc, off, 8) != 0) {
+                    SetLe(new_toc, off, Le(new_toc, off, 8) + shift, 8);
+                }
+            }
+            const auto toc_hash = Sha256(new_toc);
+            std::copy(toc_hash.begin(), toc_hash.end(), ext.begin() + 0x18);
+            const u64 gap = (old_blob + shift) - (0x100 + toc_sz);
+            std::string full = ext + new_toc + std::string(gap, '\0') + tail;
+            SetLe(full, 0x40, full.size(), 8);
+
+            const auto ext_path = t.path / "LegacyExtSuper.nup";
+            Put(ext_path, full);
+            FileSys::RealVfsFilesystem real;
+            NupContainer c{
+                real.OpenFile(Common::FS::PathToUTF8String(ext_path), FileSys::OpenMode::Read)};
+            REQUIRE(c.GetStatus() == Loader::ResultStatus::Success);
+            REQUIRE(c.VerifyIntegrity({}) == Loader::ResultStatus::Success);
+            REQUIRE(c.GetPackages()[0].title_name == "Legacy Title");
+        }
+    };
+
+    run_malformed_journal_suite();
+    run_destructive_pack_suite();
+    run_legacy_archive_suite();
 }

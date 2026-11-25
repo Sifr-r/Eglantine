@@ -3,7 +3,7 @@
 
 use crate::host_tool::{self, Event};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -28,12 +28,29 @@ struct Preferences {
 pub struct Library {
     file: PathBuf,
     preferences: Preferences,
+    entries_by_folder: BTreeMap<PathBuf, FolderScan>,
     entries: Vec<LibraryEntry>,
 }
 
 pub struct LibraryScan {
     folders: BTreeMap<PathBuf, bool>,
     cache: PathBuf,
+}
+
+pub struct LibraryScanResult {
+    folders: BTreeMap<PathBuf, FolderScan>,
+    pub warning: Option<String>,
+}
+
+struct FolderScan {
+    entries: Vec<LibraryEntry>,
+    complete: bool,
+}
+
+impl LibraryScanResult {
+    pub fn is_complete(&self) -> bool {
+        self.folders.values().all(|folder| folder.complete)
+    }
 }
 
 pub fn emulator_data_dir() -> PathBuf {
@@ -97,9 +114,7 @@ impl Library {
             }
             Err(error) => return Err(format!("Could not read {}: {error}", file.display())),
         };
-        let mut library = Self { file, preferences, entries: Vec::new() };
-        library.refresh()?;
-        Ok(library)
+        Ok(Self { file, preferences, entries_by_folder: BTreeMap::new(), entries: Vec::new() })
     }
 
     pub fn entries(&self) -> &[LibraryEntry] { &self.entries }
@@ -111,11 +126,8 @@ impl Library {
         }
         let mut next = self.preferences.clone();
         next.folders.entry(directory).or_insert(true);
-        self.update(next)
-    }
-
-    pub fn refresh(&mut self) -> Result<(), String> {
-        self.entries = scan(&self.preferences)?;
+        Self::save(&self.file, &next)?;
+        self.preferences = next;
         Ok(())
     }
 
@@ -126,18 +138,22 @@ impl Library {
         }
     }
 
-    pub fn apply_metadata(&mut self, metadata: Vec<LibraryEntry>) {
-        for entry in metadata {
-            if let Some(existing) = self.entries.iter_mut().find(|existing| existing.path == entry.path) {
-                existing.title = entry.title;
-                existing.program_id = entry.program_id;
-                if existing.cover.is_none() {
-                    existing.cover = entry.cover;
-                }
+    pub fn apply_metadata(&mut self, metadata: LibraryScanResult) {
+        let mut previous = std::mem::take(&mut self.entries_by_folder);
+        self.entries_by_folder = metadata.folders.into_iter().map(|(folder, scan)| {
+            let latest = if scan.complete {
+                scan
             } else {
-                self.entries.push(entry);
-            }
-        }
+                previous.remove(&folder)
+                    .filter(|prior| prior.complete || !prior.entries.is_empty())
+                    .unwrap_or(scan)
+            };
+            (folder, latest)
+        }).collect();
+        let games: BTreeMap<_, _> = self.entries_by_folder.values()
+            .flat_map(|folder| &folder.entries)
+            .map(|entry| (&entry.path, entry)).collect();
+        self.entries = games.into_values().cloned().collect();
         sort_entries(&mut self.entries, &self.preferences.played);
     }
 
@@ -151,14 +167,6 @@ impl Library {
         Ok(())
     }
 
-    fn update(&mut self, next: Preferences) -> Result<(), String> {
-        let entries = scan(&next)?;
-        Self::save(&self.file, &next)?;
-        self.preferences = next;
-        self.entries = entries;
-        Ok(())
-    }
-
     fn save(file: &Path, preferences: &Preferences) -> Result<(), String> {
         let bytes = serde_json::to_vec_pretty(preferences).map_err(|error| format!("Could not encode library: {error}"))?;
         replace(file, &bytes)
@@ -166,13 +174,20 @@ impl Library {
 }
 
 impl LibraryScan {
-    pub fn read(self) -> (Vec<LibraryEntry>, Option<String>) {
-        let mut entries = BTreeMap::new();
-        let mut failures = Vec::new();
+    pub fn read(self) -> LibraryScanResult {
+        let mut folders = BTreeMap::new();
+        let mut discovery_warning = None;
+        let mut cover_warning = None;
         for (directory, deep) in self.folders {
-            if !directory.is_dir() {
+            let missing = match fs::metadata(&directory) {
+                Ok(metadata) => !metadata.is_dir(),
+                Err(error) => error.kind() == io::ErrorKind::NotFound,
+            };
+            if missing {
+                folders.insert(directory, FolderScan { entries: Vec::new(), complete: true });
                 continue;
             }
+            let mut entries = Vec::new();
             let mut args = vec![OsStr::new("--gpui-library"), directory.as_os_str()];
             if !deep {
                 args.push(OsStr::new("--shallow"));
@@ -188,16 +203,14 @@ impl LibraryScan {
                     }
                     Event::Game { path, title, program_id, icon_hex } => {
                         let path = path.canonicalize().unwrap_or(path);
-                        let cover = icon_hex.as_deref().and_then(|icon| {
-                            match cache_cover(&self.cache, &path, icon) {
-                                Ok(path) => Some(path),
-                                Err(error) => {
-                                    failures.push(error);
-                                    None
-                                }
+                        let cover = match find_cover(&self.cache, &path, icon_hex.as_deref()) {
+                            Ok(cover) => cover,
+                            Err(error) => {
+                                cover_warning.get_or_insert(error);
+                                None
                             }
-                        });
-                        entries.insert(path.clone(), LibraryEntry { title, path, cover, program_id });
+                        };
+                        entries.push(LibraryEntry { title, path, cover, program_id });
                     }
                     _ => return Err("The emulator returned an unexpected library event".into()),
                 }
@@ -209,13 +222,24 @@ impl LibraryScan {
                 Ok(()) if scan_errors > 0 => Some(format!("Couldn't read {scan_errors} entries")),
                 Ok(()) => None,
             };
+            let complete = error.is_none();
             if let Some(error) = error {
-                failures.push(format!("{}: {error}", directory.display()));
+                discovery_warning.get_or_insert_with(|| format!("{}: {error}", directory.display()));
             }
+            folders.insert(directory, FolderScan { entries, complete });
         }
-        let error = failures.into_iter().next();
-        (entries.into_values().collect(), error)
+        LibraryScanResult { folders, warning: discovery_warning.or(cover_warning) }
     }
+}
+
+fn find_cover(cache: &Path, game: &Path, icon: Option<&str>) -> Result<Option<PathBuf>, String> {
+    let sidecar = ["png", "jpg", "jpeg", "webp"].into_iter()
+        .map(|extension| game.with_extension(extension))
+        .find(|path| path.is_file());
+    if sidecar.is_some() {
+        return Ok(sidecar);
+    }
+    icon.map(|data| cache_cover(cache, game, data)).transpose()
 }
 
 fn cache_cover(cache: &Path, game: &Path, hex: &str) -> Result<PathBuf, String> {
@@ -278,49 +302,6 @@ fn qt_folders(ini: &str) -> BTreeMap<PathBuf, bool> {
     folders
 }
 
-fn scan(preferences: &Preferences) -> Result<Vec<LibraryEntry>, String> {
-    let mut pending: Vec<_> = preferences.folders.iter().map(|(path, deep)| (path.clone(), *deep)).collect();
-    let mut seen = BTreeSet::new();
-    let mut games = BTreeSet::new();
-    while let Some((directory, deep)) = pending.pop() {
-        let files = match fs::read_dir(&directory) {
-            Ok(files) => files,
-            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied) => continue,
-            Err(error) => return Err(format!("Could not scan {}: {error}", directory.display())),
-        };
-        let directory = directory.canonicalize().map_err(|error| format!("Could not read {}: {error}", directory.display()))?;
-        if !seen.insert((directory.clone(), deep)) { continue; }
-        if directory.join("main").is_file() && directory.join("main.npdm").is_file() {
-            games.insert(directory.join("main"));
-            continue;
-        }
-        for entry in files {
-            let entry = entry.map_err(|error| format!("Could not scan {}: {error}", directory.display()))?;
-            let file_type = entry.file_type().map_err(|error| format!("Could not read {}: {error}", entry.path().display()))?;
-            let path = directory.join(entry.file_name());
-            if file_type.is_dir() && deep {
-                if !entry.file_name().eq_ignore_ascii_case("romfs") { pending.push((path, true)); }
-            } else if file_type.is_file() && supported(&path) {
-                games.insert(path);
-            }
-        }
-    }
-    let mut entries: Vec<_> = games.into_iter().map(|path| {
-        let title_path = if path.file_name().is_some_and(|name| name == "main") { path.parent().unwrap_or(&path) } else { &path };
-        let title = title_path.file_stem().unwrap_or(title_path.as_os_str()).to_string_lossy().into_owned();
-        let cover = ["png", "jpg", "jpeg", "webp"].into_iter().map(|ext| path.with_extension(ext)).find(|path| path.is_file());
-        LibraryEntry { title, path, cover, program_id: None }
-    }).collect();
-    sort_entries(&mut entries, &preferences.played);
-    Ok(entries)
-}
-
-fn supported(path: &Path) -> bool {
-    path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
-        ["nro", "nso", "nca", "xci", "xcz", "nsp", "nsz", "nup", "kip"].iter().any(|candidate| ext.eq_ignore_ascii_case(candidate))
-    })
-}
-
 fn sort_entries(entries: &mut [LibraryEntry], played: &BTreeMap<PathBuf, u64>) {
     entries.sort_by_cached_key(|entry| (std::cmp::Reverse(played.get(&entry.path).copied()), entry.title.to_lowercase(), entry.path.clone()));
 }
@@ -330,22 +311,123 @@ mod tests {
     use super::*;
 
     #[test]
-    fn library_recurses_deduplicates_and_remembers_played_order() {
+    fn opening_and_adding_folders_only_loads_preferences() {
         let scratch = tempfile::tempdir().unwrap();
         let games = scratch.path().join("games");
-        let nested = games.join("nested");
-        fs::create_dir_all(&nested).unwrap();
-        fs::write(games.join("A.nsp"), []).unwrap();
-        fs::write(nested.join("風.NUP"), []).unwrap();
-        fs::write(games.join("ignored.txt"), []).unwrap();
+        fs::create_dir(&games).unwrap();
+        fs::write(games.join("unvalidated.nsp"), []).unwrap();
         let dir = scratch.path().join("gpui");
         let mut library = Library::open(dir.clone()).unwrap();
-        library.add_folder(games).unwrap();
-        library.add_folder(nested).unwrap();
+        library.add_folder(games.clone()).unwrap();
+        assert!(library.entries().is_empty());
+        let reopened = Library::open(dir).unwrap();
+        assert!(reopened.entries().is_empty());
+        assert_eq!(
+            reopened.metadata_request().folders,
+            BTreeMap::from([(games.canonicalize().unwrap(), true)]),
+        );
+    }
+
+    #[test]
+    fn host_snapshots_replace_entries_and_restore_played_order() {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path().join("gpui");
+        let mut library = Library::open(dir.clone()).unwrap();
+        let folder = scratch.path().join("games");
+        let snapshot = |entries| LibraryScanResult {
+            folders: BTreeMap::from([(folder.clone(), FolderScan { entries, complete: true })]),
+            warning: None,
+        };
+        let entry = |title: &str| LibraryEntry {
+            title: title.into(),
+            path: folder.join(format!("{title}.nro")),
+            cover: None,
+            program_id: None,
+        };
+        let alpha = entry("Alpha");
+        let beta = entry("Beta");
+        library.apply_metadata(snapshot(vec![beta.clone(), alpha.clone()]));
+        assert_eq!(library.entries()[0].path, alpha.path);
+        library.note_played(&beta.path).unwrap();
+        assert_eq!(library.entries()[0].path, beta.path);
+
+        let mut reopened = Library::open(dir).unwrap();
+        reopened.apply_metadata(snapshot(vec![alpha.clone(), beta]));
+        assert_eq!(reopened.entries()[0].title, "Beta");
+        reopened.apply_metadata(snapshot(vec![alpha]));
+        assert_eq!(reopened.entries().len(), 1);
+        assert_eq!(reopened.entries()[0].title, "Alpha");
+        reopened.apply_metadata(snapshot(Vec::new()));
+        assert!(reopened.entries().is_empty());
+    }
+
+    #[test]
+    fn incomplete_discovery_retains_only_the_affected_folder() {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut library = Library::open(scratch.path().join("gpui")).unwrap();
+        let alpha = scratch.path().join("alpha");
+        let beta = scratch.path().join("beta");
+        let entry = |folder: &Path, title: &str| LibraryEntry {
+            title: title.into(),
+            path: folder.join(format!("{title}.nro")),
+            cover: None,
+            program_id: None,
+        };
+
+        let first = LibraryScanResult {
+            folders: BTreeMap::from([
+                (alpha.clone(), FolderScan { entries: vec![entry(&alpha, "Alpha")], complete: true }),
+                (beta.clone(), FolderScan { entries: vec![entry(&beta, "Beta")], complete: true }),
+            ]),
+            warning: None,
+        };
+        library.apply_metadata(first);
         assert_eq!(library.entries().len(), 2);
-        let played = library.entries()[1].path.clone();
-        library.note_played(&played).unwrap();
-        assert_eq!(Library::open(dir).unwrap().entries()[0].path, played);
+
+        let interrupted = LibraryScanResult {
+            folders: BTreeMap::from([
+                (alpha, FolderScan { entries: Vec::new(), complete: true }),
+                (beta.clone(), FolderScan { entries: vec![entry(&beta, "Partial")], complete: false }),
+            ]),
+            warning: Some("The emulator did not finish the scan".into()),
+        };
+        assert!(!interrupted.is_complete());
+        library.apply_metadata(interrupted);
+        assert_eq!(library.entries().len(), 1);
+        assert_eq!(library.entries()[0].title, "Beta");
+
+        let recovered = LibraryScanResult {
+            folders: BTreeMap::from([
+                (beta.clone(), FolderScan { entries: vec![entry(&beta, "New")], complete: true }),
+            ]),
+            warning: Some("Invalid embedded cover".into()),
+        };
+        assert!(recovered.is_complete());
+        library.apply_metadata(recovered);
+        assert_eq!(library.entries().len(), 1);
+        assert_eq!(library.entries()[0].title, "New");
+    }
+
+    #[test]
+    fn sidecar_cover_takes_priority_over_embedded_icon() {
+        let scratch = tempfile::tempdir().unwrap();
+        let cache = scratch.path().join("covers");
+        let game = scratch.path().join("game.nro");
+        let sidecar = game.with_extension("png");
+        fs::write(&sidecar, []).unwrap();
+        assert_eq!(find_cover(&cache, &game, Some("invalid")).unwrap(), Some(sidecar.clone()));
+        assert!(!cache.exists());
+
+        fs::remove_file(sidecar).unwrap();
+        let mut icon = io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut icon, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = icon.into_inner();
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        let cached = find_cover(&cache, &game, Some(&hex)).unwrap().unwrap();
+        assert_eq!(cached.parent(), Some(cache.as_path()));
+        assert_eq!(fs::read(cached).unwrap(), bytes);
     }
 
     #[test]

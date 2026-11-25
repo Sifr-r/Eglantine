@@ -3,30 +3,12 @@
 version = 4
 
 [[package]]
-name = "eglantine_ampere_core"
-version = "0.1.0"
-
-[[package]]
 name = "eglantine_ampere_spirv"
 version = "0.1.0"
-dependencies = [
- "eglantine_ampere_core",
-]
 
 [[package]]
 name = "eglantine_ffi"
 version = "0.1.0"
 dependencies = [
- "eglantine_ampere_core",
  "eglantine_ampere_spirv",
- "eglantine_nup_fs",
- "eglantine_switch2_io",
 ]
-
-[[package]]
-name = "eglantine_nup_fs"
-version = "0.1.0"
-
-[[package]]
-name = "eglantine_switch2_io"
-version = "0.1.0"

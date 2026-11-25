@@ -4,7 +4,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <array>
+#include <chrono>
 #include <stop_token>
+#include <thread>
 
 #include "common/scope_exit.h"
 #include "core/core.h"
@@ -14,6 +16,7 @@
 #include "core/hle/kernel/k_event.h"
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/kernel.h"
+#include "core/hle/service/nx2_gsv.h"
 #include "core/hle/service/os/process.h"
 #include "core/loader/loader.h"
 #include "core/memory/cheat_engine.h"
@@ -192,4 +195,72 @@ TEST_CASE("KAutoObjectWithListContainer Finalize is idempotent and refuses post-
     CHECK_FALSE(event_a.is_linked());
     CHECK_FALSE(event_b.is_linked());
     CHECK(container.GetOwnedCount(nullptr) == 0);
+}
+
+TEST_CASE("Kernel shutdown closes core main, idle, and shutdown threads after ShutdownCores",
+          "[core][shutdown-ordering]") {
+    const ScopedSystemTestContext context;
+    Core::System system;
+    system.Initialize();
+    auto& kernel = system.Kernel();
+    kernel.Initialize();
+
+    REQUIRE(kernel.ObjectListContainer().GetOwnedCount(nullptr) > 0);
+    kernel.ShutdownCores();
+    kernel.Shutdown();
+    CHECK(kernel.ObjectListContainer().GetOwnedCount(nullptr) == 0);
+
+    // Calling Shutdown() again must remain safe without double-closing core threads.
+    CHECK_NOTHROW(kernel.Shutdown());
+}
+
+TEST_CASE("DrainGpuCallbacks wakes early on stop token and bounds wedged GPU waits",
+          "[core][shutdown-ordering]") {
+    SECTION("Pre-stopped token skips queueing and returns immediately") {
+        std::stop_source stop_source;
+        stop_source.request_stop();
+        bool enqueued = false;
+
+        const bool ok = Service::Detail::WaitForGpuCallbackDrain(
+            stop_source.get_token(), std::chrono::seconds{5},
+            [&](auto&&) { enqueued = true; }, [] { return false; });
+
+        CHECK(ok);
+        CHECK_FALSE(enqueued);
+    }
+
+    SECTION("Stop token wakes a wedged wait early") {
+        std::stop_source stop_source;
+        std::jthread stopper([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds{20});
+            stop_source.request_stop();
+        });
+
+        const auto start = std::chrono::steady_clock::now();
+        const bool ok = Service::Detail::WaitForGpuCallbackDrain(
+            stop_source.get_token(), std::chrono::seconds{5}, [](auto&&) {}, [] { return false; });
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+
+        CHECK(ok);
+        CHECK(elapsed < std::chrono::seconds{2});
+    }
+
+    SECTION("Completed callback finishes and returns true") {
+        std::stop_source stop_source;
+        std::jthread worker;
+        const bool ok = Service::Detail::WaitForGpuCallbackDrain(
+            stop_source.get_token(), std::chrono::seconds{5},
+            [&](auto cb) { worker = std::jthread(std::move(cb)); }, [] { return false; });
+
+        CHECK(ok);
+    }
+
+    SECTION("Wedged callback without stop hits the bounded timeout and returns false") {
+        std::stop_source stop_source;
+        const bool ok = Service::Detail::WaitForGpuCallbackDrain(
+            stop_source.get_token(), std::chrono::milliseconds{15}, [](auto&&) {},
+            [] { return false; });
+
+        CHECK_FALSE(ok);
+    }
 }

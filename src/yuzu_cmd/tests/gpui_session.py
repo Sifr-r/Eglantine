@@ -110,6 +110,27 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(rows[1]["title"], self.rom.stem)
         self.assertEqual(rows[1]["format"], "NRO")
 
+    def test_library_scan_depth_and_rejects_invalid_containers(self):
+        directory = self.root / "library discovery"
+        nested = directory / "nested"
+        nested.mkdir(parents=True)
+        root_game = directory / "root.nro"
+        nested_game = nested / "nested.nro"
+        write_homebrew(root_game)
+        write_homebrew(nested_game)
+        (directory / "not-a-game.nup").write_bytes(b"invalid container")
+
+        for options, expected in (
+            (("--shallow",), {root_game.resolve()}),
+            ((), {root_game.resolve(), nested_game.resolve()}),
+        ):
+            result, rows = self.run_cli("--gpui-library", directory, *options)
+            self.assertEqual(result.returncode, 0, (rows, result.stderr))
+            self.assertEqual(rows[-1]["event"], "library_done")
+            self.assertEqual(rows[-1]["scan_errors"], 0)
+            games = [Path(row["path"]) for row in rows if row["event"] == "game"]
+            self.assertCountEqual(games, expected)
+
     def test_library_config_is_read_only(self):
         config = self.root / "préférences.ini"
         original = b"; Read-only settings fixture\n[Controls]\n"

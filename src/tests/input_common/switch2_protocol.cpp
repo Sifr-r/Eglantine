@@ -5,8 +5,8 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
-#include <cstdlib>
 #include <functional>
+#include <limits>
 #include <map>
 #include <span>
 #include <string>
@@ -26,10 +26,6 @@
 #include "input_common/helpers/switch2_protocol/switch2_driver.h"
 #include "input_common/helpers/switch2_protocol/switch2_transport.h"
 #include "input_common/helpers/switch2_protocol/switch2_types.h"
-
-#ifdef EGLANTINE_ENABLE_RUST_SWITCH2_IO
-#include "eglantine_switch2_io.h"
-#endif
 
 using namespace InputCommon::Switch2;
 using namespace std::chrono_literals;
@@ -406,6 +402,8 @@ TEST_CASE("Vibration encoding, report framing, and status conversion", "[switch2
             .hf_amp = 0U,
         };
         REQUIRE(zero_pkt.Encode5Bytes() == std::array<u8, 5>{0x00, 0x00, 0x00, 0x00, 0x00});
+        REQUIRE(VibrationPacketData{}.Encode5Bytes() ==
+                std::array<u8, 5>{0xE1, 0x01, 0x10, 0x0E, 0x00});
 
         const VibrationPacketData known_pkt{
             .lf_freq = 0x155U,
@@ -414,6 +412,14 @@ TEST_CASE("Vibration encoding, report framing, and status conversion", "[switch2
             .hf_amp = 0x301U,
         };
         REQUIRE(known_pkt.Encode5Bytes() == std::array<u8, 5>{0xF0, 0x04, 0x5C, 0x95, 0xAA});
+
+        const VibrationPacketData custom_pkt{
+            .lf_freq = 0x3A5U,
+            .lf_amp = 0x31FU,
+            .hf_freq = 0x2B7U,
+            .hf_amp = 0x1D3U,
+        };
+        REQUIRE(custom_pkt.Encode5Bytes() == std::array<u8, 5>{0xB7, 0x4E, 0x57, 0xFA, 0xC7});
 
         const VibrationPacketData overflow_pkt{
             .lf_freq = 0xFFFFU,
@@ -488,6 +494,18 @@ TEST_CASE("Vibration encoding, report framing, and status conversion", "[switch2
         REQUIRE(clamped_pkt.lf_freq == 448U);
         REQUIRE(clamped_pkt.hf_freq == 120U);
     }
+
+    SECTION("A missing rumble amplitude or frequency produces a neutral value") {
+        const f32 nan = std::numeric_limits<f32>::quiet_NaN();
+        const Common::Input::VibrationStatus status{
+            .low_amplitude = nan,
+            .low_frequency = nan,
+            .high_amplitude = nan,
+            .high_frequency = nan,
+        };
+        REQUIRE(VibrationPacketData::FromVibrationStatus(status).Encode5Bytes() ==
+                VibrationPacketData{}.Encode5Bytes());
+    }
 }
 
 TEST_CASE("BuildCommandPacket and BuildMemoryReadPayload frame BLE vs USB headers", "[switch2]") {
@@ -511,6 +529,43 @@ TEST_CASE("BuildCommandPacket and BuildMemoryReadPayload frame BLE vs USB header
     const auto empty_ble =
         BuildCommandPacket(CommandId::UsbInit, SubCommandId::FeatureInit, std::span<const u8>{}, true);
     REQUIRE(empty_ble == std::vector<u8>{0x03, 0x91, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00});
+}
+
+TEST_CASE("Switch2 command responses validate framing before returning their payload", "[switch2]") {
+    constexpr std::array<u8, 2> payload{0xBE, 0xEF};
+    std::array<u8, 10> frame{CommandId::Memory, 0x01, 0, 0, 0, 0, 0, 0, payload[0], payload[1]};
+    REQUIRE_FALSE(ParseCommandResponse(std::span{frame}.first(7), CommandId::Memory, true));
+    REQUIRE_FALSE(ParseCommandResponse(frame, CommandId::Leds, true));
+
+    const auto ble = ParseCommandResponse(frame, CommandId::Memory, true);
+    REQUIRE(ble);
+    REQUIRE(std::ranges::equal(*ble, payload));
+    frame[1] = 0x00;
+    REQUIRE_FALSE(ParseCommandResponse(frame, CommandId::Memory, true));
+
+    const auto usb = ParseCommandResponse(frame, CommandId::Memory, false);
+    REQUIRE(usb);
+    REQUIRE(std::ranges::equal(*usb, payload));
+}
+
+TEST_CASE("Switch2 memory responses validate length and address", "[switch2]") {
+    constexpr u32 address = MemoryAddress::ControllerInfo;
+    constexpr std::array<u8, 4> data{1, 2, 3, 4};
+    std::array<u8, 13> payload{};
+    payload[0] = static_cast<u8>(data.size());
+    WriteU32LE(payload, 4, address);
+    std::ranges::copy(data, payload.begin() + 8);
+
+    const auto parsed = ParseMemoryReadResponse(payload, 4, address);
+    REQUIRE(parsed);
+    REQUIRE(std::ranges::equal(*parsed, data));
+    REQUIRE_FALSE(ParseMemoryReadResponse(payload, 4, address + 4));
+    REQUIRE_FALSE(ParseMemoryReadResponse(payload, 0, address));
+    REQUIRE_FALSE(ParseMemoryReadResponse(std::array<u8, 90>{}, 0x50, address));
+
+    payload[0] = 5;
+    REQUIRE_FALSE(ParseMemoryReadResponse(payload, 4, address));
+    REQUIRE_FALSE(ParseMemoryReadResponse(std::span{payload}.first(11), 5, address));
 }
 
 TEST_CASE("SignedLoopingDifference16 handles normal deltas and 16-bit wrap-around", "[switch2]") {
@@ -1603,151 +1658,215 @@ TEST_CASE("Switch2Controllers Dual Joy-Con Roll steering handles disconnect, Mer
     }
 }
 
-TEST_CASE("Switch2 protocol codecs match Rust FFI parity", "[switch2]") {
-    const auto exercise_codecs = [] {
-        REQUIRE(FeatureMaskForProduct(ProductId::JoyCon2Left) == FeatureFlags::JoyCon);
-        REQUIRE(FeatureMaskForProduct(ProductId::ProController2) == FeatureFlags::Standard);
+TEST_CASE("Switch2 codecs handle edge cases across reports and calibration", "[switch2]") {
+    REQUIRE(FeatureMaskForProduct(ProductId::JoyCon2Left) == FeatureFlags::JoyCon);
+    REQUIRE(FeatureMaskForProduct(ProductId::JoyCon2Right) == FeatureFlags::JoyCon);
+    REQUIRE(FeatureMaskForProduct(ProductId::ProController2) == FeatureFlags::Standard);
+    REQUIRE(FeatureMaskForProduct(ProductId::NsoGameCube) == FeatureFlags::Standard);
+    REQUIRE(IsSupportedProductId(static_cast<u16>(ProductId::ProController2)));
+    REQUIRE_FALSE(IsSupportedProductId(0x2009U));
+    REQUIRE(ProductIdToControllerType(ProductId::NsoGameCube) == ControllerType::GameCube);
+    REQUIRE(ProductName(ProductId::JoyCon2Left) == "Switch 2 Joy-Con (Left)");
 
-        std::array<u8, MinimumInputReportSize + 1> usb_raw{};
-        usb_raw[0] = CommonReportId;
-        WriteU32LE(usb_raw, 1, 0x11223344U);
-        const auto stripped = StripHidReportId(usb_raw);
-        REQUIRE(stripped.has_value());
-        REQUIRE(stripped->size() == MinimumInputReportSize);
+    // USB HID report stripping error paths + non-CommonReportId handling
+    REQUIRE_FALSE(StripHidReportId(std::span<const u8>{}).has_value());
+    std::array<u8, MinimumInputReportSize> too_short_usb{};
+    REQUIRE_FALSE(StripHidReportId(too_short_usb).has_value());
 
-        std::array<u8, 16> adv{};
-        WriteU16LE(adv, 3, NintendoVendorId);
-        WriteU16LE(adv, 5, static_cast<u16>(ProductId::JoyCon2Right));
-        adv[10] = 0x11;
-        adv[15] = 0x66;
-        const auto ble = ParseBleManufacturerData(adv);
-        REQUIRE(ble.has_value());
-        REQUIRE(ble->product_id == ProductId::JoyCon2Right);
-        REQUIRE_FALSE(ble->is_pairing_mode);
+    std::array<u8, MinimumInputReportSize + 1> usb_raw{};
+    usb_raw[0] = CommonReportId;
+    WriteU32LE(usb_raw, 1, 0x11223344U);
+    const auto stripped = StripHidReportId(usb_raw);
+    REQUIRE(stripped.has_value());
+    REQUIRE(stripped->size() == MinimumInputReportSize);
 
-        std::array<u8, UserCalibrationBlockSize> user_cal{};
-        WriteU16LE(user_cal, 0, UserCalibrationMagic);
-        const auto c_pack = PackStickXY(2050U, 2040U);
-        const auto max_pack = PackStickXY(1450U, 1550U);
-        const auto min_pack = PackStickXY(1400U, 1300U);
-        std::copy(c_pack.begin(), c_pack.end(), user_cal.begin() + 2);
-        std::copy(max_pack.begin(), max_pack.end(), user_cal.begin() + 5);
-        std::copy(min_pack.begin(), min_pack.end(), user_cal.begin() + 8);
-        const auto parsed_user = ParseUserStickCalibration(user_cal);
-        REQUIRE(parsed_user.has_value());
-        REQUIRE(parsed_user->center_x == 2050U);
-        REQUIRE(parsed_user->min_y == 1300U);
+    usb_raw[0] = 0x30U;
+    usb_raw[1] = 0xAAU;
+    const auto stripped_alt = StripHidReportId(usb_raw);
+    REQUIRE(stripped_alt.has_value());
+    REQUIRE(stripped_alt->size() == MinimumInputReportSize);
+    REQUIRE((*stripped_alt)[0] == 0xAAU);
 
-        std::array<u8, 37> cinfo_buf{};
-        cinfo_buf[2] = 'S';
-        cinfo_buf[3] = 'W';
-        cinfo_buf[4] = '2';
-        WriteU16LE(cinfo_buf, 18, NintendoVendorId);
-        WriteU16LE(cinfo_buf, 20, static_cast<u16>(ProductId::NsoGameCube));
-        WriteRgb24(cinfo_buf, 25, 0x123456U);
-        const auto cinfo = ParseControllerInfo(cinfo_buf);
-        REQUIRE(cinfo.has_value());
-        REQUIRE(cinfo->serial_number == "SW2");
-        REQUIRE(cinfo->product_id == ProductId::NsoGameCube);
-        REQUIRE(cinfo->body_color == 0x123456U);
+    // BLE advertisement error paths + pairing vs reconnect MAC transitions
+    REQUIRE_FALSE(ParseBleManufacturerData(std::span<const u8>{}).has_value());
+    std::array<u8, 15> short_adv{};
+    REQUIRE_FALSE(ParseBleManufacturerData(short_adv).has_value());
 
-        const VibrationPacketData vib = VibrationPacketData::FromVibrationStatus(
-            {.low_amplitude = 0.6f,
-             .low_frequency = 120.0f,
-             .high_amplitude = 0.4f,
-             .high_frequency = 240.0f,
-             .type = Common::Input::VibrationAmplificationType::Linear});
-        const auto enc5 = vib.Encode5Bytes();
-        const auto ble_vib = BuildVibrationReport(0x03U, true, vib);
-        REQUIRE(ble_vib.size() == 33U);
-        REQUIRE(std::equal(enc5.begin(), enc5.end(), ble_vib.begin() + 2));
+    std::array<u8, 16> adv{};
+    WriteU16LE(adv, 3, 0x1234U);
+    WriteU16LE(adv, 5, static_cast<u16>(ProductId::JoyCon2Right));
+    REQUIRE_FALSE(ParseBleManufacturerData(adv).has_value());
 
-        const auto usb_pro = BuildUsbVibrationReport(ProductId::ProController2, 0x05U, vib);
-        REQUIRE(usb_pro.size() == 64U);
-        REQUIRE(usb_pro[0] == 0x02U);
-        REQUIRE(usb_pro[1] == 0x55U);
-        REQUIRE(std::equal(enc5.begin(), enc5.end(), usb_pro.begin() + 2));
+    WriteU16LE(adv, 3, NintendoVendorId);
+    WriteU16LE(adv, 5, 0x2009U);
+    REQUIRE_FALSE(ParseBleManufacturerData(adv).has_value());
 
-        const auto usb_gc = BuildUsbVibrationReport(ProductId::NsoGameCube, 0x05U, vib);
-        REQUIRE(usb_gc == std::vector<u8>{0x03, 0x55, 0x01, 0, 0, 0, 0});
+    WriteU16LE(adv, 5, static_cast<u16>(ProductId::JoyCon2Right));
+    const auto pairing_ble = ParseBleManufacturerData(adv);
+    REQUIRE(pairing_ble.has_value());
+    REQUIRE(pairing_ble->reconnect_mac == 0ULL);
+    REQUIRE(pairing_ble->is_pairing_mode);
+    constexpr u64 host_mac = 0x660000000011ULL;
+    REQUIRE(ShouldAcceptBleAdvertisement(*pairing_ble, host_mac));
 
-        const auto usb_jc = BuildUsbVibrationReport(ProductId::JoyCon2Left, 0x05U, vib);
-        REQUIRE(usb_jc.size() == 7U);
-        REQUIRE(usb_jc[0] == 0x01U);
+    adv[10] = 0x11;
+    adv[15] = 0x66;
+    const auto ble = ParseBleManufacturerData(adv);
+    REQUIRE(ble.has_value());
+    REQUIRE(ble->product_id == ProductId::JoyCon2Right);
+    REQUIRE(ble->reconnect_mac == host_mac);
+    REQUIRE_FALSE(ble->is_pairing_mode);
+    REQUIRE(ShouldAcceptBleAdvertisement(*ble, host_mac));
+    REQUIRE_FALSE(ShouldAcceptBleAdvertisement(*ble, host_mac ^ 1));
+    REQUIRE(BuildPairSetMacPayload(0xAABBCCDDEEFFULL) ==
+            std::array<u8, 14>{0x00, 0x02, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA,
+                              0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA});
 
-        auto input_raw = MakeNativeInputReport(static_cast<u32>(PadButton::A), 2600U, 1500U,
-                                               1800U, 2400U);
-        WriteS16LE(input_raw, 48, 2048);
-        WriteS16LE(input_raw, 54, 100);
-        const auto parsed_input =
-            ParseInputReport(input_raw, *parsed_user, *parsed_user, DefaultStickDeadzone);
-        REQUIRE(parsed_input.has_value());
-        const auto motion = ConvertImuToMotion(*parsed_input, {0.0f, 0.0f, 0.0f}, 4000ULL);
-        REQUIRE(motion.accel_x == Catch::Approx(0.5));
-        REQUIRE(motion.delta_timestamp == 4000ULL);
+    // User/factory stick calibration error paths & zero-offset axis clamping
+    std::array<u8, UserCalibrationBlockSize> bad_user_cal{};
+    REQUIRE_FALSE(ParseUserStickCalibration(bad_user_cal).has_value());
+    REQUIRE_FALSE(
+        ParseUserStickCalibration(std::span<const u8>{bad_user_cal.data(), 10}).has_value());
+    const auto zero_factory = ParseStickCalibration(std::array<u8, 9>{});
+    REQUIRE(zero_factory.center_x == 2048U);
+    REQUIRE(ApplyStickCalibrationAxis(2100U, 2000U, 0U, 500U, 50U) == 1.0f);
+    REQUIRE(ApplyStickCalibrationAxis(1900U, 2000U, 1000U, 0U, 50U) == -1.0f);
 
-        const auto mem_req = BuildMemoryReadPayload(0x40U, MemoryAddress::ControllerInfo);
-        const auto cmd_pkt =
-            BuildCommandPacket(CommandId::Memory, SubCommandId::MemoryRead, mem_req, true);
-        REQUIRE(cmd_pkt.size() == 16U);
+    std::array<u8, UserCalibrationBlockSize> user_cal{};
+    WriteU16LE(user_cal, 0, UserCalibrationMagic);
+    const auto c_pack = PackStickXY(2050U, 2040U);
+    const auto max_pack = PackStickXY(1450U, 1550U);
+    const auto min_pack = PackStickXY(1400U, 1300U);
+    std::copy(c_pack.begin(), c_pack.end(), user_cal.begin() + 2);
+    std::copy(max_pack.begin(), max_pack.end(), user_cal.begin() + 5);
+    std::copy(min_pack.begin(), min_pack.end(), user_cal.begin() + 8);
+    const auto parsed_user = ParseUserStickCalibration(user_cal);
+    REQUIRE(parsed_user.has_value());
+    REQUIRE(parsed_user->center_x == 2050U);
+    REQUIRE(parsed_user->min_y == 1300U);
 
-        REQUIRE(ReverseLowerBits4(0x01U) == 0x08U);
-        REQUIRE(SignedLoopingDifference16(65530U, 5U) == 11);
+    // ControllerInfo error paths & unknown PID preservation
+    REQUIRE_FALSE(ParseControllerInfo(std::array<u8, 36>{}).has_value());
+    std::array<u8, 37> cinfo_buf{};
+    cinfo_buf[2] = 'S';
+    cinfo_buf[3] = 'W';
+    cinfo_buf[4] = '2';
+    WriteU16LE(cinfo_buf, 18, NintendoVendorId);
+    WriteU16LE(cinfo_buf, 20, static_cast<u16>(ProductId::NsoGameCube));
+    WriteRgb24(cinfo_buf, 25, 0x123456U);
+    const auto cinfo = ParseControllerInfo(cinfo_buf);
+    REQUIRE(cinfo.has_value());
+    REQUIRE(cinfo->serial_number == "SW2");
+    REQUIRE(cinfo->product_id == ProductId::NsoGameCube);
+    REQUIRE(cinfo->body_color == 0x123456U);
 
-        GyroMouseProcessor gyro_proc;
-        const auto t0 = std::chrono::steady_clock::time_point{10s};
-        const auto g_out = gyro_proc.Process(
-            *parsed_input, ControllerType::Pro, false, true, Settings::Switch2GyroMouseMode::Yaw,
-            Settings::Switch2GyroActivationMode::Hold, 1.0f, t0);
-        REQUIRE(g_out.active);
+    WriteU16LE(cinfo_buf, 20, 0x2009U);
+    const auto unknown_cinfo = ParseControllerInfo(cinfo_buf);
+    REQUIRE(unknown_cinfo.has_value());
+    REQUIRE(static_cast<u16>(unknown_cinfo->product_id) == 0x2009U);
 
-        OpticalMouseProcessor opt_proc;
-        const auto valid_mouse = MakeValidMouseReport(100U, 200U, 300U, 400U);
-        REQUIRE(opt_proc.Process(valid_mouse, ControllerType::Left, true).active);
-    };
+    // HD Rumble 2 clamping, neutral/stop frames, and left/right channel parity
+    const VibrationPacketData neutral_vib = VibrationPacketData::FromVibrationStatus(
+        {.low_amplitude = -0.25f,
+         .low_frequency = 0.0f,
+         .high_amplitude = 0.0f,
+         .high_frequency = -10.0f,
+         .type = Common::Input::VibrationAmplificationType::Linear});
+    REQUIRE(neutral_vib.lf_amp == 0U);
+    REQUIRE(neutral_vib.hf_amp == 0U);
+    REQUIRE(neutral_vib.lf_freq == 0x0E1U);
+    REQUIRE(neutral_vib.hf_freq == 0x1E1U);
 
-    exercise_codecs();
+    const VibrationPacketData clamped_vib = VibrationPacketData::FromVibrationStatus(
+        {.low_amplitude = 2.0f,
+         .low_frequency = 10.0f,
+         .high_amplitude = 1.5f,
+         .high_frequency = 640.0f,
+         .type = Common::Input::VibrationAmplificationType::Linear});
+    REQUIRE(clamped_vib.lf_amp == 800U);
+    REQUIRE(clamped_vib.lf_freq == 56U);
+    REQUIRE(clamped_vib.hf_amp == 800U);
+    REQUIRE(clamped_vib.hf_freq == 0x1FFU);
 
-#ifdef EGLANTINE_ENABLE_RUST_SWITCH2_IO
-    const auto set_env = [](const char* name, const char* value) {
-#ifdef _WIN32
-        _putenv_s(name, value != nullptr ? value : "");
-#else
-        if (value != nullptr) {
-            setenv(name, value, 1);
-        } else {
-            unsetenv(name);
-        }
-#endif
-    };
-    const auto get_env = [](const char* name) -> std::pair<bool, std::string> {
-        const char* val = std::getenv(name);
-        return val != nullptr ? std::pair<bool, std::string>{true, std::string{val}}
-                              : std::pair<bool, std::string>{false, std::string{}};
-    };
-    const auto prev_mode = get_env("EDEN_NX2_RUST_SWITCH2_IO");
-    const auto prev_verify = get_env("EDEN_NX2_RUST_SWITCH2_IO_VERIFY");
-    SCOPE_EXIT {
-        set_env("EDEN_NX2_RUST_SWITCH2_IO", prev_mode.first ? prev_mode.second.c_str() : nullptr);
-        set_env("EDEN_NX2_RUST_SWITCH2_IO_VERIFY",
-                prev_verify.first ? prev_verify.second.c_str() : nullptr);
-    };
+    const VibrationPacketData vib = VibrationPacketData::FromVibrationStatus(
+        {.low_amplitude = 0.6f,
+         .low_frequency = 120.0f,
+         .high_amplitude = 0.4f,
+         .high_frequency = 240.0f,
+         .type = Common::Input::VibrationAmplificationType::Linear});
+    const auto enc5 = vib.Encode5Bytes();
+    const auto ble_vib = BuildVibrationReport(0x13U, true, vib, neutral_vib, clamped_vib);
+    REQUIRE(ble_vib.size() == 33U);
+    REQUIRE(ble_vib[1] == 0x53U);
+    REQUIRE(std::equal(ble_vib.begin() + 1, ble_vib.begin() + 17, ble_vib.begin() + 17));
+    REQUIRE(std::equal(enc5.begin(), enc5.end(), ble_vib.begin() + 2));
 
-    set_env("EDEN_NX2_RUST_SWITCH2_IO_VERIFY", "1");
-    set_env("EDEN_NX2_RUST_SWITCH2_IO", nullptr);
-    exercise_codecs();
+    const auto usb_pro = BuildUsbVibrationReport(ProductId::ProController2, 0x05U, vib);
+    REQUIRE(usb_pro.size() == 64U);
+    REQUIRE(usb_pro[0] == 0x02U);
+    REQUIRE(usb_pro[1] == 0x55U);
+    REQUIRE(usb_pro[0x11] == 0x55U);
+    REQUIRE(std::equal(enc5.begin(), enc5.end(), usb_pro.begin() + 2));
+    REQUIRE(std::equal(enc5.begin(), enc5.end(), usb_pro.begin() + 0x12));
 
-    set_env("EDEN_NX2_RUST_SWITCH2_IO_VERIFY", nullptr);
-    set_env("EDEN_NX2_RUST_SWITCH2_IO", "1");
-    exercise_codecs();
+    const auto usb_gc_active = BuildUsbVibrationReport(ProductId::NsoGameCube, 0x05U, vib);
+    REQUIRE(usb_gc_active == std::vector<u8>{0x03, 0x55, 0x01, 0, 0, 0, 0});
+    const auto usb_gc_stop = BuildUsbVibrationReport(ProductId::NsoGameCube, 0x0FU, neutral_vib);
+    REQUIRE(usb_gc_stop == std::vector<u8>{0x03, 0x5F, 0x02, 0, 0, 0, 0});
 
-    // Check the BLE UUIDs exported by the C ABI.
-    std::size_t uuid_len = 0;
-    const char* uuid_ptr = egl_sw2_ble_uuid(EGL_SW2_UUID_INPUT_REPORT, &uuid_len);
-    REQUIRE(std::string_view{uuid_ptr, uuid_len} == InputReportUuid);
-    uuid_ptr = egl_sw2_ble_uuid(EGL_SW2_UUID_COMMAND_WRITE, &uuid_len);
-    REQUIRE(std::string_view{uuid_ptr, uuid_len} == CommandWriteUuid);
-    uuid_ptr = egl_sw2_ble_uuid(EGL_SW2_UUID_COMMAND_RESPONSE, &uuid_len);
-    REQUIRE(std::string_view{uuid_ptr, uuid_len} == CommandResponseUuid);
-#endif
+    const auto usb_jc = BuildUsbVibrationReport(ProductId::JoyCon2Left, 0x05U, vib);
+    REQUIRE(usb_jc.size() == 7U);
+    REQUIRE(usb_jc[0] == 0x01U);
+
+    // Input report short rejection + valid parsing + motion
+    REQUIRE_FALSE(ParseInputReport(std::array<u8, MinimumInputReportSize - 1>{}, *parsed_user,
+                                   *parsed_user, DefaultStickDeadzone)
+                      .has_value());
+
+    auto input_raw = MakeNativeInputReport(static_cast<u32>(PadButton::A), 2600U, 1500U,
+                                           1800U, 2400U);
+    WriteS16LE(input_raw, 48, 2048);
+    WriteS16LE(input_raw, 54, 100);
+    const auto parsed_input =
+        ParseInputReport(input_raw, *parsed_user, *parsed_user, DefaultStickDeadzone);
+    REQUIRE(parsed_input.has_value());
+    const auto motion = ConvertImuToMotion(*parsed_input, {0.0f, 0.0f, 0.0f}, 4000ULL);
+    REQUIRE(motion.accel_x == Catch::Approx(0.5));
+    REQUIRE(motion.delta_timestamp == 4000ULL);
+
+    const auto mem_req = BuildMemoryReadPayload(0x40U, MemoryAddress::ControllerInfo);
+    const auto cmd_pkt =
+        BuildCommandPacket(CommandId::Memory, SubCommandId::MemoryRead, mem_req, true);
+    REQUIRE(cmd_pkt.size() == 16U);
+
+    REQUIRE(ReverseLowerBits4(0x01U) == 0x08U);
+    REQUIRE(SignedLoopingDifference16(65530U, 5U) == 11);
+
+    GyroMouseProcessor gyro_proc;
+    const auto t0 = std::chrono::steady_clock::time_point{10s};
+    gyro_proc.StartCalibration(t0);
+    REQUIRE_FALSE(gyro_proc
+                      .Process(*parsed_input, ControllerType::Pro, false, true,
+                               Settings::Switch2GyroMouseMode::Yaw,
+                               Settings::Switch2GyroActivationMode::Hold, 1.0f, t0)
+                      .active);
+    const auto g_out = gyro_proc.Process(
+        *parsed_input, ControllerType::Pro, false, true, Settings::Switch2GyroMouseMode::Yaw,
+        Settings::Switch2GyroActivationMode::Hold, 1.0f, t0 + 2s);
+    REQUIRE(g_out.active);
+
+    const auto g_roll = gyro_proc.Process(
+        *parsed_input, ControllerType::Left, true, true, Settings::Switch2GyroMouseMode::Roll,
+        Settings::Switch2GyroActivationMode::Toggle, 1.5f, t0 + 3s);
+    REQUIRE(g_roll.active);
+    REQUIRE(g_roll.roll_steer_x.has_value());
+
+    OpticalMouseProcessor opt_proc;
+    const auto valid_mouse = MakeValidMouseReport(100U, 200U, 300U, 400U);
+    REQUIRE(opt_proc.Process(valid_mouse, ControllerType::Left, true).active);
+    const auto wrap_mouse = MakeValidMouseReport(5U, 65530U, 300U, 400U);
+    REQUIRE(opt_proc.Process(wrap_mouse, ControllerType::Left, true).delta_x == -95);
+    REQUIRE_FALSE(opt_proc.Process(MakeValidMouseReport(0U, 0U, 0U, 400U), ControllerType::Left,
+                                   true)
+                      .active);
 }

@@ -23,12 +23,15 @@
 
 namespace Network {
 
-/// Maximum size of a payload that a member may relay to the other members of a room. This is
-/// sized for the largest UDP datagram that can be sent over IPv4.
-constexpr std::size_t MaxRelayedPayloadSize = 65507;
-
 /// Maximum length of a game name or version string accepted in a game info packet.
 constexpr std::size_t MaxGameInfoStringSize = 256;
+
+static_assert(ProxyPacketHeaderSize ==
+              sizeof(u8) + sizeof(u8) + sizeof(IPv4Address) + sizeof(u16) + sizeof(u8) +
+                  sizeof(IPv4Address) + sizeof(u16) + sizeof(u8) + sizeof(u8) + sizeof(u32));
+static_assert(LdnPacketHeaderSize ==
+              sizeof(u8) + sizeof(u8) + sizeof(IPv4Address) + sizeof(IPv4Address) + sizeof(u8) +
+                  sizeof(u32));
 
 class Room::RoomImpl {
 public:
@@ -972,6 +975,14 @@ IPv4Address Room::RoomImpl::GenerateFakeIPAddress() {
 }
 
 void Room::RoomImpl::HandleProxyPacket(const ENetEvent* event) {
+    if (event->packet->dataLength > ProxyPacketHeaderSize + MaxRelayedPayloadSize) {
+        LOG_WARNING(Network,
+                    "Received a proxy packet of {} bytes, which is larger than the maximum of "
+                    "{} bytes. Ignoring it.",
+                    event->packet->dataLength, ProxyPacketHeaderSize + MaxRelayedPayloadSize);
+        return;
+    }
+
     Packet in_packet;
     in_packet.Append(event->packet->data, event->packet->dataLength);
     in_packet.IgnoreBytes(sizeof(u8)); // Message type
@@ -1031,8 +1042,6 @@ void Room::RoomImpl::HandleProxyPacket(const ENetEvent* event) {
         return;
     }
 
-    Packet out_packet;
-    out_packet.Append(event->packet->data, event->packet->dataLength);
     if (local_ip != *sender_fake_ip) {
         LOG_DEBUG(Network,
                   "The source address {}.{}.{}.{} of a proxy packet was corrected to "
@@ -1040,7 +1049,8 @@ void Room::RoomImpl::HandleProxyPacket(const ENetEvent* event) {
                   local_ip[0], local_ip[1], local_ip[2], local_ip[3], (*sender_fake_ip)[0],
                   (*sender_fake_ip)[1], (*sender_fake_ip)[2], (*sender_fake_ip)[3]);
     }
-    if (!out_packet.OverwriteBytes(RelaySourceIpOffset, sender_fake_ip->data(), sender_fake_ip->size())) {
+    if (!in_packet.OverwriteBytes(RelaySourceIpOffset, sender_fake_ip->data(),
+                                  sender_fake_ip->size())) {
         // The packet is too short to carry a source address. Relaying it would relay the
         // address that the member claimed, which must never happen.
         LOG_WARNING(Network,
@@ -1048,8 +1058,11 @@ void Room::RoomImpl::HandleProxyPacket(const ENetEvent* event) {
                     "Ignoring it.");
         return;
     }
-    ENetPacket* enet_packet = enet_packet_create(out_packet.GetData(), out_packet.GetDataSize(),
+    ENetPacket* enet_packet = enet_packet_create(in_packet.GetData(), in_packet.GetDataSize(),
                                                  ENET_PACKET_FLAG_RELIABLE);
+    if (!enet_packet) {
+        return;
+    }
 
     const auto& destination_address = remote_ip;
     if (broadcast) { // Send the data to everyone except the sender
@@ -1086,6 +1099,14 @@ void Room::RoomImpl::HandleProxyPacket(const ENetEvent* event) {
 }
 
 void Room::RoomImpl::HandleLdnPacket(const ENetEvent* event) {
+    if (event->packet->dataLength > LdnPacketHeaderSize + MaxRelayedPayloadSize) {
+        LOG_WARNING(Network,
+                    "Received an LDN packet of {} bytes, which is larger than the maximum of "
+                    "{} bytes. Ignoring it.",
+                    event->packet->dataLength, LdnPacketHeaderSize + MaxRelayedPayloadSize);
+        return;
+    }
+
     Packet in_packet;
     in_packet.Append(event->packet->data, event->packet->dataLength);
 
@@ -1137,8 +1158,6 @@ void Room::RoomImpl::HandleLdnPacket(const ENetEvent* event) {
         return;
     }
 
-    Packet out_packet;
-    out_packet.Append(event->packet->data, event->packet->dataLength);
     if (local_ip != *sender_fake_ip) {
         LOG_DEBUG(Network,
                   "The source address {}.{}.{}.{} of an LDN packet was corrected to "
@@ -1146,7 +1165,8 @@ void Room::RoomImpl::HandleLdnPacket(const ENetEvent* event) {
                   local_ip[0], local_ip[1], local_ip[2], local_ip[3], (*sender_fake_ip)[0],
                   (*sender_fake_ip)[1], (*sender_fake_ip)[2], (*sender_fake_ip)[3]);
     }
-    if (!out_packet.OverwriteBytes(RelaySourceIpOffset, sender_fake_ip->data(), sender_fake_ip->size())) {
+    if (!in_packet.OverwriteBytes(RelaySourceIpOffset, sender_fake_ip->data(),
+                                  sender_fake_ip->size())) {
         // The packet is too short to carry a source address. Relaying it would relay the
         // address that the member claimed, which must never happen.
         LOG_WARNING(Network,
@@ -1154,8 +1174,11 @@ void Room::RoomImpl::HandleLdnPacket(const ENetEvent* event) {
                     "Ignoring it.");
         return;
     }
-    ENetPacket* enet_packet = enet_packet_create(out_packet.GetData(), out_packet.GetDataSize(),
+    ENetPacket* enet_packet = enet_packet_create(in_packet.GetData(), in_packet.GetDataSize(),
                                                  ENET_PACKET_FLAG_RELIABLE);
+    if (!enet_packet) {
+        return;
+    }
 
     const auto& destination_address = remote_ip;
     if (broadcast) { // Send the data to everyone except the sender

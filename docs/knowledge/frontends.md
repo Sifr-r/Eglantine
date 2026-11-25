@@ -21,6 +21,7 @@ GPUI owns the desktop shell (`--safe-theme`, `-f`/`--fullscreen`, `-g`/`--game`,
 | `library.rs`, `emulator_config.rs` | Library roots/recency, settings (`HomeKey`/`HomeButton`/`UserProfile`), one-time `qt-config.ini` import, launch overrides |
 | `session.rs`, `host_tool.rs`, `content.rs` | Supervises `eden-cli` pipes (`gpui_session.{h,cpp}`) and one-shot metadata/content ops (`gpui_library.{h,cpp}`, `gpui_content.{h,cpp}`) |
 
+- **Library discovery:** The shell requests asynchronous `eden-cli --gpui-library` scans. C++ owns traversal, file validation, and metadata discovery. GPUI updates each folder from a completed scan, retains entries for folders whose scans fail, and applies sidecar covers, played order, and the saved selection.
 - **Tests:** `cargo test --locked --manifest-path rust/apps/eglantine_gpui/Cargo.toml` (add `--no-default-features --lib` for GPUI-free unit tests); `python -I src/yuzu_cmd/tests/gpui_session.py build/bin/eden-cli.exe`.
 
 ## SDL-hosted Android prototype

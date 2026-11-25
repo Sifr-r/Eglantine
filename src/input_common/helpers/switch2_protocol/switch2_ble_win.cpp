@@ -771,7 +771,7 @@ private:
         if (!WriteCommand(packet, response, PairCommandTimeout)) {
             return false;
         }
-        if (response.size() < 8 || response[0] != CommandId::Pair || response[1] != 0x01) {
+        if (!ParseCommandResponse(response, CommandId::Pair, true)) {
             LOG_WARNING(Input, "Unexpected pairing response for {} (subcmd=0x{:02X}, len={})",
                         m_address, subcommand_id, response.size());
             return false;
@@ -780,16 +780,7 @@ private:
     }
 
     bool PerformPairingHandshake(u64 host_mac) {
-        std::array<u8, 14> set_mac_payload{};
-        set_mac_payload[0] = 0x00;
-        set_mac_payload[1] = 0x02;
-        for (std::size_t i = 0; i < 6; ++i) {
-            const u8 byte_val = static_cast<u8>((host_mac >> (i * 8)) & 0xFFULL);
-            set_mac_payload[2 + i] = byte_val;
-            set_mac_payload[8 + i] = byte_val;
-        }
-
-        if (!SendPairSubcommand(SubCommandId::PairSetMac, set_mac_payload)) {
+        if (!SendPairSubcommand(SubCommandId::PairSetMac, BuildPairSetMacPayload(host_mac))) {
             return false;
         }
 
@@ -1124,11 +1115,7 @@ private:
 
             const std::vector<u8> payload = BufferToBytes(mfg_data.Data());
             const std::optional<BleAdvertisementInfo> adv = ParseBleManufacturerData(payload);
-            if (!adv.has_value()) {
-                continue;
-            }
-
-            if (!adv->is_pairing_mode && adv->reconnect_mac != host_mac) {
+            if (!adv || !ShouldAcceptBleAdvertisement(*adv, host_mac)) {
                 continue;
             }
 
