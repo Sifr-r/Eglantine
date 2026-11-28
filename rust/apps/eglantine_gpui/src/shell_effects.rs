@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use eglantine_gpui::{
     content::{self, ContentOperation},
@@ -45,6 +48,10 @@ impl Shell {
                 self.client.sync_viewport(rect);
             }
         }
+        if self.ble_handoff_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            self.ble_handoff_deadline = None;
+            self.controller.suspend_native();
+        }
         for event in self.client.poll() {
             match event {
                 SessionEvent::Running => {
@@ -52,6 +59,9 @@ impl Shell {
                     self.overlay = Overlay::None;
                     self.gba_fast_forward = false;
                     self.pending_gba_action = None;
+                    if self.active_ble_handoff.is_some() && self.controller.is_native_active() {
+                        self.ble_handoff_deadline = Some(Instant::now() + Duration::from_secs(4));
+                    }
                     let selected = self.library_selection_path();
                     if let (Some(library), Some(path)) = (&mut self.library, self.session_path.clone()) {
                         if let Err(error) = library.note_played(&path) {
@@ -91,6 +101,10 @@ impl Shell {
                     self.request_pause();
                 }
                 SessionEvent::HomeReleased => self.home_released = true,
+                SessionEvent::ControllerClaimed => {
+                    self.ble_handoff_deadline = None;
+                    self.controller.suspend_native();
+                }
                 SessionEvent::Stopped => {
                     self.session = Session::Idle;
                     self.home_released = true;
@@ -101,7 +115,10 @@ impl Shell {
                     self.overlay = Overlay::None;
                     self.target = self.return_target;
                     self.session_path = None;
-                    self.controller.resume_native();
+                    let handoff = self.active_ble_handoff.take();
+                    self.ble_handoff_deadline = None;
+                    self.controller.set_native_muted(false);
+                    self.controller.resume_native_with_handoff(handoff.as_deref());
                     self.scroll_to_game(self.selected);
                     window.activate_window();
                     window.focus(&self.focus);
@@ -146,7 +163,10 @@ impl Shell {
                     self.message = Some(error);
                     if self.session == Session::Starting {
                         self.session = Session::Idle;
-                        self.controller.resume_native();
+                        let handoff = self.active_ble_handoff.take();
+                        self.ble_handoff_deadline = None;
+                        self.controller.set_native_muted(false);
+                        self.controller.resume_native_with_handoff(handoff.as_deref());
                     } else if self.session == Session::Pausing {
                         self.session = Session::Running;
                     } else if matches!(self.session, Session::Closing | Session::Resuming) {
@@ -331,7 +351,14 @@ impl Shell {
             .map(|viewport| EmbedTarget { parent_window: hwnd, viewport })
         });
         let gba = self.gba_launch_config();
-        self.controller.suspend_native();
+        let ble_handoff = self.controller.ble_handoff();
+        if ble_handoff.is_some() {
+            self.controller.set_native_muted(true);
+            self.client.set_next_ble_handoff(ble_handoff.clone());
+        } else {
+            self.controller.suspend_native();
+            self.client.set_next_ble_handoff(None);
+        }
         let result = match &self.settings {
             Some(config) => self.client.launch_game_with_embed(
                 &path,
@@ -348,9 +375,14 @@ impl Shell {
                 self.session_path = Some(path);
                 self.session = Session::Starting;
                 self.pause_destination = PauseDestination::PauseMenu;
+                self.active_ble_handoff = ble_handoff;
+                self.ble_handoff_deadline = None;
             }
             Err(error) => {
-                self.controller.resume_native();
+                self.active_ble_handoff = None;
+                self.ble_handoff_deadline = None;
+                self.controller.set_native_muted(false);
+                self.controller.resume_native_with_handoff(ble_handoff.as_deref());
                 self.message = Some(error);
             }
         }

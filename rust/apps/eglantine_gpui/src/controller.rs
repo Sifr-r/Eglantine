@@ -50,7 +50,11 @@ struct BridgeEnvelope {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum BridgeWireEvent {
-    Controller { name: Option<String> },
+    Controller {
+        name: Option<String>,
+        #[serde(default)]
+        ble_handoff: Option<String>,
+    },
     ControllerInput { buttons: u32, left_x: f32, left_y: f32 },
     #[serde(other)]
     Other,
@@ -58,7 +62,7 @@ enum BridgeWireEvent {
 
 #[derive(Debug, PartialEq)]
 enum Switch2Event {
-    Controller(Option<String>),
+    Controller(Option<String>, Option<String>),
     Input { buttons: u32, left_x: f32, left_y: f32 },
 }
 
@@ -69,17 +73,22 @@ struct Switch2Bridge {
 }
 
 impl Switch2Bridge {
-    fn start() -> Option<Self> {
+    fn start(ble_handoff: Option<&str>) -> Option<Self> {
         let executable = std::env::current_exe()
             .ok()?
             .with_file_name(format!("eden-cli{}", std::env::consts::EXE_SUFFIX));
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .arg("--gpui-controller")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+            .stderr(Stdio::null());
+        if let Some(handoff) = ble_handoff {
+            command.env("EGLANTINE_SWITCH2_BLE_HANDOFF", handoff);
+        } else {
+            command.env_remove("EGLANTINE_SWITCH2_BLE_HANDOFF");
+        }
+        let mut child = command.spawn().ok()?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take()?;
         let (sender, receiver) = mpsc::sync_channel(64);
@@ -146,7 +155,9 @@ fn read_bridge_event(reader: &mut impl BufRead) -> Result<Option<Option<Switch2E
         return Err(());
     }
     let mapped = match envelope.event {
-        BridgeWireEvent::Controller { name } => Some(Switch2Event::Controller(name)),
+        BridgeWireEvent::Controller { name, ble_handoff } => {
+            Some(Switch2Event::Controller(name, ble_handoff))
+        }
         BridgeWireEvent::ControllerInput { buttons, left_x, left_y } => {
             Some(Switch2Event::Input { buttons, left_x, left_y })
         }
@@ -239,6 +250,8 @@ pub struct Controller {
     state: Option<StickRepeat>,
     native: Option<Switch2Bridge>,
     native_name: Option<String>,
+    native_ble_handoff: Option<String>,
+    native_muted: bool,
     native_buttons: u32,
     native_stick: (f32, f32),
 }
@@ -262,11 +275,25 @@ impl Controller {
             #[cfg(windows)]
             backend,
             state: None,
-            native: Switch2Bridge::start(),
+            native: Switch2Bridge::start(None),
             native_name: None,
+            native_ble_handoff: None,
+            native_muted: false,
             native_buttons: 0,
             native_stick: (0.0, 0.0),
         }
+    }
+
+    pub fn ble_handoff(&self) -> Option<String> {
+        self.native_ble_handoff.clone()
+    }
+
+    pub fn is_native_active(&self) -> bool {
+        self.native.is_some()
+    }
+
+    pub fn set_native_muted(&mut self, muted: bool) {
+        self.native_muted = muted;
     }
 
     pub fn suspend_native(&mut self) {
@@ -274,13 +301,16 @@ impl Controller {
             bridge.stop();
         }
         self.native_name = None;
+        self.native_ble_handoff = None;
+        self.native_muted = false;
         self.native_buttons = 0;
         self.native_stick = (0.0, 0.0);
     }
 
-    pub fn resume_native(&mut self) {
+    pub fn resume_native_with_handoff(&mut self, ble_handoff: Option<&str>) {
+        self.native_muted = false;
         if self.native.is_none() {
-            self.native = Switch2Bridge::start();
+            self.native = Switch2Bridge::start(ble_handoff);
         }
     }
 
@@ -346,19 +376,22 @@ impl Controller {
         if let Some(bridge) = &self.native {
             for event in bridge.drain() {
                 match event {
-                    Switch2Event::Controller(name) => {
+                    Switch2Event::Controller(name, ble_handoff) => {
                         self.native_name = name;
+                        self.native_ble_handoff = ble_handoff;
                         if self.native_name.is_none() {
                             self.native_buttons = 0;
                             self.native_stick = (0.0, 0.0);
                         }
                     }
                     Switch2Event::Input { buttons, left_x, left_y } => {
-                        actions.extend(map_switch2_button_edges(
-                            self.native_buttons,
-                            buttons,
-                            home_button,
-                        ));
+                        if !self.native_muted {
+                            actions.extend(map_switch2_button_edges(
+                                self.native_buttons,
+                                buttons,
+                                home_button,
+                            ));
+                        }
                         self.native_buttons = buttons;
                         self.native_stick = (left_x, left_y);
                     }
@@ -366,7 +399,7 @@ impl Controller {
             }
         }
 
-        if stick.is_none() && self.native_name.is_some() {
+        if !self.native_muted && stick.is_none() && self.native_name.is_some() {
             stick = Some(self.native_stick);
         }
 
@@ -412,16 +445,19 @@ mod tests {
         let mut ready = &b"{\"version\":1,\"event\":\"ready\"}\n"[..];
         assert_eq!(read_bridge_event(&mut ready), Ok(Some(None)));
 
-        let mut connected = &b"{\"version\":1,\"event\":\"controller\",\"name\":\"Switch 2 Pro Controller\"}\n"[..];
+        let mut connected = &b"{\"version\":1,\"event\":\"controller\",\"name\":\"Switch 2 Pro Controller\",\"ble_handoff\":\"0123456789AB:2069\"}\n"[..];
         assert_eq!(
             read_bridge_event(&mut connected),
-            Ok(Some(Some(Switch2Event::Controller(Some("Switch 2 Pro Controller".into())))))
+            Ok(Some(Some(Switch2Event::Controller(
+                Some("Switch 2 Pro Controller".into()),
+                Some("0123456789AB:2069".into()),
+            ))))
         );
 
         let mut disconnected = &b"{\"version\":1,\"event\":\"controller\",\"name\":null}\n"[..];
         assert_eq!(
             read_bridge_event(&mut disconnected),
-            Ok(Some(Some(Switch2Event::Controller(None))))
+            Ok(Some(Some(Switch2Event::Controller(None, None))))
         );
 
         let mut input = &b"{\"version\":1,\"event\":\"controller_input\",\"buttons\":8,\"left_x\":0.75,\"left_y\":-0.25}\n"[..];

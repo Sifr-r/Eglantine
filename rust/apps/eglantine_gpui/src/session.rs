@@ -23,6 +23,7 @@ pub enum SessionEvent {
     Stopped,
     HomeRequested,
     HomeReleased,
+    ControllerClaimed,
     ActionCompleted,
     SoftwareKeyboardShow(SwkbdShowRequest),
     SoftwareKeyboardTextCheck {
@@ -60,6 +61,7 @@ enum WireEvent {
     State { state: State },
     HomeRequested,
     HomeReleased,
+    ControllerClaimed,
     SwkbdShow {
         request_id: u64,
         #[serde(default)]
@@ -128,6 +130,7 @@ struct Launch {
     handoff: bool,
     gba: GbaLaunchConfig,
     embed: Option<EmbedTarget>,
+    ble_handoff: Option<String>,
     _override_file: Option<tempfile::TempPath>,
 }
 
@@ -149,9 +152,13 @@ pub struct SessionClient {
     host: Option<Host>,
     restart: bool,
     next_id: u64,
+    pending_ble_handoff: Option<String>,
 }
 
 impl SessionClient {
+    pub fn set_next_ble_handoff(&mut self, handoff: Option<String>) {
+        self.pending_ble_handoff = handoff;
+    }
     pub fn launch(&mut self, game: &Path, fullscreen: bool, config: Option<&Path>) -> Result<(), String> {
         self.launch_with_gba(game, fullscreen, config, GbaLaunchConfig::default())
     }
@@ -184,6 +191,7 @@ impl SessionClient {
             handoff: false,
             gba,
             embed,
+            ble_handoff: None,
             _override_file: None,
         })
     }
@@ -232,17 +240,19 @@ impl SessionClient {
             handoff: false,
             gba,
             embed,
+            ble_handoff: None,
             _override_file: override_file,
         })
     }
 
-    fn launch_with_config(&mut self, launch: Launch) -> Result<(), String> {
+    fn launch_with_config(&mut self, mut launch: Launch) -> Result<(), String> {
         if self.host.is_some() {
             return Err("A game session is already active".into());
         }
         if !launch.game.is_file() && !launch.game.is_dir() {
             return Err(format!("Game was not found at {}", launch.game.display()));
         }
+        launch.ble_handoff = self.pending_ble_handoff.take();
         self.start(launch)
     }
 
@@ -274,6 +284,11 @@ impl SessionClient {
         }
         if launch.handoff {
             command.env("EDEN_CLI_RESTART_HANDOFF", "1");
+        }
+        if let Some(handoff) = &launch.ble_handoff {
+            command.env("EGLANTINE_SWITCH2_BLE_HANDOFF", handoff);
+        } else {
+            command.env_remove("EGLANTINE_SWITCH2_BLE_HANDOFF");
         }
         if let Some(embed) = launch.embed {
             command.env("EGLANTINE_GPUI_PARENT_HWND", embed.parent_window.to_string());
@@ -518,6 +533,7 @@ fn drain_events(host: &mut Host, events: &mut Vec<SessionEvent>, restart: &mut b
             Ok(WireEvent::State { state }) => apply_state(host, state, events),
             Ok(WireEvent::HomeRequested) => events.push(SessionEvent::HomeRequested),
             Ok(WireEvent::HomeReleased) => events.push(SessionEvent::HomeReleased),
+            Ok(WireEvent::ControllerClaimed) => events.push(SessionEvent::ControllerClaimed),
             Ok(WireEvent::SwkbdShow {
                 request_id,
                 header_text,
@@ -643,6 +659,10 @@ mod tests {
         let mut frame = &b"{\"version\":1,\"event\":\"reply\",\"id\":17,\"ok\":true,\"state\":\"paused\"}\n"[..];
         assert!(matches!(read_event(&mut frame), Ok(Some(WireEvent::Reply { id: 17, ok: true, state: Some(State::Paused), .. }))));
         assert!(matches!(read_event(&mut frame), Ok(None)));
+        assert!(matches!(
+            read_event(&mut &b"{\"version\":1,\"event\":\"controller_claimed\"}\n"[..]),
+            Ok(Some(WireEvent::ControllerClaimed))
+        ));
         assert!(read_event(&mut &b"{\"version\":2,\"event\":\"ready\"}\n"[..]).is_err());
         assert!(read_event(&mut &b"{\"version\":1,\"event\":\"ready\"}"[..]).is_err());
         assert!(read_event(&mut &vec![b' '; MAX_FRAME as usize + 1][..]).is_err());

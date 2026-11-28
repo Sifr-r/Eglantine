@@ -4,7 +4,6 @@
 use std::time::Duration;
 
 use eglantine_gpui::{
-    emulator_config::EmulatorSetting,
     software_keyboard::TextCheckFeedback,
     theme::{ComponentId, HomeMode, LibraryMode, PanelSide, Placement, ThemeComponent, ThemeStyle},
 };
@@ -590,7 +589,8 @@ impl Shell {
 
     fn settings_panel(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = &self.appearance.package().theme;
-        let categories = column().w(relative(0.36)).flex_none().gap_2()
+        let categories = column().id("settings-categories").w(relative(0.36)).flex_none().gap_2()
+            .overflow_y_scroll()
             .children(self.categories().iter().copied().map(|category| {
                 let mut button = self.overlay_button(Target::Category(category), category.label(), cx);
                 if self.category == category && self.target != Target::Category(category) {
@@ -611,7 +611,7 @@ impl Shell {
                     },
                     None => global.to_owned(),
                 };
-                self.overlay_button(Target::Setting(*setting), setting_label(*setting), cx).w_full()
+                self.overlay_button(Target::Setting(*setting), setting.label(), cx).w_full()
                     .child(div().ml_auto().child(value))
             }));
         }
@@ -820,20 +820,6 @@ fn shortcut_glyph(component: ComponentId) -> &'static str {
         ComponentId::Content => "\u{e81e}",
         ComponentId::Settings => "\u{e713}",
         ComponentId::Exit => "\u{e8bb}",
-    }
-}
-
-fn setting_label(setting: EmulatorSetting) -> &'static str {
-    match setting {
-        EmulatorSetting::Renderer => "Renderer",
-        EmulatorSetting::Resolution => "Resolution scale",
-        EmulatorSetting::Vsync => "VSync",
-        EmulatorSetting::GameDisplay => "Game display",
-        EmulatorSetting::Volume => "Volume",
-        EmulatorSetting::CpuAccuracy => "CPU accuracy",
-        EmulatorSetting::UserProfile => "User profile",
-        EmulatorSetting::HomeKey => "Home key (keyboard)",
-        EmulatorSetting::HomeButton => "Home button (controller)",
     }
 }
 

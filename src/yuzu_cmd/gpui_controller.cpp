@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+#include <fmt/format.h>
+
 #include "input_common/helpers/switch2_protocol/switch2_driver.h"
 #include "input_common/helpers/switch2_protocol/switch2_transport.h"
 #include "input_common/helpers/switch2_protocol/switch2_types.h"
@@ -33,6 +35,7 @@ struct ControllerBridgeState {
     std::vector<std::shared_ptr<Switch2Driver>> drivers;
     std::vector<std::shared_ptr<Switch2Driver>> retired_drivers;
     std::optional<std::string> current_name;
+    std::optional<std::string> current_ble_handoff;
     bool name_dirty{false};
     bool input_dirty{false};
     std::uint32_t last_buttons{0};
@@ -42,6 +45,46 @@ struct ControllerBridgeState {
 
 std::string DisplayNameForDriver(const Switch2Driver& driver) {
     return std::string{ProductName(driver.GetProductId())};
+}
+
+std::optional<std::string> FormatBleHandoffLocked(
+    const std::vector<std::shared_ptr<Switch2Driver>>& drivers) {
+    std::string handoff;
+    for (const auto& driver : drivers) {
+        if (!driver || driver->GetTransportType() != TransportType::Ble || !driver->IsConnected()) {
+            continue;
+        }
+        std::string mac_hex;
+        mac_hex.reserve(12);
+        for (const char ch : driver->GetAddress()) {
+            if (ch != ':') {
+                mac_hex.push_back(ch);
+            }
+        }
+        if (mac_hex.size() != 12) {
+            continue;
+        }
+        if (!handoff.empty()) {
+            handoff.push_back(',');
+        }
+        handoff += fmt::format("{}:{:04X}", mac_hex, static_cast<u16>(driver->GetProductId()));
+    }
+    if (handoff.empty()) {
+        return std::nullopt;
+    }
+    return handoff;
+}
+
+void UpdateControllerSnapshotLocked(ControllerBridgeState& state) {
+    auto next_name = state.drivers.empty()
+                         ? std::nullopt
+                         : std::optional<std::string>{DisplayNameForDriver(*state.drivers.front())};
+    auto next_handoff = FormatBleHandoffLocked(state.drivers);
+    if (next_name != state.current_name || next_handoff != state.current_ble_handoff) {
+        state.current_name = std::move(next_name);
+        state.current_ble_handoff = std::move(next_handoff);
+        state.name_dirty = true;
+    }
 }
 
 } // namespace
@@ -127,13 +170,8 @@ bool RunControllerBridge(Session& session) {
                             ++it;
                         }
                     }
+                    UpdateControllerSnapshotLocked(*locked_state);
                     if (was_primary) {
-                        locked_state->current_name =
-                            locked_state->drivers.empty()
-                                ? std::nullopt
-                                : std::optional<std::string>{
-                                      DisplayNameForDriver(*locked_state->drivers.front())};
-                        locked_state->name_dirty = true;
                         if (locked_state->last_buttons != 0 || locked_state->last_left_x != 0.0f ||
                             locked_state->last_left_y != 0.0f) {
                             locked_state->last_buttons = 0;
@@ -154,12 +192,8 @@ bool RunControllerBridge(Session& session) {
                         return existing && existing->GetAddress() == address;
                     });
                 if (!duplicate) {
-                    const bool became_primary = state->drivers.empty();
                     state->drivers.push_back(driver);
-                    if (became_primary) {
-                        state->current_name = DisplayNameForDriver(*driver);
-                        state->name_dirty = true;
-                    }
+                    UpdateControllerSnapshotLocked(*state);
                     accepted = true;
                 }
             }
@@ -211,6 +245,7 @@ bool RunControllerBridge(Session& session) {
 
         bool emit_name = false;
         std::optional<std::string> name_copy;
+        std::optional<std::string> ble_handoff_copy;
         bool emit_input = false;
         std::uint32_t buttons = 0;
         float left_x = 0.0f;
@@ -220,6 +255,7 @@ bool RunControllerBridge(Session& session) {
             if (state->name_dirty) {
                 emit_name = true;
                 name_copy = state->current_name;
+                ble_handoff_copy = state->current_ble_handoff;
                 state->name_dirty = false;
             }
             if (state->input_dirty) {
@@ -232,7 +268,7 @@ bool RunControllerBridge(Session& session) {
         }
 
         if (emit_name) {
-            session.ControllerState(name_copy);
+            session.ControllerState(name_copy, ble_handoff_copy);
         }
         if (emit_input) {
             session.ControllerInput(buttons, left_x, left_y);

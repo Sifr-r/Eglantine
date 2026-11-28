@@ -64,6 +64,13 @@ impl LaunchOptions {
 }
 
 fn main() {
+    #[cfg(windows)]
+    // GPUI's DirectComposition layer covers the embedded SDL gameplay window.
+    // SAFETY: Setting a process environment variable is safe on Windows.
+    unsafe {
+        std::env::set_var("GPUI_DISABLE_DIRECT_COMPOSITION", "1");
+    }
+
     let options = LaunchOptions::parse(std::env::args_os());
     Application::new().run(move |app: &mut App| {
         let dir = eglantine_gpui::library::data_dir();

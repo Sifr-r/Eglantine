@@ -62,6 +62,7 @@
 #include "hid_core/frontend/emulated_controller.h"
 #include "hid_core/hid_core.h"
 #include "input_common/drivers/keyboard.h"
+#include "input_common/drivers/switch2.h"
 #include "input_common/drivers/switch2_auto_pair.h"
 #include "input_common/main.h"
 #include "network/network.h"
@@ -292,6 +293,7 @@ struct SdlState {
     bool gpui_mapped_home_held{};
     bool gpui_home_down{};
     bool gpui_home_announced{};
+    bool gpui_controller_claimed{};
     bool gpui_start_error{};
     std::atomic_bool gpui_game_exit{};
     // The configuration of this session. It is owned by the state because SDL_AppMain returns
@@ -1579,6 +1581,17 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     }
     if (!state->gpui_session || state->gpui_session->GetState() == Gpui::SessionState::Running) {
         RunKeyScript(state->input_subsystem, state->system);
+    }
+    if (state->gpui_session && !state->gpui_controller_claimed) {
+        if (const auto* switch2 = state->input_subsystem.GetSwitch2()) {
+            for (const auto& device : switch2->GetConnectedDevices()) {
+                if (device.transport == InputCommon::Switch2::TransportType::Ble) {
+                    state->gpui_controller_claimed = true;
+                    state->gpui_session->SendEvent("controller_claimed");
+                    break;
+                }
+            }
+        }
     }
     CheckSwitch2AutoPair(state);
 #ifdef YUZU_ENABLE_MCP

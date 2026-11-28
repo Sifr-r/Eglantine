@@ -451,12 +451,18 @@ void Session::CloseSoftwareKeyboard(std::uint64_t request_id) {
               .dump());
 }
 
-void Session::ControllerState(std::optional<std::string_view> name) {
+void Session::ControllerState(std::optional<std::string_view> name,
+                              std::optional<std::string_view> ble_handoff) {
     Json payload{{"version", ProtocolVersion}, {"event", "controller"}};
     if (name) {
         payload["name"] = *name;
     } else {
         payload["name"] = nullptr;
+    }
+    if (ble_handoff) {
+        payload["ble_handoff"] = *ble_handoff;
+    } else {
+        payload["ble_handoff"] = nullptr;
     }
     Write(payload.dump(-1, ' ', false, Json::error_handler_t::replace));
 }

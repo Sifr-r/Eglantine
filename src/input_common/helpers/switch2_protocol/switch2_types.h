@@ -179,6 +179,11 @@ struct BleAdvertisementInfo {
     bool is_pairing_mode{};
 };
 
+struct BleHandoffDevice {
+    u64 bluetooth_addr{};
+    ProductId product_id{ProductId::None};
+};
+
 struct StickCalibration {
     u16 center_x{2048};
     u16 center_y{2048};
@@ -307,6 +312,8 @@ struct Switch2DeviceInfo {
                                                           u64 host_mac) {
     return info.is_pairing_mode || info.reconnect_mac == host_mac;
 }
+
+[[nodiscard]] std::vector<BleHandoffDevice> ParseBleHandoffList(std::string_view spec);
 
 [[nodiscard]] std::pair<u16, u16> UnpackStickXY(std::span<const u8> three_bytes);
 [[nodiscard]] StickCalibration ParseStickCalibration(std::span<const u8> data);

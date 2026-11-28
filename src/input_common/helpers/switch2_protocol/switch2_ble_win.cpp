@@ -14,6 +14,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <optional>
 #include <span>
@@ -1084,6 +1085,37 @@ private:
                 m_watcher = watcher;
                 m_received_token = recv_token;
                 m_stopped_token = stop_token;
+            }
+
+            if (const char* handoff_env = std::getenv("EGLANTINE_SWITCH2_BLE_HANDOFF");
+                handoff_env != nullptr && handoff_env[0] != '\0') {
+                for (const auto& entry : ParseBleHandoffList(handoff_env)) {
+                    bool inserted = false;
+                    {
+                        std::lock_guard addr_lock(m_state->addresses_mutex);
+                        inserted = m_state->active_addresses.insert(entry.bluetooth_addr).second;
+                    }
+                    if (!inserted) {
+                        continue;
+                    }
+                    LOG_INFO(Input, "Queuing Switch 2 BLE handoff for {} ({})",
+                             ProductName(entry.product_id),
+                             FormatBluetoothAddress(entry.bluetooth_addr));
+                    {
+                        std::lock_guard queue_lock(m_state->queue_mutex);
+                        m_state->pending_queue.push_back(PendingDevice{
+                            .bluetooth_addr = entry.bluetooth_addr,
+                            .adv =
+                                BleAdvertisementInfo{
+                                    .vendor_id = NintendoVendorId,
+                                    .product_id = entry.product_id,
+                                    .reconnect_mac = adapter_mac,
+                                    .is_pairing_mode = false,
+                                },
+                        });
+                    }
+                    m_state->queue_cv.notify_one();
+                }
             }
 
             return true;

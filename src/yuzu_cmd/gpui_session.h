@@ -100,7 +100,8 @@ public:
     void ShowSoftwareKeyboardTextCheck(std::uint64_t request_id, SwkbdTextCheckKind kind,
                                        std::string_view message);
     void CloseSoftwareKeyboard(std::uint64_t request_id);
-    void ControllerState(std::optional<std::string_view> name);
+    void ControllerState(std::optional<std::string_view> name,
+                         std::optional<std::string_view> ble_handoff = std::nullopt);
     void ControllerInput(std::uint32_t buttons, float left_x, float left_y);
     [[nodiscard]] bool IsConnected() const;
 

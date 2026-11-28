@@ -53,7 +53,54 @@ u16 EncodeVibrationAmplitude(f32 amplitude) {
     return static_cast<u16>(std::lround(std::clamp(amplitude, 0.0f, 1.0f) * 800.0f));
 }
 
+std::optional<u64> ParseFixedHexU64(std::string_view hex) {
+    if (hex.empty() || hex.size() > 16) {
+        return std::nullopt;
+    }
+    u64 value = 0;
+    for (const char ch : hex) {
+        u64 digit = 0;
+        if (ch >= '0' && ch <= '9') {
+            digit = static_cast<u64>(ch - '0');
+        } else if (ch >= 'a' && ch <= 'f') {
+            digit = static_cast<u64>(10 + (ch - 'a'));
+        } else if (ch >= 'A' && ch <= 'F') {
+            digit = static_cast<u64>(10 + (ch - 'A'));
+        } else {
+            return std::nullopt;
+        }
+        value = (value << 4) | digit;
+    }
+    return value;
+}
+
 } // namespace
+
+std::vector<BleHandoffDevice> ParseBleHandoffList(std::string_view spec) {
+    std::vector<BleHandoffDevice> devices;
+    while (!spec.empty()) {
+        const std::size_t comma = spec.find(',');
+        const std::string_view token = spec.substr(0, comma);
+        if (comma == std::string_view::npos) {
+            spec = {};
+        } else {
+            spec.remove_prefix(comma + 1);
+        }
+        if (token.size() != 17 || token[12] != ':') {
+            continue;
+        }
+        const auto addr = ParseFixedHexU64(token.substr(0, 12));
+        const auto raw_pid = ParseFixedHexU64(token.substr(13, 4));
+        if (!addr || *addr == 0 || !raw_pid || !IsSupportedProductId(static_cast<u16>(*raw_pid))) {
+            continue;
+        }
+        devices.push_back(BleHandoffDevice{
+            .bluetooth_addr = *addr,
+            .product_id = static_cast<ProductId>(static_cast<u16>(*raw_pid)),
+        });
+    }
+    return devices;
+}
 
 std::optional<std::span<const u8>> StripHidReportId(std::span<const u8> usb_report) {
     if (usb_report.size() < MinimumInputReportSize + 1) {

@@ -1914,3 +1914,20 @@ TEST_CASE("Switch2Driver::Initialize sends startup feature mask only on BLE", "[
         driver->Stop();
     }
 }
+
+TEST_CASE("ParseBleHandoffList parses valid MAC:PID entries and ignores invalid tokens",
+          "[switch2]") {
+    const auto empty = ParseBleHandoffList("");
+    REQUIRE(empty.empty());
+
+    const auto parsed = ParseBleHandoffList(
+        "0123456789ab:2069,bad,000000000000:2069,AABBCCDDEEFF:2066,AABBCCDDEEFF:2009,"
+        "AABBCCDDEEFG:2067,112233445566:2073");
+    REQUIRE(parsed.size() == 3U);
+    REQUIRE(parsed[0].bluetooth_addr == 0x0123456789ABULL);
+    REQUIRE(parsed[0].product_id == ProductId::ProController2);
+    REQUIRE(parsed[1].bluetooth_addr == 0xAABBCCDDEEFFULL);
+    REQUIRE(parsed[1].product_id == ProductId::JoyCon2Right);
+    REQUIRE(parsed[2].bluetooth_addr == 0x112233445566ULL);
+    REQUIRE(parsed[2].product_id == ProductId::NsoGameCube);
+}
