@@ -199,11 +199,141 @@ void Session::Parse(std::string_view line, std::vector<Request>& requests) {
     }
     const auto& command = message["command"].get_ref<const std::string&>();
     if (command == "pause") {
-        requests.push_back({id, Command::Pause});
+        requests.push_back({.id = id, .command = Command::Pause});
     } else if (command == "resume") {
-        requests.push_back({id, Command::Resume});
+        requests.push_back({.id = id, .command = Command::Resume});
     } else if (command == "stop") {
-        requests.push_back({id, Command::Stop});
+        requests.push_back({.id = id, .command = Command::Stop});
+    } else if (command == "save_state" || command == "load_state") {
+        std::uint8_t slot = 1;
+        if (message.contains("slot")) {
+            if (!message["slot"].is_number_unsigned()) {
+                Reply(id, "Invalid save state slot");
+                return;
+            }
+            const auto raw_slot = message["slot"].get<std::uint64_t>();
+            if (raw_slot < 1 || raw_slot > 9) {
+                Reply(id, "Save state slot must be between 1 and 9");
+                return;
+            }
+            slot = static_cast<std::uint8_t>(raw_slot);
+        }
+        requests.push_back({
+            .id = id,
+            .command = command == "save_state" ? Command::SaveState : Command::LoadState,
+            .slot = slot,
+        });
+    } else if (command == "set_fast_forward") {
+        if (!message.contains("enabled") || !message["enabled"].is_boolean()) {
+            Reply(id, "Missing boolean 'enabled' field");
+            return;
+        }
+        requests.push_back({
+            .id = id,
+            .command = Command::SetFastForward,
+            .enabled = message["enabled"].get<bool>(),
+        });
+    } else if (command == "rewind_step") {
+        requests.push_back({.id = id, .command = Command::RewindStep});
+    } else if (command == "set_video_options") {
+        bool color_correction = false;
+        bool interframe_blending = false;
+        if (message.contains("color_correction")) {
+            if (!message["color_correction"].is_boolean()) {
+                Reply(id, "Invalid boolean 'color_correction' field");
+                return;
+            }
+            color_correction = message["color_correction"].get<bool>();
+        }
+        if (message.contains("interframe_blending")) {
+            if (!message["interframe_blending"].is_boolean()) {
+                Reply(id, "Invalid boolean 'interframe_blending' field");
+                return;
+            }
+            interframe_blending = message["interframe_blending"].get<bool>();
+        }
+        requests.push_back({
+            .id = id,
+            .command = Command::SetVideoOptions,
+            .color_correction = color_correction,
+            .interframe_blending = interframe_blending,
+        });
+    } else if (command == "set_cheats") {
+        if (!message.contains("codes") || !message["codes"].is_array()) {
+            Reply(id, "Missing 'codes' array");
+            return;
+        }
+        std::vector<std::string> codes;
+        for (const auto& item : message["codes"]) {
+            if (!item.is_string()) {
+                Reply(id, "Cheat entries must be strings");
+                return;
+            }
+            codes.push_back(item.get<std::string>());
+        }
+        requests.push_back({
+            .id = id,
+            .command = Command::SetCheats,
+            .codes = std::move(codes),
+        });
+    } else if (command == "reset") {
+        requests.push_back({.id = id, .command = Command::Reset});
+    } else if (command == "set_viewport") {
+        if (!message.contains("x") || !message["x"].is_number_integer() ||
+            !message.contains("y") || !message["y"].is_number_integer() ||
+            !message.contains("width") || !message["width"].is_number_integer() ||
+            !message.contains("height") || !message["height"].is_number_integer()) {
+            Reply(id, "Invalid viewport rectangle");
+            return;
+        }
+        const auto x = message["x"].get<std::int64_t>();
+        const auto y = message["y"].get<std::int64_t>();
+        const auto width = message["width"].get<std::int64_t>();
+        const auto height = message["height"].get<std::int64_t>();
+        if (x < -16384 || x > 16384 || y < -16384 || y > 16384 || width <= 0 || height <= 0 ||
+            width > 16384 || height > 16384) {
+            Reply(id, "Invalid viewport rectangle");
+            return;
+        }
+        requests.push_back({
+            .id = id,
+            .command = Command::SetViewport,
+            .viewport_x = static_cast<int>(x),
+            .viewport_y = static_cast<int>(y),
+            .viewport_width = static_cast<int>(width),
+            .viewport_height = static_cast<int>(height),
+        });
+    } else if (command == "swkbd_submit") {
+        if (!message.contains("request_id") || !message["request_id"].is_number_unsigned() ||
+            !message.contains("text") || !message["text"].is_string()) {
+            Reply(id, "Invalid software keyboard submit payload");
+            return;
+        }
+        bool confirmed = false;
+        if (message.contains("confirmed")) {
+            if (!message["confirmed"].is_boolean()) {
+                Reply(id, "Invalid boolean 'confirmed' field");
+                return;
+            }
+            confirmed = message["confirmed"].get<bool>();
+        }
+        requests.push_back({
+            .id = id,
+            .command = Command::SwkbdSubmit,
+            .swkbd_request_id = message["request_id"].get<std::uint64_t>(),
+            .swkbd_text = message["text"].get<std::string>(),
+            .swkbd_confirmed = confirmed,
+        });
+    } else if (command == "swkbd_cancel") {
+        if (!message.contains("request_id") || !message["request_id"].is_number_unsigned()) {
+            Reply(id, "Invalid software keyboard cancel payload");
+            return;
+        }
+        requests.push_back({
+            .id = id,
+            .command = Command::SwkbdCancel,
+            .swkbd_request_id = message["request_id"].get<std::uint64_t>(),
+        });
     } else {
         Reply(id, "Unknown session command");
     }
@@ -227,7 +357,7 @@ void Session::Reply(std::uint64_t id, std::string_view error) {
     if (!error.empty()) {
         reply["message"] = error;
     }
-    Write(reply.dump());
+    Write(reply.dump(-1, ' ', false, Json::error_handler_t::replace));
 }
 
 void Session::Error(std::string_view message) {
@@ -240,7 +370,8 @@ void Session::SendEvent(std::string_view event) {
 }
 
 void Session::Game(std::string_view path, std::string_view title, std::string_view format,
-                   std::optional<std::uint64_t> program_id, std::string_view icon_hex) {
+                   std::optional<std::uint64_t> program_id, std::string_view icon_hex,
+                   std::string_view system, const GameInfo& info) {
     Json game{{"version", ProtocolVersion}, {"event", "game"}, {"path", path},
               {"title", title},             {"format", format}};
     if (program_id) {
@@ -249,12 +380,96 @@ void Session::Game(std::string_view path, std::string_view title, std::string_vi
     if (!icon_hex.empty()) {
         game["icon_hex"] = icon_hex;
     }
+    if (!system.empty()) {
+        game["system"] = system;
+    }
+    if (!info.publisher.empty()) {
+        game["publisher"] = info.publisher;
+    }
+    if (!info.version.empty()) {
+        game["game_version"] = info.version;
+    }
+    if (!info.region.empty()) {
+        game["region"] = info.region;
+    }
+    if (!info.product_code.empty()) {
+        game["product_code"] = info.product_code;
+    }
+    if (!info.internal_title.empty()) {
+        game["internal_title"] = info.internal_title;
+    }
+    if (!info.hardware.empty()) {
+        game["hardware"] = info.hardware;
+    }
+    if (info.file_size > 0) {
+        game["file_size"] = info.file_size;
+    }
+    if (!info.languages.empty()) {
+        game["languages"] = info.languages;
+    }
     Write(game.dump(-1, ' ', false, Json::error_handler_t::replace));
 }
 
 void Session::LibraryDone(std::size_t scan_errors) {
     Write(Json{{"version", ProtocolVersion}, {"event", "library_done"}, {"scan_errors", scan_errors}}
               .dump());
+}
+
+void Session::ShowSoftwareKeyboard(const SwkbdShowParams& params) {
+    Json message{
+        {"version", ProtocolVersion},
+        {"event", "swkbd_show"},
+        {"request_id", params.request_id},
+        {"header_text", params.header_text},
+        {"sub_text", params.sub_text},
+        {"guide_text", params.guide_text},
+        {"ok_text", params.ok_text},
+        {"initial_text", params.initial_text},
+        {"min_length", params.min_length},
+        {"max_length", params.max_length},
+        {"password", params.password},
+        {"multiline", params.multiline},
+        {"disable_cancel", params.disable_cancel},
+    };
+    Write(message.dump(-1, ' ', false, Json::error_handler_t::replace));
+}
+
+void Session::ShowSoftwareKeyboardTextCheck(std::uint64_t request_id, SwkbdTextCheckKind kind,
+                                            std::string_view message) {
+    Json payload{
+        {"version", ProtocolVersion},
+        {"event", "swkbd_text_check"},
+        {"request_id", request_id},
+        {"result", kind == SwkbdTextCheckKind::Confirm ? "confirm" : "failure"},
+        {"message", message},
+    };
+    Write(payload.dump(-1, ' ', false, Json::error_handler_t::replace));
+}
+
+void Session::CloseSoftwareKeyboard(std::uint64_t request_id) {
+    Write(Json{{"version", ProtocolVersion}, {"event", "swkbd_close"}, {"request_id", request_id}}
+              .dump());
+}
+
+void Session::ControllerState(std::optional<std::string_view> name) {
+    Json payload{{"version", ProtocolVersion}, {"event", "controller"}};
+    if (name) {
+        payload["name"] = *name;
+    } else {
+        payload["name"] = nullptr;
+    }
+    Write(payload.dump(-1, ' ', false, Json::error_handler_t::replace));
+}
+
+void Session::ControllerInput(std::uint32_t buttons, float left_x, float left_y) {
+    Json payload{
+        {"version", ProtocolVersion},
+        {"event", "controller_input"},
+        {"buttons", buttons},
+        {"left_x", left_x},
+        {"left_y", left_y},
+    };
+    Write(payload.dump());
 }
 
 bool Session::IsConnected() const {

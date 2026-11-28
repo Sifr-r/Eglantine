@@ -3,7 +3,19 @@
 version = 4
 
 [[package]]
+name = "eglantine-library"
+version = "0.1.0"
+
+[[package]]
 name = "eglantine_ampere_spirv"
+version = "0.1.0"
+
+[[package]]
+name = "eglantine_ctr"
+version = "0.1.0"
+
+[[package]]
+name = "eglantine_ds"
 version = "0.1.0"
 
 [[package]]

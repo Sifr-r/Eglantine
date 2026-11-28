@@ -19,10 +19,24 @@ Retire a duplicate only after identical outputs, failure behavior, and acceptabl
 | Crate | Path | C ABI Header & Responsibility |
 |---|---|---|
 | `eglantine_ampere_spirv` | `rust/crates/ampere_spirv` | `rust/include/eglantine_ampere_spirv.h` — SM86->SSA IR->SPIR-V 1.6 emitter (`OpTypeCooperativeMatrixKHR`, `std::thread::scope`) |
-| `eglantine_ffi` | `rust/crates/eglantine_ffi` | `staticlib` (`eglantine_rs`) exporting the three direct SM86 `extern "C"` symbols via feature-gated `#[used]` anchors |
+| `eglantine_ds` | `rust/crates/ds_core` | Safe Rust API for NDS payload loading and ARM9/ARM7 execution |
+| `eglantine_ctr` | `rust/crates/ctr_core` | Safe Rust API for restricted 3DSX loading and ARM11 execution |
+| `eglantine_ffi` | `rust/crates/eglantine_ffi` | `staticlib` (`eglantine_rs`) exporting the direct SM86 `extern "C"` symbols via `#[used]` anchors |
 
-- **Crate and CMake dependencies.** `eglantine_ffi` depends on `ampere_spirv` through the `ampere-spirv` Cargo feature. `ENABLE_RUST_AMP_SPIRV` defaults to `ON`. `CMakeModules/AddRustCrate.cmake` builds `eglantine_rs` for `shader_recompiler` and its consumers.
+- **Crate and CMake dependencies.** `eglantine_ffi` depends on `ampere_spirv` (`ampere-spirv`). `ENABLE_RUST_AMP_SPIRV` enables the feature when `CMakeLists.txt` builds `eglantine_rs` via `CMakeModules/AddRustCrate.cmake`.
 - **C ABI & Android NDK:** Crossings use `#[repr(C)]` POD types + callback tables; domain modules enforce `#![deny(warnings)]` and `#![forbid(unsafe_code)]`, isolating pointer checks/`catch_unwind`/`*_free` in `ffi.rs`. `AddRustCrate.cmake` cross-compiles `arm64-v8a`, `x86_64`, `armeabi-v7a` using the NDK Clang wrapper, `CMAKE_AR`, and `-ldl -lm -llog`.
+
+## Nintendo DS and Nintendo 3DS
+
+Both dependency-free crates expose `Machine::load`, `step`, `run_until`, and read-only access to guest registers and memory. The headless entry points validate synthetic guest programs. Frontend launch and playable title support require later milestones.
+
+- DS validates the ARM9 and ARM7 payload records and their referenced ranges in an NDS image. It models shared main RAM and private ARM7 RAM. A step runs ARM9 before ARM7. A guest fault stops both processors and preserves the effects of any instruction already retired.
+- 3DS loads a restricted 3DSX image with zero relocation entries. It sets code, read-only data, and writable data permissions and zero-fills BSS. A step runs one ARM11 instruction. A fault leaves the failed instruction's state unchanged.
+- Both instruction subsets cover unconditional ARM MOV immediate, LDR literal, STR immediate without writeback, and B.
+
+Within each crate, `Cargo.toml` defines the package, `src/lib.rs` exports the public API, `src/loader.rs` validates images, `src/memory.rs` checks guest accesses, `src/cpu.rs` executes instructions, `src/machine.rs` owns session state and execution limits, `src/error.rs` defines typed faults, and `tests/boot.rs` verifies the public API with independently authored fixtures.
+
+Run `cargo test --manifest-path rust/Cargo.toml --locked --offline -p eglantine_ds -p eglantine_ctr` for both cores, or drop the package selectors for the workspace.
 
 ## ISPC Kernels & Runtime Switches
 

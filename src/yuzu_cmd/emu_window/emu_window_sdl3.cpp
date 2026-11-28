@@ -62,9 +62,48 @@ EmuWindow_SDL3::~EmuWindow_SDL3() {
     SDL_RemoveTimer(titlebar_timer);
     SDL_RemoveTimer(mouse_timer);
     delete pending_title.exchange(nullptr);
+    if (embedded_parent && render_window) {
+        GpuiEmbed::Detach(render_window);
+    }
     system.HIDCore().UnloadInputDevices();
     input_subsystem->Shutdown();
     SDL_Quit();
+}
+
+void EmuWindow_SDL3::CreateRenderWindow(const char* title, SDL_WindowFlags extra_flags,
+                                          bool fullscreen) {
+    const SDL_WindowFlags hidden_flags = Nx2HiddenWindowFlags();
+    if (hidden_flags == 0) {
+        embedded_parent = GpuiEmbed::ReadParentFromEnv();
+    }
+    const int width = embedded_parent ? std::max(1, embedded_parent->viewport.width)
+                                      : Layout::ScreenUndocked::Width;
+    const int height = embedded_parent ? std::max(1, embedded_parent->viewport.height)
+                                       : Layout::ScreenUndocked::Height;
+    const SDL_WindowFlags flags =
+        GpuiEmbed::CreateFlags(embedded_parent.has_value()) | extra_flags | hidden_flags;
+    render_window = SDL_CreateWindow(title, width, height, flags);
+    if (render_window == nullptr) {
+        LOG_CRITICAL(Frontend, "Failed to create SDL3 window! {}", SDL_GetError());
+        std::exit(EXIT_FAILURE);
+    }
+    if (embedded_parent) {
+        if (!GpuiEmbed::Attach(render_window, *embedded_parent)) {
+            LOG_WARNING(Frontend,
+                        "Failed to attach embedded game window; falling back to standalone window");
+            embedded_parent.reset();
+            if (hidden_flags == 0) {
+                SDL_ShowWindow(render_window);
+            }
+        }
+    }
+    if (!embedded_parent) {
+        SetWindowIcon();
+        if (fullscreen) {
+            Fullscreen();
+            ShowCursor(false);
+        }
+    }
 }
 
 InputCommon::MouseButton EmuWindow_SDL3::SDLButtonToMouseButton(u32 button) const {
@@ -163,7 +202,9 @@ bool EmuWindow_SDL3::IsOpen() const {
 
 void EmuWindow_SDL3::ApplyPendingTitle() {
     if (std::string* const title = pending_title.exchange(nullptr)) {
-        SDL_SetWindowTitle(render_window, title->c_str());
+        if (!IsEmbedded()) {
+            SDL_SetWindowTitle(render_window, title->c_str());
+        }
         delete title;
     }
 }
@@ -260,6 +301,10 @@ void EmuWindow_SDL3::OnEvent(SDL_Event& event) {
             OnMouseMotion(event.motion.x, event.motion.y);
         return;
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        if (IsEmbedded()) {
+            GpuiEmbed::Focus(render_window);
+        }
+        [[fallthrough]];
     case SDL_EVENT_MOUSE_BUTTON_UP:
         // ignore if it came from touch
         if (event.button.which != SDL_TOUCH_MOUSEID)
@@ -281,12 +326,35 @@ void EmuWindow_SDL3::OnEvent(SDL_Event& event) {
 }
 
 bool EmuWindow_SDL3::HasInputFocus() const {
+    if (IsEmbedded()) {
+        return GpuiEmbed::HasFocus(render_window);
+    }
     return (SDL_GetWindowFlags(render_window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+}
+
+bool EmuWindow_SDL3::IsEmbedded() const {
+    return embedded_parent.has_value();
+}
+
+bool EmuWindow_SDL3::SetViewport(int x, int y, int width, int height) {
+    if (!IsEmbedded()) {
+        return true;
+    }
+    const GpuiEmbed::Viewport viewport{.x = x, .y = y, .width = width, .height = height};
+    if (!GpuiEmbed::Resize(render_window, viewport)) {
+        return false;
+    }
+    embedded_parent->viewport = viewport;
+    OnResize();
+    return true;
 }
 
 bool EmuWindow_SDL3::SetSessionVisible(bool visible) {
     if (Nx2HiddenWindowFlags() != 0) {
         return true;
+    }
+    if (IsEmbedded()) {
+        return GpuiEmbed::SetVisible(render_window, visible);
     }
     if (visible) {
         return SDL_ShowWindow(render_window) && SDL_RaiseWindow(render_window);
@@ -316,5 +384,7 @@ void EmuWindow_SDL3::SetWindowIcon() {
 }
 
 void EmuWindow_SDL3::OnMinimalClientAreaChangeRequest(std::pair<u32, u32> minimal_size) {
-    SDL_SetWindowMinimumSize(render_window, minimal_size.first, minimal_size.second);
+    if (!IsEmbedded()) {
+        SDL_SetWindowMinimumSize(render_window, minimal_size.first, minimal_size.second);
+    }
 }

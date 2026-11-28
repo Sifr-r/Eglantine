@@ -14,6 +14,7 @@
 #include "common/common_types.h"
 
 #include "core/hle/result.h"
+#include "core/hle/service/ssl/ssl_results.h"
 
 namespace Network {
 class SocketBase;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -24,10 +27,20 @@ constexpr int NodeCountMax = 8;
 constexpr int StationCountMax = NodeCountMax - 1;
 constexpr size_t PassphraseLengthMax = 64;
 
+// Limits published by the Nintendo Switch SDK 15.3.2 header nn/ldn/ldn_Types.h.
+constexpr size_t PassphraseLengthMin = 16;
+constexpr int UserNameLengthMax = 10;
+constexpr int LocalCommunicationVersionMin = 0;
+constexpr int LocalCommunicationVersionMax = 32767;
+constexpr int ScanResultCountMax = 24;
+constexpr int AcceptFilterEntryCountMax = 256;
+
+// This is nn::ldn::SecurityMode.
 enum class SecurityMode : u16 {
-    All,
-    Retail,
-    Debug,
+    Any = 0,
+    Product = 1,
+    Debug = 2,
+    SystemDebug = 3,
 };
 
 enum class NodeStateChange : u8 {
@@ -39,22 +52,30 @@ enum class NodeStateChange : u8 {
 
 DECLARE_ENUM_FLAG_OPERATORS(NodeStateChange)
 
+// This is nn::ldn::ScanFilterFlag.
 enum class ScanFilterFlag : u32 {
     None = 0,
     LocalCommunicationId = 1 << 0,
     SessionId = 1 << 1,
     NetworkType = 1 << 2,
+    Bssid = 1 << 3,
     Ssid = 1 << 4,
     SceneId = 1 << 5,
     IntentId = LocalCommunicationId | SceneId,
     NetworkId = IntentId | SessionId,
+    All = NetworkType | IntentId | SessionId | Bssid | Ssid,
 };
 
+DECLARE_ENUM_FLAG_OPERATORS(ScanFilterFlag)
+
+// This is nn::ldn::NetworkType. The SDK describes it as a set of bits that are
+// combined with a logical OR, so a scan filter carries a mask of the network
+// types it accepts.
 enum class NetworkType : u32 {
-    None,
-    General,
-    Ldn,
-    All,
+    None = 0,
+    General = 1 << 0,
+    Ldn = 1 << 1,
+    All = General | Ldn,
 };
 
 enum class PackedNetworkType : u8 {

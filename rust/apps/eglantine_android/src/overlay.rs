@@ -425,11 +425,13 @@ mod tests {
     fn persistence_round_trips_overlay_settings() {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("eglantine_overlay_{}_{}", std::process::id(), nanos));
-        let mut overlay = OverlayState::default();
-        overlay.enabled = false;
-        overlay.hide_on_controller = false;
-        overlay.opacity = 0.45;
-        overlay.scale = 1.25;
+        let overlay = OverlayState {
+            enabled: false,
+            hide_on_controller: false,
+            opacity: 0.45,
+            scale: 1.25,
+            ..OverlayState::default()
+        };
         overlay.save_to_dir(&dir).unwrap();
 
         let reloaded = OverlayState::load_from_dir(&dir);

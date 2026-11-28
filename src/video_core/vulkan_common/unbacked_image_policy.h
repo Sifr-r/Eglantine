@@ -27,4 +27,15 @@ constexpr bool ShouldLeaveImageUnbacked(u64 texels, u64 required_bytes, u64 devi
     return required_bytes == 0 || required_bytes > device_local_bytes / 4;
 }
 
+/// Whether unbacked sparse images guarantee zero-reads on non-resident blocks and do not fault
+/// on the given driver. `forced_env` is the first character of `EDEN_NX2_SPARSE_UNBACKED`
+/// ('0', '1', or '\0').
+constexpr bool CanUseUnbackedSparseImagesPolicy(bool residency_non_resident_strict,
+                                              bool is_amd_or_radv, char forced_env) noexcept {
+    if (forced_env == '0' || forced_env == '1') {
+        return forced_env == '1';
+    }
+    return residency_non_resident_strict && !is_amd_or_radv;
+}
+
 } // namespace Vulkan

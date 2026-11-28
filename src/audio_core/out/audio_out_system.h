@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -57,11 +58,36 @@ enum class State {
 };
 
 /**
+ * Device session backend interface for AudioOut::System.
+ */
+class DeviceSessionInterface {
+public:
+    virtual ~DeviceSessionInterface() = default;
+
+    virtual Result Initialize(std::string_view name, SampleFormat sample_format, u16 channel_count,
+                              size_t session_id, Kernel::KProcess* handle,
+                              u64 applet_resource_user_id, Sink::StreamType type) = 0;
+    virtual void Finalize() = 0;
+    virtual void AppendBuffers(std::span<const AudioBuffer> buffers) = 0;
+    virtual void ReleaseBuffer(const AudioBuffer& buffer) const = 0;
+    virtual bool IsBufferConsumed(const AudioBuffer& buffer) const = 0;
+    virtual void Start() = 0;
+    virtual void Stop() = 0;
+    virtual void ClearBuffers() = 0;
+    virtual void SetVolume(f32 volume) const = 0;
+    virtual u64 GetPlayedSampleCount() const = 0;
+    virtual void SetRingSize(u32 ring_size) = 0;
+};
+
+/**
  * Controls and drives audio output.
  */
 class System {
 public:
     explicit System(Core::System& system, Kernel::KEvent* event, size_t session_id);
+    explicit System(Core::System& system, Kernel::KEvent* event, size_t session_id,
+                    std::unique_ptr<DeviceSessionInterface> session,
+                    std::function<void()> signal_event_callback = {});
     ~System();
 
     /**
@@ -126,9 +152,9 @@ public:
      *
      * @param buffer - New buffer to append.
      * @param tag    - Unique tag of the buffer.
-     * @return True if the buffer was appended, otherwise false.
+     * @return Result code.
      */
-    bool AppendBuffer(const AudioOutBuffer& buffer, u64 tag);
+    Result AppendBuffer(const AudioOutBuffer& buffer, u64 tag);
 
     /**
      * Register all appended buffers.
@@ -227,6 +253,8 @@ public:
     u64 GetPlayedSampleCount() const;
 
 private:
+    void SignalBufferEvent();
+
     /// Core system
     Core::System& system;
     /// Process handle
@@ -235,10 +263,12 @@ private:
     u64 applet_resource_user_id{};
     /// Buffer event, signalled when a buffer is ready
     Kernel::KEvent* buffer_event;
+    /// Optional test callback invoked when signalling buffer_event
+    std::function<void()> signal_event_callback{};
     /// Session id of this system
     size_t session_id{};
     /// Device session for this system
-    std::unique_ptr<DeviceSession> session;
+    std::unique_ptr<DeviceSessionInterface> session;
     /// Audio buffers in use by this system
     AudioBuffers<BufferCount> buffers{BufferCount};
     /// Sample rate of this system
@@ -249,6 +279,8 @@ private:
     u16 channel_count{};
     /// State of this system
     std::atomic<State> state{State::Stopped};
+    /// Whether Finalize() has already been executed
+    bool finalized{};
     /// Name of this system
     std::string name{};
     /// Volume of this system

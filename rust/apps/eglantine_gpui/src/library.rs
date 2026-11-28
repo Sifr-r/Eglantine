@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::host_tool::{self, Event};
+use crate::metadata::{self, GameInfo, MetadataCache};
+use eglantine_library::ConsoleId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -17,6 +19,23 @@ pub struct LibraryEntry {
     pub path: PathBuf,
     pub cover: Option<PathBuf>,
     pub program_id: Option<String>,
+    pub console: Option<ConsoleId>,
+    pub info: GameInfo,
+}
+
+pub fn browse_indices(
+    entries: &[LibraryEntry], query: &str, alphabetical: bool,
+    mut includes: impl FnMut(&LibraryEntry) -> bool,
+) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    let mut indices: Vec<_> = entries.iter().enumerate().filter_map(|(index, entry)| {
+        (includes(entry) && (query.is_empty() || entry.title.to_lowercase().contains(&query)))
+            .then_some(index)
+    }).collect();
+    if alphabetical {
+        indices.sort_by_cached_key(|&index| (entries[index].title.to_lowercase(), &entries[index].path));
+    }
+    indices
 }
 
 #[derive(Clone, Default, Deserialize, Serialize)]
@@ -28,17 +47,22 @@ struct Preferences {
 pub struct Library {
     file: PathBuf,
     preferences: Preferences,
+    cache: MetadataCache,
     entries_by_folder: BTreeMap<PathBuf, FolderScan>,
     entries: Vec<LibraryEntry>,
 }
 
 pub struct LibraryScan {
     folders: BTreeMap<PathBuf, bool>,
-    cache: PathBuf,
+    cache_dir: PathBuf,
+    cached_metadata: MetadataCache,
+    extract_metadata: bool,
+    force_refresh: bool,
 }
 
 pub struct LibraryScanResult {
     folders: BTreeMap<PathBuf, FolderScan>,
+    update_cache: bool,
     pub warning: Option<String>,
 }
 
@@ -114,7 +138,8 @@ impl Library {
             }
             Err(error) => return Err(format!("Could not read {}: {error}", file.display())),
         };
-        Ok(Self { file, preferences, entries_by_folder: BTreeMap::new(), entries: Vec::new() })
+        let cache = MetadataCache::load(&dir).unwrap_or_default();
+        Ok(Self { file, preferences, cache, entries_by_folder: BTreeMap::new(), entries: Vec::new() })
     }
 
     pub fn entries(&self) -> &[LibraryEntry] { &self.entries }
@@ -131,10 +156,13 @@ impl Library {
         Ok(())
     }
 
-    pub fn metadata_request(&self) -> LibraryScan {
+    pub fn metadata_request(&self, extract_metadata: bool, force_refresh: bool) -> LibraryScan {
         LibraryScan {
             folders: self.preferences.folders.clone(),
-            cache: self.file.with_file_name("covers"),
+            cache_dir: self.file.with_file_name("covers"),
+            cached_metadata: self.cache.clone(),
+            extract_metadata,
+            force_refresh,
         }
     }
 
@@ -155,6 +183,14 @@ impl Library {
             .map(|entry| (&entry.path, entry)).collect();
         self.entries = games.into_values().cloned().collect();
         sort_entries(&mut self.entries, &self.preferences.played);
+        if metadata.update_cache && !self.entries.is_empty() {
+            for entry in &self.entries {
+                self.cache.upsert(entry);
+            }
+            if let Some(dir) = self.file.parent() {
+                let _ = self.cache.save(dir);
+            }
+        }
     }
 
     pub fn note_played(&mut self, path: &Path) -> Result<(), String> {
@@ -201,16 +237,61 @@ impl LibraryScan {
                         done = true;
                         scan_errors = errors;
                     }
-                    Event::Game { path, title, program_id, icon_hex } => {
+                    Event::Game {
+                        path,
+                        title,
+                        format,
+                        program_id,
+                        icon_hex,
+                        system,
+                        publisher,
+                        version,
+                        region,
+                        product_code,
+                        internal_title,
+                        hardware,
+                        file_size,
+                        languages,
+                    } => {
                         let path = path.canonicalize().unwrap_or(path);
-                        let cover = match find_cover(&self.cache, &path, icon_hex.as_deref()) {
-                            Ok(cover) => cover,
-                            Err(error) => {
-                                cover_warning.get_or_insert(error);
-                                None
+                        let console = system.as_deref().and_then(ConsoleId::parse);
+                        let (cover, info) = if !self.extract_metadata && !self.force_refresh {
+                            if let Some(cached) = self.cached_metadata.lookup_fresh(&path) {
+                                (cached.cover, cached.info)
+                            } else {
+                                (
+                                    metadata::find_sidecar_cover(&path),
+                                    GameInfo { format, ..Default::default() },
+                                )
                             }
+                        } else {
+                            let info = GameInfo {
+                                format,
+                                publisher,
+                                version,
+                                region,
+                                product_code,
+                                internal_title,
+                                hardware,
+                                file_size,
+                                languages,
+                            };
+                            let cover = match find_cover(
+                                &self.cache_dir,
+                                &path,
+                                program_id.as_deref(),
+                                info.product_code.as_deref(),
+                                icon_hex.as_deref(),
+                            ) {
+                                Ok(cover) => cover,
+                                Err(error) => {
+                                    cover_warning.get_or_insert(error);
+                                    None
+                                }
+                            };
+                            (cover, info)
                         };
-                        entries.push(LibraryEntry { title, path, cover, program_id });
+                        entries.push(LibraryEntry { title, path, cover, program_id, console, info });
                     }
                     _ => return Err("The emulator returned an unexpected library event".into()),
                 }
@@ -228,16 +309,23 @@ impl LibraryScan {
             }
             folders.insert(directory, FolderScan { entries, complete });
         }
-        LibraryScanResult { folders, warning: discovery_warning.or(cover_warning) }
+        LibraryScanResult {
+            folders,
+            update_cache: self.extract_metadata || self.force_refresh,
+            warning: discovery_warning.or(cover_warning),
+        }
     }
 }
 
-fn find_cover(cache: &Path, game: &Path, icon: Option<&str>) -> Result<Option<PathBuf>, String> {
-    let sidecar = ["png", "jpg", "jpeg", "webp"].into_iter()
-        .map(|extension| game.with_extension(extension))
-        .find(|path| path.is_file());
-    if sidecar.is_some() {
-        return Ok(sidecar);
+fn find_cover(
+    cache: &Path,
+    game: &Path,
+    program_id: Option<&str>,
+    product_code: Option<&str>,
+    icon: Option<&str>,
+) -> Result<Option<PathBuf>, String> {
+    if let Some(local) = metadata::find_local_cover(cache, game, program_id, product_code) {
+        return Ok(Some(local));
     }
     icon.map(|data| cache_cover(cache, game, data)).transpose()
 }
@@ -311,6 +399,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn alphabetical_library_orders_titles_without_changing_recent_order() {
+        let entries: Vec<_> = ["Zebra Circuit", "moss valley", "Amber Relay"].into_iter()
+            .map(|title| LibraryEntry {
+                title: title.into(), path: PathBuf::from(title), cover: None, program_id: None, console: None,
+                info: GameInfo::default(),
+            }).collect();
+        assert_eq!(browse_indices(&entries, "", true, |_| true), [2, 1, 0]);
+        assert_eq!(browse_indices(&entries, "VALLEY", true, |_| true), [1]);
+        assert_eq!(browse_indices(&entries, "", false, |entry| entry.title != "moss valley"), [0, 2]);
+    }
+
+    #[test]
+    fn filters_and_sorts_a_large_mixed_console_collection() {
+        let entries: Vec<_> = (0..1000).rev().map(|number| {
+            let console = if number % 2 == 0 { ConsoleId::GameBoyAdvance } else { ConsoleId::GameBoyColor };
+            LibraryEntry {
+                title: format!("Relay {number:04}"), path: PathBuf::from(format!("{number}.rom")),
+                cover: None, program_id: None, console: Some(console), info: GameInfo::default(),
+            }
+        }).collect();
+        let is_advance = |entry: &LibraryEntry| entry.console == Some(ConsoleId::GameBoyAdvance);
+        let games = browse_indices(&entries, "", true, is_advance);
+        assert_eq!(games.len(), 500);
+        assert_eq!(entries[games[0]].path, PathBuf::from("0.rom"));
+        assert_eq!(entries[*games.last().unwrap()].path, PathBuf::from("998.rom"));
+        let filter = browse_indices(&entries, "RELay 009", true, is_advance);
+        assert_eq!(filter.iter().map(|&index| entries[index].title.as_str()).collect::<Vec<_>>(),
+            ["Relay 0090", "Relay 0092", "Relay 0094", "Relay 0096", "Relay 0098"]);
+    }
+
+    #[test]
     fn opening_and_adding_folders_only_loads_preferences() {
         let scratch = tempfile::tempdir().unwrap();
         let games = scratch.path().join("games");
@@ -323,7 +442,7 @@ mod tests {
         let reopened = Library::open(dir).unwrap();
         assert!(reopened.entries().is_empty());
         assert_eq!(
-            reopened.metadata_request().folders,
+            reopened.metadata_request(true, false).folders,
             BTreeMap::from([(games.canonicalize().unwrap(), true)]),
         );
     }
@@ -336,6 +455,7 @@ mod tests {
         let folder = scratch.path().join("games");
         let snapshot = |entries| LibraryScanResult {
             folders: BTreeMap::from([(folder.clone(), FolderScan { entries, complete: true })]),
+            update_cache: true,
             warning: None,
         };
         let entry = |title: &str| LibraryEntry {
@@ -343,6 +463,8 @@ mod tests {
             path: folder.join(format!("{title}.nro")),
             cover: None,
             program_id: None,
+            console: None,
+            info: GameInfo::default(),
         };
         let alpha = entry("Alpha");
         let beta = entry("Beta");
@@ -372,6 +494,8 @@ mod tests {
             path: folder.join(format!("{title}.nro")),
             cover: None,
             program_id: None,
+            console: None,
+            info: GameInfo::default(),
         };
 
         let first = LibraryScanResult {
@@ -379,6 +503,7 @@ mod tests {
                 (alpha.clone(), FolderScan { entries: vec![entry(&alpha, "Alpha")], complete: true }),
                 (beta.clone(), FolderScan { entries: vec![entry(&beta, "Beta")], complete: true }),
             ]),
+            update_cache: true,
             warning: None,
         };
         library.apply_metadata(first);
@@ -389,6 +514,7 @@ mod tests {
                 (alpha, FolderScan { entries: Vec::new(), complete: true }),
                 (beta.clone(), FolderScan { entries: vec![entry(&beta, "Partial")], complete: false }),
             ]),
+            update_cache: false,
             warning: Some("The emulator did not finish the scan".into()),
         };
         assert!(!interrupted.is_complete());
@@ -400,6 +526,7 @@ mod tests {
             folders: BTreeMap::from([
                 (beta.clone(), FolderScan { entries: vec![entry(&beta, "New")], complete: true }),
             ]),
+            update_cache: true,
             warning: Some("Invalid embedded cover".into()),
         };
         assert!(recovered.is_complete());
@@ -415,7 +542,7 @@ mod tests {
         let game = scratch.path().join("game.nro");
         let sidecar = game.with_extension("png");
         fs::write(&sidecar, []).unwrap();
-        assert_eq!(find_cover(&cache, &game, Some("invalid")).unwrap(), Some(sidecar.clone()));
+        assert_eq!(find_cover(&cache, &game, None, None, Some("invalid")).unwrap(), Some(sidecar.clone()));
         assert!(!cache.exists());
 
         fs::remove_file(sidecar).unwrap();
@@ -425,9 +552,51 @@ mod tests {
             .unwrap();
         let bytes = icon.into_inner();
         let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-        let cached = find_cover(&cache, &game, Some(&hex)).unwrap().unwrap();
+        let cached = find_cover(&cache, &game, None, None, Some(&hex)).unwrap().unwrap();
         assert_eq!(cached.parent(), Some(cache.as_path()));
         assert_eq!(fs::read(cached).unwrap(), bytes);
+    }
+
+    #[test]
+    fn metadata_request_persists_flags_and_cache() {
+        let scratch = tempfile::tempdir().unwrap();
+        let dir = scratch.path().join("gpui");
+        let games = scratch.path().join("games");
+        fs::create_dir(&games).unwrap();
+        let rom = games.join("Example.gba");
+        fs::write(&rom, b"synthetic-rom").unwrap();
+
+        let mut library = Library::open(dir.clone()).unwrap();
+        let entry = LibraryEntry {
+            title: "Example".into(),
+            path: rom.clone(),
+            cover: None,
+            program_id: None,
+            console: Some(ConsoleId::GameBoyAdvance),
+            info: GameInfo {
+                format: Some("GBA".into()),
+                publisher: Some("Nintendo".into()),
+                ..Default::default()
+            },
+        };
+        library.apply_metadata(LibraryScanResult {
+            folders: BTreeMap::from([(games, FolderScan { entries: vec![entry], complete: true })]),
+            update_cache: true,
+            warning: None,
+        });
+
+        let reopened = Library::open(dir).unwrap();
+        let scan_off = reopened.metadata_request(false, false);
+        assert!(!scan_off.extract_metadata);
+        assert!(!scan_off.force_refresh);
+        assert_eq!(
+            scan_off.cached_metadata.lookup_fresh(&rom).unwrap().info.publisher.as_deref(),
+            Some("Nintendo")
+        );
+
+        let scan_force = reopened.metadata_request(false, true);
+        assert!(!scan_force.extract_metadata);
+        assert!(scan_force.force_refresh);
     }
 
     #[test]

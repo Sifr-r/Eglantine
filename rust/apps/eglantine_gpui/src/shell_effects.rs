@@ -5,13 +5,15 @@ use std::path::PathBuf;
 
 use eglantine_gpui::{
     content::{self, ContentOperation},
-    session::SessionEvent,
+    emulator_config::EmulatorSetting,
+    session::{EmbedTarget, SessionEvent},
+    software_keyboard::SoftwareKeyboardState,
 };
 use gpui::{Context, PathPromptOptions, Window};
 
 use crate::controller::Input;
 
-use super::{Overlay, Screen, Session, Shell, Target};
+use super::{Category, Overlay, PauseDestination, Screen, Session, Shell, Target};
 
 #[derive(Clone, Copy)]
 pub(super) enum Picker {
@@ -19,6 +21,7 @@ pub(super) enum Picker {
     Folder,
     Content,
     Firmware,
+    Bios,
 }
 
 impl Shell {
@@ -28,24 +31,58 @@ impl Shell {
             self.controller_name = name;
             cx.notify();
         }
+        if self.session != Session::Idle {
+            if self.parent_hwnd.is_none() {
+                self.parent_hwnd = crate::embed::current_window_hwnd();
+            }
+            if let Some(hwnd) = self.parent_hwnd
+                && let Some(rect) = crate::embed::viewport_rect(
+                    hwnd,
+                    crate::embed::GAME_TOP_BAR_HEIGHT,
+                    window.scale_factor(),
+                )
+            {
+                self.client.sync_viewport(rect);
+            }
+        }
         for event in self.client.poll() {
             match event {
                 SessionEvent::Running => {
                     self.session = Session::Running;
                     self.overlay = Overlay::None;
-                    if let (Some(library), Some(path)) = (&mut self.library, &self.session_path) {
-                        if let Err(error) = library.note_played(path) {
+                    self.gba_fast_forward = false;
+                    self.pending_gba_action = None;
+                    let selected = self.library_selection_path();
+                    if let (Some(library), Some(path)) = (&mut self.library, self.session_path.clone()) {
+                        if let Err(error) = library.note_played(&path) {
                             self.message = Some(error);
-                        } else if let Some(index) = library.entries().iter().position(|entry| &entry.path == path) {
-                            self.set_library_selection(index);
-                            self.return_target = Target::Game(index);
+                        } else {
+                            let path_console = self.entries().iter().find(|entry| entry.path == path).map(|entry| entry.console);
+                            let preferred = if self.console.is_none() || path_console == Some(self.console) {
+                                Some(path.as_path())
+                            } else { selected.as_deref() };
+                            self.rebuild_library(preferred);
+                            if self.library_indices.contains(&self.selected) {
+                                self.return_target = Target::Game(self.selected);
+                            }
                         }
                     }
                 }
                 SessionEvent::Paused => {
                     self.session = Session::Paused;
-                    self.overlay = Overlay::Pause;
-                    self.target = Target::Resume;
+                    match std::mem::replace(&mut self.pause_destination, PauseDestination::PauseMenu) {
+                        PauseDestination::PauseMenu => {
+                            self.overlay = Overlay::Pause;
+                            self.target = Target::Resume;
+                        }
+                        PauseDestination::EmulationSettings => {
+                            self.open_settings(Category::Emulation);
+                        }
+                        PauseDestination::ConfirmStop => {
+                            self.overlay = Overlay::Confirm(Target::Stop);
+                            self.target = Target::Back;
+                        }
+                    }
                     window.activate_window();
                     window.focus(&self.focus);
                 }
@@ -57,17 +94,59 @@ impl Shell {
                 SessionEvent::Stopped => {
                     self.session = Session::Idle;
                     self.home_released = true;
+                    self.gba_fast_forward = false;
+                    self.pending_gba_action = None;
+                    self.pause_destination = PauseDestination::PauseMenu;
+                    self.swkbd = None;
                     self.overlay = Overlay::None;
                     self.target = self.return_target;
                     self.session_path = None;
+                    self.controller.resume_native();
                     self.scroll_to_game(self.selected);
                     window.activate_window();
                     window.focus(&self.focus);
                 }
+                SessionEvent::SoftwareKeyboardShow(request) => {
+                    self.swkbd = Some(SoftwareKeyboardState::from_request(request));
+                    self.overlay = Overlay::SoftwareKeyboard;
+                    self.target = Target::SwkbdSubmit;
+                    window.activate_window();
+                    window.focus(&self.focus);
+                }
+                SessionEvent::SoftwareKeyboardTextCheck { request_id, result, message } => {
+                    if let Some(swkbd) = &mut self.swkbd
+                        && swkbd.apply_text_check(request_id, result, message)
+                    {
+                        self.target = Target::SwkbdSubmit;
+                        window.activate_window();
+                        window.focus(&self.focus);
+                    }
+                }
+                SessionEvent::SoftwareKeyboardClose { request_id } => {
+                    if self.swkbd.as_ref().is_some_and(|swkbd| swkbd.request_id == request_id) {
+                        self.swkbd = None;
+                        if self.overlay == Overlay::SoftwareKeyboard {
+                            self.overlay = Overlay::None;
+                        }
+                    }
+                }
+                SessionEvent::ActionCompleted => {
+                    if let Some(action) = self.pending_gba_action.take() {
+                        self.commit_gba_action(action);
+                    }
+                }
                 SessionEvent::Error(error) => {
+                    self.pending_gba_action = None;
+                    self.pause_destination = PauseDestination::PauseMenu;
+                    if self.overlay == Overlay::SoftwareKeyboard
+                        && let Some(swkbd) = &mut self.swkbd
+                    {
+                        swkbd.clear_submitting_on_error(error.clone());
+                    }
                     self.message = Some(error);
                     if self.session == Session::Starting {
                         self.session = Session::Idle;
+                        self.controller.resume_native();
                     } else if self.session == Session::Pausing {
                         self.session = Session::Running;
                     } else if matches!(self.session, Session::Closing | Session::Resuming) {
@@ -109,6 +188,7 @@ impl Shell {
             Picker::Folder => "Add game folder",
             Picker::Content => "Choose content to install",
             Picker::Firmware => "Choose a firmware folder",
+            Picker::Bios => "Choose GBA BIOS (16 KiB)",
         };
         let reply = cx.prompt_for_paths(PathPromptOptions {
             files: !folder,
@@ -127,17 +207,21 @@ impl Shell {
                                 Picker::Folder => {
                                     if let Some(library) = &mut shell.library {
                                         match library.add_folder(path) {
-                                            Ok(()) => shell.refresh_metadata(window, cx),
+                                            Ok(()) => shell.refresh_metadata(false, window, cx),
                                             Err(error) => shell.message = Some(error),
                                         }
                                     }
                                 }
                                 Picker::Game => {
                                     shell.overlay = Overlay::None;
-                                    shell.launch(path);
+                                    shell.launch(path, window);
                                 }
                                 Picker::Content => shell.run_content(ContentOperation::InstallContent, Some(path), window, cx),
                                 Picker::Firmware => shell.run_content(ContentOperation::InstallFirmware, Some(path), window, cx),
+                                Picker::Bios => {
+                                    shell.gba_bios_path = Some(path.to_string_lossy().into_owned());
+                                    shell.message = Some("Selected custom GBA BIOS.".into());
+                                }
                             }
                         }
                     }
@@ -149,11 +233,13 @@ impl Shell {
         }).detach();
     }
 
-    pub(super) fn refresh_metadata(&mut self, window: &Window, cx: &Context<Self>) {
+    pub(super) fn refresh_metadata(&mut self, force_refresh: bool, window: &Window, cx: &mut Context<Self>) {
         let Some(library) = &self.library else { return };
         self.metadata_request += 1;
         let generation = self.metadata_request;
-        let scan = library.metadata_request();
+        self.metadata_busy = true;
+        cx.notify();
+        let scan = library.metadata_request(self.auto_extract_metadata, force_refresh);
         let task = cx.background_executor().spawn(async move { scan.read() });
         cx.spawn_in(window, async move |entity, cx| {
             let mut scan = task.await;
@@ -163,22 +249,36 @@ impl Shell {
                 if shell.metadata_request != generation {
                     return;
                 }
+                shell.metadata_busy = false;
                 let selected = shell.library_selection_path();
                 let focused = matches!(shell.target, Target::Game(_));
                 if let Some(library) = &mut shell.library {
                     library.apply_metadata(scan);
                 }
-                let index = selected.and_then(|path| shell.entries().iter().position(|entry| entry.path == path));
-                if index.is_some() || complete {
+                shell.rebuild_library(selected.as_deref());
+                let retained = selected.as_ref().is_some_and(|path| shell.entries().get(shell.selected)
+                    .is_some_and(|entry| &entry.path == path));
+                if retained || complete {
                     shell.pending_library_selection = None;
                 }
-                shell.selected = index.unwrap_or_default();
-                if focused || shell.target == Target::AddFolder && !shell.entries().is_empty() && shell.screen == Screen::Home {
-                    shell.target = if shell.entries().is_empty() { Target::AddFolder } else { Target::Game(shell.selected) };
+                if matches!(shell.return_target, Target::Game(_)) {
+                    shell.return_target = if shell.library_indices.is_empty() {
+                        Target::AddFolder
+                    } else {
+                        Target::Game(shell.selected)
+                    };
+                }
+                if focused || shell.target == Target::AddFolder && !shell.library_indices.is_empty() && shell.screen == Screen::Home {
+                    shell.target = if shell.library_indices.is_empty() { Target::AddFolder } else { Target::Game(shell.selected) };
+                    shell.scroll_to_game(shell.selected);
+                } else if retained && shell.target == Target::AddFolder && shell.screen == Screen::Library {
+                    shell.target = Target::Game(shell.selected);
                     shell.scroll_to_game(shell.selected);
                 }
                 if let Some(warning) = warning {
                     shell.message = Some(warning);
+                } else if force_refresh {
+                    shell.message = Some("Metadata updated.".into());
                 }
                 cx.notify();
             }));
@@ -205,21 +305,54 @@ impl Shell {
         }).detach();
     }
 
-    pub(super) fn launch(&mut self, path: PathBuf) {
+    pub(super) fn launch(&mut self, path: PathBuf, window: &mut Window) {
         if self.session != Session::Idle || self.content_busy {
             return;
         }
+        if self.parent_hwnd.is_none() {
+            self.parent_hwnd = crate::embed::current_window_hwnd();
+        }
+        let want_fullscreen = self.settings.as_ref().is_some_and(|config| {
+            config
+                .game_value(&path, EmulatorSetting::GameDisplay)
+                .ok()
+                .flatten()
+                .map_or_else(|| config.game_fullscreen(), |value| value == "Fullscreen")
+        });
+        if self.parent_hwnd.is_some() && want_fullscreen && !window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
+        let embed = self.parent_hwnd.and_then(|hwnd| {
+            crate::embed::viewport_rect(
+                hwnd,
+                crate::embed::GAME_TOP_BAR_HEIGHT,
+                window.scale_factor(),
+            )
+            .map(|viewport| EmbedTarget { parent_window: hwnd, viewport })
+        });
+        let gba = self.gba_launch_config();
+        self.controller.suspend_native();
         let result = match &self.settings {
-            Some(config) => self.client.launch_game_with_profile(&path, config, self.user_profile_override),
-            None => self.client.launch(&path, false, None),
+            Some(config) => self.client.launch_game_with_embed(
+                &path,
+                config,
+                self.user_profile_override,
+                gba,
+                embed,
+            ),
+            None => self.client.launch_with_embed(&path, false, None, gba, embed),
         };
         match result {
             Ok(()) => {
                 self.return_target = self.target;
                 self.session_path = Some(path);
                 self.session = Session::Starting;
+                self.pause_destination = PauseDestination::PauseMenu;
             }
-            Err(error) => self.message = Some(error),
+            Err(error) => {
+                self.controller.resume_native();
+                self.message = Some(error);
+            }
         }
     }
 }

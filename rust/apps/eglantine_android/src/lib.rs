@@ -11,6 +11,7 @@ use settings::SettingsSnapshot;
 use state::{App, SelectionResult};
 use ui::{DrawCmd, FrameDrawList};
 
+mod browser;
 mod library;
 mod overlay;
 mod settings;

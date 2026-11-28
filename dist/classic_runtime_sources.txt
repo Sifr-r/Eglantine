@@ -1,0 +1,18 @@
+Eglantine Game Boy runtime source
+
+Eglantine builds the mGBA 0.10.5 static library with the upstream
+`LIBMGBA_ONLY` option. The build excludes mGBA's standalone command-line
+parser and prefixes its bundled CRC fallback. The dependency manifest
+records the SHA-512 digest of the complete source archive used by this build.
+
+Upstream source, including blip_buf and inih
+https://codeload.github.com/mgba-emu/mgba/tar.gz/refs/tags/0.10.5
+
+Upstream revision
+26b7884bc25a5933960f3cdcd98bac1ae14d42e2
+
+The Eglantine source for the corresponding release contains the complete
+build and integration sources. To rebuild against a modified mGBA source
+copy, configure the Eglantine release source with `-Dmgba_CUSTOM_DIR=<source>`
+and build the `yuzu-cmd` target. The integration lives in
+`src/emulation/classic` and `src/yuzu_cmd/classic_session.cpp`.

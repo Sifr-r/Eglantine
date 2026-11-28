@@ -3,6 +3,7 @@
 
 use serde::Deserialize;
 use crate::emulator_config::EmulatorConfig;
+use crate::software_keyboard::{SwkbdShowRequest, SwkbdTextCheckKind};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -22,6 +23,16 @@ pub enum SessionEvent {
     Stopped,
     HomeRequested,
     HomeReleased,
+    ActionCompleted,
+    SoftwareKeyboardShow(SwkbdShowRequest),
+    SoftwareKeyboardTextCheck {
+        request_id: u64,
+        result: SwkbdTextCheckKind,
+        message: String,
+    },
+    SoftwareKeyboardClose {
+        request_id: u64,
+    },
     Error(String),
 }
 
@@ -49,8 +60,62 @@ enum WireEvent {
     State { state: State },
     HomeRequested,
     HomeReleased,
+    SwkbdShow {
+        request_id: u64,
+        #[serde(default)]
+        header_text: String,
+        #[serde(default)]
+        sub_text: String,
+        #[serde(default)]
+        guide_text: String,
+        #[serde(default)]
+        ok_text: String,
+        #[serde(default)]
+        initial_text: String,
+        #[serde(default)]
+        min_length: u32,
+        #[serde(default)]
+        max_length: u32,
+        #[serde(default)]
+        password: bool,
+        #[serde(default)]
+        multiline: bool,
+        #[serde(default)]
+        disable_cancel: bool,
+    },
+    SwkbdTextCheck {
+        request_id: u64,
+        result: SwkbdTextCheckKind,
+        #[serde(default)]
+        message: String,
+    },
+    SwkbdClose {
+        request_id: u64,
+    },
     Error { message: String },
     Reply { id: u64, ok: bool, state: Option<State>, message: Option<String> },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ViewportRect {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmbedTarget {
+    pub parent_window: u64,
+    pub viewport: ViewportRect,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GbaLaunchConfig {
+    pub bios_path: Option<String>,
+    pub color_correction: bool,
+    pub interframe_blending: bool,
+    pub cheats: Vec<String>,
 }
 
 struct Launch {
@@ -61,6 +126,8 @@ struct Launch {
     home_button: String,
     user_profile: Option<u8>,
     handoff: bool,
+    gba: GbaLaunchConfig,
+    embed: Option<EmbedTarget>,
     _override_file: Option<tempfile::TempPath>,
 }
 
@@ -73,6 +140,8 @@ struct Host {
     deadline: Instant,
     ready: bool,
     reported_error: bool,
+    desired_viewport: Option<ViewportRect>,
+    sent_viewport: Option<ViewportRect>,
 }
 
 #[derive(Default)]
@@ -84,6 +153,27 @@ pub struct SessionClient {
 
 impl SessionClient {
     pub fn launch(&mut self, game: &Path, fullscreen: bool, config: Option<&Path>) -> Result<(), String> {
+        self.launch_with_gba(game, fullscreen, config, GbaLaunchConfig::default())
+    }
+
+    pub fn launch_with_gba(
+        &mut self,
+        game: &Path,
+        fullscreen: bool,
+        config: Option<&Path>,
+        gba: GbaLaunchConfig,
+    ) -> Result<(), String> {
+        self.launch_with_embed(game, fullscreen, config, gba, None)
+    }
+
+    pub fn launch_with_embed(
+        &mut self,
+        game: &Path,
+        fullscreen: bool,
+        config: Option<&Path>,
+        gba: GbaLaunchConfig,
+        embed: Option<EmbedTarget>,
+    ) -> Result<(), String> {
         self.launch_with_config(Launch {
             game: game.into(),
             fullscreen,
@@ -92,6 +182,8 @@ impl SessionClient {
             home_button: "guide".into(),
             user_profile: None,
             handoff: false,
+            gba,
+            embed,
             _override_file: None,
         })
     }
@@ -102,6 +194,27 @@ impl SessionClient {
 
     pub fn launch_game_with_profile(
         &mut self, game: &Path, config: &EmulatorConfig, user_profile_override: Option<u8>,
+    ) -> Result<(), String> {
+        self.launch_game_with_gba(game, config, user_profile_override, GbaLaunchConfig::default())
+    }
+
+    pub fn launch_game_with_gba(
+        &mut self,
+        game: &Path,
+        config: &EmulatorConfig,
+        user_profile_override: Option<u8>,
+        gba: GbaLaunchConfig,
+    ) -> Result<(), String> {
+        self.launch_game_with_embed(game, config, user_profile_override, gba, None)
+    }
+
+    pub fn launch_game_with_embed(
+        &mut self,
+        game: &Path,
+        config: &EmulatorConfig,
+        user_profile_override: Option<u8>,
+        gba: GbaLaunchConfig,
+        embed: Option<EmbedTarget>,
     ) -> Result<(), String> {
         let (fullscreen, override_file) = config.session_file(game)?;
         let path = override_file.as_deref().unwrap_or(config.path()).to_path_buf();
@@ -117,6 +230,8 @@ impl SessionClient {
             home_button: config.home_button().to_owned(),
             user_profile,
             handoff: false,
+            gba,
+            embed,
             _override_file: override_file,
         })
     }
@@ -139,11 +254,42 @@ impl SessionClient {
         command.env_remove("EDEN_CLI_RESTART_HANDOFF");
         command.env("EGLANTINE_GPUI_HOME_KEY", &launch.home_key);
         command.env("EGLANTINE_GPUI_HOME_BUTTON", &launch.home_button);
+        if let Some(bios) = &launch.gba.bios_path {
+            command.env("EGLANTINE_GPUI_GBA_BIOS", bios);
+        } else {
+            command.env_remove("EGLANTINE_GPUI_GBA_BIOS");
+        }
+        command.env(
+            "EGLANTINE_GPUI_GBA_COLOR_CORRECTION",
+            if launch.gba.color_correction { "1" } else { "0" },
+        );
+        command.env(
+            "EGLANTINE_GPUI_GBA_INTERFRAME_BLENDING",
+            if launch.gba.interframe_blending { "1" } else { "0" },
+        );
+        if !launch.gba.cheats.is_empty() {
+            command.env("EGLANTINE_GPUI_GBA_CHEATS", launch.gba.cheats.join(";"));
+        } else {
+            command.env_remove("EGLANTINE_GPUI_GBA_CHEATS");
+        }
         if launch.handoff {
             command.env("EDEN_CLI_RESTART_HANDOFF", "1");
         }
-        if launch.fullscreen {
-            command.arg("-f");
+        if let Some(embed) = launch.embed {
+            command.env("EGLANTINE_GPUI_PARENT_HWND", embed.parent_window.to_string());
+            command.env(
+                "EGLANTINE_GPUI_VIEWPORT",
+                format!(
+                    "{},{},{},{}",
+                    embed.viewport.x, embed.viewport.y, embed.viewport.width, embed.viewport.height
+                ),
+            );
+        } else {
+            command.env_remove("EGLANTINE_GPUI_PARENT_HWND");
+            command.env_remove("EGLANTINE_GPUI_VIEWPORT");
+            if launch.fullscreen {
+                command.arg("-f");
+            }
         }
         if let Some(profile) = launch.user_profile {
             command.arg("-u").arg(profile.to_string());
@@ -172,9 +318,12 @@ impl SessionClient {
                 }
             }
         });
+        let initial_viewport = launch.embed.map(|embed| embed.viewport);
         self.host = Some(Host {
             child, input, launch, state: None, pending: None,
             deadline: Instant::now() + BOOT_TIMEOUT, ready: false, reported_error: false,
+            desired_viewport: initial_viewport,
+            sent_viewport: initial_viewport,
         });
         Ok(())
     }
@@ -183,13 +332,93 @@ impl SessionClient {
     pub fn resume(&mut self) -> Result<(), String> { self.send("resume", Some(State::Paused)) }
     pub fn stop(&mut self) -> Result<(), String> { self.send("stop", None) }
 
+    pub fn save_state(&mut self, slot: u8) -> Result<(), String> {
+        self.send_fields("save_state", None, serde_json::json!({ "slot": slot }))
+    }
+
+    pub fn load_state(&mut self, slot: u8) -> Result<(), String> {
+        self.send_fields("load_state", None, serde_json::json!({ "slot": slot }))
+    }
+
+    pub fn set_fast_forward(&mut self, enabled: bool) -> Result<(), String> {
+        self.send_fields("set_fast_forward", None, serde_json::json!({ "enabled": enabled }))
+    }
+
+    pub fn rewind_step(&mut self) -> Result<(), String> {
+        self.send("rewind_step", None)
+    }
+
+    pub fn set_video_options(&mut self, color_correction: bool, interframe_blending: bool) -> Result<(), String> {
+        self.send_fields(
+            "set_video_options",
+            None,
+            serde_json::json!({
+                "color_correction": color_correction,
+                "interframe_blending": interframe_blending,
+            }),
+        )?;
+        if let Some(host) = &mut self.host {
+            host.launch.gba.color_correction = color_correction;
+            host.launch.gba.interframe_blending = interframe_blending;
+        }
+        Ok(())
+    }
+
+    pub fn set_cheats(&mut self, codes: &[String]) -> Result<(), String> {
+        self.send_fields("set_cheats", None, serde_json::json!({ "codes": codes }))
+    }
+
+    pub fn reset_game(&mut self) -> Result<(), String> {
+        self.send("reset", None)
+    }
+
     pub fn restart(&mut self) -> Result<(), String> {
         self.stop()?;
         self.restart = true;
         Ok(())
     }
 
+    pub fn submit_software_keyboard(
+        &mut self,
+        request_id: u64,
+        text: &str,
+        confirmed: bool,
+    ) -> Result<(), String> {
+        self.send_fields(
+            "swkbd_submit",
+            None,
+            serde_json::json!({
+                "request_id": request_id,
+                "text": text,
+                "confirmed": confirmed,
+            }),
+        )
+    }
+
+    pub fn cancel_software_keyboard(&mut self, request_id: u64) -> Result<(), String> {
+        self.send_fields(
+            "swkbd_cancel",
+            None,
+            serde_json::json!({
+                "request_id": request_id,
+            }),
+        )
+    }
+
+    pub fn sync_viewport(&mut self, viewport: ViewportRect) {
+        if let Some(host) = &mut self.host {
+            host.desired_viewport = Some(viewport);
+            if let Some(embed) = &mut host.launch.embed {
+                embed.viewport = viewport;
+            }
+        }
+    }
+
     fn send(&mut self, command: &str, state: Option<State>) -> Result<(), String> {
+        self.send_fields(command, state, serde_json::json!({}))
+    }
+
+    fn send_fields(&mut self, command: &str, state: Option<State>, extra: serde_json::Value) -> Result<(), String> {
         let host = self.host.as_mut().ok_or("No game session is active")?;
         if !host.ready || host.pending.is_some()
             || !matches!(host.state, Some(State::Running | State::Paused))
@@ -199,8 +428,9 @@ impl SessionClient {
         }
         self.next_id += 1;
         let id = self.next_id;
+        let line = build_command_line(id, command, extra)?;
         let input = host.child.stdin.as_mut().ok_or("The game host input was closed")?;
-        writeln!(input, "{{\"version\":{PROTOCOL},\"id\":{id},\"command\":\"{command}\"}}")
+        writeln!(input, "{line}")
             .map_err(|error| format!("Could not send {command} to the game: {error}"))?;
         host.pending = Some((id, Instant::now() + CONTROL_TIMEOUT));
         Ok(())
@@ -223,7 +453,35 @@ impl SessionClient {
         }
         let status = match host.child.try_wait() {
             Ok(Some(status)) => status,
-            Ok(None) => return events,
+            Ok(None) => {
+                let pending_viewport = (host.ready
+                    && host.pending.is_none()
+                    && matches!(host.state, Some(State::Running | State::Paused)))
+                .then(|| {
+                    host.desired_viewport
+                        .filter(|viewport| host.sent_viewport != Some(*viewport))
+                })
+                .flatten();
+                if let Some(viewport) = pending_viewport {
+                    if self
+                        .send_fields(
+                            "set_viewport",
+                            None,
+                            serde_json::json!({
+                                "x": viewport.x,
+                                "y": viewport.y,
+                                "width": viewport.width,
+                                "height": viewport.height,
+                            }),
+                        )
+                        .is_ok()
+                        && let Some(host) = &mut self.host
+                    {
+                        host.sent_viewport = Some(viewport);
+                    }
+                }
+                return events;
+            }
             Err(error) => {
                 self.restart = false;
                 let _ = host.child.kill();
@@ -260,6 +518,37 @@ fn drain_events(host: &mut Host, events: &mut Vec<SessionEvent>, restart: &mut b
             Ok(WireEvent::State { state }) => apply_state(host, state, events),
             Ok(WireEvent::HomeRequested) => events.push(SessionEvent::HomeRequested),
             Ok(WireEvent::HomeReleased) => events.push(SessionEvent::HomeReleased),
+            Ok(WireEvent::SwkbdShow {
+                request_id,
+                header_text,
+                sub_text,
+                guide_text,
+                ok_text,
+                initial_text,
+                min_length,
+                max_length,
+                password,
+                multiline,
+                disable_cancel,
+            }) => events.push(SessionEvent::SoftwareKeyboardShow(SwkbdShowRequest {
+                request_id,
+                header_text,
+                sub_text,
+                guide_text,
+                ok_text,
+                initial_text,
+                min_length,
+                max_length,
+                password,
+                multiline,
+                disable_cancel,
+            })),
+            Ok(WireEvent::SwkbdTextCheck { request_id, result, message }) => {
+                events.push(SessionEvent::SoftwareKeyboardTextCheck { request_id, result, message });
+            }
+            Ok(WireEvent::SwkbdClose { request_id }) => {
+                events.push(SessionEvent::SoftwareKeyboardClose { request_id });
+            }
             Ok(WireEvent::Error { message }) => {
                 host.reported_error = true;
                 events.push(SessionEvent::Error(message));
@@ -278,6 +567,7 @@ fn drain_events(host: &mut Host, events: &mut Vec<SessionEvent>, restart: &mut b
                     if let Some(state) = state {
                         apply_state(host, state, events);
                     }
+                    events.push(SessionEvent::ActionCompleted);
                 } else {
                     *restart = false;
                     events.push(SessionEvent::Error(message.unwrap_or_else(|| "Game action was rejected".into())));
@@ -318,6 +608,14 @@ impl Drop for SessionClient {
     }
 }
 
+fn build_command_line(id: u64, command: &str, mut extra: serde_json::Value) -> Result<String, String> {
+    let obj = extra.as_object_mut().ok_or("Session command payload must be an object")?;
+    obj.insert("version".into(), serde_json::json!(PROTOCOL));
+    obj.insert("id".into(), serde_json::json!(id));
+    obj.insert("command".into(), serde_json::json!(command));
+    serde_json::to_string(&extra).map_err(|error| format!("Could not encode {command}: {error}"))
+}
+
 fn read_event(reader: &mut impl BufRead) -> Result<Option<WireEvent>, String> {
     let mut frame = Vec::new();
     let size = reader.take(MAX_FRAME + 1).read_until(b'\n', &mut frame)
@@ -348,5 +646,79 @@ mod tests {
         assert!(read_event(&mut &b"{\"version\":2,\"event\":\"ready\"}\n"[..]).is_err());
         assert!(read_event(&mut &b"{\"version\":1,\"event\":\"ready\"}"[..]).is_err());
         assert!(read_event(&mut &vec![b' '; MAX_FRAME as usize + 1][..]).is_err());
+    }
+
+    #[test]
+    fn encodes_extended_gba_session_commands() {
+        let line = build_command_line(4, "save_state", serde_json::json!({ "slot": 3 })).unwrap();
+        let decoded: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(decoded["version"], 1);
+        assert_eq!(decoded["id"], 4);
+        assert_eq!(decoded["command"], "save_state");
+        assert_eq!(decoded["slot"], 3);
+
+        let cheats = build_command_line(
+            5,
+            "set_cheats",
+            serde_json::json!({ "codes": ["02000010:BEEF"] }),
+        ).unwrap();
+        let decoded_cheats: serde_json::Value = serde_json::from_str(&cheats).unwrap();
+        assert_eq!(decoded_cheats["command"], "set_cheats");
+        assert_eq!(decoded_cheats["codes"][0], "02000010:BEEF");
+
+        let viewport = build_command_line(
+            6,
+            "set_viewport",
+            serde_json::json!({ "x": 0, "y": 48, "width": 1280, "height": 672 }),
+        ).unwrap();
+        let decoded_viewport: serde_json::Value = serde_json::from_str(&viewport).unwrap();
+        assert_eq!(decoded_viewport["command"], "set_viewport");
+        assert_eq!(decoded_viewport["x"], 0);
+        assert_eq!(decoded_viewport["y"], 48);
+        assert_eq!(decoded_viewport["width"], 1280);
+        assert_eq!(decoded_viewport["height"], 672);
+    }
+
+    #[test]
+    fn parses_and_encodes_software_keyboard_protocol() {
+        let mut show = r#"{"version":1,"event":"swkbd_show","request_id":3,"header_text":"Name","initial_text":"Églantine","min_length":2,"max_length":16,"password":false,"multiline":false,"disable_cancel":false}
+"#.as_bytes();
+        match read_event(&mut show).unwrap().unwrap() {
+            WireEvent::SwkbdShow { request_id, header_text, initial_text, min_length, max_length, .. } => {
+                assert_eq!(request_id, 3);
+                assert_eq!(header_text, "Name");
+                assert_eq!(initial_text, "Églantine");
+                assert_eq!((min_length, max_length), (2, 16));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let mut check = r#"{"version":1,"event":"swkbd_text_check","request_id":3,"result":"confirm","message":"Use this?"}
+"#.as_bytes();
+        assert!(matches!(
+            read_event(&mut check).unwrap().unwrap(),
+            WireEvent::SwkbdTextCheck { request_id: 3, result: SwkbdTextCheckKind::Confirm, message }
+            if message == "Use this?"
+        ));
+
+        let mut close = r#"{"version":1,"event":"swkbd_close","request_id":3}
+"#.as_bytes();
+        assert!(matches!(read_event(&mut close).unwrap().unwrap(), WireEvent::SwkbdClose { request_id: 3 }));
+
+        let submit = build_command_line(
+            9,
+            "swkbd_submit",
+            serde_json::json!({ "request_id": 3, "text": "日本語", "confirmed": true }),
+        ).unwrap();
+        let decoded_submit: serde_json::Value = serde_json::from_str(&submit).unwrap();
+        assert_eq!(decoded_submit["command"], "swkbd_submit");
+        assert_eq!(decoded_submit["request_id"], 3);
+        assert_eq!(decoded_submit["text"], "日本語");
+        assert_eq!(decoded_submit["confirmed"], true);
+
+        let cancel = build_command_line(10, "swkbd_cancel", serde_json::json!({ "request_id": 3 })).unwrap();
+        let decoded_cancel: serde_json::Value = serde_json::from_str(&cancel).unwrap();
+        assert_eq!(decoded_cancel["command"], "swkbd_cancel");
+        assert_eq!(decoded_cancel["request_id"], 3);
     }
 }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 // SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
@@ -294,14 +297,14 @@ Result IUserLocalCommunicationService::Initialize(ClientProcessId aruid) {
     LOG_INFO(Service_LDN, "called, process_id={}", aruid.pid);
 
     const auto network_interface = Network::GetSelectedNetworkInterface();
-    R_UNLESS(network_interface, ResultAirplaneModeEnabled);
+    R_UNLESS(network_interface, ResultWifiOff);
 
     if (auto room_member = Network::GetRoomMember().lock()) {
         ldn_packet_received = room_member->BindOnLdnPacketReceived(
             [this](const Network::LDNPacket& packet) { OnLDNPacketReceived(packet); });
     } else {
         LOG_ERROR(Service_LDN, "Couldn't bind callback!");
-        R_RETURN(ResultAirplaneModeEnabled);
+        R_RETURN(ResultWifiOff);
     }
 
     lan_discovery.Initialize([&]() { OnEventFired(); });

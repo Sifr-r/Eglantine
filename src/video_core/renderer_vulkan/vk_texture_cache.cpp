@@ -3814,24 +3814,26 @@ bool Image::BindZeroBlock() {
     }
     s.bound_bytes += tile;
     std::vector<VkSparseImageMemoryBind> image_binds;
-    for (u32 level = 0; level < s.tail_level; ++level) {
-        const u32 width = (std::max)(s.width >> level, 1U);
-        const u32 height = (std::max)(s.height >> level, 1U);
-        for (u32 y = 0; y < height; y += s.tile_height) {
-            for (u32 x = 0; x < width; x += s.tile_width) {
-                image_binds.push_back(VkSparseImageMemoryBind{
-                    .subresource{
-                        .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                        .mipLevel = level,
-                        .arrayLayer = 0,
-                    },
-                    .offset{static_cast<s32>(x), static_cast<s32>(y), 0},
-                    .extent{(std::min)(s.tile_width, width - x), (std::min)(s.tile_height, height - y),
-                            1},
-                    .memory = memory,
-                    .memoryOffset = offset,
-                    .flags = 0,
-                });
+    for (u32 layer = 0; layer < static_cast<u32>(info.resources.layers); ++layer) {
+        for (u32 level = 0; level < s.tail_level; ++level) {
+            const u32 width = (std::max)(s.width >> level, 1U);
+            const u32 height = (std::max)(s.height >> level, 1U);
+            for (u32 y = 0; y < height; y += s.tile_height) {
+                for (u32 x = 0; x < width; x += s.tile_width) {
+                    image_binds.push_back(VkSparseImageMemoryBind{
+                        .subresource{
+                            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                            .mipLevel = level,
+                            .arrayLayer = layer,
+                        },
+                        .offset{static_cast<s32>(x), static_cast<s32>(y), 0},
+                        .extent{(std::min)(s.tile_width, width - x),
+                                (std::min)(s.tile_height, height - y), 1},
+                        .memory = memory,
+                        .memoryOffset = offset,
+                        .flags = 0,
+                    });
+                }
             }
         }
     }
@@ -4795,8 +4797,10 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
     border_color = tsc.BorderColor();
     srgb_border_color = tsc.SrgbBorderColor();
 
-    const f32 max_anisotropy = std::clamp(tsc.MaxAnisotropy(), 1.0f, 16.0f);
-    default_anisotropy = static_cast<f32>(1U << tsc.max_anisotropy);
+    const f32 anisotropy_limit = (std::min)(16.0f, device.GetMaxSamplerAnisotropy());
+    const f32 max_anisotropy = std::clamp(tsc.MaxAnisotropy(), 1.0f, anisotropy_limit);
+    default_anisotropy =
+        std::clamp(static_cast<f32>(1U << tsc.max_anisotropy), 1.0f, anisotropy_limit);
 
     const VkFilter mag_filter{MaxwellToVK::Sampler::Filter(tsc.mag_filter)};
     const VkFilter min_filter{MaxwellToVK::Sampler::Filter(tsc.min_filter)};

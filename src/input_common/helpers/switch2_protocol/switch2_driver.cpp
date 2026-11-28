@@ -96,11 +96,24 @@ Common::Input::DriverResult Switch2Driver::Initialize(u8 player_number, bool rev
         });
     }
 
-    // PROTOCOL.md section 7: the normal controller feature set is buttons + analog sticks +
-    // IMU + rumble, plus the optical sensor on the Joy-Con 2.
+    // PROTOCOL.md section 7: BLE announces the temporary startup feature mask before enabling the
+    // normal controller feature set (buttons + analog sticks + IMU + rumble, plus optical sensor
+    // on the Joy-Con 2).
+    std::vector<u8> cmd_response;
+    if (transport->GetTransportType() == TransportType::Ble) {
+        const std::array<u8, 4> startup_flags{FeatureFlags::Startup, 0x00, 0x00, 0x00};
+        if (!WriteCommandChecked(CommandId::Feature, SubCommandId::FeatureInit, startup_flags,
+                                 cmd_response)) {
+            LOG_WARNING(Input, "Switch2Driver: Startup FeatureInit failed for {}", GetAddress());
+        }
+        if (!WriteCommandChecked(CommandId::Feature, SubCommandId::FeatureEnable, startup_flags,
+                                 cmd_response)) {
+            LOG_WARNING(Input, "Switch2Driver: Startup FeatureEnable failed for {}", GetAddress());
+        }
+    }
+
     const u8 feature_flags = FeatureMaskForProduct(info.product_id);
     const std::array<u8, 4> feature_payload{feature_flags, 0x00, 0x00, 0x00};
-    std::vector<u8> cmd_response;
     if (!WriteCommandChecked(CommandId::Feature, SubCommandId::FeatureInit, feature_payload,
                              cmd_response)) {
         LOG_WARNING(Input, "Switch2Driver: FeatureInit failed for {}", GetAddress());

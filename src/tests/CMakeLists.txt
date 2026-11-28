@@ -53,6 +53,7 @@ add_executable(tests
     core/key_code_map.cpp
     core/launch_params.cpp
     core/ldn.cpp
+    core/sdk_result_codes.cpp
     core/loader_file_formats.cpp
     core/memory_range.cpp
     core/nso_loader.cpp
@@ -64,6 +65,7 @@ add_executable(tests
     core/nx2_gsv_bounds.cpp
     core/nx2_guest_ranges.cpp
     core/nx2_session_state.cpp
+    core/operation_mode.cpp
     core/platform_profile.cpp
     core/platform_sizing.cpp
     core/priority_queue.cpp
@@ -124,6 +126,7 @@ add_executable(tests
     video_core/global_address_tracking.cpp
     video_core/global_atomic_routing.cpp
     video_core/nvn_storage_descriptor.cpp
+    video_core/nvn_device_limits.cpp
     video_core/ampere_f2i.cpp
     video_core/ampere_ldc.cpp
     video_core/ampere_vote.cpp
@@ -162,6 +165,15 @@ if (ENABLE_UPDATE_CHECKER)
 endif()
 
 target_link_libraries(tests PRIVATE audio_core common core frontend_common input_common video_core)
+
+if(TARGET gba_core)
+    target_sources(tests PRIVATE emulation/gba_core.cpp)
+    target_link_libraries(tests PRIVATE gba_core)
+endif()
+if(TARGET classic_runtime)
+    target_sources(tests PRIVATE emulation/battery_save.cpp emulation/classic_runtime.cpp)
+    target_link_libraries(tests PRIVATE classic_runtime)
+endif()
 if (TARGET eglantine_rs)
     target_link_libraries(tests PRIVATE eglantine_rs)
 endif()

@@ -4185,6 +4185,20 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
                                         driver_id == VK_DRIVER_ID_ARM_PROPRIETARY ||
                                         driver_id == VK_DRIVER_ID_MOLTENVK;
     const u32 max_shared_memory = device.GetMaxComputeSharedMemorySize();
+    const auto workgroup_size = env.WorkgroupSize();
+    const auto max_wg_size = device.GetMaxComputeWorkGroupSize();
+    const u32 max_wg_invocations = device.GetMaxComputeWorkGroupInvocations();
+    const u64 total_invocations =
+        u64{workgroup_size[0]} * u64{workgroup_size[1]} * u64{workgroup_size[2]};
+    if (workgroup_size[0] > max_wg_size[0] || workgroup_size[1] > max_wg_size[1] ||
+        workgroup_size[2] > max_wg_size[2] || total_invocations > max_wg_invocations) {
+        LOG_WARNING(Render_Vulkan,
+                    "Compute shader {:#016x} workgroup {}x{}x{} ({} threads) exceeds device "
+                    "limits ({}x{}x{}, max {} invocations)",
+                    key.unique_hash, workgroup_size[0], workgroup_size[1], workgroup_size[2],
+                    total_invocations, max_wg_size[0], max_wg_size[1], max_wg_size[2],
+                    max_wg_invocations);
+    }
 
     const u32 clamp_limit = needs_shared_mem_clamp ? max_shared_memory : 0U;
     auto compiled =

@@ -861,6 +861,7 @@ public:
 
     bool WriteCommand(std::span<const u8> packet, std::vector<u8>& out_response,
                       std::chrono::milliseconds) override {
+        recorded_commands.emplace_back(packet.begin(), packet.end());
         if (packet.size() < 8) {
             return false;
         }
@@ -926,6 +927,7 @@ public:
     }
 
     std::map<u32, std::vector<u8>> memory{};
+    std::vector<std::vector<u8>> recorded_commands{};
     std::function<void()> on_write_vibration{};
 
 private:
@@ -1869,4 +1871,46 @@ TEST_CASE("Switch2 codecs handle edge cases across reports and calibration", "[s
     REQUIRE_FALSE(opt_proc.Process(MakeValidMouseReport(0U, 0U, 0U, 400U), ControllerType::Left,
                                    true)
                       .active);
+}
+
+TEST_CASE("Switch2Driver::Initialize sends startup feature mask only on BLE", "[switch2]") {
+    auto extract_feature_commands = [](const std::vector<std::vector<u8>>& commands) {
+        std::vector<std::pair<u8, u8>> features;
+        for (const auto& cmd : commands) {
+            if (cmd.size() >= 9 && cmd[0] == CommandId::Feature) {
+                features.emplace_back(cmd[3], cmd[8]);
+            }
+        }
+        return features;
+    };
+
+    SECTION("BLE sends Startup FeatureInit/FeatureEnable before Standard") {
+        auto transport = std::make_shared<MockSwitch2Transport>(
+            ProductId::ProController2, "AA:BB:CC:DD:EE:10", TransportType::Ble);
+        auto driver = std::make_shared<Switch2Driver>(transport);
+        REQUIRE(driver->Initialize(1, false) == Common::Input::DriverResult::Success);
+
+        const auto features = extract_feature_commands(transport->recorded_commands);
+        REQUIRE(features == std::vector<std::pair<u8, u8>>{
+                                {SubCommandId::FeatureInit, FeatureFlags::Startup},
+                                {SubCommandId::FeatureEnable, FeatureFlags::Startup},
+                                {SubCommandId::FeatureInit, FeatureFlags::Standard},
+                                {SubCommandId::FeatureEnable, FeatureFlags::Standard},
+                            });
+        driver->Stop();
+    }
+
+    SECTION("USB only sends normal feature mask in Switch2Driver::Initialize") {
+        auto transport = std::make_shared<MockSwitch2Transport>(
+            ProductId::ProController2, "usb:1:10", TransportType::Usb);
+        auto driver = std::make_shared<Switch2Driver>(transport);
+        REQUIRE(driver->Initialize(1, false) == Common::Input::DriverResult::Success);
+
+        const auto features = extract_feature_commands(transport->recorded_commands);
+        REQUIRE(features == std::vector<std::pair<u8, u8>>{
+                                {SubCommandId::FeatureInit, FeatureFlags::Standard},
+                                {SubCommandId::FeatureEnable, FeatureFlags::Standard},
+                            });
+        driver->Stop();
+    }
 }

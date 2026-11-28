@@ -5,6 +5,46 @@ use super::*;
 use std::io::{Cursor, Write};
 
 #[test]
+fn component_overrides_round_trip_and_keep_other_consoles() {
+    use eglantine_library::ConsoleId::{GameBoy, GameBoyAdvance};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("component.eglantine-theme");
+    let mut package = ThemePackage::default();
+    let list = ThemeComponent::LibraryList;
+    package.theme.version = 2;
+    package.theme.components.insert(list, ComponentStyle { padding: Some(12), ..Default::default() });
+    package.theme.consoles.entry(GameBoyAdvance.as_str().into()).or_default()
+        .insert(list, ComponentStyle { radius: Some(4), background: Some(Color(0xc7da94)), ..Default::default() });
+    package.theme.console_layouts.insert(GameBoyAdvance.as_str().into(), ConsoleLayout::Grid);
+    package.export(&path).unwrap();
+    let imported = ThemePackage::import(&path).unwrap();
+    assert_eq!(package, imported);
+    let gba = imported.theme.component(Some(GameBoyAdvance), list);
+    assert_eq!(gba.padding, Some(12));
+    assert_eq!(gba.radius, Some(4));
+    assert_eq!(gba.background, Some(Color(0xc7da94)));
+    assert_eq!(imported.theme.component(Some(GameBoy), list).background, Some(Color(0xbbcc86)));
+    assert_eq!(imported.theme.console_layout(GameBoyAdvance), eglantine_library::LibraryLayout::Grid);
+}
+
+#[test]
+fn component_validation_rejects_inaccessible_and_unknown_overrides() {
+    let mut theme = Theme::default();
+    let part = ThemeComponent::LibraryList;
+    theme.components.insert(part, ComponentStyle { focus: Some(Color(0xbed28e)), ..Default::default() });
+    assert!(theme.validate_draft().is_err());
+    theme.version = 2;
+    assert!(theme.validate_draft().is_ok());
+    assert!(theme.validate().is_err());
+    theme.components.clear();
+    theme.consoles.insert("unknown".into(), BTreeMap::new());
+    assert!(theme.validate_draft().is_err());
+    theme.consoles.clear();
+    theme.console_layouts.insert("switch-2".into(), ConsoleLayout::Grid);
+    assert!(theme.validate_draft().is_err());
+}
+
+#[test]
 fn default_theme_matches_approved_home() {
     let theme = Theme::default();
     theme.validate().unwrap();

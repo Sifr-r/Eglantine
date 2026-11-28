@@ -11,6 +11,7 @@
 namespace Service::NFC {
 
 constexpr Result ResultDeviceNotFound(ErrorModule::NFC, 64);
+constexpr Result ResultNfcDeviceNotFound(ErrorModule::NFC, 64);
 constexpr Result ResultInvalidArgument(ErrorModule::NFC, 65);
 constexpr Result ResultWrongApplicationAreaSize(ErrorModule::NFC, 68);
 constexpr Result ResultWrongDeviceState(ErrorModule::NFC, 73);
@@ -19,6 +20,7 @@ constexpr Result ResultUnknown76(ErrorModule::NFC, 76);
 constexpr Result ResultNfcNotInitialized(ErrorModule::NFC, 77);
 constexpr Result ResultNfcDisabled(ErrorModule::NFC, 80);
 constexpr Result ResultWriteAmiiboFailed(ErrorModule::NFC, 88);
+constexpr Result ResultNeedRestart(ErrorModule::NFC, 96);
 constexpr Result ResultTagRemoved(ErrorModule::NFC, 97);
 constexpr Result ResultUnknown112(ErrorModule::NFC, 112);
 constexpr Result ResultUnableToAccessBackupFile(ErrorModule::NFC, 113);
@@ -30,8 +32,12 @@ constexpr Result ResultCorruptedDataWithBackup(ErrorModule::NFC, 136);
 constexpr Result ResultCorruptedData(ErrorModule::NFC, 144);
 constexpr Result ResultWrongApplicationAreaId(ErrorModule::NFC, 152);
 constexpr Result ResultApplicationAreaExist(ErrorModule::NFC, 168);
+constexpr Result ResultNotSupported(ErrorModule::NFC, 176);
 constexpr Result ResultInvalidTagType(ErrorModule::NFC, 178);
+constexpr Result ResultMaxNfcDeviceActivated(ErrorModule::NFC, 192);
+constexpr Result ResultConflictFunction(ErrorModule::NFC, 200);
 constexpr Result ResultBackupPathAlreadyExist(ErrorModule::NFC, 216);
 constexpr Result ResultMifareError288(ErrorModule::NFC, 288);
+constexpr Result ResultAccessError(ErrorModule::NFC, 288);
 
 } // namespace Service::NFC

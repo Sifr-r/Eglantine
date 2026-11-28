@@ -311,6 +311,11 @@ if (ENABLE_MCP_SERVER)
     add_subdirectory(mcp)
 endif()
 
+add_subdirectory(emulation/gba)
+if(YUZU_CMD OR YUZU_TESTS)
+    add_subdirectory(emulation/classic)
+endif()
+
 if (YUZU_TESTS)
     add_subdirectory(tests)
 endif()

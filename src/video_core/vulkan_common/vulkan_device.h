@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdlib>
@@ -25,6 +26,7 @@
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/settings.h"
+#include "video_core/vulkan_common/unbacked_image_policy.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
 VK_DEFINE_HANDLE(VmaAllocator)
@@ -435,12 +437,13 @@ public:
             const char* value = std::getenv("EDEN_NX2_SPARSE_UNBACKED");
             return value == nullptr ? '\0' : value[0];
         }();
-        if (forced == '0' || forced == '1') {
-            return forced == '1';
-        }
         const VkDriverIdKHR id = GetDriverID();
-        return id != VK_DRIVER_ID_AMD_PROPRIETARY && id != VK_DRIVER_ID_AMD_OPEN_SOURCE &&
-               id != VK_DRIVER_ID_MESA_RADV;
+        const bool is_amd_or_radv = id == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                                    id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+                                    id == VK_DRIVER_ID_MESA_RADV;
+        const bool strict_zero =
+            properties.properties.sparseProperties.residencyNonResidentStrict != VK_FALSE;
+        return CanUseUnbackedSparseImagesPolicy(strict_zero, is_amd_or_radv, forced);
     }
 
     /// Whether a pipeline cache can be read while pipelines build into it, as Vulkan allows. Intel's
@@ -482,6 +485,20 @@ public:
     std::array<u32, 3> GetMaxComputeWorkGroupCount() const {
         const auto& count = properties.properties.limits.maxComputeWorkGroupCount;
         return {count[0], count[1], count[2]};
+    }
+
+    std::array<u32, 3> GetMaxComputeWorkGroupSize() const {
+        const auto& size = properties.properties.limits.maxComputeWorkGroupSize;
+        return {size[0], size[1], size[2]};
+    }
+
+    u32 GetMaxComputeWorkGroupInvocations() const {
+        return properties.properties.limits.maxComputeWorkGroupInvocations;
+    }
+
+    /// Returns the maximum supported sampler anisotropy.
+    f32 GetMaxSamplerAnisotropy() const noexcept {
+        return (std::max)(properties.properties.limits.maxSamplerAnisotropy, 1.0f);
     }
 
     /// Returns the maximum size for push constants.

@@ -16,6 +16,9 @@ namespace GameListDiscovery {
 
 struct TitleMetadata {
     std::string title;
+    std::string publisher;
+    std::string version;
+    std::vector<std::string> languages;
     std::vector<u8> icon;
     bool title_valid{};
 };

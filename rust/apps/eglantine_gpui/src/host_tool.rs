@@ -17,7 +17,32 @@ const MAX_FRAME: u64 = 600 * 1024;
 pub(crate) enum Event {
     Ready,
     Error { message: String },
-    Game { path: PathBuf, title: String, program_id: Option<String>, icon_hex: Option<String> },
+    Game {
+        path: PathBuf,
+        title: String,
+        #[serde(default)]
+        format: Option<String>,
+        program_id: Option<String>,
+        icon_hex: Option<String>,
+        #[serde(alias = "console")]
+        system: Option<String>,
+        #[serde(default)]
+        publisher: Option<String>,
+        #[serde(default, rename = "game_version")]
+        version: Option<String>,
+        #[serde(default)]
+        region: Option<String>,
+        #[serde(default)]
+        product_code: Option<String>,
+        #[serde(default)]
+        internal_title: Option<String>,
+        #[serde(default)]
+        hardware: Option<String>,
+        #[serde(default)]
+        file_size: Option<u64>,
+        #[serde(default)]
+        languages: Vec<String>,
+    },
     LibraryDone { scan_errors: usize },
     ContentDone,
 }

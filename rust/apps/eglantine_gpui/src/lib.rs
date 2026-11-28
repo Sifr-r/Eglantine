@@ -4,6 +4,8 @@
 pub mod emulator_config;
 pub mod content;
 pub mod library;
+pub mod metadata;
 pub mod session;
+pub mod software_keyboard;
 pub mod theme;
 mod host_tool;

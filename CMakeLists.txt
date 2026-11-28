@@ -286,6 +286,7 @@ cmake_dependent_option(YUZU_ROOM_STANDALONE "Enable standalone room executable" 
 
 cmake_dependent_option(YUZU_CMD "Compile the eden-cli executable" ON "NOT ANDROID" OFF)
 cmake_dependent_option(ENABLE_GPUI "Build the Eglantine GPUI desktop frontend" ON "NOT ANDROID AND YUZU_CMD" OFF)
+cmake_dependent_option(ENABLE_CLASSIC_RUNTIME "Bundle the Game Boy runtime in the desktop gameplay host" ON "(YUZU_CMD OR YUZU_TESTS) AND NOT ANDROID AND NOT YUZU_STATIC_ROOM" OFF)
 
 cmake_dependent_option(YUZU_CRASH_DUMPS "Compile crash dump (Minidump) support" OFF "WIN32 OR LINUX" OFF)
 option(ENABLE_SENTRY "Enable Sentry crash reporting in the desktop frontends" OFF)

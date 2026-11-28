@@ -175,6 +175,10 @@ jobs:
           if [ -f dist/eglantine.icns ]; then
             cp dist/eglantine.icns "$app/Contents/Resources/eglantine.icns"
           fi
+          if [ -d build/release/bin/licenses/classic ]; then
+            mkdir -p "$app/Contents/Resources/licenses"
+            cp -R build/release/bin/licenses/classic "$app/Contents/Resources/licenses/"
+          fi
           test -x "$app/Contents/MacOS/eglantine"
           test -x "$app/Contents/MacOS/eden-cli"
           for binary in "$app/Contents/MacOS/eglantine" "$app/Contents/MacOS/eden-cli"; do

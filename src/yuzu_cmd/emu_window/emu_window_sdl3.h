@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -20,6 +21,7 @@
 
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
+#include "yuzu_cmd/emu_window/embedded_window.h"
 
 namespace Core {
 class System;
@@ -48,6 +50,11 @@ public:
 
     bool HasInputFocus() const;
     bool SetSessionVisible(bool visible);
+    bool IsEmbedded() const;
+    bool SetViewport(int x, int y, int width, int height);
+    SDL_Window* GetRenderWindow() const {
+        return render_window;
+    }
 
     /// Sets the title the titlebar timer prepared; call from the main thread.
     void ApplyPendingTitle();
@@ -65,6 +72,8 @@ public:
     void SetWindowIcon();
 
 protected:
+    void CreateRenderWindow(const char* title, SDL_WindowFlags extra_flags, bool fullscreen);
+
     /// Called by WaitEvent when a key is pressed or released.
     void OnKeyEvent(int key, u8 state);
 
@@ -119,6 +128,8 @@ protected:
 
     /// Internal SDL3 render window
     SDL_Window* render_window{};
+
+    std::optional<GpuiEmbed::ParentConfig> embedded_parent;
 
     /// Input subsystem to use with this window.
     InputCommon::InputSubsystem* input_subsystem;

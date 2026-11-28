@@ -5,6 +5,9 @@
 resolver = "2"
 members = [
     "crates/ampere_spirv",
+    "crates/ctr_core",
+    "crates/ds_core",
+    "crates/eglantine_library",
     "crates/eglantine_ffi",
 ]
 

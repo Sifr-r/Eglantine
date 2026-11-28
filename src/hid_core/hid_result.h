@@ -21,6 +21,7 @@ constexpr Result ResultVibrationInvalidNpadId{ErrorModule::HID, 123};
 constexpr Result ResultVibrationDeviceIndexOutOfRange{ErrorModule::HID, 124};
 constexpr Result ResultVibrationStrengthOutOfRange{ErrorModule::HID, 126};
 constexpr Result ResultVibrationArraySizeMismatch{ErrorModule::HID, 131};
+constexpr Result ResultVibrationFileInvalid{ErrorModule::HID, 140};
 
 constexpr Result InvalidSixAxisFusionRange{ErrorModule::HID, 423};
 
@@ -33,9 +34,11 @@ constexpr Result ResultGestureNotInitialized{ErrorModule::HID, 523};
 
 constexpr Result ResultMcuIsNotReady{ErrorModule::HID, 541};
 
+constexpr Result ResultNpadError{ErrorModule::HID, 600};
 constexpr Result NpadIsDualJoycon{ErrorModule::HID, 601};
 constexpr Result NpadIsSameType{ErrorModule::HID, 602};
 constexpr Result ResultNpadIsNotProController{ErrorModule::HID, 604};
+constexpr Result ResultNpadControllerNotConnected{ErrorModule::HID, 604};
 
 constexpr Result ResultInvalidNpadId{ErrorModule::HID, 709};
 constexpr Result ResultNpadNotConnected{ErrorModule::HID, 710};
@@ -62,6 +65,16 @@ constexpr Result InvalidPalmaHandle{ErrorModule::HID, 3302};
 namespace Service::IRS {
 
 constexpr Result InvalidProcessorState{ErrorModule::Irsensor, 78};
+constexpr Result ResultIrsensorUnavailable{ErrorModule::Irsensor, 110};
+constexpr Result ResultIrsensorUnconnected{ErrorModule::Irsensor, 110};
+constexpr Result ResultIrsensorUnsupported{ErrorModule::Irsensor, 111};
+constexpr Result ResultIrsensorDeviceError{ErrorModule::Irsensor, 122};
+constexpr Result ResultIrsensorFirmwareCheckIncompleted{ErrorModule::Irsensor, 150};
+constexpr Result ResultIrsensorNotReady{ErrorModule::Irsensor, 160};
+constexpr Result ResultIrsensorDeviceNotReady{ErrorModule::Irsensor, 160};
+constexpr Result ResultIrsensorDeviceResourceNotAvailable{ErrorModule::Irsensor, 161};
 constexpr Result InvalidIrCameraHandle{ErrorModule::Irsensor, 204};
+constexpr Result ResultHandAnalysisError{ErrorModule::Irsensor, 1100};
+constexpr Result ResultHandAnalysisModeIncorrect{ErrorModule::Irsensor, 1101};
 
 } // namespace Service::IRS

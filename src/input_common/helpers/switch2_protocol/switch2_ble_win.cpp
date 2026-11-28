@@ -178,6 +178,7 @@ struct ScannerState {
 
     std::mutex addresses_mutex;
     std::unordered_set<u64> active_addresses;
+    std::unordered_set<u64> logged_rejected_addresses;
 
     std::mutex queue_mutex;
     std::condition_variable queue_cv;
@@ -946,6 +947,10 @@ public:
         }
 
         if (was_running) {
+            {
+                std::lock_guard lock(m_state->addresses_mutex);
+                m_state->logged_rejected_addresses.clear();
+            }
             std::lock_guard lock(m_state->callback_mutex);
             m_state->on_discovered = nullptr;
         }
@@ -1116,6 +1121,27 @@ private:
             const std::vector<u8> payload = BufferToBytes(mfg_data.Data());
             const std::optional<BleAdvertisementInfo> adv = ParseBleManufacturerData(payload);
             if (!adv || !ShouldAcceptBleAdvertisement(*adv, host_mac)) {
+                bool should_log = false;
+                {
+                    std::lock_guard addr_lock(state->addresses_mutex);
+                    should_log = state->logged_rejected_addresses.insert(bluetooth_addr).second;
+                }
+                if (should_log) {
+                    if (!adv) {
+                        LOG_INFO(Input,
+                                 "Ignored Switch 2 BLE advertisement from {}: invalid or short "
+                                 "0x0553 payload (len={})",
+                                 FormatBluetoothAddress(bluetooth_addr), payload.size());
+                    } else {
+                        LOG_INFO(Input,
+                                 "Ignored Switch 2 BLE {} at {}: not in pairing mode "
+                                 "(reconnect_mac={}, host_mac={})",
+                                 ProductName(adv->product_id),
+                                 FormatBluetoothAddress(bluetooth_addr),
+                                 FormatBluetoothAddress(adv->reconnect_mac),
+                                 FormatBluetoothAddress(host_mac));
+                    }
+                }
                 continue;
             }
 
@@ -1125,6 +1151,7 @@ private:
                     state->active_addresses.contains(bluetooth_addr)) {
                     return;
                 }
+                state->logged_rejected_addresses.erase(bluetooth_addr);
                 state->active_addresses.insert(bluetooth_addr);
             }
 

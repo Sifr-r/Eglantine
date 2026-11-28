@@ -16,11 +16,30 @@ pub struct Preferences {
     pub height: u16,
     pub fullscreen: bool,
     pub selected: Option<PathBuf>,
+    pub console: Option<String>,
+    pub gba_bios_path: Option<String>,
+    pub gba_color_correction: bool,
+    pub gba_interframe_blending: bool,
+    pub gba_save_slot: u8,
+    pub gba_cheats: Vec<String>,
+    pub auto_extract_metadata: bool,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
-        Self { width: 1280, height: 760, fullscreen: false, selected: None }
+        Self {
+            width: 1280,
+            height: 760,
+            fullscreen: false,
+            selected: None,
+            console: None,
+            gba_bios_path: None,
+            gba_color_correction: false,
+            gba_interframe_blending: false,
+            gba_save_slot: 1,
+            gba_cheats: Vec::new(),
+            auto_extract_metadata: true,
+        }
     }
 }
 
@@ -60,6 +79,9 @@ impl Preferences {
         if !(450..=8192).contains(&self.height) {
             self.height = defaults.height;
         }
+        if !(1..=9).contains(&self.gba_save_slot) {
+            self.gba_save_slot = defaults.gba_save_slot;
+        }
     }
 }
 
@@ -75,6 +97,13 @@ mod tests {
             height: 810,
             fullscreen: true,
             selected: Some(PathBuf::from("Library/Métro.nsp")),
+            console: Some("game-boy-advance".to_owned()),
+            gba_bios_path: Some("bios/gba_bios.bin".to_owned()),
+            gba_color_correction: true,
+            gba_interframe_blending: false,
+            gba_save_slot: 3,
+            gba_cheats: vec!["02000010:BEEF".to_owned()],
+            auto_extract_metadata: false,
         };
         preferences.save(dir.path()).unwrap();
         let saved = Preferences::load(dir.path()).unwrap();

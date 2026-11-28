@@ -70,6 +70,7 @@ public:
 
     DisconnectReason GetDisconnectReason() const;
     Result Scan(std::span<NetworkInfo> out_networks, s16& out_count, const ScanFilter& filter);
+    bool MatchesScanFilter(const NetworkInfo& info, const ScanFilter& filter) const;
     Result SetAdvertiseData(std::span<const u8> data);
 
     Result OpenAccessPoint();

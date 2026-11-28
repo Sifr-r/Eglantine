@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "eglantine_ctr"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true

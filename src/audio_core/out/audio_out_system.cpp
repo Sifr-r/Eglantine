@@ -4,6 +4,7 @@
 // SPDX-FileCopyrightText: Copyright 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
 #include <mutex>
 
 #include "audio_core/audio_event.h"
@@ -31,16 +32,120 @@ template<typename T, size_t N>
 
 namespace AudioCore::AudioOut {
 
+namespace {
+
+class RealDeviceSession final : public DeviceSessionInterface {
+public:
+    explicit RealDeviceSession(Core::System& system_)
+        : system{system_}, device_session{std::make_unique<DeviceSession>(system_)} {}
+
+    Result Initialize(std::string_view name, SampleFormat sample_format, u16 channel_count,
+                      size_t session_id, Kernel::KProcess* handle, u64 applet_resource_user_id,
+                      Sink::StreamType type) override {
+        device_session = std::make_unique<DeviceSession>(system);
+        return device_session->Initialize(name, sample_format, channel_count, session_id, handle,
+                                          applet_resource_user_id, type);
+    }
+
+    void Finalize() override {
+        device_session.reset();
+    }
+
+    void AppendBuffers(std::span<const AudioBuffer> buffers) override {
+        if (device_session) {
+            device_session->AppendBuffers(buffers);
+        }
+    }
+
+    void ReleaseBuffer(const AudioBuffer& buffer) const override {
+        if (device_session) {
+            device_session->ReleaseBuffer(buffer);
+        }
+    }
+
+    bool IsBufferConsumed(const AudioBuffer& buffer) const override {
+        return device_session && device_session->IsBufferConsumed(buffer);
+    }
+
+    void Start() override {
+        if (device_session) {
+            device_session->Start();
+        }
+    }
+
+    void Stop() override {
+        if (device_session) {
+            device_session->Stop();
+        }
+    }
+
+    void ClearBuffers() override {
+        if (device_session) {
+            device_session->ClearBuffers();
+        }
+    }
+
+    void SetVolume(f32 volume) const override {
+        if (device_session) {
+            device_session->SetVolume(volume);
+        }
+    }
+
+    u64 GetPlayedSampleCount() const override {
+        return device_session ? device_session->GetPlayedSampleCount() : 0;
+    }
+
+    void SetRingSize(u32 ring_size) override {
+        if (device_session) {
+            device_session->SetRingSize(ring_size);
+        }
+    }
+
+private:
+    Core::System& system;
+    std::unique_ptr<DeviceSession> device_session;
+};
+
+} // namespace
+
 System::System(Core::System& system_, Kernel::KEvent* event_, size_t session_id_)
+    : System{system_, event_, session_id_, std::make_unique<RealDeviceSession>(system_)} {}
+
+System::System(Core::System& system_, Kernel::KEvent* event_, size_t session_id_,
+               std::unique_ptr<DeviceSessionInterface> session_,
+               std::function<void()> signal_event_callback_)
     : system{system_}, buffer_event{event_},
-      session_id{session_id_}, session{std::make_unique<DeviceSession>(system_)} {}
+      signal_event_callback{std::move(signal_event_callback_)}, session_id{session_id_},
+      session{std::move(session_)} {}
 
 System::~System() {
     Finalize();
 }
 
+void System::SignalBufferEvent() {
+    if (signal_event_callback) {
+        signal_event_callback();
+    }
+    if (buffer_event) {
+        buffer_event->Signal(system.Kernel());
+    }
+}
+
 void System::Finalize() {
-    Stop();
+    if (finalized) {
+        return;
+    }
+    finalized = true;
+
+    if (state == State::Started) {
+        session->Stop();
+        session->SetVolume(0.0f);
+        session->ClearBuffers();
+        state = State::Stopped;
+    }
+
+    u32 buffers_released{};
+    buffers.FlushBuffers(buffers_released);
     session->Finalize();
 }
 
@@ -107,6 +212,9 @@ Result System::Start() {
     session->Start();
     state = State::Started;
 
+    const u64 frame_bytes = static_cast<u64>(channel_count) * sizeof(s16);
+    buffers.RebaseTimestamps(frame_bytes);
+
     boost::container::static_vector<AudioBuffer, BufferCount> buffers_to_flush{};
     buffers.RegisterBuffers(buffers_to_flush);
     session->AppendBuffers(FixStaticVectorADL(buffers_to_flush));
@@ -120,23 +228,44 @@ Result System::Stop() {
         session->Stop();
         session->SetVolume(0.0f);
         session->ClearBuffers();
-        if (buffers.ReleaseBuffers(system.CoreTiming(), *session, true)) {
-            buffer_event->Signal(system.Kernel());
+        if (buffers.ReleaseConsumedBuffers(system.CoreTiming(), *session)) {
+            SignalBufferEvent();
         }
+        buffers.UnregisterBuffers();
         state = State::Stopped;
     }
 
     return ResultSuccess;
 }
 
-bool System::AppendBuffer(const AudioOutBuffer& buffer, u64 tag) {
-    if (channel_count == 0 || buffers.GetTotalBufferCount() == BufferCount) {
-        return false;
+Result System::AppendBuffer(const AudioOutBuffer& buffer, u64 tag) {
+    if (channel_count == 0) {
+        return Service::Audio::ResultOperationFailed;
     }
 
     const u64 frame_bytes = static_cast<u64>(channel_count) * sizeof(s16);
     if (buffer.size > MaxDeviceBufferSize || buffer.size % frame_bytes != 0) {
-        return false;
+        return Service::Audio::ResultInvalidArgument;
+    }
+
+    if (buffer.offset > (std::numeric_limits<u64>::max)() - buffer.size) {
+        return Service::Audio::ResultInvalidArgument;
+    }
+    const u64 end_offset = buffer.offset + buffer.size;
+    if (buffer.capacity > 0 && end_offset > buffer.capacity) {
+        return Service::Audio::ResultInvalidArgument;
+    }
+
+    if (buffer.samples > (std::numeric_limits<VAddr>::max)() - buffer.offset) {
+        return Service::Audio::ResultInvalidArgument;
+    }
+    const VAddr sample_addr = buffer.samples + buffer.offset;
+    if (sample_addr > (std::numeric_limits<VAddr>::max)() - buffer.size) {
+        return Service::Audio::ResultInvalidArgument;
+    }
+
+    if (buffers.GetTotalBufferCount() >= BufferCount) {
+        return Service::Audio::ResultBufferCountReached;
     }
 
     const auto timestamp{buffers.GetNextTimestamp()};
@@ -144,7 +273,7 @@ bool System::AppendBuffer(const AudioOutBuffer& buffer, u64 tag) {
         .start_timestamp = timestamp,
         .end_timestamp = timestamp + buffer.size / frame_bytes,
         .played_timestamp = 0,
-        .samples = buffer.samples,
+        .samples = sample_addr,
         .tag = tag,
         .size = buffer.size,
     };
@@ -152,7 +281,7 @@ bool System::AppendBuffer(const AudioOutBuffer& buffer, u64 tag) {
     buffers.AppendBuffer(new_buffer);
     RegisterBuffers();
 
-    return true;
+    return ResultSuccess;
 }
 
 void System::RegisterBuffers() {
@@ -167,7 +296,7 @@ void System::ReleaseBuffers() {
     bool signal{buffers.ReleaseBuffers(system.CoreTiming(), *session, false)};
     if (signal) {
         // Signal if any buffer was released, or if none are registered, we need more.
-        buffer_event->Signal(system.Kernel());
+        SignalBufferEvent();
     }
 }
 
@@ -176,7 +305,7 @@ u32 System::GetReleasedBuffers(std::span<u64> tags) {
 }
 
 bool System::FlushAudioOutBuffers() {
-    if (state != State::Started) {
+    if (state != State::Stopped) {
         return false;
     }
 
@@ -184,7 +313,7 @@ bool System::FlushAudioOutBuffers() {
     buffers.FlushBuffers(buffers_released);
 
     if (buffers_released > 0) {
-        buffer_event->Signal(system.Kernel());
+        SignalBufferEvent();
     }
     return true;
 }

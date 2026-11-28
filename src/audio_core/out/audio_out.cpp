@@ -16,6 +16,7 @@ Out::Out(Core::System& system_, Manager& manager_, Kernel::KEvent* event_, size_
 
 void Out::Free() {
     std::scoped_lock l{parent_mutex};
+    system.Finalize();
     manager.ReleaseSessionIdLocked(system.GetSessionId());
 }
 
@@ -49,11 +50,7 @@ Result Out::StopSystem() {
 
 Result Out::AppendBuffer(const AudioOutBuffer& buffer, const u64 tag) {
     std::scoped_lock l{parent_mutex};
-
-    if (system.AppendBuffer(buffer, tag)) {
-        return ResultSuccess;
-    }
-    return Service::Audio::ResultBufferCountReached;
+    return system.AppendBuffer(buffer, tag);
 }
 
 void Out::ReleaseAndRegisterBuffers() {

@@ -62,6 +62,7 @@ TEST_CASE("LDN waits for the selected host's connection reply", "[core][ldn]") {
     info.ldn.node_count = 1;
     info.ldn.node_count_max = 8;
     info.ldn.nodes[0].ipv4_address = {1, 0, 168, 192};
+    info.ldn.nodes[0].local_communication_version = 1;
 
     Network::LDNPacket reply{};
     reply.type = Network::LDNPacketType::SyncNetwork;
@@ -158,7 +159,8 @@ TEST_CASE("LDN reports a missing connection reply and ignores late replies", "[c
     NetworkInfo info{};
     info.ldn.node_count = 1;
     info.ldn.nodes[0].ipv4_address = {1, 0, 168, 192};
-    REQUIRE(station.Connect(info, {}, 1) == ResultAuthenticationTimeout);
+    info.ldn.nodes[0].local_communication_version = 1;
+    REQUIRE(station.Connect(info, {}, 1) == ResultConnectionTimeout);
     REQUIRE(station.GetState() == State::StationOpened);
 
     Network::LDNPacket reply{};
@@ -202,4 +204,80 @@ TEST_CASE("LDN creates fresh identities for recreated networks and separate host
     REQUIRE(other.network_id.session_id != recreated.network_id.session_id);
     REQUIRE(host.Finalize().IsSuccess());
     REQUIRE(other_host.Finalize().IsSuccess());
+}
+
+TEST_CASE("LDN scan filter treats the network type as a mask", "[core][ldn]") {
+    using namespace Service::LDN;
+
+    LANDiscovery station;
+    NetworkInfo info{};
+    info.common.network_type = PackedNetworkType::Ldn;
+
+    ScanFilter filter{};
+    filter.flag = ScanFilterFlag::NetworkType;
+
+    // The SDK describes the filter's network type as "a logical OR of
+    // NetworkType values", so a mask that includes Ldn accepts an Ldn network.
+    filter.network_type = NetworkType::Ldn;
+    REQUIRE(station.MatchesScanFilter(info, filter));
+
+    filter.network_type = NetworkType::All;
+    REQUIRE(station.MatchesScanFilter(info, filter));
+
+    filter.network_type = NetworkType::General;
+    REQUIRE_FALSE(station.MatchesScanFilter(info, filter));
+
+    // A general network is accepted by a mask that includes General.
+    info.common.network_type = PackedNetworkType::General;
+    filter.network_type = NetworkType::General;
+    REQUIRE(station.MatchesScanFilter(info, filter));
+
+    filter.network_type = NetworkType::All;
+    REQUIRE(station.MatchesScanFilter(info, filter));
+
+    filter.network_type = NetworkType::Ldn;
+    REQUIRE_FALSE(station.MatchesScanFilter(info, filter));
+}
+
+TEST_CASE("LDN scan filter honours the BSSID flag", "[core][ldn]") {
+    using namespace Service::LDN;
+
+    LANDiscovery station;
+    NetworkInfo info{};
+    info.common.bssid.raw = {0x02, 0x00, 0x0a, 0x0b, 0x0c, 0x0d};
+
+    ScanFilter filter{};
+    filter.flag = ScanFilterFlag::Bssid;
+    filter.mac_address = info.common.bssid;
+    REQUIRE(station.MatchesScanFilter(info, filter));
+
+    filter.mac_address.raw[5] = 0xff;
+    REQUIRE_FALSE(station.MatchesScanFilter(info, filter));
+}
+
+TEST_CASE("LDN rejects a peer with an incompatible local communication version", "[core][ldn]") {
+    using namespace Service::LDN;
+    if (!Network::GetSelectedNetworkInterface()) {
+        SKIP("LDN requires a host IPv4 interface");
+    }
+
+    TestLANDiscovery station;
+    station.SetConnectionTimeout(25ms);
+    REQUIRE(station.Initialize([] {}).IsSuccess());
+    REQUIRE(station.OpenStation().IsSuccess());
+
+    NetworkInfo info{};
+    info.ldn.node_count = 1;
+    info.ldn.nodes[0].ipv4_address = {1, 0, 168, 192};
+    info.ldn.nodes[0].local_communication_version = 4;
+
+    // Our version is earlier than the peer's, and later than the peer's.
+    REQUIRE(station.Connect(info, {}, 3) == ResultLowerVersion);
+    REQUIRE(station.Connect(info, {}, 5) == ResultHigherVersion);
+
+    // Matching versions pass the compatibility check and reach the host.
+    REQUIRE(station.Connect(info, {}, 4) == ResultConnectionTimeout);
+    REQUIRE(station.GetState() == State::StationOpened);
+
+    REQUIRE(station.Finalize().IsSuccess());
 }

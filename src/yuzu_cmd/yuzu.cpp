@@ -14,6 +14,7 @@
 #include <vector>
 #include <cstdlib>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <csignal>
 #include <cstring>
@@ -52,8 +53,10 @@
 #include "core/file_sys/registered_cache.h"
 #include "core/file_sys/vfs/vfs_real.h"
 #include "core/hle/service/am/applet_manager.h"
+#include "core/hle/service/am/frontend/applets.h"
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
+#include "emulation/classic/cartridge.h"
 #include "frontend_common/config.h"
 #include "frontend_common/sentry_crash_reporter.h"
 #include "hid_core/frontend/emulated_controller.h"
@@ -67,6 +70,9 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
 #include "video_core/shader_warm/shader_warm_builder.h"
+#ifdef EGLANTINE_CLASSIC_RUNTIME
+#include "yuzu_cmd/classic_session.h"
+#endif
 #include "yuzu_cmd/emu_window/emu_window_sdl3.h"
 #ifdef HAS_OPENGL
 #include "yuzu_cmd/emu_window/emu_window_sdl3_gl.h"
@@ -74,8 +80,10 @@
 #include "yuzu_cmd/emu_window/emu_window_sdl3_null.h"
 #include "yuzu_cmd/emu_window/emu_window_sdl3_vk.h"
 #include "yuzu_cmd/gpui_content.h"
+#include "yuzu_cmd/gpui_controller.h"
 #include "yuzu_cmd/gpui_library.h"
 #include "yuzu_cmd/gpui_session.h"
+#include "yuzu_cmd/software_keyboard_applet.h"
 #ifdef YUZU_ENABLE_MCP
 #include "mcp/server.h"
 #include "yuzu_cmd/mcp_host_cli.h"
@@ -271,8 +279,12 @@ struct SdlState {
     // Must outlive emu_window, which keeps a pointer to it.
     InputCommon::InputSubsystem input_subsystem{};
     std::unique_ptr<EmuWindow_SDL3> emu_window;
+    std::shared_ptr<YuzuCmd::SoftwareKeyboardController> swkbd_controller;
     bool network_initialized{};
     std::unique_ptr<Gpui::Session> gpui_session;
+#ifdef EGLANTINE_CLASSIC_RUNTIME
+    std::unique_ptr<DesktopClassic::Session> classic_session;
+#endif
     SDL_Scancode gpui_home_key{SDL_SCANCODE_F10};
     SDL_GamepadButton gpui_home_button{SDL_GAMEPAD_BUTTON_GUIDE};
     bool gpui_key_held{};
@@ -603,10 +615,125 @@ static bool BuildWarm(Core::System& system, int argc, char** argv, wchar_t** arg
     return result.ok;
 }
 
-enum class GpuiTool { None, Library, Content };
+enum class GpuiTool { None, Library, Content, SwkbdTest, Controller };
+
+static bool RunGpuiSwkbdTest(Gpui::Session& session, std::string_view scenario) {
+    using namespace Service::AM::Frontend;
+    auto controller = std::make_shared<YuzuCmd::SoftwareKeyboardController>();
+    YuzuCmd::HostSoftwareKeyboardApplet applet{controller};
+
+    struct ResultRecord {
+        int final_completions{};
+        int text_check_calls{};
+        SwkbdResult last_result{SwkbdResult::Cancel};
+        std::u16string last_text;
+    } record;
+
+    Core::Frontend::KeyboardInitializeParameters params{};
+    params.header_text = u"Enter Name";
+    params.sub_text = u"Profile";
+    params.guide_text = u"Type here";
+    params.ok_text = u"Done";
+    params.initial_text = u"Églantine";
+    params.min_text_length = 2;
+    params.max_text_length = 16;
+    params.password_mode = SwkbdPasswordMode::Disabled;
+    params.enable_return_button = false;
+    params.disable_cancel_button = false;
+
+    const bool use_text_check = scenario == "text_check";
+    if (use_text_check) {
+        params.min_text_length = 3;
+        params.max_text_length = 8;
+    } else if (scenario == "disable_cancel") {
+        params.disable_cancel_button = true;
+    }
+
+    applet.InitializeKeyboard(
+        false, std::move(params),
+        [&](SwkbdResult result, std::u16string text, bool confirmed) {
+            if (use_text_check && result == SwkbdResult::Ok && !confirmed) {
+                ++record.text_check_calls;
+                if (text == u"bad") {
+                    applet.ShowTextCheckDialog(SwkbdTextCheckResult::Failure, u"Name reserved");
+                    return;
+                }
+                if (text == u"warn") {
+                    applet.ShowTextCheckDialog(SwkbdTextCheckResult::Confirm, u"Use warn?");
+                    return;
+                }
+            }
+            ++record.final_completions;
+            record.last_result = result;
+            record.last_text = std::move(text);
+            applet.ExitKeyboard();
+        },
+        {});
+
+    session.SetState(Gpui::SessionState::Running);
+    applet.ShowNormalKeyboard();
+    controller->DrainGpuiEvents(session, nullptr);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (record.final_completions == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::vector<Gpui::Request> requests;
+        if (!session.Poll(requests)) {
+            applet.Close();
+            break;
+        }
+        for (const auto& request : requests) {
+            if (request.command == Gpui::Command::Stop) {
+                session.SetState(Gpui::SessionState::Stopping);
+                applet.Close();
+                session.Reply(request.id);
+                break;
+            }
+            if (request.command == Gpui::Command::SwkbdSubmit) {
+                std::string error;
+                if (!controller->Submit(request.swkbd_request_id, request.swkbd_text,
+                                        request.swkbd_confirmed, error)) {
+                    session.Reply(request.id, error);
+                } else {
+                    session.Reply(request.id);
+                }
+            } else if (request.command == Gpui::Command::SwkbdCancel) {
+                std::string error;
+                if (!controller->Cancel(request.swkbd_request_id, error)) {
+                    session.Reply(request.id, error);
+                } else {
+                    session.Reply(request.id);
+                }
+            } else {
+                session.Reply(request.id, "Unsupported command in swkbd test");
+            }
+        }
+        controller->DrainGpuiEvents(session, nullptr);
+        if (record.final_completions == 0) {
+            SDL_Delay(5);
+        }
+    }
+
+    // Calling Close() again after completion must never trigger a second completion.
+    applet.Close();
+    controller->DrainGpuiEvents(session, nullptr);
+
+    const std::string result_utf8 = Common::UTF16ToUTF8(record.last_text);
+    const std::string summary = fmt::format(
+        "swkbd_test_done:{}:{}:{}:{}", record.final_completions, record.text_check_calls,
+        record.last_result == SwkbdResult::Ok ? "ok" : "cancel", result_utf8);
+    session.SendEvent(summary);
+    session.SetState(Gpui::SessionState::Stopped);
+    return record.final_completions == 1;
+}
 
 static bool RunGpuiTool(GpuiTool tool, Gpui::Session& session, Core::System& system, int argc,
                         char** argv, [[maybe_unused]] wchar_t** wide_argv) {
+    if (tool == GpuiTool::SwkbdTest) {
+        return RunGpuiSwkbdTest(session, argc >= 3 ? std::string_view{argv[2]} : "submit");
+    }
+    if (tool == GpuiTool::Controller) {
+        return Gpui::RunControllerBridge(session);
+    }
     const char* config = SDL_GetEnvironmentVariable(SDL_GetEnvironment(), "EGLANTINE_GPUI_CONFIG");
     if (config && *config && !SdlConfig::ReadToolValues(config)) {
         session.Error("The GPUI emulator configuration could not be read");
@@ -660,9 +787,11 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     *appstate = state;
     const std::string_view first_option = argc > 1 ? argv[1] : "";
     const bool gpui_requested = first_option == "--gpui-session";
-    const auto gpui_tool = first_option == "--gpui-library"   ? GpuiTool::Library
-                           : first_option == "--gpui-content" ? GpuiTool::Content
-                                                              : GpuiTool::None;
+    const auto gpui_tool = first_option == "--gpui-library"      ? GpuiTool::Library
+                           : first_option == "--gpui-content"    ? GpuiTool::Content
+                           : first_option == "--gpui-swkbd-test" ? GpuiTool::SwkbdTest
+                           : first_option == "--gpui-controller" ? GpuiTool::Controller
+                                                                 : GpuiTool::None;
     std::unique_ptr<Gpui::Session> gpui_tool_session;
     if (gpui_requested || gpui_tool != GpuiTool::None) {
         auto session = Gpui::Session::Open();
@@ -775,6 +904,87 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     }
     state->owned_config = std::make_unique<SdlConfig>(lp.config_path);
     state->config = state->owned_config.get();
+
+    if (!lp.filepath.empty() && !lp.print_help && !lp.print_version && !lp.pack_nup_source &&
+        !lp.unpack_nup_source && !lp.edit_nup_source) {
+        const std::filesystem::path path{Common::FS::ToU8String(lp.filepath)};
+        auto extension = Common::FS::PathToUTF8String(path.extension());
+        if (!extension.empty()) {
+            extension.erase(0, 1);
+            std::ranges::transform(extension, extension.begin(), [](unsigned char value) {
+                return static_cast<char>(std::tolower(value));
+            });
+        }
+        if (Emulation::Classic::IsClassicCartridgeExtension(extension)) {
+#ifdef EGLANTINE_CLASSIC_RUNTIME
+            Core::ApplyLaunchParams(lp);
+            const auto classic_dir =
+                Common::FS::GetEdenPath(Common::FS::EdenPath::EdenDir) / "classic";
+            const auto profile_str = std::to_string(Settings::values.current_user.GetValue());
+            const auto save_root = classic_dir / "saves" / profile_str;
+            const auto state_root = classic_dir / "states" / profile_str;
+            SDL_Environment* const sdl_env = SDL_GetEnvironment();
+            std::filesystem::path bios_path = classic_dir / "bios" / "gba_bios.bin";
+            bool bios_explicit = false;
+            if (const char* env_bios =
+                    sdl_env ? SDL_GetEnvironmentVariable(sdl_env, "EGLANTINE_GPUI_GBA_BIOS")
+                            : nullptr;
+                env_bios && env_bios[0] != '\0') {
+                bios_path = std::filesystem::path{Common::FS::ToU8String(env_bios)};
+                bios_explicit = true;
+            }
+            const auto env_flag = [sdl_env](const char* name) {
+                const char* v = sdl_env ? SDL_GetEnvironmentVariable(sdl_env, name) : nullptr;
+                return v && (std::string_view{v} == "1" || std::string_view{v} == "true");
+            };
+            std::vector<std::string> cheats;
+            if (const char* env_cheats =
+                    sdl_env ? SDL_GetEnvironmentVariable(sdl_env, "EGLANTINE_GPUI_GBA_CHEATS")
+                            : nullptr;
+                env_cheats && env_cheats[0] != '\0') {
+                std::string_view sv{env_cheats};
+                while (!sv.empty()) {
+                    const auto sep = sv.find_first_of(";\n");
+                    const auto item = sv.substr(0, sep);
+                    if (!item.empty()) {
+                        cheats.emplace_back(item);
+                    }
+                    if (sep == std::string_view::npos) {
+                        break;
+                    }
+                    sv.remove_prefix(sep + 1);
+                }
+            }
+            std::string error;
+            state->classic_session = DesktopClassic::Session::Open(
+                {.cartridge = path,
+                 .save_root = save_root,
+                 .state_root = state_root,
+                 .bios_path = bios_path,
+                 .bios_explicit = bios_explicit,
+                 .extension = extension,
+                 .fullscreen = lp.fullscreen,
+                 .volume = Settings::values.audio_muted.GetValue()
+                               ? 0.0f
+                               : static_cast<float>(Settings::values.volume.GetValue()) / 100.0f,
+                 .color_correction = env_flag("EGLANTINE_GPUI_GBA_COLOR_CORRECTION"),
+                 .interframe_blending = env_flag("EGLANTINE_GPUI_GBA_INTERFRAME_BLENDING"),
+                 .cheats = std::move(cheats),
+                 .gpui = state->gpui_session.get(),
+                 .home_key = state->gpui_home_key,
+                 .home_button = state->gpui_home_button},
+                error);
+            if (state->classic_session) {
+                return SDL_APP_CONTINUE;
+            }
+#else
+            const std::string_view error = "Classic cartridge playback is disabled in this build";
+#endif
+            LOG_ERROR(Frontend, "{}", error);
+            return fail_session(error);
+        }
+    }
+
     // Before anything loads a GPU driver.
     Common::ConfigureDriverShaderCache(Settings::values.private_driver_shader_cache.GetValue(),
                                        Settings::values.driver_shader_cache_size.GetValue());
@@ -812,6 +1022,13 @@ extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
     }
 
     state->system.Initialize();
+    state->swkbd_controller = std::make_shared<YuzuCmd::SoftwareKeyboardController>();
+    {
+        Service::AM::Frontend::FrontendAppletSet applets{};
+        applets.software_keyboard =
+            std::make_unique<YuzuCmd::HostSoftwareKeyboardApplet>(state->swkbd_controller);
+        state->system.SetFrontendAppletSet(std::move(applets));
+    }
 
 
     // Apply the command line arguments
@@ -1200,8 +1417,14 @@ static bool RunGpuiSession(SdlState& state) {
     auto& session = *state.gpui_session;
     using enum Gpui::SessionState;
 
+    if (state.swkbd_controller) {
+        state.swkbd_controller->DrainGpuiEvents(session, state.emu_window.get());
+    }
     std::vector<Gpui::Request> requests;
     if (state.gpui_game_exit || !session.Poll(requests)) {
+        if (state.swkbd_controller) {
+            state.swkbd_controller->CloseNormal();
+        }
         session.SetState(Stopping);
         return false;
     }
@@ -1242,10 +1465,57 @@ static bool RunGpuiSession(SdlState& state) {
             }
             break;
         case Gpui::Command::Stop:
+            if (state.swkbd_controller) {
+                state.swkbd_controller->CloseNormal();
+            }
             session.SetState(Stopping);
             break;
+        case Gpui::Command::SetViewport:
+            if (!state.emu_window->SetViewport(request.viewport_x, request.viewport_y,
+                                               request.viewport_width, request.viewport_height)) {
+                session.Reply(request.id, "Could not resize the game viewport");
+                continue;
+            }
+            break;
+        case Gpui::Command::SwkbdSubmit: {
+            if (!state.swkbd_controller) {
+                session.Reply(request.id, "Software keyboard is not available");
+                continue;
+            }
+            std::string error;
+            if (!state.swkbd_controller->Submit(request.swkbd_request_id, request.swkbd_text,
+                                                request.swkbd_confirmed, error)) {
+                session.Reply(request.id, error);
+                continue;
+            }
+            break;
+        }
+        case Gpui::Command::SwkbdCancel: {
+            if (!state.swkbd_controller) {
+                session.Reply(request.id, "Software keyboard is not available");
+                continue;
+            }
+            std::string error;
+            if (!state.swkbd_controller->Cancel(request.swkbd_request_id, error)) {
+                session.Reply(request.id, error);
+                continue;
+            }
+            break;
+        }
+        case Gpui::Command::SaveState:
+        case Gpui::Command::LoadState:
+        case Gpui::Command::SetFastForward:
+        case Gpui::Command::RewindStep:
+        case Gpui::Command::SetVideoOptions:
+        case Gpui::Command::SetCheats:
+        case Gpui::Command::Reset:
+            session.Reply(request.id, "This command is only supported in GBA sessions");
+            continue;
         }
         session.Reply(request.id);
+    }
+    if (state.swkbd_controller) {
+        state.swkbd_controller->DrainGpuiEvents(session, state.emu_window.get());
     }
     return session.GetState() != Stopping;
 }
@@ -1299,6 +1569,11 @@ static bool HandleGpuiHome(SdlState& state, const SDL_Event& event) {
 
 extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     SdlState *state = (SdlState *)appstate;
+#ifdef EGLANTINE_CLASSIC_RUNTIME
+    if (state->classic_session) {
+        return state->classic_session->Iterate();
+    }
+#endif
     if (state->gpui_session && !RunGpuiSession(*state)) {
         return SDL_APP_SUCCESS;
     }
@@ -1314,7 +1589,11 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
         }
     }
 #endif
-    if (state->emu_window) {
+    if (!state->gpui_session && state->swkbd_controller && state->emu_window) {
+        state->swkbd_controller->DrainSdlEvents(state->emu_window->GetRenderWindow());
+    }
+    if (state->emu_window &&
+        !(state->swkbd_controller && state->swkbd_controller->IsSdlActive())) {
         state->emu_window->ApplyPendingTitle();
     }
     if (restart_requested) {
@@ -1324,7 +1603,16 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
 }
 extern "C" SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
     SdlState *state = (SdlState *)appstate;
+#ifdef EGLANTINE_CLASSIC_RUNTIME
+    if (state->classic_session) {
+        return state->classic_session->Event(*event);
+    }
+#endif
     if (state->emu_window) {
+        if (!state->gpui_session && state->swkbd_controller &&
+            state->swkbd_controller->HandleSdlEvent(*event, state->emu_window->GetRenderWindow())) {
+            return SDL_APP_CONTINUE;
+        }
         if (state->gpui_session) {
             if (HandleGpuiHome(*state, *event)) {
                 return SDL_APP_CONTINUE;
@@ -1343,6 +1631,13 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     if (!state) {
         return;
     }
+#ifdef EGLANTINE_CLASSIC_RUNTIME
+    if (state->classic_session) {
+        state->classic_session->Finish(result);
+        delete state;
+        return;
+    }
+#endif
     auto gpui_session = std::move(state->gpui_session);
     if (gpui_session) {
         if (result == SDL_APP_FAILURE && !state->gpui_start_error) {
@@ -1355,6 +1650,9 @@ extern "C" void SDL_AppQuit(void *appstate, SDL_AppResult result) {
     state->mcp_server.reset(); // stops serving before the system goes away
     state->mcp_host.reset();
 #endif
+    if (state->swkbd_controller) {
+        state->swkbd_controller->CloseNormal();
+    }
     state->system.DetachDebugger();
     // SDL calls this even when SDL_AppInit never powered the system on (no ROM given, --help or
     // --version): the kernel is uninitialised then, and Pause()/ShutdownMainProcess() would

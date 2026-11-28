@@ -12,3 +12,6 @@ publish = false
 
 [lib]
 crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+eglantine-library = { path = "../../crates/eglantine_library" }

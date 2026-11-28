@@ -4,8 +4,11 @@
 #![forbid(unsafe_code)]
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::path::PathBuf;
+
+use eglantine_library::ConsoleId;
 
 use crate::library::{GameEntry, LibraryStore, is_document_uri};
 use crate::overlay::OverlayState;
@@ -23,16 +26,17 @@ pub(super) enum ViewMode {
 
 pub(super) struct App {
     suspended: bool,
-    document: Option<CString>,
-    activity: Activity,
+    pub(super) document: Option<CString>,
+    pub(super) activity: Activity,
     view: ViewMode,
-    library: LibraryStore,
+    pub(super) library: LibraryStore,
+    pub(super) console_selections: HashMap<Option<ConsoleId>, CString>,
     overlay: OverlayState,
     settings: SettingsSnapshot,
     driver_name: CString,
     storage_dir: Option<PathBuf>,
     has_prod_keys: bool,
-    scroll_offset: usize,
+    pub(super) scroll_offset: usize,
 }
 
 impl Default for App {
@@ -43,6 +47,7 @@ impl Default for App {
             activity: Activity::default(),
             view: ViewMode::Library,
             library: LibraryStore::default(),
+            console_selections: HashMap::new(),
             overlay: OverlayState::default(),
             settings: SettingsSnapshot::default(),
             driver_name: c"System default".to_owned(),
@@ -66,12 +71,9 @@ impl App {
         self.library = LibraryStore::load_from_dir(&path);
         self.overlay = OverlayState::load_from_dir(&path);
         self.storage_dir = Some(path);
+        self.console_selections.clear();
+        self.sync_visible_selection();
         self.clamp_scroll();
-        if self.document.is_none()
-            && let Some(selected) = self.library.selected_game()
-        {
-            self.document = Some(selected.uri.clone());
-        }
     }
 
     pub(super) fn set_has_prod_keys(&mut self, present: bool) {
@@ -87,7 +89,10 @@ impl App {
     }
 
     pub(super) fn selected_game_index(&self) -> Option<usize> {
-        self.library.selected_index()
+        let selected_raw = self.library.selected_index()?;
+        self.visible_game_indices()
+            .into_iter()
+            .position(|idx| idx == selected_raw)
     }
 
     pub(super) fn scroll_offset(&self) -> usize {
@@ -189,12 +194,8 @@ impl App {
         } else if let Some(tree_uri) = tree_uri.filter(|uri| is_document_uri(uri)) {
             self.library.add_folder(tree_uri);
             let scanned = self.library.upsert_games(games);
+            self.sync_visible_selection();
             self.clamp_scroll();
-            if self.document.is_none()
-                && let Some(selected) = self.library.selected_game()
-            {
-                self.document = Some(selected.uri.clone());
-            }
             self.save_library();
             let detail = format!(
                 "{scanned} scanned ({} total in library).",
@@ -250,26 +251,14 @@ impl App {
     }
 
     pub(super) fn select_game_index(&mut self, index: usize) -> bool {
-        if !self.is_idle() {
-            return false;
-        }
-        let Some(uri) = self.library.select(index).map(CStr::to_owned) else {
-            return false;
-        };
-        self.document = Some(uri);
-        self.save_library();
-        if let Some(game) = self.library.selected_game() {
-            let title = game.title.to_string_lossy();
-            self.activity = Activity::Message(status_with_detail("Selected: ", &title).into());
-        }
-        true
+        self.select_visible_game(index)
     }
 
     pub(super) fn scroll_games(&mut self, delta: isize) {
         if !self.is_idle() {
             return;
         }
-        let max_offset = self.library.games().len().saturating_sub(VISIBLE_GAME_ROWS);
+        let max_offset = self.visible_game_count().saturating_sub(VISIBLE_GAME_ROWS);
         let next = if delta < 0 {
             self.scroll_offset.saturating_sub(delta.unsigned_abs())
         } else {
@@ -328,16 +317,16 @@ impl App {
         true
     }
 
-    fn is_idle(&self) -> bool {
+    pub(super) fn is_idle(&self) -> bool {
         !self.suspended && matches!(self.activity, Activity::Ready | Activity::Message(_))
     }
 
-    fn clamp_scroll(&mut self) {
-        let max_offset = self.library.games().len().saturating_sub(VISIBLE_GAME_ROWS);
+    pub(super) fn clamp_scroll(&mut self) {
+        let max_offset = self.visible_game_count().saturating_sub(VISIBLE_GAME_ROWS);
         self.scroll_offset = self.scroll_offset.min(max_offset);
     }
 
-    fn save_library(&self) {
+    pub(super) fn save_library(&self) {
         if let Some(dir) = &self.storage_dir {
             let _ = self.library.save_to_dir(dir);
         }
@@ -345,7 +334,7 @@ impl App {
 }
 
 #[derive(Clone, Copy)]
-enum PickerKind {
+pub(super) enum PickerKind {
     GameFile,
     GameFolder,
     KeysFile,
@@ -353,7 +342,7 @@ enum PickerKind {
 }
 
 #[derive(Default)]
-enum Activity {
+pub(super) enum Activity {
     #[default]
     Ready,
     Picking(PickerKind),
@@ -368,7 +357,7 @@ pub(super) enum SelectionResult<'a> {
     Failed(Option<&'a str>),
 }
 
-fn status_with_detail(prefix: &str, detail: &str) -> CString {
+pub(super) fn status_with_detail(prefix: &str, detail: &str) -> CString {
     let mut message = String::from(prefix);
     let mut chars = detail.chars();
     message.extend(chars.by_ref().take(MAX_STATUS_DETAIL).map(|c| match c {
@@ -385,6 +374,34 @@ fn status_with_detail(prefix: &str, detail: &str) -> CString {
 #[cfg(test)]
 mod tests {
     use super::{App, SelectionResult};
+
+    #[test]
+    fn console_switching_filters_titles_and_restores_selection() {
+        let mut app = App::default();
+        assert!(app.begin_folder_selection());
+        app.folder_scan_result(
+            Some("content://p/tree/library"),
+            vec![
+                ("content://p/doc/advance-a".into(), "Amber".into(), 0),
+                ("content://p/doc/advance-b".into(), "Bramble".into(), 0),
+                ("content://p/doc/switch".into(), "Native".into(), 1),
+            ],
+            None,
+        );
+        app.classify_game("content://p/doc/advance-a", "game-boy-advance");
+        app.classify_game("content://p/doc/advance-b", "game-boy-advance");
+        app.classify_game("content://p/doc/switch", "switch-2");
+        assert!(app.select_console(Some("game-boy-advance")));
+        assert_eq!(app.visible_game_count(), 2);
+        assert!(app.select_game_index(1));
+        assert!(app.select_console(Some("switch-2")));
+        assert_eq!(app.visible_game_count(), 1);
+        assert!(app.select_console(Some("game-boy-advance")));
+        assert_eq!(app.selected_game_index(), Some(1));
+        assert_eq!(app.selected_title(), Some(c"Bramble"));
+        assert!(app.select_console(Some("game-boy-color")));
+        assert!(!app.can_launch());
+    }
 
     #[test]
     fn a_pending_picker_cannot_be_opened_twice() {

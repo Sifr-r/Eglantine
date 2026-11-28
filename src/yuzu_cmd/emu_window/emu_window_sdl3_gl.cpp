@@ -100,25 +100,9 @@ EmuWindow_SDL3_GL::EmuWindow_SDL3_GL(InputCommon::InputSubsystem* input_subsyste
 
     std::string window_title = fmt::format("{} | {}-{}", Common::g_build_fullname,
                                            Common::g_scm_branch, Common::g_scm_desc);
-    render_window =
-        SDL_CreateWindow(window_title.c_str(), Layout::ScreenUndocked::Width,
-                         Layout::ScreenUndocked::Height,
-                         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
-                             SDL_WINDOW_HIGH_PIXEL_DENSITY | Nx2HiddenWindowFlags());
-
-    if (render_window == nullptr) {
-        LOG_CRITICAL(Frontend, "Failed to create SDL3 window! {}", SDL_GetError());
-        exit(1);
-    }
+    CreateRenderWindow(window_title.c_str(), SDL_WINDOW_OPENGL, fullscreen);
 
     strict_context_required = strcmp(SDL_GetCurrentVideoDriver(), "wayland") == 0;
-
-    SetWindowIcon();
-
-    if (fullscreen) {
-        Fullscreen();
-        ShowCursor(false);
-    }
 
     window_context = SDL_GL_CreateContext(render_window);
     core_context = CreateSharedContext();

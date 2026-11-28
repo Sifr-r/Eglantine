@@ -91,31 +91,75 @@ public:
      * @param core_timing - The CoreTiming instance
      * @param session     - The device session
      *
-     * @return If any buffer was released.
+     * @return If any buffer was released, or if no buffers remain registered.
      */
-    bool ReleaseBuffers(const Core::Timing::CoreTiming& core_timing, const DeviceSession& session,
+    template <typename Session>
+    bool ReleaseBuffers(const Core::Timing::CoreTiming& core_timing, const Session& session,
                         bool force) {
         std::scoped_lock l{lock};
-        bool buffer_released{false};
-        while (registered_count > 0) {
-            auto index{registered_index - registered_count};
-            if (index < 0) {
-                index += N;
-            }
-
-            // Check with the backend if this buffer can be released yet.
-            // If we're shutting down, we don't care if it's been played or not.
-            if (!force && !session.IsBufferConsumed(buffers[index])) {
-                break;
-            }
-
-            session.ReleaseBuffer(buffers[index]);
-
-            ReleaseBufferLocked(index, core_timing.GetGlobalTimeNs().count());
-            buffer_released = true;
-        }
-
+        const bool buffer_released = ReleaseBuffersLocked(core_timing, session, force);
         return buffer_released || registered_count == 0;
+    }
+
+    /**
+     * Release only registered buffers that have already been consumed by the backend.
+     *
+     * @param core_timing - The CoreTiming instance
+     * @param session     - The device session
+     *
+     * @return True if at least one buffer was released, otherwise false.
+     */
+    template <typename Session>
+    bool ReleaseConsumedBuffers(const Core::Timing::CoreTiming& core_timing,
+                                const Session& session) {
+        std::scoped_lock l{lock};
+        return ReleaseBuffersLocked(core_timing, session, false);
+    }
+
+    /**
+     * Move all registered buffers back to the front of the appended queue so they will be
+     * re-registered in FIFO order when playback resumes.
+     */
+    void UnregisterBuffers() {
+        std::scoped_lock l{lock};
+        if (registered_count == 0) {
+            return;
+        }
+        appended_count += registered_count;
+        registered_index = released_index;
+        registered_count = 0;
+    }
+
+    /**
+     * Rebase timestamps of all queued (appended) buffers starting from 0 for a newly started
+     * device session stream.
+     *
+     * @param frame_bytes - Bytes per audio frame (channel_count * sizeof(s16)).
+     */
+    void RebaseTimestamps(u64 frame_bytes) {
+        std::scoped_lock l{lock};
+        if (frame_bytes == 0) {
+            return;
+        }
+        if (appended_count == 0 && registered_count == 0) {
+            auto prev_index{appended_index - 1};
+            if (prev_index < 0) {
+                prev_index += append_limit;
+            }
+            buffers[prev_index].end_timestamp = 0;
+            return;
+        }
+        u64 timestamp{0};
+        for (s32 i = 0; i < appended_count; i++) {
+            auto index{appended_index - appended_count + i};
+            if (index < 0) {
+                index += append_limit;
+            }
+            const u64 frames = buffers[index].size / frame_bytes;
+            buffers[index].start_timestamp = timestamp;
+            timestamp += frames;
+            buffers[index].end_timestamp = timestamp;
+        }
     }
 
     /**
@@ -259,6 +303,31 @@ public:
     }
 
 private:
+    template <typename Session>
+    bool ReleaseBuffersLocked(const Core::Timing::CoreTiming& core_timing, const Session& session,
+                              bool force) {
+        bool buffer_released{false};
+        while (registered_count > 0) {
+            auto index{registered_index - registered_count};
+            if (index < 0) {
+                index += N;
+            }
+
+            // Check with the backend if this buffer can be released yet.
+            // If we're shutting down, we don't care if it's been played or not.
+            if (!force && !session.IsBufferConsumed(buffers[index])) {
+                break;
+            }
+
+            session.ReleaseBuffer(buffers[index]);
+
+            ReleaseBufferLocked(index, core_timing.GetGlobalTimeNs().count());
+            buffer_released = true;
+        }
+
+        return buffer_released;
+    }
+
     void ReleaseBufferLocked(s32 index, s64 timestamp) {
         buffers[index].played_timestamp = timestamp;
 
@@ -296,7 +365,7 @@ private:
             }
         }
 
-        while (appended_count > 0) {
+        while (appended_count > 0 && buffers_flushed.size() < buffers_to_flush) {
             auto index{appended_index - appended_count};
             if (index < 0) {
                 index += N;
@@ -307,10 +376,7 @@ private:
             appended_count--;
             released_count++;
             released_index = (released_index + 1) % append_limit;
-
-            if (buffers_flushed.size() >= buffers_to_flush) {
-                break;
-            }
+            registered_index = (registered_index + 1) % append_limit;
         }
 
         return static_cast<u32>(buffers_flushed.size());

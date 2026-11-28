@@ -10,12 +10,19 @@
 
 namespace Service::PSC::Time {
 
+constexpr Result ResultNotInitialized{ErrorModule::TimeService, 0};
 constexpr Result ResultPermissionDenied{ErrorModule::TimeService, 1};
+constexpr Result ResultNoCapability{ErrorModule::TimeService, 1};
+constexpr Result ResultClockInvalid{ErrorModule::TimeService, 100};
 constexpr Result ResultClockMismatch{ErrorModule::TimeService, 102};
 constexpr Result ResultClockUninitialized{ErrorModule::TimeService, 103};
 constexpr Result ResultTimeNotFound{ErrorModule::TimeService, 200};
+constexpr Result ResultNotComparable{ErrorModule::TimeService, 200};
 constexpr Result ResultOverflow{ErrorModule::TimeService, 201};
+constexpr Result ResultOverflowed{ErrorModule::TimeService, 201};
+constexpr Result ResultOutOfResource{ErrorModule::TimeService, 800};
 constexpr Result ResultFailed{ErrorModule::TimeService, 801};
+constexpr Result ResultOutOfMemory{ErrorModule::TimeService, 801};
 constexpr Result ResultInvalidArgument{ErrorModule::TimeService, 901};
 constexpr Result ResultTimeZoneOutOfRange{ErrorModule::TimeService, 902};
 constexpr Result ResultTimeZoneParseFailed{ErrorModule::TimeService, 903};

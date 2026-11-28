@@ -142,7 +142,7 @@ pub(super) fn handle_pointer_up(app: &mut App, x: f32, y: f32) -> i32 {
 }
 
 fn handle_library_pointer_up(app: &mut App, x: f32, y: f32) -> i32 {
-    let game_count = app.games().len();
+    let game_count = app.visible_game_count();
     if game_count > VISIBLE_GAME_ROWS {
         if PREV_BUTTON.contains(x, y) {
             app.scroll_games(-(VISIBLE_GAME_ROWS as isize));
@@ -285,11 +285,11 @@ fn build_library_panel(
     cmds: &mut Vec<DrawCmd>,
     deferred_texts: &mut Vec<(f32, f32, Color, usize)>,
 ) {
-    let games = app.games();
+    let visible_count = app.visible_game_count();
     let scroll = app.scroll_offset();
     let selected = app.selected_game_index();
 
-    if games.is_empty() {
+    if visible_count == 0 {
         cmds.push(draw_text(
             24.0,
             116.0,
@@ -301,7 +301,7 @@ fn build_library_panel(
 
     for slot in 0..VISIBLE_GAME_ROWS {
         let index = scroll + slot;
-        let Some(game) = games.get(index) else {
+        let Some((_, game)) = app.visible_game_at(index) else {
             break;
         };
         let label = format_row_label(game.title.to_string_lossy().as_ref());
@@ -319,14 +319,14 @@ fn build_library_panel(
         }
     }
 
-    if games.len() > VISIBLE_GAME_ROWS {
-        let range_end = (scroll + VISIBLE_GAME_ROWS).min(games.len());
+    if visible_count > VISIBLE_GAME_ROWS {
+        let range_end = (scroll + VISIBLE_GAME_ROWS).min(visible_count);
         cmds.push(fill_rect(PREV_BUTTON, BUTTON_ENABLED_COLOR));
         cmds.push(fill_rect(NEXT_BUTTON, BUTTON_ENABLED_COLOR));
         cmds.push(draw_text(PREV_BUTTON.x + 12.0, 234.0, TEXT_COLOR, c"Prev".as_ptr()));
         cmds.push(draw_text(NEXT_BUTTON.x + 12.0, 234.0, TEXT_COLOR, c"Next".as_ptr()));
         if let Ok(page_text) =
-            CString::new(format!("Games {}-{} of {}", scroll + 1, range_end, games.len()))
+            CString::new(format!("Games {}-{} of {}", scroll + 1, range_end, visible_count))
         {
             let text_idx = texts.len();
             texts.push(page_text);

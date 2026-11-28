@@ -90,7 +90,7 @@ Result LANDiscovery::GetNetworkInfo(NetworkInfo& out_network) const {
         return ResultSuccess;
     }
 
-    return ResultBadState;
+    return ResultInvalidState;
 }
 
 Result LANDiscovery::GetNetworkInfo(NetworkInfo& out_network,
@@ -109,7 +109,7 @@ Result LANDiscovery::GetNetworkInfo(NetworkInfo& out_network,
         return ResultSuccess;
     }
 
-    return ResultBadState;
+    return ResultInvalidState;
 }
 
 DisconnectReason LANDiscovery::GetDisconnectReason() const {
@@ -135,37 +135,55 @@ Result LANDiscovery::Scan(std::span<NetworkInfo> out_networks, s16& out_count,
             break;
         }
 
-        if (IsFlagSet(filter.flag, ScanFilterFlag::LocalCommunicationId)) {
-            if (filter.network_id.intent_id.local_communication_id !=
-                info.network_id.intent_id.local_communication_id) {
-                continue;
-            }
-        }
-        if (IsFlagSet(filter.flag, ScanFilterFlag::SessionId)) {
-            if (filter.network_id.session_id != info.network_id.session_id) {
-                continue;
-            }
-        }
-        if (IsFlagSet(filter.flag, ScanFilterFlag::NetworkType)) {
-            if (filter.network_type != static_cast<NetworkType>(info.common.network_type)) {
-                continue;
-            }
-        }
-        if (IsFlagSet(filter.flag, ScanFilterFlag::Ssid)) {
-            if (filter.ssid != info.common.ssid) {
-                continue;
-            }
-        }
-        if (IsFlagSet(filter.flag, ScanFilterFlag::SceneId)) {
-            if (filter.network_id.intent_id.scene_id != info.network_id.intent_id.scene_id) {
-                continue;
-            }
+        if (!MatchesScanFilter(info, filter)) {
+            continue;
         }
 
         out_networks[out_count++] = info;
     }
 
     return ResultSuccess;
+}
+
+bool LANDiscovery::MatchesScanFilter(const NetworkInfo& info, const ScanFilter& filter) const {
+    if (IsFlagSet(filter.flag, ScanFilterFlag::LocalCommunicationId)) {
+        if (filter.network_id.intent_id.local_communication_id !=
+            info.network_id.intent_id.local_communication_id) {
+            return false;
+        }
+    }
+    if (IsFlagSet(filter.flag, ScanFilterFlag::SessionId)) {
+        if (filter.network_id.session_id != info.network_id.session_id) {
+            return false;
+        }
+    }
+    if (IsFlagSet(filter.flag, ScanFilterFlag::NetworkType)) {
+        // The SDK describes ScanFilter::networkType as "a logical OR of
+        // NetworkType values", so it is a mask of the accepted network types
+        // rather than a single type to match exactly.
+        const u32 accepted = static_cast<u32>(filter.network_type);
+        const u32 actual = static_cast<u32>(info.common.network_type);
+        if ((accepted & actual) == 0) {
+            return false;
+        }
+    }
+    if (IsFlagSet(filter.flag, ScanFilterFlag::Bssid)) {
+        if (filter.mac_address != info.common.bssid) {
+            return false;
+        }
+    }
+    if (IsFlagSet(filter.flag, ScanFilterFlag::Ssid)) {
+        if (filter.ssid != info.common.ssid) {
+            return false;
+        }
+    }
+    if (IsFlagSet(filter.flag, ScanFilterFlag::SceneId)) {
+        if (filter.network_id.intent_id.scene_id != info.network_id.intent_id.scene_id) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 Result LANDiscovery::SetAdvertiseData(std::span<const u8> data) {
@@ -187,7 +205,7 @@ Result LANDiscovery::OpenAccessPoint() {
     std::scoped_lock lock{packet_mutex};
     disconnect_reason = DisconnectReason::None;
     if (state == State::None) {
-        return ResultBadState;
+        return ResultInvalidState;
     }
 
     ResetStations();
@@ -199,7 +217,7 @@ Result LANDiscovery::OpenAccessPoint() {
 Result LANDiscovery::CloseAccessPoint() {
     std::scoped_lock lock{packet_mutex};
     if (state == State::None) {
-        return ResultBadState;
+        return ResultInvalidState;
     }
 
     if (state == State::AccessPointCreated) {
@@ -216,7 +234,7 @@ Result LANDiscovery::OpenStation() {
     std::scoped_lock lock{packet_mutex};
     disconnect_reason = DisconnectReason::None;
     if (state == State::None) {
-        return ResultBadState;
+        return ResultInvalidState;
     }
 
     ResetStations();
@@ -228,7 +246,7 @@ Result LANDiscovery::OpenStation() {
 Result LANDiscovery::CloseStation() {
     std::scoped_lock lock{packet_mutex};
     if (state == State::None) {
-        return ResultBadState;
+        return ResultInvalidState;
     }
 
     if (state == State::StationConnected || host_ip) {
@@ -247,7 +265,7 @@ Result LANDiscovery::CreateNetwork(const SecurityConfig& security_config,
     std::scoped_lock lock{packet_mutex};
 
     if (state != State::AccessPointOpened) {
-        return ResultBadState;
+        return ResultInvalidState;
     }
 
     InitNetworkInfo();
@@ -303,10 +321,20 @@ Result LANDiscovery::Connect(const NetworkInfo& network_info_, const UserConfig&
                              u16 local_communication_version) {
     std::unique_lock lock{packet_mutex};
     if (state != State::StationOpened || host_ip) {
-        return ResultBadState;
+        return ResultInvalidState;
     }
     if (network_info_.ldn.node_count == 0) {
-        return ResultInvalidNodeCount;
+        return ResultNodeNotFound;
+    }
+    // The SDK reports a version mismatch as ResultLowerVersion when the local
+    // version is earlier than the peer's, and ResultHigherVersion when it is
+    // later.
+    const u16 peer_version = network_info_.ldn.nodes[0].local_communication_version;
+    if (local_communication_version < peer_version) {
+        return ResultLowerVersion;
+    }
+    if (local_communication_version > peer_version) {
+        return ResultHigherVersion;
     }
 
     Result rc = GetNodeInfo(node_info, user_config, local_communication_version);
@@ -328,7 +356,7 @@ Result LANDiscovery::Connect(const NetworkInfo& network_info_, const UserConfig&
     if (!replied) {
         SendPacket(Network::LDNPacketType::Disconnect, node_info, *host_ip);
         host_ip.reset();
-        return ResultAuthenticationTimeout;
+        return ResultConnectionTimeout;
     }
     if (state != State::StationConnected) {
         return ResultConnectionFailed;

@@ -15,9 +15,11 @@ Eglantine is a Switch / Switch 2 emulator forked from Eden (Yuzu lineage). Nativ
 | Boot, platform, HLE, saves, NUP, audio, network | [core](docs/knowledge/core.md) | [`Core::System`](src/core/core.cpp), [`PlatformProfile`](src/core/platform_profile.h), [`Nx2SessionState`](src/core/nx2_session_state.h) | `[platform-profile]`, `[platform-sizing]`, `[shutdown-ordering]`, `[nx2-session]` |
 | Device behaviour the guest can observe (operation mode, applets, catalogue, saves, profiles) | [device_behaviour](docs/knowledge/device_behaviour.md) | [`AppletManager`](src/core/hle/service/am/applet_manager.cpp), [`ISystemSettingsServer`](src/core/hle/service/set/system_settings_server.cpp), [`Settings::values.use_docked_mode`](src/common/settings.h) | `[save-data]`, `[set]`, `[ldn]`, `[sockets]`, `[key_code_map]` |
 | File recognition, library scans, frontends | [frontends](docs/knowledge/frontends.md) | [Loader](src/core/loader/loader.cpp), [Shared discovery](src/frontend_common/game_list_discovery.h), [Android host](src/android/app/native/main.cpp), [GPUI shell](rust/apps/eglantine_gpui/src/main.rs) | `[loader-formats]`, `[config_persistence]`, `gpui_session.py`, `cargo test` |
+| Game Boy cartridge validation, runtime, battery saves | [frontends](docs/knowledge/frontends.md#game-boy-runtime) | [Classic runtime](src/emulation/classic), [SDL session](src/yuzu_cmd/classic_session.cpp), [mGBA dependency](externals/mgba/CMakeLists.txt) | `[classic-runtime]`, `[classic-battery]`, `gpui_session.py` |
 | Host memory, GPU readbacks, textures, Vulkan | [video_core](docs/knowledge/video_core.md) | [Host memory](src/common/host_memory.cpp), [Buffer cache](src/video_core/buffer_cache/buffer_cache.h), [Texture code](src/video_core/textures) | `[host_memory]`, `[buffer-download-policy]`, `[textures]`, `[draw_skip_policy]` |
 | Native shaders (SM86 lowering & direct SPIR-V) | [shader_recompiler](docs/knowledge/shader_recompiler.md) | [Ampere lowering](src/shader_recompiler/frontend/ampere/lower_to_maxwell.h), [Pipeline cache](src/video_core/renderer_vulkan/vk_pipeline_cache.cpp), [Shader triage](.claude/skills/nx2-shader-triage/SKILL.md) | `[ampere]`, `[ampere-lazy-lowering]`, controlled frame comparison |
 | Rust FFI crates, language ownership, ISPC | [rust_ffi](docs/knowledge/rust_ffi.md) | [Workspace](rust/Cargo.toml), [FFI crate](rust/crates/eglantine_ffi/src/lib.rs), [AddRustCrate](CMakeModules/AddRustCrate.cmake) | `cargo test --manifest-path rust/Cargo.toml --locked --offline` |
+| Nintendo DS and Nintendo 3DS guest execution | [rust_ffi](docs/knowledge/rust_ffi.md#nintendo-ds-and-nintendo-3ds) | [DS machine](rust/crates/ds_core/src/machine.rs), [3DS machine](rust/crates/ctr_core/src/machine.rs) | `cargo test --manifest-path rust/Cargo.toml --locked --offline -p eglantine_ds -p eglantine_ctr` |
 | Controllers and Switch 2 protocol | [input_common](docs/knowledge/input_common.md) | [Switch 2 protocol](src/input_common/helpers/switch2_protocol), [Shared config](src/frontend_common/config.cpp) | `[switch2]`, hardware transport checks |
 | Build, CI, release checks, live debug | [build_ci](docs/knowledge/build_ci.md) | [CMakeLists](CMakeLists.txt), [Source checks](.github/workflows/source-checks.yml), [Debug server](src/core/debugger/nx2_debug_server.cpp), [Tool index](tools/README.md) | `test_check_release_paths.py`, `test_workflows.py`, [live workflow](.claude/skills/nx2-debug-server/SKILL.md) |
 | Tree conventions & active known gaps | [known_gaps](docs/knowledge/known_gaps.md) | [Nx2Perf](src/video_core/nx2_perf.h), [DrawSkip](src/video_core/renderer_vulkan/draw_skip_policy.h), [Provenance](ASSET_PROVENANCE.md) | Verify against open items before changing shared contracts |
@@ -52,11 +54,13 @@ cargo test --locked --manifest-path rust/apps/eglantine_gpui/Cargo.toml   # GPUI
 | `android` | `src/android` | Android SDL3 + Rust/C++ frontend (Groovy Gradle) |
 | `simd_kernels` | `src/simd_kernels` | Multi-ISA ISPC texture kernels (`AddIspcKernel.cmake`) |
 | `eglantine_rs` | `rust/` | `std`-only Cargo FFI bundle (`eglantine_ffi` -> `eglantine_rs`) |
+| `eglantine_ds` | `rust/crates/ds_core` | Headless NDS direct loading and bounded ARM9/ARM7 execution |
+| `eglantine_ctr` | `rust/crates/ctr_core` | Headless 3DSX loading and bounded ARM11 execution |
 | `tests` | `src/tests` | Catch2 unit tests mirroring `src/` |
 
 C++ owns emulator state, `eden-cli`, desktop game discovery, Ampere-to-Maxwell lowering, NUP
 archives, and the Switch 2 controller protocol. GPUI owns the desktop shell, SDL3 + Rust (`eglantine_android`) + C++
-owns Android, and Rust owns direct SM86 compute SPIR-V. See the
+owns Android, and Rust owns direct SM86 compute SPIR-V and headless DS and 3DS guest execution. See the
 [language ownership table](docs/knowledge/rust_ffi.md#first-party-language-and-domain-ownership)
 for the crate dependencies and runtime switches.
 

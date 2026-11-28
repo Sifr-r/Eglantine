@@ -226,8 +226,10 @@ jobs:
           test -x build/release/bin/eglantine
           test -x build/release/bin/eden-cli
           strip build/release/bin/eglantine build/release/bin/eden-cli
+          entries=(eglantine eden-cli)
+          if [ -d build/release/bin/licenses/classic ]; then entries+=(licenses/classic); fi
           tar -czf "eglantine-${SHA}-${PLATFORM}.tar.gz" \
-            -C build/release/bin eglantine eden-cli
+            -C build/release/bin "${entries[@]}"
           ls -la "eglantine-${SHA}-${PLATFORM}.tar.gz"
 
       # A self-contained AppImage: linuxdeploy bundles every library the two programs need except
@@ -271,6 +273,10 @@ jobs:
           export LDAI_OUTPUT="eglantine-${SHA}-${PLATFORM}.AppImage"
           export OUTPUT="$LDAI_OUTPUT"
           export ARCH="$arch"
+          if [ -d build/release/bin/licenses/classic ]; then
+            mkdir -p AppDir/usr/share/licenses/eglantine
+            cp -R build/release/bin/licenses/classic AppDir/usr/share/licenses/eglantine/
+          fi
           "$tools/linuxdeploy-$arch.AppImage" --appdir AppDir \
             --executable build/release/bin/eglantine \
             --executable build/release/bin/eden-cli \

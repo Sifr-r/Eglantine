@@ -3,10 +3,12 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io;
 use std::path::Path;
+use eglantine_library::ConsoleId;
 
 const LIBRARY_FILE: &str = "android_library.tsv";
 const LIBRARY_TEMP_FILE: &str = "android_library.tsv.tmp";
@@ -15,6 +17,8 @@ pub(super) struct GameEntry {
     pub(super) uri: CString,
     pub(super) title: CString,
     pub(super) program_id: u64,
+    pub(super) console: Option<ConsoleId>,
+    pub(super) played_at: u64,
 }
 
 #[derive(Default)]
@@ -22,6 +26,7 @@ pub(super) struct LibraryStore {
     folders: Vec<String>,
     games: Vec<GameEntry>,
     selected_index: Option<usize>,
+    pub(super) active_console: Option<ConsoleId>,
 }
 
 impl LibraryStore {
@@ -85,6 +90,8 @@ impl LibraryStore {
                     uri: uri_cstr,
                     title: title_cstr,
                     program_id,
+                    console: None,
+                    played_at: 0,
                 });
             }
             touched += 1;
@@ -92,6 +99,11 @@ impl LibraryStore {
 
         self.sort_and_restore_selection(selected_uri.as_deref());
         touched
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn game_by_uri_mut(&mut self, uri: &str) -> Option<&mut GameEntry> {
+        self.games.iter_mut().find(|game| game.uri.as_bytes() == uri.as_bytes())
     }
 
     pub(super) fn select(&mut self, index: usize) -> Option<&CStr> {
@@ -110,6 +122,7 @@ impl LibraryStore {
         let mut store = Self::default();
         let mut incoming = Vec::new();
         let mut selected_uri = None;
+        let mut metadata = HashMap::new();
 
         for line in contents.lines() {
             let mut parts = line.split('\t');
@@ -137,11 +150,31 @@ impl LibraryStore {
                         selected_uri = Some(uri.to_owned());
                     }
                 }
+                Some("console") => {
+                    if let (Some(id), None) = (parts.next(), parts.next()) {
+                        store.active_console = ConsoleId::parse(id).filter(|id| id.supported());
+                    }
+                }
+                Some("metadata") => {
+                    if let (Some(id), Some(played), Some(uri), None) =
+                        (parts.next(), parts.next(), parts.next(), parts.next())
+                        && is_document_uri(uri)
+                        && let Ok(played_at) = played.parse::<u64>()
+                    {
+                        metadata.insert(uri, (ConsoleId::parse(id), played_at));
+                    }
+                }
                 _ => {}
             }
         }
 
         store.upsert_games(incoming);
+        for game in &mut store.games {
+            if let Some(&(console, played_at)) = metadata.get(game.uri.to_str().unwrap_or_default()) {
+                game.console = console;
+                game.played_at = played_at;
+            }
+        }
         if let Some(uri) = selected_uri.as_deref() {
             store.sort_and_restore_selection(Some(uri));
         }
@@ -163,6 +196,19 @@ impl LibraryStore {
             out.push_str(&sanitize_single_line(&game.title.to_string_lossy()));
             out.push('\t');
             out.push_str(&sanitize_single_line(&game.uri.to_string_lossy()));
+            out.push('\n');
+            if game.console.is_some() || game.played_at != 0 {
+                out.push_str(&format!(
+                    "metadata\t{}\t{}\t{}\n",
+                    game.console.map_or("", ConsoleId::as_str),
+                    game.played_at,
+                    game.uri.to_string_lossy(),
+                ));
+            }
+        }
+        if let Some(console) = self.active_console {
+            out.push_str("console\t");
+            out.push_str(console.as_str());
             out.push('\n');
         }
         if let Some(selected) = self.selected_game() {

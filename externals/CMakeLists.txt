@@ -27,6 +27,10 @@ set(BUILD_SHARED_LIBS OFF)
 # Skip install rules for all externals
 set_directory_properties(PROPERTIES EXCLUDE_FROM_ALL ON)
 
+if(ENABLE_CLASSIC_RUNTIME)
+    add_subdirectory(mgba)
+endif()
+
 # Xbyak
 if (ARCHITECTURE_x86 OR ARCHITECTURE_x86_64)
     AddJsonPackage(xbyak)

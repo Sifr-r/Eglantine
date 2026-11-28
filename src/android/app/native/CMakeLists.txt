@@ -7,6 +7,7 @@ add_rust_static_library(
     TARGET eglantine-android-frontend
     MANIFEST "${PROJECT_SOURCE_DIR}/rust/apps/eglantine_android/Cargo.toml"
     LIB_NAME eglantine_android
+    EXTRA_WATCH_DIRS "${PROJECT_SOURCE_DIR}/rust/crates/eglantine_library"
     OFFLINE
 )
 

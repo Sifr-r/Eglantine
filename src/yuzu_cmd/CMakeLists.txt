@@ -28,6 +28,8 @@ else()
 endif()
 
 add_executable(yuzu-cmd
+    emu_window/embedded_window.cpp
+    emu_window/embedded_window.h
     emu_window/emu_window_sdl3.cpp
     emu_window/emu_window_sdl3.h
     emu_window/emu_window_sdl3_null.cpp
@@ -36,19 +38,35 @@ add_executable(yuzu-cmd
     emu_window/emu_window_sdl3_vk.h
     gpui_content.cpp
     gpui_content.h
+    gpui_controller.cpp
+    gpui_controller.h
     gpui_library.cpp
     gpui_library.h
     gpui_session.cpp
     gpui_session.h
     sdl_config.cpp
     sdl_config.h
+    software_keyboard_applet.cpp
+    software_keyboard_applet.h
     yuzu.cpp
     yuzu.rc
     ${OPENGL_SOURCES}
 )
 
-target_link_libraries(yuzu-cmd PRIVATE common core input_common frontend_common video_core
+target_link_libraries(yuzu-cmd PRIVATE classic_cartridge common core input_common frontend_common video_core
     nlohmann_json::nlohmann_json)
+
+if(TARGET classic_runtime)
+    target_sources(yuzu-cmd PRIVATE classic_session.cpp classic_session.h)
+    target_link_libraries(yuzu-cmd PRIVATE classic_runtime OpenSSL::Crypto)
+    target_compile_definitions(yuzu-cmd PRIVATE EGLANTINE_CLASSIC_RUNTIME)
+    add_custom_command(TARGET yuzu-cmd POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory
+            "${PROJECT_BINARY_DIR}/classic-notices" "$<TARGET_FILE_DIR:yuzu-cmd>/licenses/classic"
+        VERBATIM
+    )
+    install(DIRECTORY "${PROJECT_BINARY_DIR}/classic-notices/" DESTINATION "share/licenses/eglantine/classic")
+endif()
 
 if (ENABLE_MCP_SERVER)
     target_sources(yuzu-cmd PRIVATE mcp_host_cli.cpp mcp_host_cli.h)

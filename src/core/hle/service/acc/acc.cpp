@@ -568,7 +568,7 @@ protected:
         if (!profile_manager.SetProfileBaseAndData(user_id, base, data)) {
             LOG_ERROR(Service_ACC, "Failed to update user data and base!");
             IPC::ResponseBuilder rb{ctx, 2};
-            rb.Push(Account::ResultAccountUpdateFailed);
+            rb.Push(Account::ResultUserNotExist);
             return;
         }
 
@@ -606,7 +606,7 @@ protected:
             !profile_manager.SetProfileBaseAndData(user_id, base, data)) {
             LOG_ERROR(Service_ACC, "Failed to update profile data, base, and image!");
             IPC::ResponseBuilder rb{ctx, 2};
-            rb.Push(Account::ResultAccountUpdateFailed);
+            rb.Push(Account::ResultUserNotExist);
             return;
         }
 

@@ -176,6 +176,13 @@
         "source_subdir": "build/cmake",
         "version": "ebb370ca83"
     },
+    "mgba": {
+        "bundled": true,
+        "hash": "d7b0b0c82e2285acafa0dc0cdb4accfcde9d9a8d8a06ed32f3a15585121ee86aecf8f5f6a762003dad1006fb9e2dcd8a3d141fda71c077182623886f64c042f5",
+        "repo": "mgba-emu/mgba",
+        "url": "https://codeload.github.com/mgba-emu/mgba/tar.gz/refs/tags/0.10.5",
+        "version": "0.10.5"
+    },
     "moltenvk": {
         "artifact": "MoltenVK-macOS.tar",
         "bundled": true,

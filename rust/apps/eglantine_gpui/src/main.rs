@@ -5,6 +5,7 @@
 
 mod appearance;
 mod controller;
+mod embed;
 mod navigation;
 mod preferences;
 mod shell;

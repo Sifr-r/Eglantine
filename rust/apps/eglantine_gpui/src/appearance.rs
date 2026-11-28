@@ -9,7 +9,11 @@ use std::{
     sync::Arc,
 };
 
-use eglantine_gpui::theme::{AssetKind, Color, ComponentId, MAX_THEME_ASSET_BYTES, PanelSide, Placement, ThemePackage};
+use eglantine_gpui::theme::{
+    AssetKind, Color, ComponentId, ConsoleLayout, MAX_THEME_ASSET_BYTES, PanelSide, Placement,
+    ThemeComponent, ThemePackage,
+};
+use eglantine_library::{ConsoleId, LibraryLayout};
 use gpui::{Context, Image, ImageFormat, KeyDownEvent, PathPromptOptions, Window};
 
 use crate::shell::Shell;
@@ -18,6 +22,7 @@ use crate::shell::Shell;
 pub enum PreviewScreen {
     Home,
     Library,
+    Console,
     Pause,
     Dialog,
 }
@@ -27,6 +32,7 @@ impl PreviewScreen {
         match self {
             Self::Home => "Home",
             Self::Library => "Library",
+            Self::Console => "Console component",
             Self::Pause => "Pause sheet",
             Self::Dialog => "Dialog",
         }
@@ -35,25 +41,31 @@ impl PreviewScreen {
     pub fn next(self) -> Self {
         match self {
             Self::Home => Self::Library,
-            Self::Library => Self::Pause,
+            Self::Library => Self::Console,
+            Self::Console => Self::Pause,
             Self::Pause => Self::Dialog,
             Self::Dialog => Self::Home,
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThemeAction {
     Name, Background, Surface, Text, Muted, FocusStart, FocusEnd, FocusText,
     Font, TextSize, Spacing, Corners, CoverSize, Motion, HomeMode, Shortcuts,
     MoveShortcutEarlier, MoveShortcutLater, ToggleShortcut, LibraryMode, SettingsSide, PauseSide, DialogWidth,
     BackgroundImage, ClearBackground, FontFile, ClearFont, IconTarget, IconFile, ClearIcon,
+    ConsoleScope, ConsoleComponent, ComponentBackground, ComponentText, ComponentFocus,
+    ComponentSelected, ComponentPadding, ComponentCorners, ResetComponent, ConsoleLayoutPreset,
     PreviewScreen, Duplicate, Apply, Import, Export, Discard, Default,
 }
 
 impl ThemeAction {
-    pub const ALL: [Self; 37] = [
+    pub const ALL: [Self; 47] = [
         Self::PreviewScreen, Self::Duplicate, Self::Apply, Self::Import, Self::Export, Self::Discard, Self::Default,
+        Self::ConsoleScope, Self::ConsoleComponent, Self::ComponentBackground, Self::ComponentText,
+        Self::ComponentFocus, Self::ComponentSelected, Self::ComponentPadding,
+        Self::ComponentCorners, Self::ResetComponent, Self::ConsoleLayoutPreset,
         Self::Name, Self::Background, Self::Surface, Self::Text, Self::Muted, Self::FocusStart,
         Self::FocusEnd, Self::FocusText, Self::Font, Self::TextSize, Self::Spacing, Self::Corners,
         Self::CoverSize, Self::Motion, Self::HomeMode, Self::Shortcuts, Self::IconTarget,
@@ -80,6 +92,12 @@ impl ThemeAction {
             Self::PreviewScreen => "Preview screen", Self::Duplicate => "Duplicate theme",
             Self::Apply => "Apply theme", Self::Import => "Import theme",
             Self::Export => "Export theme", Self::Discard => "Discard changes", Self::Default => "Restore default theme",
+            Self::ConsoleScope => "Console theme scope", Self::ConsoleComponent => "Component to edit",
+            Self::ComponentBackground => "Component background", Self::ComponentText => "Component text",
+            Self::ComponentFocus => "Component focus outline", Self::ComponentSelected => "Selected surface",
+            Self::ComponentPadding => "Component padding", Self::ComponentCorners => "Component corners",
+            Self::ResetComponent => "Reset component",
+            Self::ConsoleLayoutPreset => "Console library layout",
         }
     }
 
@@ -96,6 +114,8 @@ pub struct Appearance {
     images: BTreeMap<String, Arc<Image>>,
     registered_fonts: BTreeSet<u64>,
     icon_target: ComponentId,
+    console_scope: Option<ConsoleId>,
+    console_component: ThemeComponent,
     preview_screen: PreviewScreen,
     pub message: Option<String>,
 }
@@ -110,6 +130,8 @@ impl Appearance {
             images: BTreeMap::new(),
             registered_fonts: BTreeSet::new(),
             icon_target: ComponentId::Library,
+            console_scope: None,
+            console_component: ThemeComponent::LibraryList,
             preview_screen: PreviewScreen::Home,
             message: None,
         };
@@ -119,6 +141,10 @@ impl Appearance {
 
     pub fn preview_screen(&self) -> PreviewScreen {
         self.preview_screen
+    }
+
+    pub fn console_preview(&self) -> (Option<ConsoleId>, ThemeComponent) {
+        (self.console_scope, self.console_component)
     }
 
     pub fn package(&self) -> &ThemePackage {
@@ -155,6 +181,29 @@ impl Appearance {
         let layout = &theme.layout;
         use ThemeAction::*;
         match action {
+            ConsoleScope => self.console_scope.map_or("All consoles", ConsoleId::name).into(),
+            ConsoleComponent => self.console_component.label().into(),
+            ConsoleLayoutPreset => self.console_scope
+                .filter(|console| console.layout() != LibraryLayout::Existing)
+                .map_or("Choose a handheld or classic console", |console| {
+                    theme.console_layouts.get(console.as_str()).map_or("Console default", |layout| layout.label())
+                }).into(),
+            ComponentBackground | ComponentText | ComponentFocus | ComponentSelected
+            | ComponentPadding | ComponentCorners => {
+                let part = theme.component(self.console_scope, self.console_component);
+                let color = match action {
+                    ComponentBackground => part.background,
+                    ComponentText => part.foreground,
+                    ComponentFocus => part.focus,
+                    ComponentSelected => part.selected_background,
+                    _ => None,
+                };
+                color.map(hex).or_else(|| match action {
+                    ComponentPadding => part.padding.map(|value| value.to_string()),
+                    ComponentCorners => part.radius.map(|value| value.to_string()),
+                    _ => None,
+                }).unwrap_or_else(|| "Inherited".into())
+            }
             Name => theme.name.clone(),
             Background => hex(style.background),
             Surface => hex(style.panel),
@@ -221,12 +270,14 @@ impl Appearance {
         use ThemeAction::*;
         let step = match action {
             TextSize => 5,
-            Spacing | Corners => 2,
+            Spacing | Corners | ComponentPadding | ComponentCorners => 2,
             CoverSize | DialogWidth => 16,
             Motion => 20,
             _ => return false,
         };
-        let Ok(current) = self.value(action).parse::<i32>() else { return true };
+        let Ok(current) = self.value(action).parse::<i32>() else {
+            return direction >= 0;
+        };
         let next = (current + direction * step).to_string();
         match self.set_value(action, &next) {
             Ok(()) => self.check_preview(),
@@ -245,10 +296,20 @@ impl Appearance {
         let draft = self.draft.as_mut().expect("begin creates a draft");
         let old = draft.theme.clone();
         let theme = &mut draft.theme;
-        let style = &mut theme.style;
         let number = || text.parse().map_err(|_| "Enter a whole number.".to_owned());
         use ThemeAction::*;
+        let mut component = match self.console_scope {
+            Some(console) => theme.consoles.get(console.as_str()).and_then(|parts| parts.get(&self.console_component)),
+            None => theme.components.get(&self.console_component),
+        }.copied().unwrap_or_default();
+        let style = &mut theme.style;
         match action {
+            ComponentBackground => component.background = Some(parse_color(text)?),
+            ComponentText => component.foreground = Some(parse_color(text)?),
+            ComponentFocus => component.focus = Some(parse_color(text)?),
+            ComponentSelected => component.selected_background = Some(parse_color(text)?),
+            ComponentPadding => component.padding = Some(number()?),
+            ComponentCorners => component.radius = Some(number()?),
             Name => {
                 theme.name = text.to_owned();
                 let mut id: String = text.chars().filter_map(|character| {
@@ -277,6 +338,15 @@ impl Appearance {
             DialogWidth => theme.layout.dialog_width = number()?,
             _ => return Err("That field does not accept text.".into()),
         }
+        if matches!(action, ComponentBackground | ComponentText | ComponentFocus | ComponentSelected
+            | ComponentPadding | ComponentCorners)
+        {
+            theme.version = 2;
+            match self.console_scope {
+                Some(console) => theme.consoles.entry(console.as_str().to_owned()).or_default(),
+                None => &mut theme.components,
+            }.insert(self.console_component, component);
+        }
         if let Err(error) = theme.validate_draft() {
             *theme = old;
             return Err(error.to_string());
@@ -291,6 +361,30 @@ impl Appearance {
             self.preview_screen = self.preview_screen.next();
             return;
         }
+        if action == ThemeAction::ConsoleScope {
+            self.preview_screen = self::PreviewScreen::Console;
+            const SCOPES: [Option<ConsoleId>; 8] = [
+                None, Some(ConsoleId::GameBoy), Some(ConsoleId::GameBoyColor),
+                Some(ConsoleId::GameBoyAdvance), Some(ConsoleId::Ds), Some(ConsoleId::Nintendo3Ds),
+                Some(ConsoleId::Switch), Some(ConsoleId::Switch2),
+            ];
+            let index = SCOPES.iter().position(|scope| *scope == self.console_scope).unwrap_or(0);
+            self.console_scope = SCOPES[(index + 1) % SCOPES.len()];
+            return;
+        }
+        if action == ThemeAction::ConsoleComponent {
+            self.preview_screen = self::PreviewScreen::Console;
+            let parts = ThemeComponent::ALL;
+            let index = parts.iter().position(|part| *part == self.console_component).unwrap_or(0);
+            self.console_component = parts[(index + 1) % parts.len()];
+            return;
+        }
+        if matches!(action, ThemeAction::ComponentBackground | ThemeAction::ComponentText
+            | ThemeAction::ComponentFocus | ThemeAction::ComponentSelected | ThemeAction::ComponentPadding
+            | ThemeAction::ComponentCorners | ThemeAction::ResetComponent | ThemeAction::ConsoleLayoutPreset)
+        {
+            self.preview_screen = self::PreviewScreen::Console;
+        }
         self.begin();
         if action == ThemeAction::Import || action == ThemeAction::Export || action.image_or_font() {
             self.pick(action, window, cx);
@@ -300,6 +394,38 @@ impl Appearance {
         use ThemeAction::*;
         let layout = &mut draft.theme.layout;
         match action {
+            ConsoleLayoutPreset => {
+                if let Some(console) = self.console_scope.filter(|console| console.layout() != LibraryLayout::Existing) {
+                    let key = console.as_str();
+                    let next = match draft.theme.console_layouts.get(key) {
+                        None => Some(ConsoleLayout::List),
+                        Some(ConsoleLayout::List) => Some(ConsoleLayout::Grid),
+                        Some(ConsoleLayout::Grid) => Some(ConsoleLayout::SplitPreview),
+                        Some(ConsoleLayout::SplitPreview) => None,
+                    };
+                    if let Some(next) = next {
+                        draft.theme.console_layouts.insert(key.into(), next);
+                    } else {
+                        draft.theme.console_layouts.remove(key);
+                    }
+                    draft.theme.version = if draft.theme.has_console_overrides() { 2 } else { 1 };
+                    self.check_preview();
+                }
+            }
+            ResetComponent => {
+                if let Some(console) = self.console_scope {
+                    if let Some(parts) = draft.theme.consoles.get_mut(console.as_str()) {
+                        parts.remove(&self.console_component);
+                        if parts.is_empty() {
+                            draft.theme.consoles.remove(console.as_str());
+                        }
+                    }
+                } else {
+                    draft.theme.components.remove(&self.console_component);
+                }
+                draft.theme.version = if draft.theme.has_console_overrides() { 2 } else { 1 };
+                self.check_preview();
+            }
             Duplicate => {
                 draft.theme = draft.theme.duplicate();
                 let name = draft.theme.name.clone();

@@ -28,7 +28,7 @@ option(EGLANTINE_RUST_OFFLINE "Pass --offline --frozen to Cargo invocations" OFF
 function(add_rust_static_library)
     set(options OFFLINE NO_DEFAULT_FEATURES)
     set(oneValueArgs TARGET MANIFEST LIB_NAME PACKAGE INCLUDE_DIR TARGET_DIR)
-    set(multiValueArgs FEATURES)
+    set(multiValueArgs FEATURES EXTRA_WATCH_DIRS)
     cmake_parse_arguments(RUST "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
     if(NOT RUST_TARGET)
@@ -224,6 +224,13 @@ function(add_rust_static_library)
         "${_manifest_dir}/crates/*/Cargo.toml"
         "${_manifest_dir}/crates/**/*.rs"
     )
+    foreach(_watch_dir IN LISTS RUST_EXTRA_WATCH_DIRS)
+        file(GLOB_RECURSE _extra_rust_sources CONFIGURE_DEPENDS
+            "${_watch_dir}/Cargo.toml"
+            "${_watch_dir}/src/*.rs"
+        )
+        list(APPEND _rust_sources ${_extra_rust_sources})
+    endforeach()
 
     add_custom_command(
         OUTPUT "${_stamp_file}"
